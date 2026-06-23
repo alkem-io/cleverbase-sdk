@@ -1,0 +1,59 @@
+# Rust
+/target/
+**/target/
+debug/
+*.rs.bk
+*.rlib
+*.prof*
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.log
+*.tsbuildinfo
+.npm/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Go
+*.exe
+*.test
+*.out
+/vendor/
+
+# WASM / build artifacts
+pkg/
+*.wasm
+
+# Native FFI build outputs
+*.dylib
+*.so
+*.a
+*.dll
+
+# Coverage
+coverage/
+*.profraw
+lcov.info
+
+# Env / secrets (never commit Cleverbase client secrets, TSA creds, etc.)
+.env*
+!.env.example
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.tmp

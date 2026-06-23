@@ -1,0 +1,22 @@
+{
+  "name": "@cleverbase/sdk",
+  "version": "0.1.0",
+  "description": "Cleverbase SDK — Node/TypeScript binding",
+  "license": "EUPL-1.2",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "cleverbase"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --platform",
+    "test": "node --test test/signing.test.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4",
+    "cbor": "^9.0.2"
+  }
+}

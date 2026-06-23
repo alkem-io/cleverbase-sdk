@@ -1,0 +1,12 @@
+.git/
+target/
+**/target/
+node_modules/
+dist/
+build/
+coverage/
+*.log
+.env*
+.DS_Store
+__pycache__/
+.venv/

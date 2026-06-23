@@ -1,0 +1,18 @@
+# Standalone workspace (detached from the core workspace so `cargo test --workspace`
+# at the repo root does not try to build the Python extension module).
+[workspace]
+
+[package]
+name = "cleverbase-py"
+version = "0.1.0"
+edition = "2021"
+license = "EUPL-1.2"
+description = "Python (PyO3) binding for the Cleverbase SDK core."
+
+[lib]
+name = "cleverbase"
+crate-type = ["cdylib"]
+
+[dependencies]
+cleverbase-core = { path = "../../crates/cleverbase-core" }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
