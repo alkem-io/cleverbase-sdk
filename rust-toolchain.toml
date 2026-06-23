@@ -1,0 +1,6 @@
+# Pin the toolchain so the enforcing clippy lint set (pedantic + nursery) is reproducible:
+# a floating `stable` gains new lints each release and would break CI unpredictably. Bump
+# deliberately. 1.92 ≥ the workspace MSRV (1.83). llvm-tools-preview backs the coverage gate.
+[toolchain]
+channel = "1.92.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

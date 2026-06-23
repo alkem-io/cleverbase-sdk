@@ -24,8 +24,7 @@ fn openssl_available() -> bool {
     Command::new("openssl")
         .arg("version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn minimal_pdf() -> Vec<u8> {
