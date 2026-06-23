@@ -2,8 +2,8 @@
 //!
 //! Builds a `TimeStampReq` over `sha256(signature value)` and extracts the `TimeStampToken` from
 //! the TSA's `TimeStampResp`. The token is embedded into the CMS as the `signature-time-stamp`
-//! unsigned attribute (see [`crate::crypto::cms::embed_timestamp`]). Cleverbase provides no TSA, so
-//! the host points this at an external qualified TSA (config).
+//! unsigned attribute (see [`crate::crypto::cms::embed_timestamp`]). Cleverbase's CSC signing API
+//! exposes no timestamp endpoint, so the host points this at a configured RFC 3161 TSA.
 
 use cms::content_info::ContentInfo;
 use cms::signed_data::SignedData;

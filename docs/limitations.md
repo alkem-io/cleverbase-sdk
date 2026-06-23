@@ -11,7 +11,9 @@ independent OpenSSL validation. The items below are deliberately deferred, block
   which is obtained through a sales-led onboarding. Until then, the flow is validated offline with
   recorded-shape fixtures and a synthetic test PKI. This is the one genuine external dependency.
 - **B-T against a real qualified TSA**: tested against a local OpenSSL TSA. Production B-T needs a
-  contracted qualified Time-Stamping Authority endpoint (Cleverbase provides none).
+  qualified RFC 3161 Time-Stamping Authority endpoint. Cleverbase's CSC signing API exposes no
+  timestamp endpoint; whether Cleverbase offers a standalone qualified TSA is unverified, so the
+  TSA is treated as integrator-supplied config (a third-party TSA, or Cleverbase's if available).
 
 ## Partial / approximate
 
@@ -34,8 +36,8 @@ independent OpenSSL validation. The items below are deliberately deferred, block
 ## Mechanical / not yet done
 
 - CI matrix across Linux (glibc/musl) / macOS / Windows; packaging & publishing of prebuilt
-  artifacts (wheels, napi prebuilds, cdylib releases) — a starter CI workflow exists.
-- ≥95% coverage gate enforcement in CI (coverage tooling configured conceptually; gate not wired).
+  artifacts (wheels, napi prebuilds, cdylib releases). CI today runs `Lint` + `Tests` workflows on
+  ubuntu-latest (single platform); the cross-platform matrix and release packaging are outstanding.
 - Per-binding full-signature tests + cross-language parity harness (bindings are tested at the
   begin/resume protocol level today); language demos; API reference docs.
 - WASM surface (T020): **not required** — the frontend helper performs no crypto, so no in-browser
