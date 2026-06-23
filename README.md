@@ -1,0 +1,77 @@
+# Cleverbase SDK
+
+A production-grade, polyglot SDK for **remote Qualified Electronic Signing (QES)** of PDFs via
+[Cleverbase](https://cleverbase.com) (a Dutch Qualified Trust Service Provider), using the Cloud
+Signature Consortium (CSC) API + OpenID Connect. Built for the
+[Alkemio](https://github.com/alkem-io) platform, designed to stand alone.
+
+Cleverbase publishes no official SDK and signs only a *hash* — so this SDK owns the whole AdES
+stack (container assembly, timestamping, validation).
+
+## Architecture
+
+A single **sans-IO Rust core** ([`crates/cleverbase-core`](crates/cleverbase-core)) holds all
+protocol + cryptography. It performs **no I/O**: it is a pure, serializable state machine that
+*emits effects* (HTTP requests to perform, browser redirects to issue) which the host executes,
+then feeds the results back. This keeps the core deterministic, auditable, and testable against
+recorded exchanges, and lets every language binding stay thin.
+
+```
+crates/cleverbase-core   sans-IO state machine, CSC/OIDC client, CAdES/PAdES CMS, RFC 3161
+crates/cleverbase-ffi     stable C ABI (CBOR in / result out) — consumed by Go
+bindings/python           PyO3 + maturin            → import cleverbase
+bindings/node             napi-rs                   → @cleverbase/sdk
+bindings/go               cgo over the C ABI        → typed Go API
+frontend/helper-ts        thin TS redirect/status helper (no crypto, no secrets)
+```
+
+## Status (Phase 1: signing)
+
+Implemented and tested (Rust unit + integration; independently validated with **OpenSSL**):
+
+- ✅ Remote QES over CSC (OAuth2 Authorization-Code, two-round: service + credential scopes).
+- ✅ **PAdES B-B** and **B-T** (RFC 3161 timestamp from an external qualified TSA).
+- ✅ **RSA** (CSC v1, OpenSSL-validated end-to-end) and **ECDSA P-256** (CSC v2, validated at the
+  CMS layer — assembly + in-crate verification; a full ECDSA OpenSSL/DSS pass is on the roadmap,
+  see `docs/limitations.md`); CAdES signed attributes incl. `signing-certificate-v2`; detached CMS
+  with an **external** signature (the Cleverbase model).
+- ✅ Signer-identity binding/verification (FR-014), per-operation evidence records (FR-015),
+  optional **visible appearance** with rendered text (FR-016), stateless resumable session handle
+  (FR-013), WYSIWYS hash-bound authorization.
+- ✅ Python, Node, and Go bindings + the TS frontend helper, all with passing tests.
+
+See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
+and [`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work.
+
+## Build & test
+
+```bash
+# Rust core + C ABI (+ independent OpenSSL/TSA validation; needs `openssl`)
+cargo test --workspace
+
+# Python binding
+python3 -m venv .venv && .venv/bin/pip install maturin cbor2 pytest
+( cd bindings/python && PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 ../../.venv/bin/maturin develop )
+.venv/bin/pytest bindings/python/tests
+
+# Node binding
+( cd bindings/node && npm install && npm run build && npm test )
+
+# Go binding (links the C ABI dylib)
+cargo build -p cleverbase-ffi
+( cd bindings/go && DYLD_LIBRARY_PATH=$PWD/../../target/debug go test )
+
+# Frontend helper
+( cd frontend/helper-ts && npm install && npm run build && npm test )
+```
+
+## Security model (Constitution Principle IV)
+
+Secrets (`client_secret`, SAD, tokens, keys) are **server-side only**. The frontend helper performs
+no cryptography and carries no secrets — only redirect URLs, an opaque correlation id, and the
+OAuth `code`/`state`. The session handle may carry short-lived authorization material and **must be
+stored encrypted server-side**.
+
+## License
+
+Licensed under the **European Union Public Licence v. 1.2 (EUPL-1.2)**. See [LICENSE](LICENSE).
