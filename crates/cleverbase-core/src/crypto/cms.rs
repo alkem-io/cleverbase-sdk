@@ -508,13 +508,25 @@ mod tests {
         );
     }
 
+    /// ASN.1 tag of the signing-time attribute's value in freshly built signed attributes.
+    fn signing_time_tag(now_unix: i64) -> der::Tag {
+        use der::Tagged;
+        let der = build_signed_attrs(&sha256(b"x"), RSA_CERT, now_unix).unwrap();
+        let attrs = SetOfVec::<Attribute>::from_der(&der).unwrap();
+        let st = attrs
+            .iter()
+            .find(|a| a.oid == ID_SIGNING_TIME)
+            .expect("signing-time attribute present");
+        st.values.iter().next().expect("a signing-time value").tag()
+    }
+
     #[test]
-    fn signing_time_uses_generalized_time_past_2050() {
-        // now_unix at/after 2050-01-01 must encode signing-time as GeneralizedTime (not UTCTime).
-        let attrs = build_signed_attrs(&sha256(b"x"), RSA_CERT, 2_524_608_000).unwrap();
-        // The signed-attrs SET OF must still parse, and the GeneralizedTime branch (0x18) is present.
-        assert!(SetOfVec::<Attribute>::from_der(&attrs).is_ok());
-        assert!(attrs.windows(1).any(|w| w == [0x18]));
+    fn signing_time_switches_to_generalized_time_at_2050() {
+        // CMS/X.509 require UTCTime for years < 2050 and GeneralizedTime from 2050 on. Assert the
+        // signing-time value's *tag* switches at the boundary — not merely that some 0x18 byte
+        // appears in the DER (which is true regardless of the encoding chosen).
+        assert_eq!(signing_time_tag(1_700_000_000), der::Tag::UtcTime); // 2023
+        assert_eq!(signing_time_tag(2_524_608_000), der::Tag::GeneralizedTime); // 2050-01-01
     }
 
     #[test]
