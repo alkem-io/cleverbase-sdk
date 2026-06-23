@@ -22,6 +22,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"unsafe"
 
@@ -134,6 +135,10 @@ func process(input []byte) ([]byte, error) {
 		return nil, fmt.Errorf("cleverbase_process returned a non-zero status: %d", int(rc))
 	}
 	defer C.cleverbase_free(outPtr, outLen)
+	// C.GoBytes takes an int length; guard the size_t→int narrowing against overflow.
+	if uint64(outLen) > uint64(math.MaxInt32) {
+		return nil, fmt.Errorf("cleverbase_process output too large: %d bytes", uint64(outLen))
+	}
 	return C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen)), nil
 }
 

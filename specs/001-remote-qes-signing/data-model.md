@@ -95,7 +95,9 @@ next effect from `phase`; effects are not stored on the handle.
 
 ### Effect (sans-IO output)
 What the host must do next.
-- `HttpEffect`: { method, url, headers, body } — idempotent; safe to retry on transport failure.
+- `HttpEffect`: { method, url, headers, body } — retry-safety depends on the operation (idempotent
+  reads may be retried; a token exchange or `signHash` must be retried only on a pure transport
+  failure, never after a server reply, since they consume a one-time SAD / produce a signature).
 - `RedirectEffect`: { url, state } — send the signer's browser here; resume with the returned `code`.
 
 ## Enumerations

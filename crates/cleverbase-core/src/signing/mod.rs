@@ -196,6 +196,21 @@ fn evidence_failure(
     }
 }
 
+/// Clear all sensitive carried state from a terminal handle. The flow never resumes past a terminal
+/// phase, so the Bearer/SAD token, the document/config (which holds the client secret), and the
+/// assembled signing bytes must not linger in a serializable handle — on success OR failure.
+fn scrub_sensitive(handle: &mut SigningSessionHandle) {
+    handle.state = None;
+    handle.credential_id = None;
+    handle.service_token = None;
+    handle.cert_chain = None;
+    handle.signed_attrs_der = None;
+    handle.staged_pdf = None;
+    handle.cms_der = None;
+    handle.request = None;
+    handle.config = None;
+}
+
 fn fail(
     mut handle: SigningSessionHandle,
     outcome: SigningOutcome,
@@ -203,6 +218,7 @@ fn fail(
 ) -> (SigningSessionHandle, Step) {
     let evidence = evidence_failure(&handle, outcome, reason);
     handle.phase = SigningPhase::Failed;
+    scrub_sensitive(&mut handle);
     (handle, Step::Failed { evidence })
 }
 
@@ -228,10 +244,7 @@ fn finalize(
         pdf_a: handle.pdf_a.unwrap_or(false),
     };
     handle.phase = SigningPhase::Completed;
-    handle.staged_pdf = None;
-    handle.signed_attrs_der = None;
-    handle.service_token = None;
-    handle.cms_der = None;
+    scrub_sensitive(&mut handle);
     Ok((handle, Step::Done { signed, evidence }))
 }
 
@@ -1051,6 +1064,25 @@ mod tests {
             expect_failed(step).outcome,
             SigningOutcome::CredentialUnavailable
         );
+    }
+
+    #[test]
+    fn terminal_handle_is_scrubbed_of_secrets() {
+        // Failure after the service token is obtained: the terminal handle must carry no secrets
+        // (Bearer token, client-secret-bearing config, document, or assembled bytes).
+        let h = advance_to(SigningPhase::InfoPending);
+        assert!(h.service_token.is_some(), "precondition: token is set here");
+        let (failed, _) = resume(h, http_err(500), ctx()).unwrap();
+        assert_eq!(failed.phase, SigningPhase::Failed);
+        assert!(failed.service_token.is_none(), "service token scrubbed");
+        assert!(failed.config.is_none(), "config (client secret) scrubbed");
+        assert!(failed.request.is_none() && failed.cert_chain.is_none());
+        assert!(failed.staged_pdf.is_none() && failed.cms_der.is_none());
+        // The success path is scrubbed too.
+        let (done, _) = run_full_flow(request(ConformanceLevel::BB, None));
+        assert_eq!(done.phase, SigningPhase::Completed);
+        assert!(done.service_token.is_none() && done.config.is_none());
+        assert!(done.staged_pdf.is_none() && done.request.is_none());
     }
 
     #[test]

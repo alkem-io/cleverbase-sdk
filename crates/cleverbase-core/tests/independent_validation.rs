@@ -374,6 +374,10 @@ fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
 fn tsa_token_gen_time_is_parsed() {
     // Drive a real openssl TSA and confirm we extract its genTime from the issued token (so the
     // evidence reports the TSA's trusted time, not the host clock).
+    if !openssl_available() {
+        eprintln!("openssl not available; skipping TSA genTime test");
+        return;
+    }
     let imprint = cleverbase_core::crypto::sha256(b"some signature value");
     let req = cleverbase_core::timestamp::build_request(&imprint, None).unwrap();
     let tsr = openssl_timestamp(&req);

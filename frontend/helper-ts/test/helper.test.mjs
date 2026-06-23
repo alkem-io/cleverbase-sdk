@@ -60,12 +60,19 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
     "begin_signing",
   ];
   for (const c of calls) {
-    const body = c.init && c.init.body ? String(c.init.body).toLowerCase() : "";
+    // Scan the whole outbound request — URL, headers, and body — not just the body, since a leak
+    // could ride in a query parameter or header.
+    const parts = [c.url || ""];
+    if (c.init) {
+      if (c.init.headers) parts.push(JSON.stringify(c.init.headers));
+      if (c.init.body) parts.push(String(c.init.body));
+    }
+    const haystack = parts.join(" ").toLowerCase();
     for (const word of forbidden) {
       // Word-boundary match so e.g. the SAD token is caught even as `"sad"` in JSON,
       // without false positives on substrings inside unrelated words.
       const re = new RegExp(`\\b${word}\\b`);
-      assert.ok(!re.test(body), `request to ${c.url} leaked '${word}'`);
+      assert.ok(!re.test(haystack), `request to ${c.url} leaked '${word}'`);
     }
   }
 });

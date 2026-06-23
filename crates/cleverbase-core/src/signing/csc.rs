@@ -119,10 +119,12 @@ pub fn parse_credentials_info(body: &[u8]) -> Result<CredentialInfo, CoreError> 
 
 fn key_algo_from_oids(oids: &[String]) -> KeyAlgo {
     for o in oids {
-        if o.starts_with("1.2.840.113549.1.1") {
+        // Trailing dots keep matching within the intended arc (PKCS#1 / ANSI X9.62) so a sibling
+        // arc like `1.2.840.113549.1.10` can't be misread as RSA.
+        if o.starts_with("1.2.840.113549.1.1.") {
             return KeyAlgo::Rsa;
         }
-        if o.starts_with("1.2.840.10045") {
+        if o.starts_with("1.2.840.10045.") {
             return KeyAlgo::EcdsaP256;
         }
     }
@@ -151,20 +153,32 @@ fn split_rdns(dn: &str) -> Vec<String> {
     parts
 }
 
-/// Remove RFC 4514 backslash escapes from an RDN value (`Doe\, Jane` → `Doe, Jane`).
+/// Remove RFC 4514 backslash escapes from an RDN value: both `\<char>` (e.g. `Doe\, Jane` →
+/// `Doe, Jane`) and `\HH` hex escapes (e.g. `\41` → `A`). Consecutive hex escapes can encode a
+/// multi-byte UTF-8 char (`\C3\A9` → `é`), so decode into a byte buffer and interpret as UTF-8.
 fn unescape_rdn_value(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let n1 = bytes[i + 1];
+            if i + 2 < bytes.len() && n1.is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit() {
+                let hi = char::from(n1).to_digit(16).unwrap();
+                let lo = char::from(bytes[i + 2]).to_digit(16).unwrap();
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+            } else {
+                // `\<char>` — the escaped character literally (an ASCII special).
+                out.push(n1);
+                i += 2;
             }
         } else {
-            out.push(c);
+            out.push(bytes[i]);
+            i += 1;
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Extract an attribute value (e.g. `CN`) from an RFC 4514 distinguished name, honoring escaping.
@@ -325,6 +339,20 @@ mod tests {
         assert_eq!(KeyAlgo::Rsa.sign_algo_oid(), "1.2.840.113549.1.1.11");
         assert_eq!(KeyAlgo::EcdsaP256.sign_algo_oid(), "1.2.840.10045.4.3.2");
         assert_eq!(KeyAlgo::Other.sign_algo_oid(), "");
+    }
+
+    #[test]
+    fn unescape_rdn_value_decodes_hex_and_char_escapes() {
+        // \<char> literal escapes.
+        assert_eq!(unescape_rdn_value("Doe\\, Jane"), "Doe, Jane");
+        // \HH hex escapes, including a multi-byte UTF-8 run (\C3\A9 = é).
+        assert_eq!(unescape_rdn_value("\\41\\42C"), "ABC");
+        assert_eq!(unescape_rdn_value("caf\\C3\\A9"), "café");
+        // extract_attr applies it end-to-end.
+        assert_eq!(
+            extract_attr("CN=\\43af\\C3\\A9, O=x", "CN").as_deref(),
+            Some("Café")
+        );
     }
 
     #[test]

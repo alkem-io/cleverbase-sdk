@@ -282,9 +282,17 @@ pub fn prepare(
     }
     let field_id = doc.add_object(Object::Dictionary(field));
 
-    // Attach the widget to the page's annotations.
-    let mut annots = match doc.get_object(page_id) {
-        Ok(Object::Dictionary(d)) => match d.get(b"Annots") {
+    // Attach the widget to the page's annotations, preserving any existing /Annots — which may be
+    // stored as an inline array OR an indirect reference (resolve the latter, don't drop it).
+    let existing_annots = doc
+        .get_object(page_id)
+        .ok()
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|d| d.get(b"Annots").ok())
+        .cloned();
+    let mut annots = match existing_annots {
+        Some(Object::Array(a)) => a,
+        Some(Object::Reference(r)) => match doc.get_object(r) {
             Ok(Object::Array(a)) => a.clone(),
             _ => Vec::new(),
         },
@@ -295,14 +303,47 @@ pub fn prepare(
         .as_dict_mut()?
         .set("Annots", Object::Array(annots));
 
-    // AcroForm with the signature field.
+    // Merge the signature field into the catalog's /AcroForm rather than overwriting it (a form PDF
+    // already has one). /AcroForm and its /Fields may each be an inline value or an indirect ref.
     let catalog_id = doc.trailer.get(b"Root")?.as_reference()?;
-    let mut acro = Dictionary::new();
-    acro.set("Fields", Object::Array(vec![Object::Reference(field_id)]));
+    let existing_acro = doc
+        .get_object(catalog_id)
+        .ok()
+        .and_then(|o| o.as_dict().ok())
+        .and_then(|d| d.get(b"AcroForm").ok())
+        .cloned();
+    let acro_ref = match &existing_acro {
+        Some(Object::Reference(r)) => Some(*r),
+        _ => None,
+    };
+    let mut acro = match &existing_acro {
+        Some(Object::Dictionary(d)) => d.clone(),
+        _ => acro_ref
+            .and_then(|r| doc.get_object(r).ok())
+            .and_then(|o| o.as_dict().ok())
+            .map_or_else(Dictionary::new, Clone::clone),
+    };
+    let mut fields = match acro.get(b"Fields") {
+        Ok(Object::Array(a)) => a.clone(),
+        Ok(Object::Reference(r)) => match doc.get_object(*r) {
+            Ok(Object::Array(a)) => a.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    fields.push(Object::Reference(field_id));
+    acro.set("Fields", Object::Array(fields));
     acro.set("SigFlags", Object::Integer(3));
-    doc.get_object_mut(catalog_id)?
-        .as_dict_mut()?
-        .set("AcroForm", Object::Dictionary(acro));
+    match acro_ref {
+        // /AcroForm is an indirect object: update it in place so the reference stays valid.
+        Some(r) => *doc.get_object_mut(r)?.as_dict_mut()? = acro,
+        // Inline or absent: set it directly on the catalog.
+        None => {
+            doc.get_object_mut(catalog_id)?
+                .as_dict_mut()?
+                .set("AcroForm", Object::Dictionary(acro));
+        }
+    }
 
     let mut buf = Vec::new();
     doc.save_to(&mut buf)?;
@@ -478,6 +519,66 @@ mod tests {
             prepare(&buf, None, None, None),
             Err(PadesError::NoPages)
         ));
+    }
+
+    #[test]
+    fn prepare_preserves_existing_acroform_and_indirect_annots() {
+        // A form PDF: an existing field in /AcroForm, and an existing annotation referenced
+        // INDIRECTLY from the page's /Annots. Signing must add to both, not overwrite/drop them.
+        let mut doc = Document::with_version("1.7");
+        let mut annot = Dictionary::new();
+        annot.set("Type", Object::Name(b"Annot".to_vec()));
+        annot.set("Subtype", Object::Name(b"Text".to_vec()));
+        let annot_id = doc.add_object(Object::Dictionary(annot));
+        let annots_arr_id = doc.add_object(Object::Array(vec![Object::Reference(annot_id)]));
+        let mut existing_field = Dictionary::new();
+        existing_field.set("FT", Object::Name(b"Tx".to_vec()));
+        let existing_field_id = doc.add_object(Object::Dictionary(existing_field));
+
+        let pages_id = doc.new_object_id();
+        let mut page = Dictionary::new();
+        page.set("Type", Object::Name(b"Page".to_vec()));
+        page.set("Parent", Object::Reference(pages_id));
+        page.set("Annots", Object::Reference(annots_arr_id)); // indirect /Annots
+        let page_id = doc.add_object(Object::Dictionary(page));
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages.set("Count", Object::Integer(1));
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut acro = Dictionary::new();
+        acro.set("Fields", Object::Array(vec![Object::Reference(existing_field_id)]));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        catalog.set("AcroForm", Object::Dictionary(acro));
+        let cat_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(cat_id));
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+
+        let prep = prepare(&buf, None, None, None).unwrap();
+        let out = Document::load_mem(&prep.staged_pdf).unwrap();
+
+        let cat = out
+            .get_object(out.trailer.get(b"Root").unwrap().as_reference().unwrap())
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let acroform = cat.get(b"AcroForm").unwrap().as_dict().unwrap();
+        assert_eq!(
+            acroform.get(b"Fields").unwrap().as_array().unwrap().len(),
+            2,
+            "existing form field + signature field both present"
+        );
+        assert_eq!(acroform.get(b"SigFlags").unwrap().as_i64().unwrap(), 3);
+        let page_id = *out.get_pages().values().next().unwrap();
+        let page = out.get_object(page_id).unwrap().as_dict().unwrap();
+        assert_eq!(
+            page.get(b"Annots").unwrap().as_array().unwrap().len(),
+            2,
+            "existing annotation + signature widget both present"
+        );
     }
 
     #[test]

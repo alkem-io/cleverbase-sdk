@@ -57,13 +57,17 @@ pub unsafe extern "C" fn cleverbase_process(
     out_len: *mut usize,
 ) -> i32 {
     unsafe {
-        if in_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
+        if out_ptr.is_null() || out_len.is_null() {
             return 1;
         }
-        // Initialize the outputs so a consumer that inspects them on a non-zero return (e.g. the
-        // panic path below) sees a null/empty buffer, never uninitialized memory.
+        // Initialize the outputs FIRST so every non-zero return below (null input or the panic
+        // path) leaves a null/empty buffer for a consumer that inspects them, never uninitialized
+        // memory.
         *out_ptr = std::ptr::null_mut();
         *out_len = 0;
+        if in_ptr.is_null() {
+            return 1;
+        }
         let input = std::slice::from_raw_parts(in_ptr, in_len);
         // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
         let bytes = match std::panic::catch_unwind(|| process_bytes(input)) {

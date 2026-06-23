@@ -86,13 +86,15 @@ request as an effect).
 ## 6. Visible appearance + PDF/A preservation
 
 **Decision**: Invisible by default; an optional per-request **Signature Appearance** (page, rect,
-reason, location, signer name, time) renders a signature widget in the incremental update. When the
-input is **PDF/A**, preserve conformance: embed required fonts in any appearance, avoid
-conformance-breaking constructs, and **verify output with veraPDF in CI**; if conformance cannot be
-preserved, **fail rather than emit a non-conformant file** (FR-016, FR-017).
+reason, location, signer name, time) renders a signature widget. The **target** design for PDF/A
+input is to preserve conformance (embed required fonts in any appearance, avoid conformance-breaking
+constructs, verify output with **veraPDF**) and **fail rather than emit a non-conformant file**
+(FR-016, FR-017). **Phase 1 status:** PDF/A is detected and the `pdf_a` flag is set best-effort for
+invisible signatures; embedded-font visible appearances and veraPDF-in-CI are deferred (see
+`docs/limitations.md`).
 
 **Rationale**: Legal/archival documents are commonly PDF/A; a signature that breaks PDF/A is a real
-defect. Incremental-update signing preserves PDF/A when done to spec.
+defect — hence the conservative best-effort flag now and the veraPDF gate as the next layer.
 
 **Alternatives**: Always-PDF/A (lossy conversion) / no-PDF/A-guarantee — both rejected per
 clarification.

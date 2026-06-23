@@ -16,8 +16,11 @@ pub enum HttpMethod {
     Post,
 }
 
-/// An HTTP request the host must perform on the core's behalf. Idempotent: safe to retry on
-/// transport failure (the core does not advance until it receives a result).
+/// An HTTP request the host must perform on the core's behalf. The core does not advance until it
+/// receives a result. Retry-safety is NOT blanket-guaranteed — it depends on the operation:
+/// idempotent reads (`credentials/list`, `credentials/info`) may be retried freely, but a token
+/// exchange or `signHash` can consume a one-time authorization (SAD) or produce a signature, so
+/// retry those only on a pure transport failure (no response received), never after a server reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpEffect {
     pub method: HttpMethod,

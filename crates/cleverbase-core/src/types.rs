@@ -106,6 +106,7 @@ pub enum MatchOn {
 
 /// Optional binding of a request to a specific expected signer (FR-014).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedSignerIdentity {
     #[serde(default)]
     pub match_on: MatchOn,
@@ -114,6 +115,7 @@ pub struct ExpectedSignerIdentity {
 
 /// A rectangle on a PDF page, in PDF points.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rect {
     pub x: f64,
     pub y: f64,
@@ -123,6 +125,7 @@ pub struct Rect {
 
 /// Which fields a visible appearance should render.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppearanceShow {
     #[serde(default)]
     pub signer_name: bool,
@@ -136,6 +139,7 @@ pub struct AppearanceShow {
 
 /// Optional visible signature appearance (FR-016). Absent ⇒ invisible signature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureAppearance {
     /// 1-based page number.
     pub page: u32,
@@ -146,6 +150,7 @@ pub struct SignatureAppearance {
 
 /// PAdES signature dictionary metadata (FR-016).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignatureMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -219,6 +224,7 @@ impl TrustServiceConfiguration {
 /// object (so a binding needs one `options_json` argument rather than one parameter per nested
 /// field). All fields are optional; the JSON shape mirrors the serde representation of the types.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestOptions {
     #[serde(default)]
     pub expected_signer: Option<ExpectedSignerIdentity>,
@@ -349,6 +355,13 @@ mod tests {
         assert_eq!(o.appearance.unwrap().page, 1);
         // Malformed JSON → Err (not a panic).
         assert!(RequestOptions::from_json("{not json").is_err());
+        // A typo'd field is rejected, not silently dropped — so a misspelled security-relevant
+        // option (e.g. `expected_signer`) can't downgrade enforcement unnoticed.
+        assert!(RequestOptions::from_json(r#"{"expected_signor":{"value":"x"}}"#).is_err());
+        assert!(
+            RequestOptions::from_json(r#"{"appearance":{"page":1,"rect":{"x":1,"y":2,"w":3,"h":4},"colour":"red"}}"#)
+                .is_err()
+        );
     }
 
     #[test]

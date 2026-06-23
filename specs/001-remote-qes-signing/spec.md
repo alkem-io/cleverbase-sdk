@@ -34,7 +34,9 @@ feature (see Assumptions).
   (page/position, reason, location, signer name, signing time).
 - Q: Preserve PDF/A conformance when the input is PDF/A? → A: Yes — when the input is PDF/A, the
   signed output remains PDF/A-valid (including embedded fonts for any visible appearance);
-  non-PDF/A inputs produce a standard signed PDF.
+  non-PDF/A inputs produce a standard signed PDF. (Phase 1 status: PDF/A is detected and reported
+  best-effort for invisible signatures; embedded-font visible appearances and veraPDF verification
+  are deferred — see `docs/limitations.md`.)
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -141,7 +143,9 @@ the frontend transmitted no secrets and performed no cryptographic operations.
 - **Signer credential type varies** (different signing-credential generations exist) → signing
   succeeds regardless of the signer's credential type, producing an equivalently valid signature.
 - **Already-signed PDF** is submitted for an additional signature → the new signature is added
-  without invalidating existing valid signatures.
+  without invalidating existing valid signatures. (Phase 1 status: an already-signed input is
+  rejected with `InvalidDocument`; multi-signature via incremental update — FR-010 — is deferred,
+  see `docs/limitations.md`. This avoids ever corrupting an existing signature.)
 - **Authorizing signer ≠ expected signer** (when identity binding is enabled) → the operation is
   refused with a distinct identity-mismatch outcome and no signature is produced.
 - **Backend restarts after authorization** but before finalization → the signature is completed
