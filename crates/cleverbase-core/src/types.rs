@@ -10,7 +10,7 @@ pub struct Secret(String);
 
 impl Secret {
     pub fn new(s: impl Into<String>) -> Self {
-        Secret(s.into())
+        Self(s.into())
     }
     /// Reveal the secret. Call sites should keep the result on the server only.
     pub fn expose(&self) -> &str {
@@ -26,7 +26,7 @@ impl core::fmt::Debug for Secret {
 
 impl From<&str> for Secret {
     fn from(s: &str) -> Self {
-        Secret(s.to_string())
+        Self(s.to_string())
     }
 }
 
@@ -314,5 +314,53 @@ mod tests {
             mk(CscApi::V2Ecdsa, Environment::Production).base_url(),
             "https://signing.lab.cleverbase.io"
         );
+    }
+
+    #[test]
+    fn secret_from_str_and_expose() {
+        let s: Secret = "abc".into();
+        assert_eq!(s.expose(), "abc");
+        assert_eq!(Secret::new(String::from("x")).expose(), "x");
+    }
+
+    #[test]
+    fn from_wire_rejects_unknown_values() {
+        assert_eq!(ConformanceLevel::from_wire("nope"), None);
+        assert_eq!(Environment::from_wire("nope"), None);
+        assert_eq!(CscApi::from_wire("nope"), None);
+    }
+
+    #[test]
+    fn request_options_from_json() {
+        // Empty / whitespace → all-none defaults.
+        let d = RequestOptions::from_json("   ").unwrap();
+        assert!(
+            d.expected_signer.is_none() && d.appearance.is_none() && d.signature_meta.is_none()
+        );
+        // A populated object parses into the typed parts.
+        let o = RequestOptions::from_json(
+            r#"{"expected_signer":{"value":"PNONL-1"},
+                "signature_meta":{"reason":"R"},
+                "appearance":{"page":1,"rect":{"x":1,"y":2,"w":3,"h":4}}}"#,
+        )
+        .unwrap();
+        assert_eq!(o.expected_signer.unwrap().value, "PNONL-1");
+        assert_eq!(o.signature_meta.unwrap().reason.as_deref(), Some("R"));
+        assert_eq!(o.appearance.unwrap().page, 1);
+        // Malformed JSON → Err (not a panic).
+        assert!(RequestOptions::from_json("{not json").is_err());
+    }
+
+    #[test]
+    fn signed_document_round_trips() {
+        let doc = SignedDocument {
+            pdf: b"%PDF".to_vec(),
+            conformance_level: ConformanceLevel::BT,
+            pdf_a: true,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&doc, &mut buf).unwrap();
+        let back: SignedDocument = ciborium::from_reader(&buf[..]).unwrap();
+        assert_eq!(doc, back);
     }
 }

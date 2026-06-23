@@ -6,6 +6,7 @@
 //! signature over the signed attributes is valid, the `message-digest` matches the ByteRange
 //! content, and the signer certificate chains to the test CA. Skipped if `openssl` is unavailable.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cleverbase_core::util::{base64_decode, base64_std};
@@ -221,10 +222,7 @@ fn produced_b_b_signature_verifies_with_openssl() {
     let content_path = dir.join("cleverbase_it_content.bin");
     std::fs::write(&cms_path, &cms_der).unwrap();
     std::fs::write(&content_path, &content).unwrap();
-    let ca = format!(
-        "{}/../../tests/fixtures/pki/ca.cert.pem",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let ca = materialize_ca_pem();
 
     let out = Command::new("openssl")
         .args([
@@ -243,6 +241,7 @@ fn produced_b_b_signature_verifies_with_openssl() {
 
     let _ = std::fs::remove_file(&cms_path);
     let _ = std::fs::remove_file(&content_path);
+    let _ = std::fs::remove_file(&ca);
 
     assert!(
         out.status.success(),
@@ -269,27 +268,97 @@ fn http_ok_bytes(body: Vec<u8>) -> ResumeInput {
     }
 }
 
-/// Play an RFC 3161 TSA using `openssl ts -reply` over the test TSA fixtures.
-fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
+fn pki_dir() -> PathBuf {
+    PathBuf::from(format!(
+        "{}/../../tests/fixtures/pki",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+}
+
+/// Unique temp path stem (pid + atomic counter) so concurrent tests never collide on temp files.
+fn unique_tag(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pki = format!("{}/../../tests/fixtures/pki", env!("CARGO_MANIFEST_DIR"));
-    let dir = std::env::temp_dir();
-    // Unique per call so concurrently-running tests never clobber each other's query/reply files.
-    let tag = format!(
-        "cb_it_{}_{}",
+    format!(
+        "{prefix}_{}_{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let tsq = dir.join(format!("{tag}.tsq"));
-    let tsr = dir.join(format!("{tag}.tsr"));
-    std::fs::write(&tsq, req_der).unwrap();
+    )
+}
+
+fn der_to_pem_cert(der: &Path, pem: &Path) {
     let out = Command::new("openssl")
-        .current_dir(&pki)
-        .args(["ts", "-reply", "-config", "tsa.cnf", "-queryfile"])
-        .arg(&tsq)
+        .arg("x509")
+        .args(["-inform", "DER", "-in"])
+        .arg(der)
         .arg("-out")
-        .arg(&tsr)
+        .arg(pem)
+        .output()
+        .expect("run openssl x509");
+    assert!(
+        out.status.success(),
+        "der->pem cert failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Materialize the test CA certificate as a PEM file (from the committed DER) for `-CAfile`.
+/// The caller removes the returned path.
+fn materialize_ca_pem() -> PathBuf {
+    let out = std::env::temp_dir().join(format!("{}.pem", unique_tag("cb_it_ca")));
+    der_to_pem_cert(&pki_dir().join("ca.cert.der"), &out);
+    out
+}
+
+/// Play an RFC 3161 TSA using `openssl ts -reply`, fully self-contained in a per-call temp dir: the
+/// public certs + the TSA key are materialized from the committed DER / PKCS#8 material, and a fresh
+/// per-call serial file is used — so there is no committed-fixture mutation and no parallel-test
+/// race on a shared serial (the on-disk `tests/fixtures/pki` is read-only here).
+fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
+    let pki = pki_dir();
+    let work = std::env::temp_dir().join(unique_tag("cb_it_tsa"));
+    std::fs::create_dir_all(&work).unwrap();
+    let ca = work.join("ca.cert.pem");
+    let cert = work.join("tsa.cert.pem");
+    let key = work.join("tsa.key.pem");
+    der_to_pem_cert(&pki.join("ca.cert.der"), &ca);
+    der_to_pem_cert(&pki.join("tsa.cert.der"), &cert);
+    let key_out = Command::new("openssl")
+        .arg("pkey")
+        .args(["-inform", "DER", "-in"])
+        .arg(pki.join("tsa.key.pk8"))
+        .arg("-out")
+        .arg(&key)
+        .output()
+        .expect("run openssl pkey");
+    assert!(
+        key_out.status.success(),
+        "pk8->pem key failed: {}",
+        String::from_utf8_lossy(&key_out.stderr)
+    );
+    std::fs::write(work.join("serial"), b"01").unwrap();
+    let cnf = format!(
+        "[tsa]\ndefault_tsa = c\n[c]\nserial = {serial}\ncrypto_device = builtin\n\
+         signer_cert = {cert}\ncerts = {ca}\nsigner_key = {key}\n\
+         default_policy = 1.3.6.1.4.1.99999.1.1\nsigner_digest = sha256\n\
+         digests = sha256, sha384, sha512\naccuracy = secs:1\nclock_precision_digits = 0\n\
+         ordering = yes\ntsa_name = yes\ness_cert_id_chain = no\ness_cert_id_alg = sha256\n",
+        serial = work.join("serial").display(),
+        cert = cert.display(),
+        ca = ca.display(),
+        key = key.display(),
+    );
+    std::fs::write(work.join("tsa.cnf"), cnf).unwrap();
+    std::fs::write(work.join("req.tsq"), req_der).unwrap();
+    let out = Command::new("openssl")
+        .arg("ts")
+        .arg("-reply")
+        .arg("-config")
+        .arg(work.join("tsa.cnf"))
+        .arg("-queryfile")
+        .arg(work.join("req.tsq"))
+        .arg("-out")
+        .arg(work.join("resp.tsr"))
         .output()
         .expect("run openssl ts");
     assert!(
@@ -297,9 +366,8 @@ fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
         "openssl ts -reply failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let resp = std::fs::read(&tsr).unwrap();
-    let _ = std::fs::remove_file(&tsq);
-    let _ = std::fs::remove_file(&tsr);
+    let resp = std::fs::read(work.join("resp.tsr")).unwrap();
+    let _ = std::fs::remove_dir_all(&work);
     resp
 }
 
@@ -449,7 +517,7 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
             assert_eq!(
                 evidence.outcome,
                 cleverbase_core::SigningOutcome::TimestampFailed
-            )
+            );
         }
         other => panic!("expected TimestampFailed, got {other:?}"),
     }
@@ -477,10 +545,7 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
     let content_path = dir.join("cb_it_bt_content.bin");
     std::fs::write(&cms_path, &cms_der).unwrap();
     std::fs::write(&content_path, &content).unwrap();
-    let ca = format!(
-        "{}/../../tests/fixtures/pki/ca.cert.pem",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let ca = materialize_ca_pem();
     let out = Command::new("openssl")
         .args([
             "cms", "-verify", "-inform", "DER", "-binary", "-purpose", "any",
@@ -497,6 +562,7 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         .expect("run openssl");
     let _ = std::fs::remove_file(&cms_path);
     let _ = std::fs::remove_file(&content_path);
+    let _ = std::fs::remove_file(&ca);
     assert!(
         out.status.success(),
         "B-T base signature verify failed: {}",

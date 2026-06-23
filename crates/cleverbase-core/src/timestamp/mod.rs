@@ -268,5 +268,24 @@ mod tests {
         assert!(parse_generalized_time_secs(&mk("20260622256100Z")).is_none()); // hour 25, min 61
         assert!(parse_generalized_time_secs(&mk("20260229120000Z")).is_none()); // 2026 not a leap year
         assert!(parse_generalized_time_secs(&mk("20240229120000Z")).is_some()); // 2024 IS a leap year
+        assert!(parse_generalized_time_secs(&mk("20261301120000Z")).is_none()); // month 13
+    }
+
+    #[test]
+    fn parse_response_rejects_non_granted_status() {
+        // Hand-built TimeStampResp: SEQUENCE { PKIStatusInfo SEQUENCE { INTEGER 2 (rejection) } }.
+        let resp = [0x30u8, 0x05, 0x30, 0x03, 0x02, 0x01, 0x02];
+        assert!(matches!(
+            parse_response(&resp),
+            Err(TimestampError::NotGranted)
+        ));
+    }
+
+    #[test]
+    fn token_parsers_reject_garbage() {
+        // Malformed token bytes must yield None (exercising the DER-walk None paths), never panic.
+        assert_eq!(parse_gen_time(b"not a token"), None);
+        assert_eq!(parse_message_imprint(b"\x30\x03garbage"), None);
+        assert_eq!(parse_gen_time(&[0x30, 0x80]), None); // indefinite-length form rejected
     }
 }

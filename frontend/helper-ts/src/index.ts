@@ -44,7 +44,9 @@ export class SigningHelper {
     this.navigate =
       opts.navigate ??
       ((url: string) => {
-        (globalThis as unknown as { location: { assign: (u: string) => void } }).location.assign(url);
+        (globalThis as unknown as { location: { assign: (u: string) => void } }).location.assign(
+          url,
+        );
       });
   }
 

@@ -156,7 +156,7 @@ pub fn assemble_signed_data(
     let leaf = Certificate::from_der(leaf_der)?;
     let sid = SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
         issuer: leaf.tbs_certificate.issuer.clone(),
-        serial_number: leaf.tbs_certificate.serial_number.clone(),
+        serial_number: leaf.tbs_certificate.serial_number,
     });
 
     let digest_alg = algorithm(ID_SHA256, false)?;
@@ -316,15 +316,11 @@ pub fn has_signature_timestamp(content_info_der: &[u8]) -> Result<bool, CmsError
         .as_slice()
         .first()
         .ok_or_else(|| CmsError::Verify("no SignerInfo".into()))?;
-    Ok(si
-        .unsigned_attrs
-        .as_ref()
-        .map(|a| {
-            a.as_slice()
-                .iter()
-                .any(|attr| attr.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN)
-        })
-        .unwrap_or(false))
+    Ok(si.unsigned_attrs.as_ref().is_some_and(|a| {
+        a.as_slice()
+            .iter()
+            .any(|attr| attr.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN)
+    }))
 }
 
 /// Verify the assembled CMS signature against the signer's leaf certificate (defense-in-depth: the
@@ -510,6 +506,15 @@ mod tests {
             stored[0], 0x30,
             "stored ECDSA signature must be a DER SEQUENCE"
         );
+    }
+
+    #[test]
+    fn signing_time_uses_generalized_time_past_2050() {
+        // now_unix at/after 2050-01-01 must encode signing-time as GeneralizedTime (not UTCTime).
+        let attrs = build_signed_attrs(&sha256(b"x"), RSA_CERT, 2_524_608_000).unwrap();
+        // The signed-attrs SET OF must still parse, and the GeneralizedTime branch (0x18) is present.
+        assert!(SetOfVec::<Attribute>::from_der(&attrs).is_ok());
+        assert!(attrs.windows(1).any(|w| w == [0x18]));
     }
 
     #[test]

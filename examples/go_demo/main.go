@@ -14,7 +14,9 @@ import (
 
 func main() {
 	entropy := make([]byte, 16)
-	_, _ = rand.Read(entropy)
+	if _, err := rand.Read(entropy); err != nil {
+		panic(err)
+	}
 
 	cfg := cleverbase.Config{
 		Environment:  "acceptance",

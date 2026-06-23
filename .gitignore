@@ -13,6 +13,8 @@ build/
 *.log
 *.tsbuildinfo
 .npm/
+# Root dev-tooling lockfile (lint/format only; installed with `npm install`, not pinned).
+/package-lock.json
 
 # Python
 __pycache__/
@@ -38,6 +40,10 @@ pkg/
 *.so
 *.a
 *.dll
+*.node
+
+# Compiled demo binary (build artifact, not source)
+/examples/go_demo/cleverbase-go-demo
 
 # Coverage
 coverage/
@@ -49,6 +55,12 @@ lcov.info
 !.env.example
 *.pem
 *.key
+
+# Generated test-PKI artifacts. The synthetic test material is committed as DER / PKCS#8
+# (*.der, *.pk8); the openssl integration tests materialize any PEMs they need into a per-call
+# temp dir, so these mutable openssl bookkeeping files must never be tracked.
+/tests/fixtures/pki/*.srl
+/tests/fixtures/pki/*serial*
 
 # Editor / OS
 .DS_Store

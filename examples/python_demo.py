@@ -7,6 +7,7 @@ Build the binding first:
 Then run:
     .venv/bin/python examples/python_demo.py
 """
+
 import os
 import time
 
@@ -17,14 +18,14 @@ import cleverbase
 pdf = b"%PDF-1.7\n... your document ..."
 out = cleverbase.begin_signing(
     pdf,
-    "acceptance",                       # environment
-    "v1_rsa",                           # CSC API generation
+    "acceptance",  # environment
+    "v1_rsa",  # CSC API generation
     "your-client-id",
     "your-client-secret",
     "https://your-app.example/callback",
-    "B-B",                              # PAdES conformance level
-    int(time.time()),                   # now (the core is sans-IO; host supplies the clock)
-    os.urandom(16),                     # entropy for OAuth state
+    "B-B",  # PAdES conformance level
+    int(time.time()),  # now (the core is sans-IO; host supplies the clock)
+    os.urandom(16),  # entropy for OAuth state
 )
 resp = cbor2.loads(out)
 step = resp["step"]

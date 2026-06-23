@@ -40,9 +40,9 @@ impl KeyAlgo {
     /// The `signAlgo` OID to request from CSC `signatures/signHash`.
     pub fn sign_algo_oid(&self) -> &'static str {
         match self {
-            KeyAlgo::Rsa => "1.2.840.113549.1.1.11", // sha256WithRSAEncryption
-            KeyAlgo::EcdsaP256 => "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
-            KeyAlgo::Other => "",
+            Self::Rsa => "1.2.840.113549.1.1.11", // sha256WithRSAEncryption
+            Self::EcdsaP256 => "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
+            Self::Other => "",
         }
     }
 }
@@ -318,5 +318,26 @@ mod tests {
     fn parse_error_is_protocol_parse() {
         let err = parse_token_response(b"not json").unwrap_err();
         assert!(matches!(err, CoreError::ProtocolParse(_)));
+    }
+
+    #[test]
+    fn sign_algo_oid_per_key_algo() {
+        assert_eq!(KeyAlgo::Rsa.sign_algo_oid(), "1.2.840.113549.1.1.11");
+        assert_eq!(KeyAlgo::EcdsaP256.sign_algo_oid(), "1.2.840.10045.4.3.2");
+        assert_eq!(KeyAlgo::Other.sign_algo_oid(), "");
+    }
+
+    #[test]
+    fn key_algo_from_oids_classifies_all_families() {
+        assert_eq!(
+            key_algo_from_oids(&["1.2.840.113549.1.1.1".into()]),
+            KeyAlgo::Rsa
+        );
+        assert_eq!(
+            key_algo_from_oids(&["1.2.840.10045.2.1".into()]),
+            KeyAlgo::EcdsaP256
+        );
+        assert_eq!(key_algo_from_oids(&["1.2.3.4".into()]), KeyAlgo::Other);
+        assert_eq!(key_algo_from_oids(&[]), KeyAlgo::Other);
     }
 }

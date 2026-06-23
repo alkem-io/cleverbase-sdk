@@ -187,7 +187,7 @@ the frontend transmitted no secrets and performed no cryptographic operations.
   equivalently valid signed output across all three. **All three bindings are delivered within
   this feature (Phase 1)**, each complete; the build order may prove the core plus one reference
   binding end-to-end before fanning out, but the shipped feature includes all three.
-- **FR-013**: The SDK MUST be stateless with respect to in-flight signing sessions: it MUST return
+- **FR-013**: The SDK MUST be stateless for in-flight signing sessions: it MUST return
   a serializable session handle that the integrator persists and supplies to finalize the
   signature, and MUST NOT itself persist signing-session state. A signature MUST be completable
   after a backend restart using only the persisted handle and without re-prompting the signer,

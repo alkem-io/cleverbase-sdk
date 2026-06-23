@@ -1,0 +1,16 @@
+# Build output, dependencies, and generated/native binding artifacts.
+**/dist/**
+**/node_modules/**
+**/target/**
+**/.venv/**
+**/.git/**
+bindings/node/index.js
+bindings/node/index.d.ts
+bindings/node/npm/**
+# Non-JS/TS trees Prettier should not touch here.
+crates/**
+specs/**
+.specify/**
+.claude/**
+*.md
+*.lock

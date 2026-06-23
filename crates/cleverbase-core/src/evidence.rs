@@ -23,7 +23,7 @@ pub enum SigningOutcome {
 
 impl SigningOutcome {
     pub fn is_success(&self) -> bool {
-        matches!(self, SigningOutcome::Signed)
+        matches!(self, Self::Signed)
     }
 }
 
@@ -98,5 +98,28 @@ mod tests {
         ciborium::into_writer(&rec, &mut buf).unwrap();
         let back: SigningEvidenceRecord = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn all_outcomes_serialize_snake_case() {
+        use SigningOutcome::*;
+        let cases = [
+            (Signed, "signed"),
+            (Declined, "declined"),
+            (AuthorizationExpired, "authorization_expired"),
+            (CredentialUnavailable, "credential_unavailable"),
+            (IdentityMismatch, "identity_mismatch"),
+            (TimestampFailed, "timestamp_failed"),
+            (InvalidDocument, "invalid_document"),
+            (AppearancePlacementError, "appearance_placement_error"),
+            (SignatureInvalid, "signature_invalid"),
+        ];
+        for (outcome, wire) in cases {
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(outcome.is_success(), matches!(outcome, Signed));
+        }
     }
 }

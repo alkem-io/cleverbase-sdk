@@ -15,7 +15,10 @@ function mockFetch(routeFn) {
 test("start -> authorize -> complete -> poll, and no secret material leaves the browser", async () => {
   const { fetchImpl, calls } = mockFetch((url) => {
     if (url.includes("/start")) {
-      return { redirectUrl: "https://connect.acc.cleverbase.com/oauth2/authorize?scope=service&state=s", correlationId: "corr-1" };
+      return {
+        redirectUrl: "https://connect.acc.cleverbase.com/oauth2/authorize?scope=service&state=s",
+        correlationId: "corr-1",
+      };
     }
     if (url.includes("/complete")) return { status: "completed" };
     if (url.includes("/status")) return { status: "completed" };
@@ -47,7 +50,15 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
   assert.strictEqual(polled, "completed");
 
   // US3 / SC-005: the frontend must never carry secrets, tokens, handles, or private keys.
-  const forbidden = ["client_secret", "privatekey", "private_key", " sad", "signhash", "session_handle", "begin_signing"];
+  const forbidden = [
+    "client_secret",
+    "privatekey",
+    "private_key",
+    " sad",
+    "signhash",
+    "session_handle",
+    "begin_signing",
+  ];
   for (const c of calls) {
     const body = c.init && c.init.body ? String(c.init.body).toLowerCase() : "";
     for (const word of forbidden) {

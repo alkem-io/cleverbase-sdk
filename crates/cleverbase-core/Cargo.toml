@@ -29,3 +29,6 @@ p256.workspace = true
 ecdsa.workspace = true
 signature.workspace = true
 pkcs8.workspace = true
+
+[lints]
+workspace = true

@@ -88,7 +88,7 @@ impl SigningSessionHandle {
         conformance_level: ConformanceLevel,
         correlation_id: String,
     ) -> Self {
-        SigningSessionHandle {
+        Self {
             schema_version: crate::SCHEMA_VERSION,
             phase,
             request_digest,

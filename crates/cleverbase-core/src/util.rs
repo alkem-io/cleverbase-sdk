@@ -5,10 +5,10 @@
 /// Civil date `(year, month, day)` from days since the Unix epoch (Howard Hinnant's algorithm).
 /// Single source for the proleptic-Gregorian conversion (visible-appearance date + TSA genTime).
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -26,15 +26,15 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    era * 146_097 + doe - 719_468
 }
 
 /// Lowercase hex encoding.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
+        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
     }
     s
 }
@@ -48,7 +48,7 @@ pub fn base64_std(input: &[u8]) -> String {
         let b0 = chunk[0];
         let b1 = *chunk.get(1).unwrap_or(&0);
         let b2 = *chunk.get(2).unwrap_or(&0);
-        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
         out.push(B64[((n >> 18) & 63) as usize] as char);
         out.push(B64[((n >> 12) & 63) as usize] as char);
         out.push(if chunk.len() > 1 {
@@ -71,17 +71,17 @@ pub fn percent_encode(s: &str) -> String {
     for &b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
             _ => {
                 out.push('%');
                 out.push(
-                    char::from_digit((b >> 4) as u32, 16)
+                    char::from_digit(u32::from(b >> 4), 16)
                         .unwrap()
                         .to_ascii_uppercase(),
                 );
                 out.push(
-                    char::from_digit((b & 0x0f) as u32, 16)
+                    char::from_digit(u32::from(b & 0x0f), 16)
                         .unwrap()
                         .to_ascii_uppercase(),
                 );
@@ -188,5 +188,15 @@ mod tests {
     fn percent_encode_reserved() {
         assert_eq!(percent_encode("a b/c?d=e&f"), "a%20b%2Fc%3Fd%3De%26f");
         assert_eq!(percent_encode("safe-_.~"), "safe-_.~");
+    }
+
+    #[test]
+    fn civil_date_inverse_property() {
+        // `days_from_civil` is documented as the inverse of `civil_from_days`; verify the round-trip
+        // across the epoch, negative days, and era boundaries (±146_097 = the 400-year cycle).
+        for days in [-146_097, -1000, -1, 0, 1, 1000, 19_000, 146_097, 200_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "inverse failed at {days}");
+        }
     }
 }

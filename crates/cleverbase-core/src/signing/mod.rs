@@ -149,7 +149,10 @@ fn json_post(url: String, bearer: &str, body: serde_json::Value) -> HttpEffect {
             ("Authorization".into(), format!("Bearer {bearer}")),
             ("Content-Type".into(), "application/json".into()),
         ],
-        body: Some(serde_json::to_vec(&body).unwrap_or_default()),
+        // `body` is always a serde_json::Value built from json!(), so serialization is infallible;
+        // expect (not unwrap_or_default) so an impossible failure surfaces rather than silently
+        // producing an empty request body.
+        body: Some(serde_json::to_vec(&body).expect("json! Value serialization is infallible")),
     }
 }
 
@@ -512,8 +515,7 @@ pub fn resume(
             let (reason, location) = request
                 .signature_meta
                 .as_ref()
-                .map(|m| (m.reason.clone(), m.location.clone()))
-                .unwrap_or((None, None));
+                .map_or((None, None), |m| (m.reason.clone(), m.location.clone()));
             // PDF/A is preserved for invisible signatures; a visible appearance uses a non-embedded
             // base font, which is not PDF/A-conformant (font embedding is a later enhancement).
             let visible = build_visible_appearance(&request, &identity, ctx.now_unix);
@@ -818,12 +820,538 @@ mod tests {
     use super::*;
     use crate::types::{
         AppearanceShow, CscApi, Environment, ExpectedSignerIdentity, MatchOn, Rect, Secret,
-        SignatureAppearance, TsaConfiguration,
+        SignatureAppearance, SignatureMeta, TsaConfiguration,
     };
     use pkcs8::DecodePrivateKey;
 
     const RSA_CERT: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-rsa.cert.der");
     const RSA_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-rsa.key.pk8");
+
+    // Match-or-panic helpers: keep the (uncovered) panic arm in one place rather than per test.
+    fn expect_redirect(step: Step) -> RedirectEffect {
+        match step {
+            Step::Redirect(r) => r,
+            other => panic!("expected redirect, got {other:?}"),
+        }
+    }
+    fn expect_failed(step: Step) -> SigningEvidenceRecord {
+        match step {
+            Step::Failed { evidence } => evidence,
+            other => panic!("expected failed, got {other:?}"),
+        }
+    }
+    fn http_err(status: u16) -> ResumeInput {
+        ResumeInput::HttpResult {
+            status,
+            headers: vec![],
+            body: b"{}".to_vec(),
+        }
+    }
+    fn http_bytes(status: u16, body: Vec<u8>) -> ResumeInput {
+        ResumeInput::HttpResult {
+            status,
+            headers: vec![],
+            body,
+        }
+    }
+
+    #[test]
+    fn unit_helpers_cover_branches() {
+        // csc_base: both API generations.
+        let mut v2 = cfg();
+        v2.csc_api = CscApi::V2Ecdsa;
+        assert!(csc_base(&v2).contains("/csc/v2"));
+        assert!(csc_base(&cfg()).contains("/csc/v1"));
+        // correlation_from: full-entropy (hex) and short-entropy (fallback) branches.
+        assert_eq!(correlation_from(&ctx()).len(), 16);
+        let short = HostContext {
+            now_unix: 42,
+            entropy: vec![1, 2, 3],
+        };
+        assert_eq!(correlation_from(&short), "corr-42");
+        // require_http / require_redirect reject the wrong ResumeInput variant.
+        assert!(matches!(
+            require_http(ResumeInput::RedirectReturn {
+                code: "c".into(),
+                state: "s".into()
+            }),
+            Err(CoreError::UnexpectedInput)
+        ));
+        assert!(matches!(
+            require_redirect(http_err(200)),
+            Err(CoreError::UnexpectedInput)
+        ));
+    }
+
+    #[test]
+    fn build_visible_appearance_covers_all_branches() {
+        let id = SignerIdentity {
+            serial_number: "s".into(),
+            common_name: String::new(),
+            given_name: None,
+            surname: None,
+            raw_subject: "CN=Raw Subject".into(),
+        };
+        let mut req = request(ConformanceLevel::BB, None);
+        req.appearance = Some(SignatureAppearance {
+            page: 2,
+            rect: Rect {
+                x: 1.0,
+                y: 2.0,
+                w: 3.0,
+                h: 4.0,
+            },
+            show: AppearanceShow {
+                signer_name: true,
+                reason: true,
+                location: true,
+                signing_time: true,
+            },
+        });
+        req.signature_meta = Some(SignatureMeta {
+            reason: Some("Approval".into()),
+            location: Some("NL".into()),
+        });
+        let va = build_visible_appearance(&req, &id, 1_700_000_000).unwrap();
+        assert_eq!(va.page, 2);
+        assert!(va.lines.iter().any(|l| l.contains("CN=Raw Subject"))); // empty CN → raw_subject
+        assert!(va.lines.iter().any(|l| l.starts_with("Reason: Approval")));
+        assert!(va.lines.iter().any(|l| l.starts_with("Location: NL")));
+        assert!(va.lines.iter().any(|l| l.starts_with("Date: "))); // exercises fmt_date
+
+        // All show flags off → the default "Digitally signed" line.
+        req.appearance = Some(SignatureAppearance {
+            page: 1,
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+            show: AppearanceShow::default(),
+        });
+        req.signature_meta = None;
+        let va2 = build_visible_appearance(&req, &id, 0).unwrap();
+        assert_eq!(va2.lines, vec!["Digitally signed".to_string()]);
+
+        // No appearance → None.
+        let mut none_req = request(ConformanceLevel::BB, None);
+        none_req.appearance = None;
+        assert!(build_visible_appearance(&none_req, &id, 0).is_none());
+
+        // A non-empty common name is used verbatim (the other `signer_name` branch).
+        let named = SignerIdentity {
+            common_name: "Jane Doe".into(),
+            ..id
+        };
+        let mut named_req = request(ConformanceLevel::BB, None);
+        named_req.appearance = Some(SignatureAppearance {
+            page: 1,
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+            show: AppearanceShow {
+                signer_name: true,
+                ..AppearanceShow::default()
+            },
+        });
+        let va3 = build_visible_appearance(&named_req, &named, 0).unwrap();
+        assert!(va3.lines.iter().any(|l| l == "Signed by: Jane Doe"));
+    }
+
+    #[test]
+    fn begin_rejects_bad_config() {
+        let mut c = cfg();
+        c.client_id = String::new();
+        assert!(matches!(
+            begin(request(ConformanceLevel::BB, None), c, ctx()),
+            Err(CoreError::InvalidConfig(_))
+        ));
+        let mut c = cfg();
+        c.redirect_uri = String::new();
+        assert!(matches!(
+            begin(request(ConformanceLevel::BB, None), c, ctx()),
+            Err(CoreError::InvalidConfig(_))
+        ));
+        let short = HostContext {
+            now_unix: 1_700_000_000,
+            entropy: vec![0u8; 4],
+        };
+        assert!(matches!(
+            begin(request(ConformanceLevel::BB, None), cfg(), short),
+            Err(CoreError::InvalidConfig(_))
+        ));
+    }
+
+    /// Drive begin → redirect-return → the named HTTP-awaiting phase, returning the handle there.
+    fn advance_to(phase: SigningPhase) -> SigningSessionHandle {
+        let (h, s) = begin(request(ConformanceLevel::BB, None), cfg(), ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (h, _) = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        // h is now at ServiceTokenPending.
+        if phase == SigningPhase::ServiceTokenPending {
+            return h;
+        }
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"access_token":"b","token_type":"Bearer"})),
+            ctx(),
+        )
+        .unwrap();
+        // ListPending.
+        if phase == SigningPhase::ListPending {
+            return h;
+        }
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"credentialIDs":["cred-1"]})),
+            ctx(),
+        )
+        .unwrap();
+        h // InfoPending
+    }
+
+    #[test]
+    fn service_token_http_failure_is_credential_unavailable() {
+        let h = advance_to(SigningPhase::ServiceTokenPending);
+        let (h, step) = resume(h, http_err(500), ctx()).unwrap();
+        assert_eq!(h.phase, SigningPhase::Failed);
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::CredentialUnavailable
+        );
+    }
+
+    #[test]
+    fn credentials_list_http_failure_is_credential_unavailable() {
+        let h = advance_to(SigningPhase::ListPending);
+        let (_h, step) = resume(h, http_err(500), ctx()).unwrap();
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::CredentialUnavailable
+        );
+    }
+
+    #[test]
+    fn credentials_info_http_failure_is_credential_unavailable() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let (_h, step) = resume(h, http_err(500), ctx()).unwrap();
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::CredentialUnavailable
+        );
+    }
+
+    #[test]
+    fn credential_token_http_failure_is_authorization_expired() {
+        // Drive to CredentialTokenPending, then fail the token exchange.
+        let h = advance_to(SigningPhase::InfoPending);
+        let (h, s) = resume(h, http_ok(info_json()), ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (h, _) = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c2".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        let (h, step) = resume(h, http_err(400), ctx()).unwrap();
+        assert_eq!(h.phase, SigningPhase::Failed);
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::AuthorizationExpired
+        );
+    }
+
+    #[test]
+    fn signhash_empty_signatures_is_signature_invalid() {
+        let (h, _req) = advance_to_sign_pending(request(ConformanceLevel::BB, None));
+        // signHash returns 200 but an empty signature element.
+        let (h, step) = resume(h, http_ok(serde_json::json!({"signatures":[""]})), ctx()).unwrap();
+        assert_eq!(h.phase, SigningPhase::Failed);
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::SignatureInvalid
+        );
+    }
+
+    #[test]
+    fn timestamp_http_failure_and_bad_token_are_timestamp_failed() {
+        // B-T flow to TimestampPending: non-2xx TSA response → TimestampFailed.
+        let h = drive_bt_to_timestamp_pending();
+        let (h, step) = resume(h, http_err(500), ctx()).unwrap();
+        assert_eq!(h.phase, SigningPhase::Failed);
+        assert_eq!(expect_failed(step).outcome, SigningOutcome::TimestampFailed);
+
+        // A 200 with an unparseable TSA body → TimestampFailed (parse_response error).
+        let h = drive_bt_to_timestamp_pending();
+        let (_h, step) = resume(h, http_bytes(200, b"not a TSR".to_vec()), ctx()).unwrap();
+        assert_eq!(expect_failed(step).outcome, SigningOutcome::TimestampFailed);
+    }
+
+    /// Drive a B-T flow to TimestampPending (signs with the RSA fixture key, then awaits the TSA).
+    fn drive_bt_to_timestamp_pending() -> SigningSessionHandle {
+        let mut c = cfg();
+        c.tsa = Some(TsaConfiguration {
+            url: "https://tsa.example/tsr".into(),
+            auth: Some(Secret::new("Bearer t")),
+            policy_oid: None,
+        });
+        let (h, s) = begin(request(ConformanceLevel::BT, None), c, ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (h, _) = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"access_token":"b","token_type":"Bearer"})),
+            ctx(),
+        )
+        .unwrap();
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"credentialIDs":["cred-1"]})),
+            ctx(),
+        )
+        .unwrap();
+        let (h, s) = resume(h, http_ok(info_json()), ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (h, _) = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c2".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        let (h, s) = resume(
+            h,
+            http_ok(serde_json::json!({"access_token":"SAD","token_type":"SAD"})),
+            ctx(),
+        )
+        .unwrap();
+        let sign_req = match s {
+            Step::PerformHttp(e) => e,
+            other => panic!("expected signHash, got {other:?}"),
+        };
+        let (h, s) = resume(
+            h,
+            http_ok(serde_json::json!({"signatures":[fixture_sign(&sign_req)]})),
+            ctx(),
+        )
+        .unwrap();
+        assert!(matches!(s, Step::PerformHttp(_)));
+        assert_eq!(h.phase, SigningPhase::TimestampPending);
+        h
+    }
+
+    #[test]
+    fn tampered_handle_fields_yield_bad_handle() {
+        // Missing cert chain at SignPending.
+        let (mut h, req) = advance_to_sign_pending(request(ConformanceLevel::BB, None));
+        let sig = fixture_sign(&req);
+        h.cert_chain = None;
+        let err = resume(h, http_ok(serde_json::json!({"signatures":[sig]})), ctx()).unwrap_err();
+        assert!(matches!(err, CoreError::BadHandle(_)));
+
+        // Missing config (any phase) → BadHandle.
+        let (mut h, _) = advance_to_sign_pending(request(ConformanceLevel::BB, None));
+        h.config = None;
+        let err = resume(
+            h,
+            ResumeInput::RedirectError {
+                error: "x".into(),
+                state: "s".into(),
+            },
+            ctx(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::BadHandle(_)));
+
+        // Wrong schema version.
+        let mut h = SigningSessionHandle::terminal(
+            SigningPhase::ServiceAuthPending,
+            "d".into(),
+            ConformanceLevel::BB,
+            "c".into(),
+        );
+        h.schema_version = 999;
+        let err = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c".into(),
+                state: "s".into(),
+            },
+            ctx(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::BadHandle(_)));
+    }
+
+    #[test]
+    fn resume_on_terminal_handle_is_rejected() {
+        let (h, _) = run_full_flow(request(ConformanceLevel::BB, None));
+        assert_eq!(h.phase, SigningPhase::Completed);
+        let err = resume(h, http_err(200), ctx()).unwrap_err();
+        assert!(matches!(err, CoreError::BadHandle(_)));
+    }
+
+    #[test]
+    fn unexpected_input_for_phase_is_rejected() {
+        // ServiceAuthPending awaits a redirect; feeding an HttpResult is UnexpectedInput.
+        let (h, _) = begin(request(ConformanceLevel::BB, None), cfg(), ctx()).unwrap();
+        let err = resume(h, http_err(200), ctx()).unwrap_err();
+        assert!(matches!(err, CoreError::UnexpectedInput));
+    }
+
+    #[test]
+    fn redirect_error_in_wrong_phase_is_unexpected_input() {
+        let h = advance_to(SigningPhase::ServiceTokenPending); // not a redirect-awaiting phase
+        let err = resume(
+            h,
+            ResumeInput::RedirectError {
+                error: "access_denied".into(),
+                state: "s".into(),
+            },
+            ctx(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::UnexpectedInput));
+    }
+
+    #[test]
+    fn non_access_denied_redirect_error_is_authorization_expired() {
+        let (h, s) = begin(request(ConformanceLevel::BB, None), cfg(), ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (_h, step) = resume(
+            h,
+            ResumeInput::RedirectError {
+                error: "server_error".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::AuthorizationExpired
+        );
+    }
+
+    fn info_with(certs: serde_json::Value, algo: &str) -> serde_json::Value {
+        serde_json::json!({
+            "key": {"algo": [algo]},
+            "cert": {"certificates": certs, "subjectDN": "CN=x", "serialNumber": "s"},
+            "SCAL": "2"
+        })
+    }
+
+    #[test]
+    fn unsupported_key_algo_is_credential_unavailable() {
+        let h = advance_to(SigningPhase::InfoPending);
+        // Ed25519 — neither RSA nor EC P-256 → KeyAlgo::Other.
+        let info = info_with(
+            serde_json::json!([util::base64_std(RSA_CERT)]),
+            "1.3.101.112",
+        );
+        let (_h, step) = resume(h, http_ok(info), ctx()).unwrap();
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::CredentialUnavailable
+        );
+    }
+
+    #[test]
+    fn malformed_certificate_base64_is_protocol_parse() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let info = info_with(
+            serde_json::json!(["@@not-base64@@"]),
+            "1.2.840.113549.1.1.1",
+        );
+        let err = resume(h, http_ok(info), ctx()).unwrap_err();
+        assert!(matches!(err, CoreError::ProtocolParse(_)));
+    }
+
+    #[test]
+    fn empty_certificate_chain_is_credential_unavailable() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let info = info_with(serde_json::json!([]), "1.2.840.113549.1.1.1");
+        let (_h, step) = resume(h, http_ok(info), ctx()).unwrap();
+        assert_eq!(
+            expect_failed(step).outcome,
+            SigningOutcome::CredentialUnavailable
+        );
+    }
+
+    fn zero_page_pdf() -> Vec<u8> {
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut pages = lopdf::Dictionary::new();
+        pages.set("Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", lopdf::Object::Array(vec![]));
+        pages.set("Count", lopdf::Object::Integer(0));
+        doc.objects
+            .insert(pages_id, lopdf::Object::Dictionary(pages));
+        let mut catalog = lopdf::Dictionary::new();
+        catalog.set("Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", lopdf::Object::Reference(pages_id));
+        let cat_id = doc.add_object(lopdf::Object::Dictionary(catalog));
+        doc.trailer.set("Root", lopdf::Object::Reference(cat_id));
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn zero_page_document_is_invalid_document() {
+        let mut req = request(ConformanceLevel::BB, None);
+        req.document = zero_page_pdf();
+        let (h, s) = begin(req, cfg(), ctx()).unwrap();
+        let state = expect_redirect(s).state;
+        let (h, _) = resume(
+            h,
+            ResumeInput::RedirectReturn {
+                code: "c".into(),
+                state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"access_token":"b","token_type":"Bearer"})),
+            ctx(),
+        )
+        .unwrap();
+        let (h, _) = resume(
+            h,
+            http_ok(serde_json::json!({"credentialIDs":["cred-1"]})),
+            ctx(),
+        )
+        .unwrap();
+        let (_h, step) = resume(h, http_ok(info_json()), ctx()).unwrap();
+        assert_eq!(expect_failed(step).outcome, SigningOutcome::InvalidDocument);
+    }
 
     fn cfg() -> TrustServiceConfiguration {
         TrustServiceConfiguration {
@@ -987,7 +1515,7 @@ mod tests {
         assert_eq!(h.phase, SigningPhase::Failed);
         match step {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::SignatureInvalid)
+                assert_eq!(evidence.outcome, SigningOutcome::SignatureInvalid);
             }
             _ => panic!("expected failed step"),
         }
@@ -1027,7 +1555,7 @@ mod tests {
         assert_eq!(h.phase, SigningPhase::Failed);
         match step {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable)
+                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable);
             }
             _ => panic!("expected failed step"),
         }
@@ -1160,7 +1688,7 @@ mod tests {
         assert_eq!(h4.phase, SigningPhase::Failed);
         match step {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::IdentityMismatch)
+                assert_eq!(evidence.outcome, SigningOutcome::IdentityMismatch);
             }
             o => panic!("{o:?}"),
         }
@@ -1220,7 +1748,7 @@ mod tests {
         assert_eq!(handle.phase, SigningPhase::Failed);
         match step {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::InvalidDocument)
+                assert_eq!(evidence.outcome, SigningOutcome::InvalidDocument);
             }
             _ => panic!("expected failed step"),
         }
@@ -1350,7 +1878,7 @@ mod tests {
         assert_eq!(h.phase, SigningPhase::Failed);
         match s {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable)
+                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable);
             }
             o => panic!("{o:?}"),
         }
@@ -1417,7 +1945,7 @@ mod tests {
         assert_eq!(h.phase, SigningPhase::Failed);
         match s {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable)
+                assert_eq!(evidence.outcome, SigningOutcome::CredentialUnavailable);
             }
             o => panic!("{o:?}"),
         }
@@ -1466,7 +1994,7 @@ mod tests {
         assert_eq!(h.phase, SigningPhase::Failed);
         match s {
             Step::Failed { evidence } => {
-                assert_eq!(evidence.outcome, SigningOutcome::AppearancePlacementError)
+                assert_eq!(evidence.outcome, SigningOutcome::AppearancePlacementError);
             }
             o => panic!("{o:?}"),
         }

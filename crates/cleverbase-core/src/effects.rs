@@ -53,7 +53,7 @@ pub enum Step {
 
 impl Step {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Step::Done { .. } | Step::Failed { .. })
+        matches!(self, Self::Done { .. } | Self::Failed { .. })
     }
 }
 

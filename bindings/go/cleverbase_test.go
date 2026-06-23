@@ -112,6 +112,46 @@ func TestResumeRedirectErrorYieldsDeclined(t *testing.T) {
 	}
 }
 
+func TestResumeHTTPAdvancesFlow(t *testing.T) {
+	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), testConfig(), "B-B", nil, 1_700_000_000, testEntropy())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	state, _ := sess.Step["state"].(string)
+	sess2, err := ResumeRedirect(sess.Handle, "code", state, 1_700_000_000, testEntropy())
+	if err != nil {
+		t.Fatalf("resume redirect: %v", err)
+	}
+	if sess2.Step["kind"] != "perform_http" {
+		t.Fatalf("expected token-exchange perform_http, got %v", sess2.Step["kind"])
+	}
+	// Feed the token-exchange HTTP response; the flow advances to the next perform_http (list).
+	body := []byte(`{"access_token":"bearer","token_type":"Bearer"}`)
+	sess3, err := ResumeHTTP(sess2.Handle, 200, body, 1_700_000_000, testEntropy())
+	if err != nil {
+		t.Fatalf("resume http: %v", err)
+	}
+	if sess3.Step["kind"] != "perform_http" {
+		t.Fatalf("expected credentials/list perform_http, got %v", sess3.Step["kind"])
+	}
+}
+
+func TestBeginWithBadConfigReturnsError(t *testing.T) {
+	// An empty client_id makes the core return InvalidConfig → WireResult::Err → a Go error.
+	cfg := testConfig()
+	cfg.ClientID = ""
+	_, err := BeginSigning([]byte("%PDF-1.7\nminimal"), cfg, "B-B", nil, 1_700_000_000, testEntropy())
+	if err == nil {
+		t.Fatal("expected an error for empty client_id")
+	}
+}
+
+func TestProcessRejectsEmptyInput(t *testing.T) {
+	if _, err := process(nil); err == nil {
+		t.Fatal("expected an error for empty input")
+	}
+}
+
 func TestInvalidDocumentFails(t *testing.T) {
 	sess, err := BeginSigning([]byte("not a pdf"), testConfig(), "B-B", nil, 1_700_000_000, testEntropy())
 	if err != nil {

@@ -13,6 +13,10 @@ use crate::crypto::sha256;
 /// Size of the `/Contents` placeholder, in bytes (hex string is twice this). Must comfortably fit
 /// the detached CMS (cert chain + signature + signed attributes + optional timestamp token).
 const CONTENTS_PLACEHOLDER_BYTES: usize = 16384;
+/// Minimum length of the `'0'` run that identifies the `/Contents` placeholder. Comfortably below
+/// the placeholder's `2 * CONTENTS_PLACEHOLDER_BYTES` (= 32768) hex zeros, yet far above any
+/// incidental short zero run, so the placeholder is located unambiguously.
+const MIN_CONTENTS_ZERO_RUN: usize = 4096;
 /// Wide dummy ByteRange integers, so real (smaller) offsets fit when patched with space padding.
 const BYTE_RANGE_DUMMY: i64 = 9_999_999_999;
 
@@ -312,7 +316,8 @@ pub fn prepare(
 
     // The /Contents value is the long zero-run AFTER the ByteRange (within our sig dict), so a
     // pre-existing zero run in the original document content cannot be mistaken for it.
-    let (z0, z1) = find_zero_run(&buf, br_key, 4096).ok_or(PadesError::Placeholder("/Contents"))?;
+    let (z0, z1) = find_zero_run(&buf, br_key, MIN_CONTENTS_ZERO_RUN)
+        .ok_or(PadesError::Placeholder("/Contents"))?;
     if z0 == 0 || buf[z0 - 1] != b'<' || buf.get(z1) != Some(&b'>') {
         return Err(PadesError::Placeholder("/Contents delimiters"));
     }
@@ -437,6 +442,42 @@ mod tests {
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn escape_pdf_text_covers_branches() {
+        assert_eq!(escape_pdf_text("a(b)\\c"), "a\\(b\\)\\\\c"); // parens + backslash escaped
+        assert_eq!(escape_pdf_text("x\ny\rz"), "x y z"); // newlines → space
+        assert_eq!(escape_pdf_text("café"), "caf?"); // non-ASCII → '?'
+    }
+
+    #[test]
+    fn is_pdf_a_detects_marker() {
+        assert!(is_pdf_a(b"<x:xmpmeta><pdfaid:part>1</pdfaid:part>"));
+        assert!(!is_pdf_a(b"%PDF-1.7 plain document"));
+    }
+
+    #[test]
+    fn prepare_rejects_zero_page_pdf() {
+        // A loadable PDF with an empty Pages tree → NoPages (not a panic / not a malformed sign).
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", Object::Array(vec![]));
+        pages.set("Count", Object::Integer(0));
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let cat_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(cat_id));
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        assert!(matches!(
+            prepare(&buf, None, None, None),
+            Err(PadesError::NoPages)
+        ));
     }
 
     #[test]

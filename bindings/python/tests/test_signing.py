@@ -8,6 +8,7 @@ import json
 
 import cbor2
 import cleverbase
+import pytest
 
 NOW = 1_700_000_000
 ENTROPY = bytes(range(16))
@@ -21,8 +22,15 @@ def test_schema_version_exposed():
 
 def test_begin_returns_service_redirect():
     out = cleverbase.begin_signing(
-        PDF, "acceptance", "v1_rsa", "client-123", "secret",
-        "https://app.example/cb", "B-B", NOW, ENTROPY,
+        PDF,
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-B",
+        NOW,
+        ENTROPY,
     )
     resp = cbor2.loads(out)
     assert resp["step"]["kind"] == "redirect"
@@ -32,8 +40,15 @@ def test_begin_returns_service_redirect():
 
 def test_resume_redirect_emits_token_exchange():
     out = cleverbase.begin_signing(
-        PDF, "acceptance", "v1_rsa", "client-123", "secret",
-        "https://app.example/cb", "B-B", NOW, ENTROPY,
+        PDF,
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-B",
+        NOW,
+        ENTROPY,
     )
     resp = cbor2.loads(out)
     handle, state = resp["handle"], resp["step"]["state"]
@@ -46,8 +61,15 @@ def test_resume_redirect_emits_token_exchange():
 
 def test_resume_redirect_error_yields_declined():
     out = cleverbase.begin_signing(
-        PDF, "acceptance", "v1_rsa", "client-123", "secret",
-        "https://app.example/cb", "B-B", NOW, ENTROPY,
+        PDF,
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-B",
+        NOW,
+        ENTROPY,
     )
     resp = cbor2.loads(out)
     handle, state = resp["handle"], resp["step"]["state"]
@@ -59,24 +81,101 @@ def test_resume_redirect_error_yields_declined():
 
 
 def test_begin_with_options_json():
-    options = json.dumps({
-        "expected_signer": {"match_on": "certificate_serial_number", "value": "PNONL-123"},
-        "appearance": {"page": 1, "rect": {"x": 50, "y": 50, "w": 200, "h": 80},
-                       "show": {"signer_name": True, "signing_time": True}},
-        "signature_meta": {"reason": "Approval", "location": "NL"},
-    })
+    options = json.dumps(
+        {
+            "expected_signer": {"match_on": "certificate_serial_number", "value": "PNONL-123"},
+            "appearance": {
+                "page": 1,
+                "rect": {"x": 50, "y": 50, "w": 200, "h": 80},
+                "show": {"signer_name": True, "signing_time": True},
+            },
+            "signature_meta": {"reason": "Approval", "location": "NL"},
+        }
+    )
     out = cleverbase.begin_signing(
-        PDF, "acceptance", "v1_rsa", "client-123", "secret",
-        "https://app.example/cb", "B-B", NOW, ENTROPY, None, options,
+        PDF,
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-B",
+        NOW,
+        ENTROPY,
+        None,
+        options,
     )
     resp = cbor2.loads(out)
     assert resp["step"]["kind"] == "redirect"
 
 
+def test_invalid_conformance_raises():
+    with pytest.raises(ValueError):
+        cleverbase.begin_signing(
+            PDF,
+            "acceptance",
+            "v1_rsa",
+            "c",
+            "s",
+            "https://app.example/cb",
+            "NOPE",
+            NOW,
+            ENTROPY,
+        )
+
+
+def test_invalid_environment_raises():
+    with pytest.raises(ValueError):
+        cleverbase.begin_signing(
+            PDF,
+            "NOPE",
+            "v1_rsa",
+            "c",
+            "s",
+            "https://app.example/cb",
+            "B-B",
+            NOW,
+            ENTROPY,
+        )
+
+
+def test_resume_with_bad_handle_raises():
+    with pytest.raises(ValueError):
+        cleverbase.resume_redirect(b"not a valid handle", "code", "state", NOW, ENTROPY)
+    with pytest.raises(ValueError):
+        cleverbase.resume_http(b"not a valid handle", 200, b"{}", NOW, ENTROPY)
+    with pytest.raises(ValueError):
+        cleverbase.resume_redirect_error(b"not a valid handle", "access_denied", "s", NOW, ENTROPY)
+
+
+def test_invalid_options_json_raises():
+    with pytest.raises(ValueError):
+        cleverbase.begin_signing(
+            PDF,
+            "acceptance",
+            "v1_rsa",
+            "c",
+            "s",
+            "https://app.example/cb",
+            "B-B",
+            NOW,
+            ENTROPY,
+            None,
+            "{not json",
+        )
+
+
 def test_invalid_document_is_failed_step():
     out = cleverbase.begin_signing(
-        b"not a pdf", "acceptance", "v1_rsa", "client-123", "secret",
-        "https://app.example/cb", "B-B", NOW, ENTROPY,
+        b"not a pdf",
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-B",
+        NOW,
+        ENTROPY,
     )
     resp = cbor2.loads(out)
     assert resp["step"]["kind"] == "failed"

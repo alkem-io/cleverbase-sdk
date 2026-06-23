@@ -24,7 +24,7 @@ TS frontend helper, expose the same operations. The signing pipeline is a staged
 
 ## Technical Context
 
-**Language/Version**: Rust (stable, edition 2021, MSRV pinned ≥ 1.83) for the core. Bindings:
+**Language/Version**: Rust (stable, edition 2021, MSRV 1.83 — the workspace `rust-version`) for the core. Bindings:
 Python ≥ 3.9 (PyO3 + maturin), Node ≥ 18 / TypeScript ≥ 5 (napi-rs) + a `wasm32-unknown-unknown`
 build (wasm-bindgen) for the browser helper, Go ≥ 1.22 (cgo over the C ABI).
 

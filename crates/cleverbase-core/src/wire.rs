@@ -176,4 +176,36 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn handle_step_envelope_round_trips() {
+        use crate::effects::RedirectEffect;
+        use crate::session::{SigningPhase, SigningSessionHandle};
+
+        let handle = SigningSessionHandle::terminal(
+            SigningPhase::ServiceAuthPending,
+            "abcd".into(),
+            ConformanceLevel::BB,
+            "corr-1".into(),
+        );
+        let step = Step::Redirect(RedirectEffect {
+            url: "https://x/authorize?state=s".into(),
+            state: "s".into(),
+        });
+        let bytes = encode_handle_step(&handle, &step);
+
+        // Decode the outer envelope, then the opaque handle, exactly as a binding does.
+        #[derive(serde::Deserialize)]
+        struct Pair {
+            #[serde(with = "serde_bytes")]
+            handle: Vec<u8>,
+            step: Step,
+        }
+        let pair: Pair = ciborium::from_reader(&bytes[..]).unwrap();
+        assert_eq!(pair.step, step);
+        let back = decode_handle(&pair.handle).unwrap();
+        assert_eq!(back.phase, SigningPhase::ServiceAuthPending);
+        assert_eq!(back.request_digest, "abcd");
+        assert_eq!(back.conformance_level, ConformanceLevel::BB);
+    }
 }

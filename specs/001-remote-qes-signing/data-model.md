@@ -140,6 +140,7 @@ Completed  → returns SignedDocument + SigningEvidenceRecord
 ```
 
 Every transition is driven by `resume(handle, effect_result)`; the core never performs I/O. All
-`Failed(*)` states also return a SigningEvidenceRecord (FR-015). Adding a signature to an
-already-signed PDF re-enters at `Created` against the updated bytes via incremental update, leaving
-prior signatures valid (FR-010).
+`Failed(*)` states also return a SigningEvidenceRecord (FR-015). In Phase 1 an **already-signed**
+input PDF is **rejected** up front with `InvalidDocument` (re-saving it would invalidate the prior
+signature); adding a further signature without invalidating existing ones requires incremental-
+update multi-signature (FR-010), which is deferred — see docs/limitations.md.

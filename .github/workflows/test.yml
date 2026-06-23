@@ -1,0 +1,114 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust core + C ABI (test + coverage ≥95%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Test (includes OpenSSL independent validation)
+        run: cargo test --workspace
+      # Constitution Principle VI: unit-test line coverage MUST stay ≥95% per crate. All protocol,
+      # CMS/PAdES, and timestamp logic lives in these two crates (the bindings are thin shims).
+      - name: Coverage gate — cleverbase-core
+        run: cargo llvm-cov --package cleverbase-core --fail-under-lines 95
+      - name: Coverage gate — cleverbase-ffi
+        run: cargo llvm-cov --package cleverbase-ffi --fail-under-lines 95
+
+  python:
+    name: Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.3.0
+        with:
+          python-version: "3.12"
+      # maturin needs a virtualenv; create one at the repo root (maturin finds it from the subdir).
+      - name: Create virtualenv
+        run: python -m venv .venv
+      - name: Install build + test deps
+        run: .venv/bin/pip install maturin pytest cbor2
+      - name: Build the extension (into the venv)
+        run: ../../.venv/bin/maturin develop
+        working-directory: bindings/python
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv
+      - name: pytest
+        run: ../../.venv/bin/pytest tests
+        working-directory: bindings/python
+
+  node:
+    name: Node binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - run: npm install
+        working-directory: bindings/node
+      - run: npm run build
+        working-directory: bindings/node
+      - run: npm test
+        working-directory: bindings/node
+
+  go:
+    name: Go binding (test + coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.0.2
+        with:
+          go-version: "1.22"
+      - run: cargo build -p cleverbase-ffi
+      - name: Test + coverage
+        working-directory: bindings/go
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          go test -coverprofile=cover.out ./...
+          total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          echo "Go binding statement coverage: ${total}%"
+          # The thin cgo shim's remaining lines are unreachable defensive branches (the C-ABI
+          # non-zero status, init/decode failure). Gate against regression at the achievable floor.
+          awk "BEGIN { exit !(${total} >= 80) }" || { echo "Go coverage ${total}% < 80%"; exit 1; }
+
+  frontend:
+    name: Frontend helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+      - run: npm install
+        working-directory: frontend/helper-ts
+      - run: npm run build
+        working-directory: frontend/helper-ts
+      - run: npm test
+        working-directory: frontend/helper-ts
