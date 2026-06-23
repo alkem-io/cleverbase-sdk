@@ -358,10 +358,10 @@ mod tests {
         // A typo'd field is rejected, not silently dropped — so a misspelled security-relevant
         // option (e.g. `expected_signer`) can't downgrade enforcement unnoticed.
         assert!(RequestOptions::from_json(r#"{"expected_signor":{"value":"x"}}"#).is_err());
-        assert!(
-            RequestOptions::from_json(r#"{"appearance":{"page":1,"rect":{"x":1,"y":2,"w":3,"h":4},"colour":"red"}}"#)
-                .is_err()
-        );
+        assert!(RequestOptions::from_json(
+            r#"{"appearance":{"page":1,"rect":{"x":1,"y":2,"w":3,"h":4},"colour":"red"}}"#
+        )
+        .is_err());
     }
 
     #[test]

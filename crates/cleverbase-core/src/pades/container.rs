@@ -547,7 +547,10 @@ mod tests {
         pages.set("Count", Object::Integer(1));
         doc.objects.insert(pages_id, Object::Dictionary(pages));
         let mut acro = Dictionary::new();
-        acro.set("Fields", Object::Array(vec![Object::Reference(existing_field_id)]));
+        acro.set(
+            "Fields",
+            Object::Array(vec![Object::Reference(existing_field_id)]),
+        );
         let mut catalog = Dictionary::new();
         catalog.set("Type", Object::Name(b"Catalog".to_vec()));
         catalog.set("Pages", Object::Reference(pages_id));
