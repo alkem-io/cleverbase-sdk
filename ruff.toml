@@ -1,0 +1,17 @@
+# Enforcing Python lint config (ruff). Applies to the Python binding tests and demos.
+target-version = "py39"
+line-length = 100
+
+[lint]
+# Strong, broad rule set: pycodestyle/pyflakes, imports, bugbear, comprehensions, simplify,
+# pyupgrade, naming, pathlib, pytest-style, ruff-native, return, unused-arguments, pylint subset.
+select = [
+    "E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF", "PT", "N", "PTH", "ARG", "RET",
+    "PLC", "PLE", "PLW",
+]
+# PT011: asserting a `match=` on PyO3-raised ValueErrors couples tests to FFI message wording.
+ignore = ["PT011"]
+
+[lint.per-file-ignores]
+# Demos are illustrative scripts, not a package: allow top-level runner style.
+"examples/**" = ["INP001"]

@@ -1,0 +1,71 @@
+# Rust
+/target/
+**/target/
+debug/
+*.rs.bk
+*.rlib
+*.prof*
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.log
+*.tsbuildinfo
+.npm/
+# Root dev-tooling lockfile (lint/format only; installed with `npm install`, not pinned).
+/package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Go
+*.exe
+*.test
+*.out
+/vendor/
+
+# WASM / build artifacts
+pkg/
+*.wasm
+
+# Native FFI build outputs
+*.dylib
+*.so
+*.a
+*.dll
+*.node
+
+# Compiled demo binary (build artifact, not source)
+/examples/go_demo/cleverbase-go-demo
+
+# Coverage
+coverage/
+*.profraw
+lcov.info
+
+# Env / secrets (never commit Cleverbase client secrets, TSA creds, etc.)
+.env*
+!.env.example
+*.pem
+*.key
+
+# Generated test-PKI artifacts. The synthetic test material is committed as DER / PKCS#8
+# (*.der, *.pk8); the openssl integration tests materialize any PEMs they need into a per-call
+# temp dir, so these mutable openssl bookkeeping files must never be tracked.
+/tests/fixtures/pki/*.srl
+/tests/fixtures/pki/*serial*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.tmp

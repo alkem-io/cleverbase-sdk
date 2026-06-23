@@ -1,0 +1,25 @@
+# Enforcing golangci-lint (v2) config for the Go binding and the Go demo.
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - unparam
+  exclusions:
+    rules:
+      # The binding is a thin cgo shim: unsafe.Pointer conversions and a C-bytes copy are
+      # inherent to the FFI boundary and are reviewed by hand, not flagged per call site.
+      - path: bindings/go/cleverbase\.go
+        linters: [gosec]
+        text: "G103|G115"
+      # gocritic's dupSubExpr misreads the cgo macro expansion of a C.func call as `x == x`.
+      - path: bindings/go/cleverbase\.go
+        linters: [gocritic]
+        text: "dupSubExpr"
