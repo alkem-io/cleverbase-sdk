@@ -60,6 +60,10 @@ pub unsafe extern "C" fn cleverbase_process(
         if in_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
             return 1;
         }
+        // Initialize the outputs so a consumer that inspects them on a non-zero return (e.g. the
+        // panic path below) sees a null/empty buffer, never uninitialized memory.
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
         let input = std::slice::from_raw_parts(in_ptr, in_len);
         // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
         let bytes = match std::panic::catch_unwind(|| process_bytes(input)) {

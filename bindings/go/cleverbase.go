@@ -131,7 +131,7 @@ func process(input []byte) ([]byte, error) {
 	var outLen C.size_t
 	rc := C.cleverbase_process((*C.uint8_t)(unsafe.Pointer(&input[0])), C.size_t(len(input)), &outPtr, &outLen)
 	if rc != 0 {
-		return nil, errors.New("cleverbase_process returned a non-zero status")
+		return nil, fmt.Errorf("cleverbase_process returned a non-zero status: %d", int(rc))
 	}
 	defer C.cleverbase_free(outPtr, outLen)
 	return C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen)), nil

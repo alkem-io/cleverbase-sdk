@@ -1,9 +1,15 @@
 // Enforcing flat ESLint config for the SDK's JavaScript/TypeScript surface:
 // the TS frontend helper, the Node binding tests, and the JS/MJS demos. Generated and
 // build artifacts are excluded.
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import js from "@eslint/js";
 import globals from "globals";
 import tseslint from "typescript-eslint";
+
+// Computed from import.meta.url for portability across Node versions (import.meta.dirname
+// is only available on newer runtimes).
+const rootDir = dirname(fileURLToPath(import.meta.url));
 
 export default tseslint.config(
   {
@@ -41,7 +47,7 @@ export default tseslint.config(
     languageOptions: {
       parserOptions: {
         project: "./frontend/helper-ts/tsconfig.json",
-        tsconfigRootDir: import.meta.dirname,
+        tsconfigRootDir: rootDir,
       },
     },
     rules: {
