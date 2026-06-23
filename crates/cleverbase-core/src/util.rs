@@ -115,7 +115,8 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     let mut n = 0;
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     for &b in input.as_bytes() {
-        if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' {
+        // Skip padding and any ASCII whitespace (space, tab, CR, LF, form feed, vertical tab).
+        if b == b'=' || b.is_ascii_whitespace() {
             continue;
         }
         quad[n] = val(b)?;
@@ -156,6 +157,8 @@ mod tests {
             assert_eq!(base64_decode(&base64_std(v)).unwrap(), v);
         }
         assert!(base64_decode("@@@@").is_err());
+        // Embedded whitespace (tabs/newlines/spaces) is tolerated, as documented.
+        assert_eq!(base64_decode("Zm9v\tZg ==\n").unwrap(), b"foof");
     }
 
     #[test]

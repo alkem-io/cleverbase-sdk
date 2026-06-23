@@ -8,7 +8,9 @@ this is a run/validation guide. See [contracts/](./contracts/) and [data-model.m
 - Rust toolchain (stable, ≥ MSRV), native target. (No WASM target needed — the frontend helper is
   pure TypeScript and performs no crypto.)
 - Binding toolchains: `maturin` (Python), Node ≥ 18 + `napi` (Node), Go ≥ 1.22 (cgo).
-- Independent validators: **EU DSS** validator and **veraPDF** (CI containers).
+- Independent validation: **OpenSSL** verifies every produced CMS in CI (an independent
+  implementation). **EU DSS** (PAdES/QES) and **veraPDF** (PDF/A) are recommended for
+  integrator-side acceptance and are not run by this repo's CI (see `docs/limitations.md`).
 - Cleverbase **acceptance** access: public stub `client_id` + `redirect_uri` registered (sales-led
   onboarding is out of scope — see spec Assumptions).
 - A configured **qualified RFC 3161 TSA** endpoint (required only for the B-T scenarios).
@@ -68,6 +70,8 @@ recorded HTTP-shape fixtures inlined in the Rust tests and/or live against the a
 
 ## Definition of done (feature)
 
-All of S1–S7 pass in CI, coverage ≥ 95% across core + bindings, and every produced signature passes
-the EU DSS / veraPDF validators. Demos for each language run S1 against the acceptance environment
+Scenarios S1–S7 are exercised by the unit and contract suites; CI runs those plus OpenSSL
+independent validation of every produced CMS and enforces the ≥95% coverage gate on the Rust
+crates (the language bindings are gated by their full test suites). End-to-end EU DSS / veraPDF
+acceptance and live-acceptance demos are integrator-side steps (see `docs/limitations.md`), run
 within the 30-minute first-signature target (SC-007).

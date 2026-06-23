@@ -18,15 +18,18 @@ container construction, RFC 3161 timestamp request/embedding) and *emits effects
 to perform, browser redirect URLs to issue) which the host executes. Network I/O, persistence, and
 clock live in the host; the core stays pure, deterministic, WASM-able, and trivially
 contract-testable against recorded HTTP fixtures. Thin idiomatic bindings — **Python (PyO3)**,
-**TypeScript/Node (napi-rs)** and **Go (cgo over a C ABI)** — plus a **WASM build** powering a thin
-TS frontend helper, expose the same operations. The signing pipeline is a staged augmentation flow
+**TypeScript/Node (napi-rs)** and **Go (cgo over a C ABI)** — expose the same operations. The
+browser frontend helper shipped in this phase is **pure TypeScript** (redirect orchestration +
+status polling, no crypto); a WASM build of the core for the browser is a later enhancement (the
+core is kept WASM-able for it). The signing pipeline is a staged augmentation flow
 (Sign → +Timestamp → … → Validate) with all seams present from day 1; this slice wires B-B and B-T.
 
 ## Technical Context
 
 **Language/Version**: Rust (stable, edition 2021, MSRV 1.83 — the workspace `rust-version`) for the core. Bindings:
-Python ≥ 3.9 (PyO3 + maturin), Node ≥ 18 / TypeScript ≥ 5 (napi-rs) + a `wasm32-unknown-unknown`
-build (wasm-bindgen) for the browser helper, Go ≥ 1.22 (cgo over the C ABI).
+Python ≥ 3.9 (PyO3 + maturin), Node ≥ 18 / TypeScript ≥ 5 (napi-rs), Go ≥ 1.22 (cgo over the C ABI).
+The browser helper is pure TypeScript in this phase; a `wasm32-unknown-unknown` (wasm-bindgen)
+build of the core is deferred to a later enhancement.
 
 **Primary Dependencies** (Rust core, all pure / no network):
 
@@ -49,8 +52,10 @@ carry short-lived authorization material and MUST be stored securely server-side
 **Testing**: `cargo test` + `proptest` (core); `pytest`, `vitest` (or jest), `go test` (bindings);
 **contract tests** replay recorded Cleverbase CSC/OIDC HTTP fixtures into the sans-IO core and also
 run against the Cleverbase **acceptance** environment + public stub credentials; **independent
-validation** of every produced signature via **EU DSS** (PAdES/QES + timestamp) and **veraPDF**
-(PDF/A) in CI. Coverage via `cargo-llvm-cov` (core) and native per-binding coverage — gate ≥ 95%.
+validation** of every produced CMS in CI via **OpenSSL** (an independent implementation).
+**EU DSS** (PAdES/QES + timestamp) and **veraPDF** (PDF/A) are recommended for integrator-side
+acceptance and are not run by this repo's CI (see `docs/limitations.md`). Coverage via
+`cargo-llvm-cov` gates the Rust crates at ≥ 95%; bindings are gated by their full test suites.
 
 **Target Platform**: Linux x86_64/aarch64 (glibc + musl), macOS arm64/x64, Windows x64; plus
 `wasm32` for the browser helper. Prebuilt artifacts shipped per platform (wheels, napi prebuilds,

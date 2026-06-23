@@ -54,7 +54,7 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
     "client_secret",
     "privatekey",
     "private_key",
-    " sad",
+    "sad",
     "signhash",
     "session_handle",
     "begin_signing",
@@ -62,7 +62,10 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
   for (const c of calls) {
     const body = c.init && c.init.body ? String(c.init.body).toLowerCase() : "";
     for (const word of forbidden) {
-      assert.ok(!body.includes(word), `request to ${c.url} leaked '${word}'`);
+      // Word-boundary match so e.g. the SAD token is caught even as `"sad"` in JSON,
+      // without false positives on substrings inside unrelated words.
+      const re = new RegExp(`\\b${word}\\b`);
+      assert.ok(!re.test(body), `request to ${c.url} leaked '${word}'`);
     }
   }
 });

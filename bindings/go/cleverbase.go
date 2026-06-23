@@ -7,6 +7,10 @@
 package cleverbase
 
 /*
+// The default LDFLAGS point at this repo's debug build of cleverbase-ffi so the binding works
+// in-tree for development and CI. Consumers building against a packaged/release library override
+// these via the CGO_LDFLAGS environment variable, e.g.
+//   CGO_LDFLAGS="-L/opt/cleverbase/lib -lcleverbase_ffi -Wl,-rpath,/opt/cleverbase/lib"
 #cgo LDFLAGS: -L${SRCDIR}/../../target/debug -lcleverbase_ffi -Wl,-rpath,${SRCDIR}/../../target/debug
 #include <stdint.h>
 #include <stdlib.h>
@@ -17,6 +21,7 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"unsafe"
 
@@ -145,6 +150,11 @@ func dispatch(op map[string]interface{}) (*Session, error) {
 	var resp wireResponse
 	if err := decMode.Unmarshal(out, &resp); err != nil {
 		return nil, err
+	}
+	// Refuse a response from an unexpected schema version rather than silently mis-decoding it
+	// after a wire-format bump (the binding and the core must agree on the envelope version).
+	if resp.SchemaVersion != schemaVersion {
+		return nil, fmt.Errorf("unexpected schema_version %d (expected %d)", resp.SchemaVersion, schemaVersion)
 	}
 	if resp.Result.Err != nil {
 		return nil, errors.New(resp.Result.Err.Message)

@@ -58,7 +58,11 @@ not an option.
 `/Contents` placeholder), compute the SHA-256 over the ByteRange, obtain the raw signature from
 Cleverbase, wrap it as a CMS/PKCS#7 `SignedData` (detached, `signing-certificate-v2` attribute,
 signer cert chain from `credentials/info`) using RustCrypto `cms`, and splice it into `/Contents`.
-Adding a signature uses incremental update so **existing signatures stay valid** (FR-010).
+The signature is written as an incremental update (the `/ByteRange` spans the original bytes plus
+the appended revision), which is the mechanism that would let **existing signatures stay valid**
+under multi-signature (FR-010). Phase 1 ships a single signature and rejects an already-signed
+input (`InvalidDocument`); accepting and preserving prior signatures (FR-010) is deferred — see
+`data-model.md`.
 
 **Rationale**: Matches PAdES (ETSI EN 319 142-1) baseline B-B; all required crates exist in Rust
 and are pure. Cleverbase returns only raw signature bytes, so we own assembly (Principle V).

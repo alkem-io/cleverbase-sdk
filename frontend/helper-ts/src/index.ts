@@ -12,7 +12,11 @@ export type SignStatus = "pending" | "authorizing" | "completed" | "declined" | 
 export interface SigningHelperOptions {
   /** Backend endpoint that starts a signing session and returns `{ redirectUrl, correlationId }`. */
   startUrl: string;
-  /** Backend endpoint that finalizes after the redirect return (receives `{ code, state }`). */
+  /**
+   * Backend endpoint hit on redirect return. Receives `{ code, state }` on success
+   * (`complete`) and `{ error, state }` on a signer decline / OAuth error
+   * (`reportRedirectError`); the backend distinguishes by which field is present.
+   */
   completeUrl: string;
   /** Backend endpoint that reports `{ status }` for a `correlationId`. */
   statusUrl: string;
