@@ -95,7 +95,11 @@ func (e *Engine) drive(s *session.Session, res Result) (status session.Status, r
 		e.Store.Update(s, func() { s.Handle = handle })
 		switch stepKind(res.Step) {
 		case stepKindPerformHTTP:
-			ef := stepHTTP(res.Step)
+			ef, perr := stepHTTP(res.Step)
+			if perr != nil {
+				e.fail(s, session.StatusFailed, reasonResumeError, nil)
+				return "", "", "", fmt.Errorf("malformed perform_http step: %w", perr)
+			}
 			e.Log.Info("effect.perform_http", "method", ef.method, "url", redact(ef.rawURL))
 			httpStatus, respBody, doErr := e.Up.Do(ef.method, ef.rawURL, ef.headers, ef.body)
 			if doErr != nil {
@@ -112,13 +116,21 @@ func (e *Engine) drive(s *session.Session, res Result) (status session.Status, r
 			}
 			res = next
 		case stepKindRedirect:
-			rawURL, state := stepRedirect(res.Step)
+			rawURL, state, perr := stepRedirect(res.Step)
+			if perr != nil {
+				e.fail(s, session.StatusFailed, reasonResumeError, nil)
+				return "", "", "", fmt.Errorf("malformed redirect step: %w", perr)
+			}
 			e.Store.SetState(s, state)
 			e.Store.Update(s, func() { s.Status = session.StatusAuthorizing })
 			e.Log.Info("transition.redirect", "state", redactState(state))
 			return session.StatusAuthorizing, e.rewriteRedirect(rawURL), "", nil
 		case stepKindDone:
-			pdf, evidence := stepDone(res.Step)
+			pdf, evidence, perr := stepDone(res.Step)
+			if perr != nil {
+				e.fail(s, session.StatusFailed, reasonResumeError, nil)
+				return "", "", "", fmt.Errorf("malformed done step: %w", perr)
+			}
 			e.Store.Update(s, func() {
 				s.Status = session.StatusCompleted
 				s.ResultPDF = pdf
@@ -160,7 +172,10 @@ func (e *Engine) Begin(corr string, document []byte, conformance string, opts *O
 		// begin always emits the service-scope redirect; anything else is a hard error.
 		return "", fmt.Errorf("begin produced unexpected step %q", kind)
 	}
-	rawURL, state := stepRedirect(res.Step)
+	rawURL, state, perr := stepRedirect(res.Step)
+	if perr != nil {
+		return "", fmt.Errorf("begin produced malformed redirect: %w", perr)
+	}
 	s := e.Store.New(corr, state, conformance, e.TTL)
 	e.Store.Update(s, func() {
 		s.Handle = res.Handle
@@ -232,8 +247,14 @@ func mapString(m map[string]any, key string) string {
 // stepKind returns the step's "kind" discriminator (or "" if absent/wrong-typed).
 func stepKind(step map[string]any) string { return mapString(step, "kind") }
 
-func stepRedirect(step map[string]any) (rawURL, state string) {
-	return mapString(step, "url"), mapString(step, "state")
+// stepRedirect extracts a redirect step's url+state, failing fast on a malformed step rather than
+// coercing a schema violation into an empty redirect URL/state that would flow to the frontend.
+func stepRedirect(step map[string]any) (rawURL, state string, err error) {
+	rawURL, state = mapString(step, "url"), mapString(step, "state")
+	if rawURL == "" || state == "" {
+		return "", "", errors.New("redirect step missing url or state")
+	}
+	return rawURL, state, nil
 }
 
 // httpEffect is the decoded shape of a perform_http step.
@@ -244,8 +265,11 @@ type httpEffect struct {
 	body    []byte
 }
 
-func stepHTTP(step map[string]any) httpEffect {
+func stepHTTP(step map[string]any) (httpEffect, error) {
 	ef := httpEffect{method: mapString(step, "method"), rawURL: mapString(step, "url")}
+	if ef.method == "" || ef.rawURL == "" {
+		return httpEffect{}, errors.New("perform_http step missing method or url")
+	}
 	if hs, ok := step["headers"].([]any); ok {
 		ef.headers = make([][2]string, 0, len(hs))
 		for _, h := range hs {
@@ -263,16 +287,19 @@ func stepHTTP(step map[string]any) httpEffect {
 	if b, ok := step["body"].([]byte); ok {
 		ef.body = b
 	}
-	return ef
+	return ef, nil
 }
 
-func stepDone(step map[string]any) (pdf, evidence []byte) {
+func stepDone(step map[string]any) (pdf, evidence []byte, err error) {
 	if signed, ok := step["signed"].(map[string]any); ok {
 		if p, ok := signed["pdf"].([]byte); ok {
 			pdf = p
 		}
 	}
-	return pdf, stepEvidence(step)
+	if len(pdf) == 0 {
+		return nil, nil, errors.New("done step missing signed pdf")
+	}
+	return pdf, stepEvidence(step), nil
 }
 
 func stepEvidence(step map[string]any) []byte {

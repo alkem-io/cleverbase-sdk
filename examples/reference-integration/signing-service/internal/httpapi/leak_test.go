@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,11 @@ func TestNoSecretInFrontendBoundResponses(t *testing.T) {
 			sink.WriteString(k)
 			for _, v := range vs {
 				sink.WriteString(v)
+				// X-Signature-Evidence is base64-encoded JSON; decode it so a secret leaked INSIDE the
+				// evidence is scanned in plaintext rather than hidden behind the base64 encoding.
+				if dec, err := base64.StdEncoding.DecodeString(v); err == nil {
+					_, _ = sink.Write(dec) // strings.Builder.Write never errors; []byte avoids a string alloc
+				}
 			}
 		}
 	}

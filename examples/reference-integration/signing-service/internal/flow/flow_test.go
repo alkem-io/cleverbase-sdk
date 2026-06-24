@@ -218,13 +218,24 @@ func TestRedactHandlesBadURL(t *testing.T) {
 }
 
 func TestStepHelpers(t *testing.T) {
-	ef := stepHTTP(map[string]any{
+	ef, err := stepHTTP(map[string]any{
 		"method": "POST", "url": "u",
 		"headers": []any{[]any{"K", "V"}, "bad", []any{"only-one"}},
 		"body":    []byte("b"),
 	})
-	if ef.method != "POST" || ef.rawURL != "u" || len(ef.headers) != 1 || ef.headers[0] != [2]string{"K", "V"} || string(ef.body) != "b" {
-		t.Fatalf("stepHTTP: %s %s %v %q", ef.method, ef.rawURL, ef.headers, ef.body)
+	if err != nil || ef.method != "POST" || ef.rawURL != "u" || len(ef.headers) != 1 || ef.headers[0] != [2]string{"K", "V"} || string(ef.body) != "b" {
+		t.Fatalf("stepHTTP: %v / %s %s %v %q", err, ef.method, ef.rawURL, ef.headers, ef.body)
+	}
+	// Fail-fast: a perform_http/redirect/done step missing required fields is an error, not a coerced
+	// zero value that would flow downstream as an empty URL/state/PDF.
+	if _, err := stepHTTP(map[string]any{"url": "u"}); err == nil {
+		t.Fatal("perform_http missing method should error")
+	}
+	if _, _, err := stepRedirect(map[string]any{"url": "u"}); err == nil {
+		t.Fatal("redirect missing state should error")
+	}
+	if _, _, err := stepDone(map[string]any{}); err == nil {
+		t.Fatal("done missing signed pdf should error")
 	}
 	if stepEvidence(map[string]any{}) != nil {
 		t.Fatal("missing evidence should be nil")
@@ -356,5 +367,43 @@ func TestCompleteOnTerminalRejected(t *testing.T) {
 	_, _, _, _ = e.Complete(s, "code", "s1") // → terminal failed
 	if _, _, _, err := e.Complete(s, "code", "s1"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("expected ErrTerminal, got %v", err)
+	}
+}
+
+// TestDriveFailsFastOnMalformedSteps proves a malformed SDK step surfaced mid-drive becomes a failed
+// session + error, instead of being coerced into an empty redirect URL/state or empty PDF downstream.
+func TestDriveFailsFastOnMalformedSteps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		step map[string]any
+	}{
+		{"perform_http missing url", map[string]any{"kind": "perform_http", "method": "POST"}},
+		{"redirect missing state", map[string]any{"kind": "redirect", "url": "u"}},
+		{"done missing pdf", map[string]any{"kind": "done", "signed": map[string]any{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newEngine([]Result{
+				redirect("https://cb/oauth2/authorize?scope=service", "s1"),
+				{Handle: []byte("h"), Step: tc.step},
+			})
+			if _, err := e.Begin("corr-1", []byte("%PDF"), "B-B", nil); err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			s, _ := e.Store.GetByState("s1")
+			if _, _, _, err := e.Complete(s, "code", "s1"); err == nil {
+				t.Fatal("expected a fail-fast error for the malformed step")
+			}
+			if s.Status != session.StatusFailed {
+				t.Fatalf("session should be failed after a malformed step, got %s", s.Status)
+			}
+		})
+	}
+}
+
+// TestBeginFailsFastOnMalformedRedirect proves begin rejects a redirect step missing its state.
+func TestBeginFailsFastOnMalformedRedirect(t *testing.T) {
+	e, _ := newEngine([]Result{{Handle: []byte("h"), Step: map[string]any{"kind": "redirect", "url": "u"}}})
+	if _, err := e.Begin("corr-1", []byte("%PDF"), "B-B", nil); err == nil {
+		t.Fatal("begin with a malformed redirect (no state) should error")
 	}
 }

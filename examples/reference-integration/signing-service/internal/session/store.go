@@ -30,6 +30,11 @@ var ErrTerminal = errors.New("session already terminal")
 // already in flight (a concurrent duplicate callback for the same state).
 var ErrResuming = errors.New("session already resuming")
 
+// evictGrace is how long a session is retained in byID after its TTL elapses, so a late /status or
+// /result fetch still resolves; past this it is evicted to bound memory (expireLocked only marks a
+// session failed — it keeps ResultPDF/Evidence — so eviction is what actually frees the memory).
+const evictGrace = 5 * time.Minute
+
 // Session is the per-journey state. Handle/ResultPDF are sensitive and never leave the backend
 // except the signed PDF on an explicit result fetch.
 type Session struct {
@@ -72,6 +77,7 @@ func NewMemory() *Memory {
 func (m *Memory) New(corr, state, conformance string, ttl time.Duration) *Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.evictExpiredLocked() // bound memory: sweep long-expired sessions whenever a new one is created
 	now := m.clock()
 	s := &Session{
 		CorrelationID: corr,
@@ -113,6 +119,12 @@ func (m *Memory) GetByState(state string) (*Session, error) {
 		return nil, ErrNotFound
 	}
 	m.expireLocked(s)
+	// expireLocked de-indexes the pending state on TTL expiry. If the state is no longer pending, the
+	// callback arrived after the session expired → treat it as an unknown/expired state (a clean 400
+	// in handleComplete), not a session we hand on to resume and then 500 on as terminal.
+	if m.byState[state] != corr {
+		return nil, ErrNotFound
+	}
 	return s, nil
 }
 
@@ -210,6 +222,21 @@ func (m *Memory) expireLocked(s *Session) {
 		if s.OAuthState != "" {
 			delete(m.byState, s.OAuthState)
 			s.OAuthState = ""
+		}
+	}
+}
+
+// evictExpiredLocked drops sessions whose TTL elapsed more than evictGrace ago from both indexes,
+// freeing their ResultPDF/Evidence. Called when a new session is created (the only growth driver), so
+// byID stays bounded by the working set plus sessions that expired within the last evictGrace window.
+func (m *Memory) evictExpiredLocked() {
+	now := m.clock()
+	for id, s := range m.byID {
+		if now.After(s.ExpiresAt.Add(evictGrace)) {
+			if s.OAuthState != "" {
+				delete(m.byState, s.OAuthState)
+			}
+			delete(m.byID, id)
 		}
 	}
 }

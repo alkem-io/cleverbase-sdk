@@ -177,3 +177,34 @@ func TestExpiryYieldsTerminalNotHang(t *testing.T) {
 		t.Fatal("expired session's state should be de-indexed")
 	}
 }
+
+func TestGetByStateReturnsNotFoundOnExpiry(t *testing.T) {
+	m := NewMemory()
+	base := time.Now()
+	m.clock = func() time.Time { return base }
+	m.New("corr-1", "state-A", "B-B", time.Minute)
+	// A callback arriving after the TTL — call GetByState directly (no prior Get), so expiry is
+	// consumed here. It must resolve as unknown/expired (ErrNotFound), not hand back a terminal
+	// session that the resume path would then turn into a 500.
+	m.clock = func() time.Time { return base.Add(2 * time.Minute) }
+	if _, err := m.GetByState("state-A"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired pending state must be ErrNotFound, got %v", err)
+	}
+}
+
+func TestEvictsLongExpiredSessionsOnNew(t *testing.T) {
+	m := NewMemory()
+	base := time.Now()
+	m.clock = func() time.Time { return base }
+	m.New("old-1", "s1", "B-B", time.Minute)
+	// Advance past TTL + evictGrace, then create a new session: the sweep must evict the stale entry
+	// from byID (bounding memory) while keeping the fresh one.
+	m.clock = func() time.Time { return base.Add(time.Minute + evictGrace + time.Minute) }
+	m.New("new-1", "s2", "B-B", time.Minute)
+	if _, err := m.Get("old-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("long-expired session must be evicted from byID, got %v", err)
+	}
+	if _, err := m.Get("new-1"); err != nil {
+		t.Fatalf("fresh session must remain: %v", err)
+	}
+}
