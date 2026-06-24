@@ -58,13 +58,16 @@ func (mockAutoApprove) Authorize(ctx context.Context, authorizeURL, _ string) (c
 
 // codeStateFromLocation parses an OIDC redirect Location, returning (code, state) — or a declined
 // error when the callback carries error=access_denied (mapped distinctly from an SDK defect, FR-011).
+//
+// FR-010: the callback URL carries the live OIDC `code` (a secret). Errors here MUST NOT interpolate
+// the raw Location — only the structural parse failure is reported (no code/state values leak to logs).
 func codeStateFromLocation(loc string) (code, state string, err error) {
 	if loc == "" {
 		return "", "", errors.New("authorize response carried no Location redirect")
 	}
 	u, err := url.Parse(loc)
 	if err != nil {
-		return "", "", fmt.Errorf("parse redirect %q: %w", loc, err)
+		return "", "", fmt.Errorf("parse redirect callback: %w", err)
 	}
 	q := u.Query()
 	if e := q.Get("error"); e != "" {
@@ -141,9 +144,11 @@ func parseCapturedCallback(raw string) (code, state string, err error) {
 	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "/") {
 		return codeStateFromLocation(raw)
 	}
+	// FR-010: the raw query carries the live `code`/`state` (secrets) — report only the parse failure,
+	// never the raw query string.
 	q, perr := url.ParseQuery(strings.TrimPrefix(raw, "?"))
 	if perr != nil {
-		return "", "", fmt.Errorf("parse callback query %q: %w", raw, perr)
+		return "", "", fmt.Errorf("parse callback query: %w", perr)
 	}
 	if e := q.Get("error"); e != "" {
 		if e == "access_denied" {

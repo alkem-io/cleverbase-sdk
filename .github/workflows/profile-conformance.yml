@@ -79,8 +79,10 @@ jobs:
           "$RUNNER_TEMP/pyhanko-venv/bin/pyhanko" --version
 
       # ---------------------------------------------------------------------------------------------
-      # Pull the digest-pinned EU DSS validation web app (same pin the script declares). If this image
-      # is unavailable the gate self-skips the DSS half; pulling here surfaces the pin explicitly.
+      # Pull the pinned EU DSS validation web app (same reference the script declares via --print-pins).
+      # The default DSS_IMAGE is a pinned RELEASE TAG (a mutable registry tag, not a content digest);
+      # override DSS_IMAGE with an @sha256:... reference for a true digest pin. If this image is
+      # unavailable the gate self-skips the DSS half; pulling here surfaces the reference explicitly.
       # ---------------------------------------------------------------------------------------------
       - name: Pull pinned EU DSS validation image
         run: |

@@ -826,13 +826,15 @@ fn unsupported_key_oid_fails_with_no_signature() {
     }
 }
 
-/// T009 / F3 (A1 — injection point is THIS Rust simulator): when the `signHash` simulator returns an
-/// ECDSA signature of an unexpected raw length (not 64 bytes and not valid DER), the core MUST reject
-/// it rather than mis-encode a malformed CMS. Exercises `ecdsa_signature_to_der`'s reject path +
-/// the post-assembly self-verify, end-to-end; no `src/` change.
+/// T009 / F3 (A1 — injection point is THIS Rust simulator): when the `signHash` simulator returns a
+/// bad ECDSA signature, the core MUST reject it rather than mis-encode a malformed CMS. Covers two
+/// realistic shapes: a WRONG RAW LENGTH (63/65 bytes — not 64, not valid DER, cannot be normalized) and
+/// a CORRECT-LENGTH-BUT-CRYPTOGRAPHICALLY-WRONG 64-byte r‖s (the realistic value a buggy/hostile CSC
+/// could return — it normalizes to a DER ECDSA-Sig-Value but fails the post-assembly self-verify). Both
+/// reach Failed/SignatureInvalid (no malformed CMS), end-to-end; no `src/` change.
 #[test]
 fn malformed_raw_ecdsa_length_is_rejected_by_core() {
-    for bad_len in [63usize, 65] {
+    for bad_len in [63usize, 64, 65] {
         let algo = KeyAlgo::EcdsaP256;
         let cfg = TrustServiceConfiguration {
             environment: Environment::Acceptance,
@@ -890,9 +892,10 @@ fn malformed_raw_ecdsa_length_is_rejected_by_core() {
             ctx(),
         )
         .unwrap();
-        // Return a raw signature of the WRONG length: neither 64 bytes nor valid DER. A genuine
-        // P-256 signature truncated/extended to bad_len cannot be a valid ECDSA-Sig-Value, so the
-        // core cannot normalize it and the self-verify must fail.
+        // Return a bad raw signature. 63/65 bytes: wrong length — not 64, not valid DER — cannot be
+        // normalized. 64 bytes of garbage: correct length but a cryptographically wrong r‖s that DOES
+        // normalize to a DER ECDSA-Sig-Value yet fails the post-assembly self-verify. Either way the
+        // core must reject (Failed/SignatureInvalid), never embed a bad/malformed signature.
         let bad_sig = vec![0x7Au8; bad_len];
         let (handle, step) = resume(
             h,

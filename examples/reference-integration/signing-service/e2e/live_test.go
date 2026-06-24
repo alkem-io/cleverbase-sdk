@@ -1,9 +1,12 @@
 package e2e
 
 import (
-	"bufio"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -60,25 +63,59 @@ func loadLiveEnv() (liveEnv, bool) {
 }
 
 // liveAuthorizer builds the configured Authorizer for the live path. interactive surfaces the
-// authorize URL and captures the callback (a local redirect-capture listener when REFSVC_REDIRECT_URI
-// is a loopback http URL, else a stdin paste); headless is the pending automatable approval drop-in.
+// authorize URL and captures the callback via a local redirect-capture listener on the loopback
+// REFSVC_REDIRECT_URI; headless is the pending automatable approval drop-in.
 func liveAuthorizer(t *testing.T, e liveEnv) Authorizer {
 	t.Helper()
 	switch e.authorizer {
 	case config.AuthorizerHeadless:
 		return Headless{}
 	case config.AuthorizerInteractive, "":
-		return Interactive{
-			Surface:         func(u string) { t.Logf("open this URL in a browser to authorize:\n%s", u) },
-			CaptureCallback: redirectCapture(t, e.redirectURI),
+		// Per-leg capture: runFlow calls Authorize twice (service-scope, then SCAL2). Each call must
+		// stand up its OWN one-shot capture so a leg-1 callback (state=S1) can never be read by leg-2
+		// and trip the CSRF guard. liveInteractive builds a fresh Interactive (fresh listener) per
+		// Authorize call.
+		return &liveInteractive{
+			t:           t,
+			redirectURI: e.redirectURI,
+			surface:     func(u string) { t.Logf("open this URL in a browser to authorize:\n%s", u) },
 			// Bound each human approval; an unapproved redirect fails fast (errAuthNotCompleted),
 			// never hangs CI (FR-011). Overridable via REFSVC_LIVE_AUTH_TIMEOUT.
-			Timeout: liveAuthTimeout(),
+			timeout: liveAuthTimeout(),
 		}
 	default:
 		t.Fatalf("unknown REFSVC_LIVE_AUTHORIZER %q", e.authorizer)
 		return nil
 	}
+}
+
+// liveInteractive is the live-harness Authorizer that wraps Interactive with a fresh per-call capture.
+// runFlow drives two redirects (service-scope, then SCAL2) by calling Authorize twice; a single shared
+// buffered capture channel would let a stale leg-1 callback be read by leg-2, tripping the CSRF
+// state-mismatch guard. liveInteractive instead stands up a brand-new one-shot capture on each call so
+// every leg sees only its own callback, and it surfaces a listener/bind failure promptly (rather than
+// blaming the signer for a timeout).
+type liveInteractive struct {
+	t           *testing.T
+	redirectURI string
+	surface     func(authorizeURL string)
+	timeout     time.Duration
+}
+
+// Authorize stands up a fresh one-shot redirect capture for THIS leg, then delegates to Interactive.
+// A listener/bind failure is surfaced immediately as a distinct error (never waited out as a signer
+// timeout). The capture is bound to the call's context so its listener is closed (no leak) on timeout.
+func (l *liveInteractive) Authorize(ctx context.Context, authorizeURL, expectState string) (code, state string, err error) {
+	// Bind/start the capture before surfacing the URL so a bind failure fails fast (FR-011) rather than
+	// after the human has already been pointed at the authorize URL.
+	capCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch, bindErr := startRedirectCapture(capCtx, l.t, l.redirectURI)
+	if bindErr != nil {
+		return "", "", bindErr
+	}
+	i := Interactive{Surface: l.surface, CaptureCallback: ch, Timeout: l.timeout}
+	return i.Authorize(ctx, authorizeURL, expectState)
 }
 
 // liveAuthTimeout reads REFSVC_LIVE_AUTH_TIMEOUT (default 3m): the window a human has to approve.
@@ -91,58 +128,68 @@ func liveAuthTimeout() time.Duration {
 	return 3 * time.Minute
 }
 
-// redirectCapture returns a channel yielding the raw redirect callback URL. If REFSVC_REDIRECT_URI is
-// an http(s) loopback URL, it stands up a one-shot listener on that host:port and yields the full
-// request URL when Cleverbase redirects the browser back. Otherwise it falls back to a stdin reader
-// (paste the callback URL). Either way it never blocks the caller forever — the Interactive Timeout
-// bounds the wait.
-func redirectCapture(t *testing.T, redirectURI string) <-chan string {
+// startRedirectCapture stands up a fresh ONE-SHOT capture for a single Authorize leg. It binds a
+// loopback HTTP listener on REFSVC_REDIRECT_URI's host:port and returns a channel that yields the full
+// callback request URL — reconstructed with the request's ACTUAL scheme (http for a loopback listener,
+// so it matches reality) — when Cleverbase redirects the browser back.
+//
+// The loopback listener is the only supported capture path: a non-loopback / non-http(s) redirect URI,
+// or a bind failure, is returned synchronously as a distinct error so the caller fails FAST (a silent
+// no-callback would otherwise be misread as "the signer did not approve in time", FR-011). The listener
+// is closed when ctx is done (the leg's timeout) or at test cleanup, so nothing leaks — there is no
+// uninterruptible stdin reader to strand.
+func startRedirectCapture(ctx context.Context, t *testing.T, redirectURI string) (<-chan string, error) {
 	t.Helper()
-	ch := make(chan string, 1)
 	u, err := url.Parse(redirectURI)
-	if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
-		srv := &http.Server{
-			Addr:              u.Host,
-			ReadHeaderTimeout: 10 * time.Second,
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				select {
-				case ch <- "https://" + r.Host + r.URL.RequestURI():
-				default:
-				}
-				_, _ = io.WriteString(w, "authorization received — you may close this tab")
-			}),
-		}
-		go func() { _ = srv.ListenAndServe() }()
-		t.Cleanup(func() { _ = srv.Close() })
-		return ch
+	if err != nil {
+		return nil, fmt.Errorf("REFSVC_REDIRECT_URI is not a valid URL: %w", err)
 	}
-	// Stdin fallback: read a single pasted callback URL.
-	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		if sc.Scan() {
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("redirect-capture requires an http(s) loopback REFSVC_REDIRECT_URI with a host (got scheme %q, host %q)", u.Scheme, u.Host)
+	}
+	// Bind eagerly so a bind error surfaces NOW (a distinct listener error), not as a silent timeout the
+	// signer gets blamed for.
+	ln, lerr := net.Listen("tcp", u.Host)
+	if lerr != nil {
+		return nil, fmt.Errorf("redirect-capture listener bind failed on %s: %w", u.Host, lerr)
+	}
+	ch := make(chan string, 1)
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
 			select {
-			case ch <- strings.TrimSpace(sc.Text()):
+			case ch <- scheme + "://" + r.Host + r.URL.RequestURI():
 			default:
 			}
-		}
+			_, _ = io.WriteString(w, "authorization received — you may close this tab")
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
 	}()
-	return ch
+	t.Cleanup(func() { _ = srv.Close() })
+	return ch, nil
 }
 
 // buildLiveService wires the SAME service used in fixtures mode but in live mode (no host rewrite):
 // only configuration differs (SC-003).
 func buildLiveService(t *testing.T, e liveEnv, conformance string) *httptest.Server {
 	t.Helper()
-	tsaURL := e.tsaURL
-	if tsaURL == "" {
-		// validateLive requires a TSA for every live profile; supply the acceptance default so the
-		// profile is internally consistent even when only B-B is exercised.
-		tsaURL = "https://tsa.acc.cleverbase.com/tsr"
-	}
+	// Use the configured TSA only (REFSVC_TSA_URL → B-T covered); otherwise leave it empty and do B-B
+	// only. NEVER hardcode a real Cleverbase TSA host: that would be an undeclared external dependency
+	// and conflict with FR-015 (a missing TSA must not block B-B). This Profile is constructed directly
+	// (not via config.Load), so config.validateLive — which governs the deployed service — does not run
+	// here; an empty TSA is therefore valid for a B-B-only live run.
 	p := &config.Profile{
 		Mode: config.ModeLive, Environment: e.env, CscAPI: e.cscAPI,
 		ClientID: e.clientID, ClientSecret: e.clientSecret, RedirectURI: e.redirectURI,
-		TsaURL: tsaURL, LiveAuthorizer: e.authorizer, LiveCABundle: e.caBundle,
+		TsaURL: e.tsaURL, LiveAuthorizer: e.authorizer, LiveCABundle: e.caBundle,
 		APIKey: apiKey, AuthEnabled: true, DefaultConformance: conformance, SessionTTL: 5 * time.Minute,
 	}
 	store := session.NewMemory()
@@ -173,6 +220,20 @@ func TestLive(t *testing.T) {
 		t.Skip("openssl required to verify the live signature against the real chain")
 	}
 
+	// Headless approval is a PENDING external dependency (U1): the Headless authorizer ships as the
+	// interface drop-in but fails fast with errHeadlessNotConfigured until an automatable Cleverbase
+	// test-credential approval is wired. live.yml runs CI unattended with REFSVC_LIVE_AUTHORIZER=headless,
+	// so probe the configured authorizer once up front; if it reports "not configured", SKIP cleanly
+	// (never fail) — the leg goes green now and runs for real the moment the mechanism exists (FR-009).
+	// The probe is safe because Headless.Authorize is a pure, side-effect-free stub. The interactive
+	// authorizer is NOT probed (its Authorize has real side effects: it surfaces a URL and waits).
+	auth := liveAuthorizer(t, e)
+	if e.authorizer == config.AuthorizerHeadless {
+		if _, _, err := auth.Authorize(context.Background(), "", ""); errors.Is(err, errHeadlessNotConfigured) {
+			t.Skip("headless approval mechanism not yet available — pending external dependency")
+		}
+	}
+
 	// Always exercise B-B; add B-T only when a TSA is configured.
 	levels := []string{config.ConformanceBB}
 	if e.tsaURL != "" {
@@ -181,6 +242,8 @@ func TestLive(t *testing.T) {
 	for _, level := range levels {
 		t.Run(level, func(t *testing.T) {
 			svc := buildLiveService(t, e, level)
+			// Per-leg authorizer: liveInteractive stands up a fresh capture on each Authorize call, so a
+			// new instance per conformance level keeps each level's captures fully independent.
 			auth := liveAuthorizer(t, e)
 			pdf, _, status, reason := runFlow(t, auth, svc, `{"conformanceLevel":"`+level+`"}`)
 			if status != "completed" {
@@ -204,14 +267,18 @@ func TestLive(t *testing.T) {
 }
 
 // TestLiveSkipsWithoutCredentials (FR-009) asserts the live gate SKIPS — never fails — when the
-// required live env is absent. It clears the live vars and runs TestLive in a subtest, asserting the
-// subtest skipped. Guards against a regression that turned the gate into a hard failure in CI.
+// required live env is absent. It clears the live vars and actually RUNS TestLive in a subtest,
+// asserting the subtest reports skipped (not failed). Guards against a regression that turned the gate
+// into a hard failure in CI.
 func TestLiveSkipsWithoutCredentials(t *testing.T) {
 	for _, k := range []string{"REFSVC_CLIENT_ID", "REFSVC_CLIENT_SECRET", "REFSVC_REDIRECT_URI", "REFSVC_LIVE_CA_BUNDLE"} {
 		t.Setenv(k, "")
 	}
-	if _, ok := loadLiveEnv(); ok {
-		t.Fatal("loadLiveEnv reported credentials present after clearing them; the gate would not skip")
+	// Run TestLive for real against the cleared env. With no credentials it must hit the FR-009 gate and
+	// t.Skip. t.Run returns false only when the subtest FAILED; a skip returns true. The regression this
+	// guards against is the gate turning into a hard failure, so a false return is the failure signal.
+	if ok := t.Run("TestLive", TestLive); !ok {
+		t.Fatal("TestLive reported FAILED with no credentials; the FR-009 gate must SKIP, never fail")
 	}
 }
 

@@ -8,16 +8,10 @@ name: Live contract path (opt-in)
 # by the test process and are NEVER echoed (FR-010).
 
 on:
+  # No inputs: B-B is always driven; B-T is additionally exercised when a TSA URL secret
+  # (LIVE_TSA_URL → REFSVC_TSA_URL) is provided to the protected environment. A missing TSA must not
+  # block B-B (FR-015), so conformance is driven by secret presence, not a manual input.
   workflow_dispatch:
-    inputs:
-      conformance:
-        description: "Conformance to drive (B-B always; B-T additionally requires a TSA URL secret)"
-        required: false
-        default: "B-B"
-        type: choice
-        options:
-          - "B-B"
-          - "B-T"
 
 permissions:
   contents: read
@@ -53,8 +47,12 @@ jobs:
       - name: Gate — is this algorithm's credential configured?
         id: gate
         env:
-          CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA }}
-          CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA }}
+          # Per-leg gating uses ONLY this leg's own credential. The `&& X || Y` form falls through to
+          # Y when X is empty (e.g. an absent RSA secret would cross-wire to the ECDSA secret, RUNNING
+          # the wrong leg). Two single-arm conditions OR'd together yield exactly one leg's secret and
+          # an empty string for the other leg — so a leg with no credential is correctly skipped.
+          CLIENT_ID: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA) }}
+          CLIENT_SECRET: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA) }}
           REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
         run: |
@@ -96,11 +94,16 @@ jobs:
           REFSVC_MODE: live
           REFSVC_ENV: acceptance
           REFSVC_CSC_API: ${{ matrix.csc_api }}
-          # Headless: the test drives the automatable approval when available; the env's protected
-          # secrets provide it. Defaults to interactive locally.
+          # Headless: unattended CI cannot do an interactive human approval. The headless approval
+          # mechanism is a PENDING external dependency (U1) — until it is wired, TestLive SKIPS this leg
+          # cleanly (green), and runs it for real the moment the mechanism exists. Defaults to
+          # interactive locally.
           REFSVC_LIVE_AUTHORIZER: headless
-          REFSVC_CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA }}
-          REFSVC_CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA }}
+          # Per-leg credential (same single-arm OR form as the gate above): ONLY this leg's own secret,
+          # empty for the other leg — never cross-wired so a leg cannot run with the wrong algorithm's
+          # credential.
+          REFSVC_CLIENT_ID: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA) }}
+          REFSVC_CLIENT_SECRET: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA) }}
           REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           # B-T is exercised only when a TSA URL secret is present (a missing TSA must NOT block B-B).
           REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}

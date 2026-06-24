@@ -45,19 +45,22 @@ set -euo pipefail
 #     pyHanko >=0.35.0,<0.36; we pin pyHanko to 0.35.1 (the highest in that range) so the pair is
 #     fully reproducible.
 #   * DSS_RELEASE — the fixed EU DSS release the level assertion is pinned to (esig/dss 6.4).
-#   * DSS_IMAGE — the EU DSS validation web app as a digest-pinned container reference. The contract
-#     allows "a digest-pinned image OR a fixed DSS release tag"; we pin BOTH (a fixed tag carrying the
-#     DSS_RELEASE, plus an optional @sha256 digest) so the image is reproducible where it is published.
-#     It is overridable via the DSS_IMAGE env var for operators running a self-hosted mirror, but the
-#     default is the pinned reference. If the image cannot be pulled/run, the DSS half self-skips with
-#     a clear SKIP (the AdES half still runs); if pyHanko is also absent the whole gate self-skips.
+#   * DSS_IMAGE — the EU DSS validation web app container reference. The contract allows "a
+#     digest-pinned image OR a fixed DSS release tag"; the DEFAULT here is a FIXED RELEASE TAG
+#     (esignaturedss/dss-demo-webapp:${DSS_RELEASE}), which is a mutable registry tag, NOT a content
+#     digest. For a true, byte-for-byte reproducible pin, override DSS_IMAGE with a digest reference
+#     (DSS_IMAGE=registry/...@sha256:...); the contract is satisfied either way. It is overridable via
+#     the DSS_IMAGE env var for operators running a self-hosted mirror or a digest pin. If the image
+#     cannot be pulled/run, the DSS half self-skips with a clear SKIP (the AdES half still runs); if
+#     pyHanko is also absent the whole gate self-skips.
 # ---------------------------------------------------------------------------------------------------
 PYHANKO_CLI_VERSION="0.4.0"
 PYHANKO_VERSION="0.35.1"
 DSS_RELEASE="6.4"
-# Default DSS validation-webapp image, pinned to the DSS_RELEASE tag. Override with DSS_IMAGE to point
-# at a self-hosted / digest-pinned mirror (e.g. registry.example/dss-webapp@sha256:...). The gate
-# self-skips the DSS half cleanly if this reference is not pullable in the current environment.
+# Default DSS validation-webapp image: a FIXED RELEASE TAG carrying DSS_RELEASE (a mutable registry
+# tag, not a content digest). Override DSS_IMAGE for a self-hosted mirror or a TRUE digest pin
+# (e.g. DSS_IMAGE=registry.example/dss-webapp@sha256:...). The gate self-skips the DSS half cleanly if
+# this reference is not pullable in the current environment.
 DSS_IMAGE="${DSS_IMAGE:-esignaturedss/dss-demo-webapp:${DSS_RELEASE}}"
 # Host port the throwaway DSS container is published on (overridable to avoid clashes in CI).
 DSS_PORT="${DSS_PORT:-8089}"
@@ -298,7 +301,9 @@ EOF
 # Drive the gate over every input PDF.
 # ---------------------------------------------------------------------------------------------------
 FAILED=0
-RAN=0  # set to 1 once at least one backend actually validated a PDF (vs. self-skipped)
+RAN=0            # set to 1 once at least one backend actually validated a PDF (vs. self-skipped)
+ADES_RAN=0       # set to 1 once pyHanko actually ran AdES validation
+LEVEL_ASSERTED=0 # set to 1 ONLY when EU DSS actually confirmed the baseline level (--expect-level)
 
 # --- AdES half (pyHanko) ---
 if [ "$HAVE_PYHANKO" -eq 1 ]; then
@@ -306,6 +311,7 @@ if [ "$HAVE_PYHANKO" -eq 1 ]; then
   for pdf in "${PDFS[@]}"; do
     note "adesverify: $pdf"
     RAN=1
+    ADES_RAN=1
     if pyhanko_validate "$pdf"; then
       printf 'PASS (AdES): %s\n' "$pdf" >&2
     else
@@ -324,6 +330,7 @@ if [ "$HAVE_DSS" -eq 1 ]; then
     for pdf in "${PDFS[@]}"; do
       note "dss level: $pdf"
       RAN=1
+      LEVEL_ASSERTED=1
       if dss_assert_level "$pdf"; then
         printf 'PASS (level %s): %s\n' "$DSS_EXPECT_FORMAT" "$pdf" >&2
       else
@@ -352,5 +359,25 @@ if [ "$RAN" -eq 0 ]; then
   skip "profile-gate toolchain not installed — every PDF was self-skipped (no AdES/level assertion made)"
   exit 0
 fi
-note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s) at level ${EXPECT_LEVEL}"
+# Report EXACTLY which checks ran. The baseline-LEVEL (--expect-level B-B/-T) is asserted ONLY by the
+# EU DSS half; the pyHanko half runs a level-agnostic adesverify. So we MUST NOT claim conformance "at
+# level X" unless DSS actually confirmed level X — otherwise a B-B PDF would falsely "pass" an explicit
+# --expect-level B-T assertion whenever DSS was unavailable. The level was REQUESTED on every run
+# (--expect-level is required), so the only honest outcomes are:
+#   * LEVEL_ASSERTED=1 — DSS confirmed the level: report PASS at the level (AdES too, if it ran).
+#   * LEVEL_ASSERTED=0 — DSS did not run (no container engine / image unpullable): the level was NOT
+#     checked. We do NOT print "PASSED ... at level X". The AdES half (if it ran) still passed; the
+#     level assertion is reported as SKIPPED and is left explicitly NOT PERFORMED.
+if [ "$LEVEL_ASSERTED" -eq 1 ]; then
+  if [ "$ADES_RAN" -eq 1 ]; then
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): AdES validated AND baseline level confirmed = ${EXPECT_LEVEL}"
+  else
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): baseline level confirmed = ${EXPECT_LEVEL} (AdES half SKIPPED — pyHanko unavailable)"
+  fi
+  exit 0
+fi
+# DSS did not run: the baseline level was NOT asserted. Only the AdES half ran here (RAN=1 with
+# LEVEL_ASSERTED=0 implies ADES_RAN=1). Report the AdES PASS and the level as explicitly SKIPPED — never
+# claim "at level ${EXPECT_LEVEL}".
+note "profile-conformance gate: AdES PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (EU DSS unavailable — level NOT asserted)"
 exit 0
