@@ -281,3 +281,38 @@ func TestStatusAndResultErrors(t *testing.T) {
 		t.Fatalf("unknown state should 400, got %d", rec.Code)
 	}
 }
+
+func TestLogReturnsConfiguredLoggerElseDiscard(t *testing.T) {
+	l := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if (&Service{Log: l}).log() != l {
+		t.Fatal("log() must return the configured logger when Log is set")
+	}
+	if (&Service{}).log() == nil {
+		t.Fatal("log() must return a non-nil discard logger when Log is unset")
+	}
+}
+
+func TestStartRNGFailureReturns500(t *testing.T) {
+	orig := randRead
+	randRead = func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+	t.Cleanup(func() { randRead = orig })
+	h := newService(happySteps(), false).Handler()
+	rec := do(t, h, "POST", "/v1/sign/start", `{"conformanceLevel":"B-B"}`, "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("a failed RNG must fail the start request (500), got %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCompleteMissingStateAndNeitherCodeNorError(t *testing.T) {
+	h := newService(happySteps(), false).Handler()
+	// Missing state → 400.
+	if rec := do(t, h, "POST", "/v1/sign/complete", `{"code":"c"}`, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing state should 400, got %d", rec.Code)
+	}
+	// A pending session exists at state "s1" (happySteps' first redirect); a body with the state but
+	// neither code nor error hits the "neither code nor error" branch → 400.
+	do(t, h, "POST", "/v1/sign/start", `{"conformanceLevel":"B-B"}`, "")
+	if rec := do(t, h, "POST", "/v1/sign/complete", `{"state":"s1"}`, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("neither code nor error should 400, got %d", rec.Code)
+	}
+}

@@ -82,12 +82,15 @@ func writeErr(w http.ResponseWriter, code int, errCode, msg string) {
 	writeJSON(w, code, map[string]string{"error": errCode, "message": msg})
 }
 
+// randRead is crypto/rand.Read, indirected so tests can exercise the RNG-failure path.
+var randRead = rand.Read
+
 // newCorrelationID returns a 128-bit random correlation ID. It propagates a failed RNG read
 // instead of silently returning a predictable/zero ID (a degraded RNG must fail the request,
 // not hand out a guessable correlation handle).
 func newCorrelationID() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := randRead(b); err != nil {
 		return "", fmt.Errorf("generate correlation id: %w", err)
 	}
 	return hex.EncodeToString(b), nil
