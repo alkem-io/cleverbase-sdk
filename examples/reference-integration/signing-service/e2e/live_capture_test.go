@@ -58,89 +58,163 @@ func waitListening(t *testing.T, hostPort string) {
 	t.Fatalf("capture listener at %s never came up", hostPort)
 }
 
-// TestLiveInteractiveTwoSequentialCapturesNoRebind (regression for the per-leg listener rebind race):
-// runFlow drives Authorize twice on the SAME REFSVC_REDIRECT_URI host:port. The prior implementation
-// re-bound a fresh listener per leg, racing leg-1's asynchronous close and hitting EADDRINUSE on leg-2.
-// This drives liveInteractive through TWO sequential Authorize legs on the same redirect URI and asserts
-// BOTH bind and capture their own callback — proving the listener is bound once and reused (no rebind).
-func TestLiveInteractiveTwoSequentialCapturesNoRebind(t *testing.T) {
+// authorizeLeg drives one liveInteractive.Authorize for state st on a background goroutine, delivers a
+// matching callback to the shared listener, and asserts it captures its OWN (code,state) without error
+// or hang. It is the per-leg body shared by the no-rebind and anti-poisoning tests.
+func authorizeLeg(t *testing.T, li *liveInteractive, hostPort, st string) {
+	t.Helper()
+	var (
+		gotCode, gotState string
+		gotErr            error
+		done              = make(chan struct{})
+	)
+	go func() {
+		gotCode, gotState, gotErr = li.Authorize(context.Background(), "https://issuer.example/authorize?state="+st, st)
+		close(done)
+	}()
+	// The listener is bound synchronously by the first Authorize; for every later leg it is already up.
+	waitListening(t, hostPort)
+	if code := deliverCallback(t, hostPort, "code=auth-code-"+st+"&state="+st); code != http.StatusOK {
+		t.Fatalf("leg %s: callback delivery returned %d, want 200 (listener must accept the real callback)", st, code)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("leg %s: Authorize hung — the shared capture never matched the callback (rebind/EADDRINUSE?)", st)
+	}
+	if gotErr != nil {
+		t.Fatalf("leg %s: Authorize errored (rebind failure would surface here): %v", st, gotErr)
+	}
+	if gotCode != "auth-code-"+st || gotState != st {
+		t.Fatalf("leg %s: got (code=%q,state=%q), want (auth-code-%s,%s)", st, gotCode, gotState, st, st)
+	}
+}
+
+// TestLiveInteractiveSharedListenerNoRebind (regression for the per-level/per-leg EADDRINUSE rebind
+// race): a SINGLE liveInteractive serves multiple sequential Authorize captures (here 4, simulating two
+// conformance levels × two legs) on the SAME REFSVC_REDIRECT_URI host:port. The prior implementation
+// re-bound a fresh listener per leg/level, racing the previous one's asynchronous close and hitting
+// EADDRINUSE. This proves the listener is bound ONCE and reused for the whole run (no rebind, no
+// EADDRINUSE) and each leg captures its own callback.
+func TestLiveInteractiveSharedListenerNoRebind(t *testing.T) {
 	hostPort := freeLoopbackHostPort(t)
-	redirectURI := "http://" + hostPort + "/cb"
 	li := &liveInteractive{
 		t:           t,
-		redirectURI: redirectURI,
+		redirectURI: "http://" + hostPort + "/cb",
+		surface:     func(string) {},
+		timeout:     2 * time.Second,
+	}
+	// 4 sequential legs on the same port: B-B(service, SCAL2) then B-T(service, SCAL2).
+	for _, st := range []string{"bb-service", "bb-scal2", "bt-service", "bt-scal2"} {
+		authorizeLeg(t, li, hostPort, st)
+	}
+}
+
+// TestLiveInteractiveDuplicateLegCallbackIgnored (regression for cross-leg CSRF poisoning): a duplicate
+// leg-1 callback (state=S1) delivered to the shared listener AFTER leg-1 consumed it and WHILE leg-2 is
+// waiting (expectState=S2) MUST be ignored — leg-2 must NOT read S1 and trip the CSRF guard. Leg-2 then
+// completes when its own S2 callback arrives. This proves state-matched routing eliminates poisoning and
+// makes duplicates harmless.
+func TestLiveInteractiveDuplicateLegCallbackIgnored(t *testing.T) {
+	const s1, s2 = "state-leg-1", "state-leg-2"
+	hostPort := freeLoopbackHostPort(t)
+	li := &liveInteractive{
+		t:           t,
+		redirectURI: "http://" + hostPort + "/cb",
 		surface:     func(string) {},
 		timeout:     2 * time.Second,
 	}
 
-	// Two legs, each with its own state, driven sequentially (as runFlow does: service-scope then SCAL2).
-	for leg, st := range []string{"state-leg-1", "state-leg-2"} {
-		var (
-			gotCode, gotState string
-			gotErr            error
-			done              = make(chan struct{})
-		)
-		go func() {
-			gotCode, gotState, gotErr = li.Authorize(context.Background(), "https://issuer.example/authorize?state="+st, st)
-			close(done)
-		}()
+	// Leg 1 completes normally (binds the shared listener and captures S1).
+	authorizeLeg(t, li, hostPort, s1)
 
-		// The listener is bound synchronously by the first Authorize; for both legs it is up by the time
-		// the goroutine reaches the capture wait. Poll until it answers, then deliver this leg's callback.
-		waitListening(t, hostPort)
-		if code := deliverCallback(t, hostPort, "code=auth-code-"+st+"&state="+st); code != http.StatusOK {
-			t.Fatalf("leg %d: callback delivery returned %d, want 200 (listener must accept the real callback)", leg+1, code)
-		}
+	// Leg 2 starts waiting on S2.
+	var (
+		gotCode, gotState string
+		gotErr            error
+		done              = make(chan struct{})
+	)
+	go func() {
+		gotCode, gotState, gotErr = li.Authorize(context.Background(), "https://issuer.example/authorize?state="+s2, s2)
+		close(done)
+	}()
+	waitListening(t, hostPort)
 
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("leg %d: Authorize hung — the per-leg capture never received the callback (rebind/EADDRINUSE?)", leg+1)
-		}
-		if gotErr != nil {
-			t.Fatalf("leg %d: Authorize errored (rebind failure would surface here): %v", leg+1, gotErr)
-		}
-		if gotCode != "auth-code-"+st || gotState != st {
-			t.Fatalf("leg %d: got (code=%q,state=%q), want (auth-code-%s,%s)", leg+1, gotCode, gotState, st, st)
-		}
+	// While leg-2 waits, a STALE/DUPLICATE leg-1 callback (state=S1) arrives — a browser reload of the
+	// success tab or a retry. Under the old channel-swap it would be routed into leg-2 and fail with
+	// "state mismatch (CSRF)". With state-matched routing it is filed under S1 and ignored by leg-2.
+	if code := deliverCallback(t, hostPort, "code=DUP-leg1&state="+s1); code != http.StatusOK {
+		t.Fatalf("duplicate leg-1 callback delivery returned %d, want 200", code)
+	}
+	// Give the duplicate a moment to (wrongly) poison leg-2 if the routing were state-blind. Leg-2 must
+	// still be blocked (no spurious completion/error).
+	select {
+	case <-done:
+		t.Fatalf("leg-2 completed/errored from the duplicate leg-1 callback (CSRF poisoning): code=%q state=%q err=%v", gotCode, gotState, gotErr)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Now leg-2's OWN callback (state=S2) arrives — leg-2 completes cleanly with its own code/state.
+	if code := deliverCallback(t, hostPort, "code=auth-code-"+s2+"&state="+s2); code != http.StatusOK {
+		t.Fatalf("leg-2 callback delivery returned %d, want 200", code)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("leg-2 hung after its own S2 callback arrived")
+	}
+	if gotErr != nil {
+		t.Fatalf("leg-2 errored (the duplicate S1 must be ignored, not poison the wait): %v", gotErr)
+	}
+	if gotCode != "auth-code-"+s2 || gotState != s2 {
+		t.Fatalf("leg-2 got (code=%q,state=%q), want (auth-code-%s,%s)", gotCode, gotState, s2, s2)
 	}
 }
 
+// captureState waits (bounded) for the capture to record a callback under expectState and returns its
+// raw URL, failing the test on timeout — a small wrapper around waitForState used by the capture tests.
+func captureState(t *testing.T, rc *redirectCapture, expectState string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	raw, err := rc.waitForState(ctx, expectState)
+	if err != nil {
+		t.Fatalf("waitForState(%q): %v", expectState, err)
+	}
+	return raw
+}
+
 // TestRedirectCaptureIgnoresNonCallbackRequests (A4 capture-handler poisoning): a stray request with
-// neither a `code` nor an `error` (favicon/preflight/probe) MUST NOT win the buffered capture channel
-// and feed a code-less callback that drops the real one. It asserts such a request is ignored (204) and
-// the subsequently-delivered REAL callback is the one captured.
+// neither a `code` nor an `error` (favicon/preflight/probe) MUST NOT be recorded as a callback and
+// claimed by a waiter. It asserts such a request is ignored (204), no state is recorded, and the
+// subsequently-delivered REAL callback is the one a waiter receives.
 func TestRedirectCaptureIgnoresNonCallbackRequests(t *testing.T) {
 	hostPort := freeLoopbackHostPort(t)
 	rc, err := startRedirectCapture(t, "http://"+hostPort+"/cb")
 	if err != nil {
 		t.Fatalf("startRedirectCapture: %v", err)
 	}
-	ch := rc.nextLeg()
 	waitListening(t, hostPort)
 
-	// A favicon-style stray request: no code, no error. Must be ignored (204), not buffered.
-	if code := deliverCallback(t, hostPort, "favicon=1"); code != http.StatusNoContent {
+	// A favicon-style stray request: no code, no error. Must be ignored (204), not recorded.
+	if code := deliverCallback(t, hostPort, "favicon=1&state=s"); code != http.StatusNoContent {
 		t.Fatalf("stray non-callback request returned %d, want 204 (it must be ignored, not captured)", code)
 	}
-	// The channel must still be empty — the stray request did not poison it.
-	select {
-	case raw := <-ch:
-		t.Fatalf("stray non-callback request poisoned the capture channel with %q", raw)
-	default:
+	// A waiter for state=s must NOT be satisfied by the stray request — it should time out, proving the
+	// stray request did not poison the state slot.
+	short, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	if _, err := rc.waitForState(short, "s"); err == nil {
+		cancel()
+		t.Fatal("stray non-callback request poisoned the capture for state=s")
 	}
+	cancel()
 
-	// The REAL callback (carries a code) is captured and wins the channel.
+	// The REAL callback (carries a code) is recorded under its state and claimed by a waiter.
 	if code := deliverCallback(t, hostPort, "code=REAL&state=s"); code != http.StatusOK {
 		t.Fatalf("real callback returned %d, want 200", code)
 	}
-	select {
-	case raw := <-ch:
-		if !strings.Contains(raw, "code=REAL") || !strings.Contains(raw, "state=s") {
-			t.Fatalf("captured callback missing code/state: %q", raw)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("real callback was not captured (the channel was poisoned or dropped)")
+	if raw := captureState(t, rc, "s"); !strings.Contains(raw, "code=REAL") || !strings.Contains(raw, "state=s") {
+		t.Fatalf("captured callback missing code/state: %q", raw)
 	}
 }
 
@@ -153,19 +227,13 @@ func TestRedirectCaptureCapturesErrorCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startRedirectCapture: %v", err)
 	}
-	ch := rc.nextLeg()
 	waitListening(t, hostPort)
 
 	if code := deliverCallback(t, hostPort, "error=access_denied&state=s"); code != http.StatusOK {
 		t.Fatalf("error callback returned %d, want 200", code)
 	}
-	select {
-	case raw := <-ch:
-		if !strings.Contains(raw, "error=access_denied") {
-			t.Fatalf("captured callback missing error param: %q", raw)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("error callback was not captured")
+	if raw := captureState(t, rc, "s"); !strings.Contains(raw, "error=access_denied") {
+		t.Fatalf("captured callback missing error param: %q", raw)
 	}
 }
 

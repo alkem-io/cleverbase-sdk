@@ -14,7 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,16 +66,18 @@ func loadLiveEnv() (liveEnv, bool) {
 // liveAuthorizer builds the configured Authorizer for the live path. interactive surfaces the
 // authorize URL and captures the callback via a local redirect-capture listener on the loopback
 // REFSVC_REDIRECT_URI; headless is the pending automatable approval drop-in.
+//
+// The interactive authorizer binds ONE redirect-capture listener for the ENTIRE TestLive run (across
+// both conformance levels AND both redirect legs) — see liveInteractive. So this is called ONCE at
+// TestLive (parent t) scope and the returned Authorizer is reused for every Authorize; building a
+// fresh one per level would re-Listen on the same fixed REFSVC_REDIRECT_URI port and race the previous
+// level's asynchronous close (EADDRINUSE).
 func liveAuthorizer(t *testing.T, e liveEnv) Authorizer {
 	t.Helper()
 	switch e.authorizer {
 	case config.AuthorizerHeadless:
 		return Headless{}
 	case config.AuthorizerInteractive, "":
-		// runFlow calls Authorize twice (service-scope, then SCAL2). The listener is bound ONCE for the
-		// whole flow and reused across both legs (no per-leg rebind on the same host:port → no EADDRINUSE
-		// race), while a FRESH one-shot capture channel is installed per leg so a leg-1 callback (state=S1)
-		// can never be read by leg-2 and trip the CSRF guard.
 		return &liveInteractive{
 			t:           t,
 			redirectURI: e.redirectURI,
@@ -90,57 +92,94 @@ func liveAuthorizer(t *testing.T, e liveEnv) Authorizer {
 	}
 }
 
-// liveInteractive is the live-harness Authorizer that wraps Interactive. runFlow drives two redirects
-// (service-scope, then SCAL2) by calling Authorize twice. The redirect-capture listener is bound ONCE
-// for the whole flow (lazily, on the first Authorize) and REUSED across both legs — re-binding a fresh
-// listener per leg on the same loopback host:port races leg-1's asynchronous close and hits EADDRINUSE.
-// Cross-leg CSRF poisoning is still prevented by installing a FRESH one-shot capture channel per leg:
-// the listener lifecycle (per-flow, closed at t.Cleanup) is decoupled from the per-leg callback channel,
-// so a stale leg-1 callback can never be read by leg-2. A listener/bind failure is surfaced promptly as
-// a distinct error (rather than blaming the signer for a timeout).
+// liveInteractive is the live-harness Authorizer that wraps Interactive. The whole TestLive run drives
+// MANY redirects: two legs (service-scope, then SCAL2) per conformance level, across B-B and B-T. ONE
+// redirect-capture listener is bound for the ENTIRE run (lazily, on the first Authorize) and reused by
+// every leg of every level. This is the single fix for BOTH defects:
+//
+//   - Per-level/per-leg EADDRINUSE rebind race — never re-Listen on the fixed REFSVC_REDIRECT_URI port,
+//     so there is no async-close-vs-rebind race. The listener is closed once, at TestLive's t.Cleanup.
+//   - Cross-leg CSRF poisoning — the capture records each callback keyed by its OWN state and each leg
+//     waits for ONLY the state it expects (see redirectCapture.waitForState), so a duplicate/stale
+//     leg-1 callback (state=S1) arriving while leg-2 waits is dropped (its state != leg-2's expectState).
+//
+// A listener/bind failure is surfaced promptly as a distinct error (rather than blaming the signer for
+// a timeout). Because the same liveInteractive is reused across the whole run, binding is guarded so the
+// listener is established exactly once even if Authorize is somehow entered concurrently.
 type liveInteractive struct {
 	t           *testing.T
 	redirectURI string
 	surface     func(authorizeURL string)
 	timeout     time.Duration
 
-	cap *redirectCapture // bound once, lazily, on the first Authorize and reused across legs
+	bindOnce sync.Once
+	cap      *redirectCapture // bound once for the whole run and reused across every level + leg
+	bindErr  error            // a bind failure captured by bindOnce, surfaced on every Authorize
 }
 
-// Authorize binds the shared redirect-capture listener once (on the first call), then installs a FRESH
-// one-shot capture channel for THIS leg and delegates to Interactive. A bind failure is surfaced before
-// the URL is surfaced so it fails fast (FR-011) rather than being waited out as a signer timeout.
+// Authorize binds the single shared redirect-capture listener once (on the first call across the whole
+// TestLive run), then delegates to Interactive with the capture's state-matched waiter for THIS leg's
+// expectState. A bind failure is surfaced before the URL is surfaced so it fails fast (FR-011) rather
+// than being waited out as a signer timeout.
 func (l *liveInteractive) Authorize(ctx context.Context, authorizeURL, expectState string) (code, state string, err error) {
-	if l.cap == nil {
-		c, bindErr := startRedirectCapture(l.t, l.redirectURI)
-		if bindErr != nil {
-			return "", "", bindErr
-		}
-		l.cap = c
+	l.bindOnce.Do(func() { l.cap, l.bindErr = startRedirectCapture(l.t, l.redirectURI) })
+	if l.bindErr != nil {
+		return "", "", l.bindErr
 	}
-	// Fresh per-leg channel: the long-lived handler routes the next callback here, so a leg-1 callback
-	// can never bleed into leg-2 (no cross-leg CSRF poisoning).
-	ch := l.cap.nextLeg()
-	i := Interactive{Surface: l.surface, CaptureCallback: ch, Timeout: l.timeout}
+	// State-matched waiter: Interactive blocks until the capture observes a callback whose state ==
+	// expectState, ignoring every other (duplicate/stale leg) callback — so no cross-leg CSRF poisoning.
+	i := Interactive{Surface: l.surface, WaitForCallback: l.cap.waitForState, Timeout: l.timeout}
 	return i.Authorize(ctx, authorizeURL, expectState)
 }
 
-// redirectCapture owns the single per-flow loopback HTTP listener and routes each browser callback to
-// the CURRENT leg's one-shot channel (swapped between legs via nextLeg). Decoupling the listener
-// lifecycle (bound once, closed at t.Cleanup) from the per-leg channel is what kills both the per-leg
-// rebind race (no re-Listen on the same port) and cross-leg CSRF poisoning (each leg sees only its own
-// callback).
+// redirectCapture owns the single, long-lived loopback HTTP listener for the whole TestLive run and
+// records every browser callback keyed by its OWN state. Each leg's Authorize calls waitForState with
+// the state it expects and is woken only by a callback carrying that exact state; callbacks for any
+// other state sit harmlessly in the map and are never delivered to a non-matching waiter. This kills
+// both the per-leg/per-level rebind race (the listener is bound once, never re-Listened) and cross-leg
+// CSRF poisoning (a stale leg-1 callback can never satisfy leg-2's wait).
 type redirectCapture struct {
-	active atomic.Pointer[chan string] // the current leg's one-shot capture channel
+	mu      sync.Mutex
+	cond    *sync.Cond        // broadcast when a new state lands, so waiters re-check the map
+	byState map[string]string // state -> full captured callback URL (the first wins per state)
 }
 
-// nextLeg installs and returns a FRESH one-shot (buffered, cap 1) capture channel for the next leg,
-// replacing any previous one. The handler reads the active pointer per request, so the swap takes effect
-// without re-binding the listener.
-func (c *redirectCapture) nextLeg() <-chan string {
-	ch := make(chan string, 1)
-	c.active.Store(&ch)
-	return ch
+// record stores a captured callback URL under its state (first writer per state wins, so a duplicate
+// callback for an already-seen state cannot clobber it) and wakes any waiter that may now match.
+func (c *redirectCapture) record(state, callbackURL string) {
+	c.mu.Lock()
+	if _, seen := c.byState[state]; !seen {
+		c.byState[state] = callbackURL
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+// waitForState blocks until a callback whose state == expectState has been recorded (returning its raw
+// URL), or ctx is done (returning errAuthNotCompleted, never a hang). Callbacks for any other state are
+// ignored: they are recorded but a waiter for expectState only ever returns its OWN state's callback, so
+// a duplicate/stale leg-1 callback (state=S1) cannot satisfy a leg-2 wait (expectState=S2). A context
+// cancel/timeout broadcasts the cond so the blocked waiter wakes and observes ctx.Err().
+func (c *redirectCapture) waitForState(ctx context.Context, expectState string) (string, error) {
+	// Wake the cond when ctx fires so a parked Wait() returns promptly (sync.Cond is not ctx-aware).
+	stop := context.AfterFunc(ctx, func() {
+		c.mu.Lock()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	})
+	defer stop()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		if raw, ok := c.byState[expectState]; ok {
+			return raw, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("%w: %w (signer did not approve within the window)", errAuthNotCompleted, err)
+		}
+		c.cond.Wait()
+	}
 }
 
 // isLoopbackHost reports whether host is a loopback target: localhost, or an IP in 127.0.0.0/8 or ::1.
@@ -156,10 +195,11 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
-// startRedirectCapture binds the single per-flow loopback HTTP listener on REFSVC_REDIRECT_URI's
-// host:port and returns a redirectCapture that routes each callback to the leg's current one-shot
-// channel. The handler reconstructs the full callback URL with the request's ACTUAL scheme (http for a
-// loopback listener, so it matches reality).
+// startRedirectCapture binds the single long-lived loopback HTTP listener on REFSVC_REDIRECT_URI's
+// host:port and returns a redirectCapture that records each callback keyed by its own state. The
+// handler reconstructs the full callback URL with the request's ACTUAL scheme (http for a loopback
+// listener, so it matches reality) and stores it under its state so a leg waiting on that state can
+// claim it; a callback with no state is recorded under "" (an empty expectState would match it).
 //
 // The loopback listener is the only supported capture path: a non-loopback host, a non-http(s) scheme,
 // or a bind failure is returned synchronously as a distinct error so the caller fails FAST (a silent
@@ -188,14 +228,15 @@ func startRedirectCapture(t *testing.T, redirectURI string) (*redirectCapture, e
 	if lerr != nil {
 		return nil, fmt.Errorf("redirect-capture listener bind failed on %s: %w", u.Host, lerr)
 	}
-	c := &redirectCapture{}
+	c := &redirectCapture{byState: make(map[string]string)}
+	c.cond = sync.NewCond(&c.mu)
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			q := r.URL.Query()
 			// Only a real OIDC callback carries a `code` or an `error`. Ignore everything else (favicon,
-			// preflight, stray probes) so a non-callback request can never win the buffered channel and
-			// feed a code-less callback that drops the real one (A4 capture-handler poisoning).
+			// preflight, stray probes) so a non-callback request can never be recorded as a callback and
+			// be claimed by a waiter (A4 capture-handler poisoning).
 			if q.Get("code") == "" && q.Get("error") == "" {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -204,12 +245,10 @@ func startRedirectCapture(t *testing.T, redirectURI string) (*redirectCapture, e
 			if r.TLS != nil {
 				scheme = "https"
 			}
-			if ap := c.active.Load(); ap != nil {
-				select {
-				case *ap <- scheme + "://" + r.Host + r.URL.RequestURI():
-				default:
-				}
-			}
+			// Record keyed by the callback's OWN state. A duplicate/stale leg-1 callback (state=S1) is
+			// therefore filed under S1 and can never satisfy a leg-2 wait (expectState=S2): cross-leg
+			// poisoning is impossible. The first callback per state wins (record drops later duplicates).
+			c.record(q.Get("state"), scheme+"://"+r.Host+r.URL.RequestURI())
 			_, _ = io.WriteString(w, "authorization received — you may close this tab")
 		}),
 	}
@@ -293,9 +332,11 @@ func TestLive(t *testing.T) {
 	for _, level := range levels {
 		t.Run(level, func(t *testing.T) {
 			svc := buildLiveService(t, e, level)
-			// Per-leg authorizer: liveInteractive stands up a fresh capture on each Authorize call, so a
-			// new instance per conformance level keeps each level's captures fully independent.
-			auth := liveAuthorizer(t, e)
+			// REUSE the single parent-scope authorizer across BOTH levels: its interactive variant binds
+			// ONE redirect-capture listener (lazily, on the first Authorize) on the fixed
+			// REFSVC_REDIRECT_URI port and keeps it for the whole run, closed once at the parent t's
+			// Cleanup. Building a fresh one per level would re-Listen on that same port and race the prior
+			// level's async close (EADDRINUSE). State-matched routing keeps each leg's callback isolated.
 			pdf, _, status, reason := runFlow(t, auth, svc, `{"conformanceLevel":"`+level+`"}`)
 			if status != "completed" {
 				// A service/credential/authorization failure (FR-011): surface it clearly, distinct

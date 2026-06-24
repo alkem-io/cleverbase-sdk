@@ -745,6 +745,7 @@ fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
         "baseline ECDSA B-T signature should verify before tampering",
     );
     let tampered = flip_signature_byte(&cms_der);
+    assert_ne!(tampered, cms_der, "tamper must change the CMS bytes");
     assert!(
         !openssl_cms_verify(&content, &tampered),
         "openssl cms -verify MUST reject a tampered ECDSA B-T signature",

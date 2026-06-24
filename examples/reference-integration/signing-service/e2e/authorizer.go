@@ -82,16 +82,23 @@ func codeStateFromLocation(loc string) (code, state string, err error) {
 }
 
 // Interactive is the default live Authorizer: it surfaces the authorize URL to a human and captures
-// the redirect callback. Capture is via a callback channel (CaptureCallback) fed by a redirect-capture
-// listener or a stdin paste; Timeout bounds the wait so an unapproved authorization fails fast with a
-// clear "authorization not completed" error instead of hanging (FR-011, Edge Cases).
+// the redirect callback. Capture is via a state-matched waiter (WaitForCallback) or — as a simpler
+// fallback — a raw callback channel (CaptureCallback) fed by a redirect-capture listener or a stdin
+// paste; Timeout bounds the wait so an unapproved authorization fails fast with a clear "authorization
+// not completed" error instead of hanging (FR-011, Edge Cases).
 type Interactive struct {
 	// Surface is called with the authorize URL the human must open (e.g. print it / open a browser).
 	// If nil, the URL is not surfaced (the caller is expected to have arranged capture out of band).
 	Surface func(authorizeURL string)
-	// CaptureCallback yields the raw redirect callback URL (or query string) once the human completes
-	// the journey — typically fed by a local redirect-capture HTTP listener at REFSVC_REDIRECT_URI or
-	// a stdin reader. It MUST be supplied; without it Authorize cannot complete and times out.
+	// WaitForCallback, when set, is the state-matched capture seam: it blocks (bounded by ctx) until a
+	// redirect callback whose state EQUALS expectState is observed, returning that callback's raw URL.
+	// Callbacks for any OTHER state are ignored by the waiter, so a duplicate/stale leg's callback can
+	// never be delivered to this leg (no cross-leg CSRF poisoning). When set it takes precedence over
+	// CaptureCallback. The redirect-capture listener supplies this in the live harness.
+	WaitForCallback func(ctx context.Context, expectState string) (callbackURL string, err error)
+	// CaptureCallback is the simpler fallback capture seam: it yields the raw redirect callback URL (or
+	// query string) once the human completes the journey. It is used only when WaitForCallback is nil.
+	// Without either seam Authorize cannot complete and times out.
 	CaptureCallback <-chan string
 	// Timeout bounds the wait for the callback. Zero means "use the caller's context deadline only".
 	Timeout time.Duration
@@ -111,6 +118,15 @@ func (i Interactive) Authorize(ctx context.Context, authorizeURL, expectState st
 		ctx, cancel = context.WithTimeout(ctx, i.Timeout)
 		defer cancel()
 	}
+	// Prefer the state-matched waiter: it only returns a callback whose state == expectState, so a
+	// stale/duplicate callback from another leg is dropped at the source (no cross-leg CSRF poisoning).
+	if i.WaitForCallback != nil {
+		raw, werr := i.WaitForCallback(ctx, expectState)
+		if werr != nil {
+			return "", "", werr
+		}
+		return i.parseAndCheck(raw, expectState)
+	}
 	if i.CaptureCallback == nil {
 		// No capture mechanism: wait out the deadline rather than block forever, then fail clearly.
 		<-ctx.Done()
@@ -123,19 +139,24 @@ func (i Interactive) Authorize(ctx context.Context, authorizeURL, expectState st
 		if !ok {
 			return "", "", fmt.Errorf("%w: capture channel closed before a callback arrived", errAuthNotCompleted)
 		}
-		code, state, err = parseCapturedCallback(raw)
-		if err != nil {
-			return "", "", err
-		}
-		// CSRF: Cleverbase must echo back the state the flow issued. A mismatch is surfaced loudly,
-		// never silently accepted (contracts/authorizer.md). The state is a per-session secret echoed
-		// alongside the code, so the error MUST NOT interpolate the raw got/expected values (FR-010) —
-		// report only the lengths so a live state token can never reach a log via t.Fatalf.
-		if expectState != "" && state != expectState {
-			return "", "", fmt.Errorf("authorize state mismatch (possible CSRF): got state of length %d, expected length %d", len(state), len(expectState))
-		}
-		return code, state, nil
+		return i.parseAndCheck(raw, expectState)
 	}
+}
+
+// parseAndCheck extracts (code, state) from a captured callback and enforces the CSRF state echo.
+func (Interactive) parseAndCheck(raw, expectState string) (code, state string, err error) {
+	code, state, err = parseCapturedCallback(raw)
+	if err != nil {
+		return "", "", err
+	}
+	// CSRF: Cleverbase must echo back the state the flow issued. A mismatch is surfaced loudly,
+	// never silently accepted (contracts/authorizer.md). The state is a per-session secret echoed
+	// alongside the code, so the error MUST NOT interpolate the raw got/expected values (FR-010) —
+	// report only the lengths so a live state token can never reach a log via t.Fatalf.
+	if expectState != "" && state != expectState {
+		return "", "", fmt.Errorf("authorize state mismatch (possible CSRF): got state of length %d, expected length %d", len(state), len(expectState))
+	}
+	return code, state, nil
 }
 
 // parseCapturedCallback accepts either a full redirect URL or a bare query string and extracts
