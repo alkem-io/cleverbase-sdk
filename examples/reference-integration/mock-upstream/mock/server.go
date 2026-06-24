@@ -24,6 +24,21 @@ import (
 // token endpoint switches on it to serve the credential SAD instead of the service token).
 const codeCredential = "cred"
 
+// maxRequestBody caps POST request bodies (signHash, token form) so an unbounded body cannot
+// exhaust memory. These payloads are tiny (a base64 hash + metadata, or an OAuth form), so 1 MiB is
+// generous; the DER TSA request has its own tighter 64 KiB cap in handleTSA.
+const maxRequestBody = 1 << 20 // 1 MiB
+
+// bodyErrorStatus maps a request-body read/decode error to an HTTP status: an over-limit body
+// (http.MaxBytesReader) is 413 Request Entity Too Large; any other decode failure is 400.
+func bodyErrorStatus(err error) int {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
 // Server holds the loaded PKI + fixtures and routes the mock endpoints.
 type Server struct {
 	pkiDir   string
@@ -130,13 +145,27 @@ func (*Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing redirect_uri", http.StatusBadRequest)
 		return
 	}
-	loc := redirectURI + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	// Build the location with net/url so code+state are merged into the redirect_uri's existing
+	// query instead of string-appended: a raw "?code=...&state=..." concatenation produces a
+	// malformed URL (e.g. a double "?") when the redirect_uri already carries a query or fragment.
+	loc, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "bad redirect_uri", http.StatusBadRequest)
+		return
+	}
+	rq := loc.Query()
+	rq.Set("code", code)
+	rq.Set("state", state)
+	loc.RawQuery = rq.Encode()
 	//nolint:gosec // G710: this is a credential-free OAuth MOCK; mirroring the caller's redirect_uri back is exactly its job (no real sessions/tokens are at risk).
-	http.Redirect(w, r, loc, http.StatusFound)
+	http.Redirect(w, r, loc.String(), http.StatusFound)
 }
 
 // handleToken returns the service Bearer token or the credential SAD based on the code.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
+	// Cap the form body before ParseForm reads it so an unbounded request cannot exhaust memory;
+	// an OAuth token form is tiny, so the shared 1 MiB cap is generous.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	_ = r.ParseForm()
 	if r.Form.Get("code") == codeCredential {
 		writeRaw(w, s.credSAD)
@@ -155,9 +184,12 @@ type signHashRequest struct {
 // handleSignHash RSA-signs the submitted to-be-signed digest with the synthetic signer key
 // (PKCS#1 v1.5 over a SHA-256 DigestInfo), mirroring the SDK's independent-validation test.
 func (s *Server) handleSignHash(w http.ResponseWriter, r *http.Request) {
+	// Cap the body before decoding so an unbounded request cannot exhaust memory; a signHash
+	// request only carries a base64 hash plus small metadata, so 1 MiB is generous.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	var req signHashRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Hash) == 0 {
-		http.Error(w, "bad signHash request", http.StatusBadRequest)
+		http.Error(w, "bad signHash request", bodyErrorStatus(err))
 		return
 	}
 	tbs, err := base64.StdEncoding.DecodeString(req.Hash[0])

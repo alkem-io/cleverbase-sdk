@@ -51,6 +51,19 @@ def render(pyi_path: Path) -> str:
         data_code_block=False,
         render_typehint_in_data_header=True,
         code_headers=True,
+        # Step heading levels properly under the H1 module title (markdownlint MD001 forbids
+        # skipping a level). pydoc-markdown's default puts module-level functions/variables at H4
+        # directly beneath the H1 — an H1->H4 jump. Here the module title is H1, its module-level
+        # functions + the `SCHEMA_VERSION` variable are H2 (one step down), and — for any class —
+        # its methods are H3 (below the class's H2). No level is skipped at any depth.
+        use_fixed_header_levels=True,
+        header_level_by_type={
+            "Module": 1,
+            "Class": 2,
+            "Function": 2,
+            "Variable": 2,
+            "Method": 3,
+        },
         # The stub has no runtime .py source on disk to reformat; skip yapf (it needs a context dir
         # and would otherwise raise) — the signatures are already canonical.
         format_code=False,

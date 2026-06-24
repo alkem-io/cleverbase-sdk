@@ -6,7 +6,7 @@
 
 # Interface: SigningHelperOptions
 
-Defined in: [index.ts:22](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L22)
+Defined in: [index.ts:39](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L39)
 
 Configuration for a [SigningHelper](../classes/SigningHelper.md): the integrator's backend endpoints plus injectable browser primitives.
 
@@ -16,7 +16,7 @@ Configuration for a [SigningHelper](../classes/SigningHelper.md): the integrator
 
 > **completeUrl**: `string`
 
-Defined in: [index.ts:30](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L30)
+Defined in: [index.ts:47](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L47)
 
 Backend endpoint hit on redirect return. Receives `{ code, state }` on success
 (`complete`) and `{ error, state }` on a signer decline / OAuth error
@@ -28,7 +28,7 @@ Backend endpoint hit on redirect return. Receives `{ code, state }` on success
 
 > `optional` **fetchImpl?**: (`input`, `init?`) => `Promise`\<`Response`\>
 
-Defined in: [index.ts:34](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L34)
+Defined in: [index.ts:51](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L51)
 
 Injectable fetch (defaults to the global `fetch`).
 
@@ -54,7 +54,7 @@ Injectable fetch (defaults to the global `fetch`).
 
 > `optional` **navigate?**: (`url`) => `void`
 
-Defined in: [index.ts:36](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L36)
+Defined in: [index.ts:53](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L53)
 
 Injectable navigation (defaults to `location.assign`).
 
@@ -74,7 +74,7 @@ Injectable navigation (defaults to `location.assign`).
 
 > **startUrl**: `string`
 
-Defined in: [index.ts:24](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L24)
+Defined in: [index.ts:41](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L41)
 
 Backend endpoint that starts a signing session and returns `{ redirectUrl, correlationId }`.
 
@@ -84,6 +84,6 @@ Backend endpoint that starts a signing session and returns `{ redirectUrl, corre
 
 > **statusUrl**: `string`
 
-Defined in: [index.ts:32](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L32)
+Defined in: [index.ts:49](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L49)
 
 Backend endpoint that reports `{ status }` for a `correlationId`.

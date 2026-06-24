@@ -38,9 +38,16 @@ func TestLiveSmoke(t *testing.T) {
 	if csc == "" {
 		csc = "v1_rsa"
 	}
+	// validateLive() requires a TSA for every live profile (a live deployment must always be able to
+	// serve B-T). Honor that contract here so the smoke can't go green on a config Load() would reject.
+	tsaURL := os.Getenv("REFSVC_TSA_URL")
+	if tsaURL == "" {
+		tsaURL = "https://tsa.acc.cleverbase.com/tsr"
+	}
 	p := &config.Profile{
 		Mode: config.ModeLive, Environment: env, CscAPI: csc,
 		ClientID: clientID, ClientSecret: clientSecret, RedirectURI: redirectURI,
+		TsaURL: tsaURL,
 		APIKey: apiKey, AuthEnabled: true, DefaultConformance: "B-B", SessionTTL: time.Minute,
 	}
 	store := session.NewMemory()

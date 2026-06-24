@@ -62,7 +62,8 @@ Advance the flow after a browser redirect returns to the registered `redirect_ur
 
 ## `GET /v1/sign/status?correlationId=…`
 
-- **Response 200**: `{ "status": "pending" | "authorizing" | "completed" | "declined" | "failed", "reason": "<code>" }`
+- **Response 200**: `{ "status": "pending" | "authorizing" | "completed" | "declined" | "failed" }`
+  with `reason` added **only** for the failed case: `{ "status": "failed", "reason": "<code>" }`.
 - `reason` is present (and required) **only** when `status == "failed"`. This is the **authoritative**
   `failed` reason set: all codes are **snake_case** (matching the Rust core's `SigningOutcome`
   serialization), and the service emits exactly one of these eleven:

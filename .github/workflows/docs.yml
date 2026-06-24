@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      # Toolchain version + components are pinned by rust-toolchain.toml (1.92.0); rustup honours it.
+      # Toolchain version + components are pinned by rust-toolchain.toml (1.94.1); rustup honours it.
       - name: Set up Rust (pinned via rust-toolchain.toml)
         run: rustup show
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0

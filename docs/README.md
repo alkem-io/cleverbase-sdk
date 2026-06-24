@@ -35,7 +35,7 @@ into the repo `.venv`) and `npm install`s the TypeScript dev-dependencies. To re
 
 ### Tool prerequisites and version pins
 
-- **rustdoc** — ships with the Rust toolchain, pinned to **1.92.0** by `rust-toolchain.toml`
+- **rustdoc** — ships with the Rust toolchain, pinned to **1.94.1** by `rust-toolchain.toml`
   (rustup selects it automatically). The build runs with `RUSTDOCFLAGS=-D warnings`, so
   `missing_docs` and any broken doc-link fail the build.
 - **gomarkdoc** — `go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest`. It renders the
@@ -55,8 +55,9 @@ rustdoc is HTML-native, so to commit Markdown we consume rustdoc's machine-reada
 RUSTC_BOOTSTRAP=1 cargo rustdoc -p cleverbase-core -- -Z unstable-options --output-format json
 ```
 
-`RUSTC_BOOTSTRAP=1` unlocks the unstable `--output-format json` on the pinned **stable** 1.92.0
-(producing `target/doc/cleverbase_core.json`, schema `format_version` 57). The off-the-shelf
+`RUSTC_BOOTSTRAP=1` unlocks the unstable `--output-format json` on the pinned **stable** toolchain
+(1.94.1; see `rust-toolchain.toml`), producing `target/doc/cleverbase_core.json`, schema
+`format_version` 57 (the 1.94.x rustdoc-JSON schema). The off-the-shelf
 JSON→Markdown converters on crates.io/npm lag the rustdoc format version (e.g. `rustdoc-md` targets
 v42), so a stale one would silently drop or mis-render items. We therefore convert with our own
 small, **unit-tested** walker, [`scripts/rustdoc_json_to_markdown.py`](../scripts/rustdoc_json_to_markdown.py)

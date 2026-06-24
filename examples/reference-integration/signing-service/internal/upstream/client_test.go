@@ -50,8 +50,12 @@ func TestDo(t *testing.T) {
 		t.Fatalf("rewritten Do: status=%d err=%v", status, err)
 	}
 
-	// Transport error surfaces.
-	if _, _, err := New("").Do(context.Background(), "GET", "http://127.0.0.1:1/x", nil, nil); err == nil {
+	// Transport error surfaces. Start a server, capture its URL, then Close() it so the address is
+	// guaranteed-closed (deterministic, no reliance on an environment-specific port being shut).
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	if _, _, err := New("").Do(context.Background(), "GET", deadURL+"/x", nil, nil); err == nil {
 		t.Fatal("expected a transport error")
 	}
 	// Bad method → request build error.

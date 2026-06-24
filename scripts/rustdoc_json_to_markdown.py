@@ -229,6 +229,64 @@ def _render_generics_params(crate: Crate, generics: Any) -> str:
     return "<" + ", ".join(rendered) + ">" if rendered else ""
 
 
+def _render_where_clause(crate: Crate, generics: Any) -> str:
+    """Render a generic item's `where` clause from `generics.where_predicates`.
+
+    Rustdoc moves bounds that can't live on the parameter list (and any the author wrote inline)
+    into `where_predicates`; omitting them documents a DIFFERENT signature than the real API. We
+    render the common shapes — `bound_predicate` (`T: Bound`, with HRTB `for<...>`),
+    `lifetime_predicate` (`'a: 'b`), and `eq_predicate` (`T::Assoc = U`) — and skip any predicate
+    shape we don't recognise rather than crash, so a future schema is visibly absent, never a panic.
+    Returns the leading-space `" where ..."` fragment to append after the args/return type, or `""`
+    when there are no predicates.
+    """
+    if not generics:
+        return ""
+    predicates = generics.get("where_predicates", [])
+    rendered: list[str] = []
+    for predicate in predicates:
+        text = _render_where_predicate(crate, predicate)
+        if text:
+            rendered.append(text)
+    return " where " + ", ".join(rendered) if rendered else ""
+
+
+def _render_where_predicate(crate: Crate, predicate: dict[str, Any]) -> str:
+    """Render one `where` predicate; `""` for an unrecognised shape (degrade, never crash)."""
+    if "bound_predicate" in predicate:
+        bp = predicate["bound_predicate"]
+        # Higher-rank trait bounds: `for<'a> T: Trait<'a>`.
+        hrtb = _render_hrtb(bp.get("generic_params", []))
+        lhs = render_type(crate, bp.get("type"))
+        bounds = bp.get("bounds", [])
+        bound_str = " + ".join(_render_generic_bound(crate, b) for b in bounds)
+        return f"{hrtb}{lhs}: {bound_str}" if bound_str else ""
+    if "lifetime_predicate" in predicate:
+        lp = predicate["lifetime_predicate"]
+        outlives = " + ".join(lp.get("outlives", []))
+        return f"{lp['lifetime']}: {outlives}" if outlives else ""
+    if "eq_predicate" in predicate:
+        eq = predicate["eq_predicate"]
+        return f"{render_type(crate, eq.get('lhs'))} = {_render_term(crate, eq.get('rhs'))}"
+    return ""
+
+
+def _render_hrtb(generic_params: list[dict[str, Any]]) -> str:
+    """Render a higher-rank `for<'a, ...>` binder prefix, or `""` when there are none."""
+    names = [p["name"] for p in generic_params if isinstance(p, dict) and p.get("name")]
+    return f"for<{', '.join(names)}> " if names else ""
+
+
+def _render_term(crate: Crate, term: Any) -> str:
+    """Render a `Term` (the rhs of an equality bound): a type or a const expression."""
+    if isinstance(term, dict):
+        if "type" in term:
+            return render_type(crate, term["type"])
+        if "constant" in term:
+            return term["constant"].get("expr", "_")
+    return render_type(crate, term)
+
+
 def render_function_signature(crate: Crate, name: str, func: dict[str, Any]) -> str:
     """Render a `fn`/method signature including qualifiers, generics, args and return type."""
     header = func.get("header", {})
@@ -244,6 +302,7 @@ def render_function_signature(crate: Crate, name: str, func: dict[str, Any]) -> 
         qualifiers += 'extern "C" '
 
     generics = _render_generics_params(crate, func.get("generics"))
+    where_clause = _render_where_clause(crate, func.get("generics"))
     sig = func["sig"]
     inputs = []
     for arg_name, arg_ty in sig.get("inputs", []):
@@ -256,7 +315,7 @@ def render_function_signature(crate: Crate, name: str, func: dict[str, Any]) -> 
         inputs.append("...")
     output = sig.get("output")
     ret = f" -> {render_type(crate, output)}" if output else ""
-    return f"{qualifiers}fn {name}{generics}({', '.join(inputs)}){ret}"
+    return f"{qualifiers}fn {name}{generics}({', '.join(inputs)}){ret}{where_clause}"
 
 
 def _render_self(ty: Any) -> str:
@@ -376,8 +435,10 @@ def _inherent_methods(crate: Crate, item: dict[str, Any]) -> list[dict[str, Any]
 
 def _emit_struct(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], level: int) -> None:
     md.heading(level, f"struct `{item['name']}`")
-    generics = _render_generics_params(crate, item["inner"]["struct"].get("generics"))
-    md.code(f"struct {item['name']}{generics}")
+    struct_generics = item["inner"]["struct"].get("generics")
+    generics = _render_generics_params(crate, struct_generics)
+    where_clause = _render_where_clause(crate, struct_generics)
+    md.code(f"struct {item['name']}{generics}{where_clause}")
     md.add_docs(item)
     kind = item["inner"]["struct"]["kind"]
     fields: list[Any] = []
@@ -400,8 +461,10 @@ def _emit_struct(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], level:
 
 def _emit_enum(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], level: int) -> None:
     md.heading(level, f"enum `{item['name']}`")
-    generics = _render_generics_params(crate, item["inner"]["enum"].get("generics"))
-    md.code(f"enum {item['name']}{generics}")
+    enum_generics = item["inner"]["enum"].get("generics")
+    generics = _render_generics_params(crate, enum_generics)
+    where_clause = _render_where_clause(crate, enum_generics)
+    md.code(f"enum {item['name']}{generics}{where_clause}")
     md.add_docs(item)
     variants = item["inner"]["enum"].get("variants", [])
     variant_items = [crate.item(v) for v in variants]
@@ -453,8 +516,10 @@ def _emit_methods(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], level
 
 def _emit_trait(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], level: int) -> None:
     md.heading(level, f"trait `{item['name']}`")
-    generics = _render_generics_params(crate, item["inner"]["trait"].get("generics"))
-    md.code(f"trait {item['name']}{generics}")
+    trait_generics = item["inner"]["trait"].get("generics")
+    generics = _render_generics_params(crate, trait_generics)
+    where_clause = _render_where_clause(crate, trait_generics)
+    md.code(f"trait {item['name']}{generics}{where_clause}")
     md.add_docs(item)
     for method_id in item["inner"]["trait"].get("items", []):
         method = crate.item(method_id)
@@ -486,7 +551,8 @@ def _emit_type_alias(crate: Crate, md: MarkdownBuilder, item: dict[str, Any], le
     md.heading(level, f"type `{item['name']}`")
     alias = item["inner"]["type_alias"]
     generics = _render_generics_params(crate, alias.get("generics"))
-    md.code(f"type {item['name']}{generics} = {render_type(crate, alias['type'])}")
+    where_clause = _render_where_clause(crate, alias.get("generics"))
+    md.code(f"type {item['name']}{generics} = {render_type(crate, alias['type'])}{where_clause}")
     md.add_docs(item)
 
 

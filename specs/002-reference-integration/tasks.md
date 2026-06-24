@@ -32,7 +32,7 @@
 
 ### Tests (write first; must fail)
 
-- [x] T007 [P] REST API contract tests (start/complete/status/result/health, API-key 401; `complete` returns `redirectUrl` for the second-redirect case; `status` returns the enumerated `reason` codes) in `signing-service/internal/httpapi/handlers_test.go` per `contracts/reference-service-api.md`.
+- [x] T007 [P] REST API contract tests (start/complete/status/result/health, API-key 401; `complete` returns `redirectUrl` for the second-redirect case; `status` returns the enumerated `reason` codes) in `signing-service/internal/httpapi/service_test.go` per `contracts/reference-service-api.md`.
 - [x] T008 [P] `RunProfile` env-load + fail-fast validation tests in `signing-service/internal/config/config_test.go`.
 - [x] T009 [P] `SessionStore` tests — TTL eviction, `oauth_state`→`correlation_id` index updated across **both** sequential OAuth states, secret scrub on terminal — in `signing-service/internal/session/store_test.go`.
 - [x] T010 [P] Flow mapping tests asserting **all nine** FR-009 terminal outcomes map to **distinct** `{status, reason}` (`completed`/`declined` + the **seven** `failed` reason codes: authorization_expired, credential_unavailable, identity_mismatch, invalid_document, timestamp_failed, appearance_placement_error, signature_invalid) in `signing-service/internal/flow/flow_test.go`.
@@ -46,7 +46,7 @@
 - [x] T015 Implement the upstream HTTP client that performs the SDK's `PerformHttp` effects in `signing-service/internal/upstream/client.go`.
 - [x] T016 Implement the flow engine — drive `begin`/`resume` via `bindings/go`, perform effects, map outcomes → `{status, reason}`, and emit **structured, secret-redacted** logs of each effect + transition (FR-008/FR-009) — in `signing-service/internal/flow/flow.go` (depends on T013–T015).
 - [x] T017 Extend `frontend/helper-ts`: `complete()`/`reportRedirectError()` return `{ status, redirectUrl? }` and add navigation of the second redirect; bump `0.1.0` → `0.2.0` with a CHANGELOG note (pre-1.0 breaking return-type change, documented per Constitution VII), in `frontend/helper-ts/src/index.ts` + `package.json` (so the web page can drive the second authorization redirect).
-- [x] T018 Implement REST handlers `start`/`complete`/`status`/`result` + `healthz`/`readyz` (status surfaces the `reason` codes) in `signing-service/internal/httpapi/handlers.go` (depends on T016).
+- [x] T018 Implement REST handlers `start`/`complete`/`status`/`result` + `healthz`/`readyz` (status surfaces the `reason` codes) in `signing-service/internal/httpapi/service.go` (depends on T016).
 - [x] T019 Implement the API-key auth middleware (enabled by default; 401 before any work) in `signing-service/internal/httpapi/auth.go`.
 - [x] T020 Implement `main` wiring + HTTP server (graceful shutdown) in `signing-service/cmd/refsvc/main.go`.
 - [x] T021 [P] Implement the web frontend (start page + return page driving **both** redirects via the extended helper) in `web/src/` (depends on T017).
@@ -71,15 +71,15 @@
 
 ### Tests (write first; must fail)
 
-- [x] T027 [P] [US1] Credential-free **backend-API E2E** test in `examples/reference-integration/e2e/credfree_test.go`: start → complete ×2 (following `redirectUrl`) → result, sending a configured `REFSVC_API_KEY` so **auth stays enabled** (exercises FR-025, not bypassed). `openssl`-validate the CMS for **both B-B and B-T** (the B-T case asserts a valid mock-TSA timestamp bound to the signature). Assert the `X-Signature-Evidence` header is present and parseable; assert hash-only; assert an already-signed PDF is rejected with `invalid_document`; and assert a negative case where an `expectedSigner` not matching the fixture signer yields `failed` + `reason: identity_mismatch` (FR-014 end-to-end).
-- [x] T028 [P] [US1] Mock-upstream unit tests reading `tests/fixtures/upstream/*.json` (authorize redirect, token, list, info, `signHash` signature validity, TSA token) in `mock-upstream/internal/server_test.go`.
-- [x] T029 [P] [US1] Session-lifecycle edge test: an abandoned/expired session reports a terminal/expired `status` (never hangs) and a stale correlation id resolves cleanly in `signing-service/internal/session/lifecycle_test.go`.
+- [x] T027 [P] [US1] Credential-free **backend-API E2E** test in `examples/reference-integration/signing-service/e2e/credfree_test.go`: start → complete ×2 (following `redirectUrl`) → result, sending a configured `REFSVC_API_KEY` so **auth stays enabled** (exercises FR-025, not bypassed). `openssl`-validate the CMS for **both B-B and B-T** (the B-T case asserts a valid mock-TSA timestamp bound to the signature). Assert the `X-Signature-Evidence` header is present and parseable; assert hash-only; assert an already-signed PDF is rejected with `invalid_document`; and assert a negative case where an `expectedSigner` not matching the fixture signer yields `failed` + `reason: identity_mismatch` (FR-014 end-to-end).
+- [x] T028 [P] [US1] Mock-upstream unit tests reading `tests/fixtures/upstream/*.json` (authorize redirect, token, list, info, `signHash` signature validity, TSA token) in `mock-upstream/mock/server_test.go`.
+- [x] T029 [P] [US1] Session-lifecycle edge test: an abandoned/expired session reports a terminal/expired `status` (never hangs) and a stale correlation id resolves cleanly in `signing-service/internal/session/store_test.go`.
 
 ### Implementation
 
-- [x] T030 [US1] Implement the mock upstream — `/oauth2/authorize` (auto-302 with `code`+`state`), `/oauth2/token`, `/csc/v{1,2}/credentials/list` + `/credentials/info`, `/signatures/signHash` (sign with the synthetic fixture key), `/tsr` RFC 3161 TSA — sourcing the shared `tests/fixtures/upstream/*.json` + `tests/fixtures/pki/`, in `mock-upstream/internal/` + `mock-upstream/cmd/mockupstream/main.go`.
+- [x] T030 [US1] Implement the mock upstream — `/oauth2/authorize` (auto-302 with `code`+`state`), `/oauth2/token`, `/csc/v{1,2}/credentials/list` + `/credentials/info`, `/signatures/signHash` (sign with the synthetic fixture key), `/tsr` RFC 3161 TSA — sourcing the shared `tests/fixtures/upstream/*.json` + `tests/fixtures/pki/`, in `mock-upstream/mock/` + `mock-upstream/cmd/mockupstream/main.go`.
 - [x] T031 [P] [US1] Add `mock-upstream/Dockerfile` (distroless, non-root).
-- [x] T032 [US1] Add fixtures-mode `RunProfile` defaults + a bundled sample PDF in `signing-service/internal/config/` and `examples/reference-integration/testdata/sample.pdf`.
+- [x] T032 [US1] Add fixtures-mode `RunProfile` defaults + a bundled sample PDF in `signing-service/internal/config/` and `examples/reference-integration/signing-service/cmd/refsvc/sample.pdf`.
 - [x] T033 [US1] Author `deploy/compose.yml` running `mock-upstream` + `signing-service` (fixtures) + `web`.
 - [x] T034 [US1] Extend `.github/workflows/test.yml` with the **credential-free E2E job** (compose up the mock+service with a test `REFSVC_API_KEY` so auth stays enabled, run T027, `openssl`-validate **B-B and B-T**) as a merge gate (no Cleverbase credentials/secrets).
 - [x] T035 [US1] README: run the credential-free stack locally (quickstart S1/S2/S3) and **document the in-memory backend-restart behavior** (in-flight sessions are lost; acceptable default).
@@ -101,7 +101,7 @@
 ### Implementation
 
 - [x] T037 [US2] Implement live-mode validation + B-T TSA wiring (reuse the same flow path; `REFSVC_TSA_URL` → TSA endpoint, `REFSVC_TSA_AUTH` → the TSA request `Authorization` header, `REFSVC_TSA_POLICY` → policy OID) in `signing-service/internal/config/` and `internal/flow/`.
-- [x] T038 [US2] Add an env-gated live smoke test (skipped without `REFSVC_CLIENT_ID`/`SECRET`) in `examples/reference-integration/e2e/live_test.go`.
+- [x] T038 [US2] Add an env-gated live smoke test (skipped without `REFSVC_CLIENT_ID`/`SECRET`) in `examples/reference-integration/signing-service/e2e/live_test.go`.
 - [x] T039 [US2] README: registering the `redirect_uri`, live env config, and the only-config-differs (artifact-identity) guarantee (SC-003).
 
 **Checkpoint**: live signing reachable by configuration; sole remaining blocker is the externally-provided Cleverbase credentials/test-signer (+ a qualified TSA for live B-T).
@@ -137,7 +137,7 @@
 
 - [x] T049 [P] Verify `signing-service` sustains **≥95%** line coverage (measured over the `signing-service` packages only; mock/web/deploy exempt); add tests to close gaps (SC-008).
 - [x] T050 [P] **Frontend-bound** no-leak assertion: scan every backend **client-bound** response (`start`/`status`/`result`) for any secret/token/SDK-handle (SC-004) in `signing-service/internal/httpapi/leak_test.go`.
-- [x] T051 [P] **Upstream** hash-only assertion: scan every outbound-to-upstream request (URL + headers + body) for document bytes or secrets, in the E2E (`examples/reference-integration/e2e/credfree_test.go`).
+- [x] T051 [P] **Upstream** hash-only assertion: scan every outbound-to-upstream request (URL + headers + body) for document bytes or secrets, in the E2E (`examples/reference-integration/signing-service/e2e/credfree_test.go`).
 - [x] T052 Run the full `quickstart.md` (S1–S5) and reconcile any documentation drift; confirm the SC-001 budget by **pre-building the staticlib and building/pulling all images first (cold baseline excluded), then timing only the warm run** (< 10 min).
 - [x] T053 [P] Top-level `examples/reference-integration/README.md` (architecture diagram, components, full config/env table); document the pluggable `SessionStore` extension point — the default is in-memory; a shared/persistent store (e.g. Redis) is the documented swap-in (FR-005).
 - [x] T054 Add `examples/reference-integration/SECURITY.md` (threat surface: API key, server-side secrets, hash-only upstream, image signing).
@@ -171,7 +171,7 @@
 ### Parallel Example: Foundational tests
 
 ```bash
-Task: "REST API contract tests in signing-service/internal/httpapi/handlers_test.go"
+Task: "REST API contract tests in signing-service/internal/httpapi/service_test.go"
 Task: "config tests in signing-service/internal/config/config_test.go"
 Task: "session store tests in signing-service/internal/session/store_test.go"
 Task: "flow outcome→{status,reason} tests in signing-service/internal/flow/flow_test.go"

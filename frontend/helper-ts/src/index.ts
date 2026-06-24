@@ -18,6 +18,23 @@
  */
 export type SignStatus = "pending" | "authorizing" | "completed" | "declined" | "failed";
 
+/**
+ * The allowed {@link SignStatus} values, as a runtime set. This is the single source of truth used
+ * both for the type union above and for validating a backend response at runtime ({@link
+ * toCompleteResult}), so a malformed status cannot leak through the closed union.
+ */
+const SIGN_STATUSES: readonly SignStatus[] = [
+  "pending",
+  "authorizing",
+  "completed",
+  "declined",
+  "failed",
+];
+
+function isSignStatus(value: unknown): value is SignStatus {
+  return typeof value === "string" && (SIGN_STATUSES as readonly string[]).includes(value);
+}
+
 /** Configuration for a {@link SigningHelper}: the integrator's backend endpoints plus injectable browser primitives. */
 export interface SigningHelperOptions {
   /** Backend endpoint that starts a signing session and returns `{ redirectUrl, correlationId }`. */
@@ -159,8 +176,15 @@ export class SigningHelper {
  * (`undefined`) legitimately means "no further redirect". A present-but-empty `redirectUrl` is a
  * malformed backend response (the contract is a non-empty authorization URL), so we surface it as an
  * error rather than silently dropping it and treating the session as needing no redirect.
+ *
+ * `status` is likewise validated against the closed {@link SignStatus} union: `res.json()` is
+ * untyped at runtime, so a malformed value (e.g. `"complete"` instead of `"completed"`) would
+ * otherwise leak through the documented union. We reject it the same way as a malformed redirectUrl.
  */
 function toCompleteResult(data: CompleteResult): CompleteResult {
+  if (!isSignStatus(data.status)) {
+    throw new Error("malformed backend response: status is not a recognized SignStatus value");
+  }
   if (data.redirectUrl === undefined) return { status: data.status };
   if (typeof data.redirectUrl !== "string" || data.redirectUrl === "") {
     throw new Error("malformed backend response: redirectUrl present but not a non-empty string");

@@ -144,3 +144,22 @@ test("complete throws on a malformed backend response (redirectUrl present but e
     /malformed backend response: redirectUrl present but not a non-empty string/,
   );
 });
+
+test("complete throws on a malformed backend status (not a recognized SignStatus)", async () => {
+  // res.json() is untyped at runtime; a backend that returns e.g. "complete" instead of "completed"
+  // must be rejected rather than leak a bogus value through the closed SignStatus union.
+  const { fetchImpl } = mockFetch((url) => {
+    if (url.includes("/complete")) return { status: "complete" };
+    return {};
+  });
+  const helper = new SigningHelper({
+    startUrl: "x",
+    completeUrl: "https://app.example/api/sign/complete",
+    statusUrl: "x",
+    fetchImpl,
+  });
+  await assert.rejects(
+    () => helper.complete("code-1", "state-1"),
+    /malformed backend response: status is not a recognized SignStatus value/,
+  );
+});

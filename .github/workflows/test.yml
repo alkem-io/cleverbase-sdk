@@ -137,6 +137,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
         run: |
           # Coverage scoped to the signing-service packages only (mock/web/deploy exempt — FR-024).
+          # cmd/refsvc is intentionally OUTSIDE this gate: it is the thin main()/wiring entrypoint
+          # (config.Load → assemble the engine/service → http.Server + signal-driven shutdown) that
+          # holds no protocol/crypto logic. It is exercised by the credential-free E2E (which boots
+          # the real service wiring) rather than unit tests, so per the maintainer decision it is
+          # exempt from the ≥95% unit-coverage bar. Keep this gate scoped to ./internal/... only.
           go test -coverprofile=cover.out ./internal/...
           total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
           echo "signing-service statement coverage: ${total}%"

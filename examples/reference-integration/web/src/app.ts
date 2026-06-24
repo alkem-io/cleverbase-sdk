@@ -55,7 +55,13 @@ async function returnPage(): Promise<void> {
 
     out.textContent = `Status: ${result.status}`;
     if (result.status === "completed") {
-      const corr = sessionStorage.getItem(CORR_KEY) ?? "";
+      const corr = sessionStorage.getItem(CORR_KEY);
+      if (!corr) {
+        // Without the correlation id (lost/cleared session storage) the result/download URL would
+        // be broken; fail fast with a clear message instead of rendering a dead link.
+        out.textContent = "Signature completed, but the session id is missing — cannot build the download link. Please start over.";
+        return;
+      }
       const link = document.getElementById("download") as HTMLAnchorElement | null;
       if (link) {
         link.href = `/api/v1/sign/result?correlationId=${encodeURIComponent(corr)}`;

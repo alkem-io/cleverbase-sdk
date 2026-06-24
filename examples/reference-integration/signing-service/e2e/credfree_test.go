@@ -331,10 +331,25 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var bodies []string
+	// scanned holds, per upstream request, the full attacker-reachable surface — request line (URL,
+	// incl. path + query), headers, and body — so the hash-only assertion covers more than just the
+	// body. A regression that smuggled the PDF/secret into the authorize URL/path/query/headers would
+	// otherwise sail through (the recorder used to save only r.Body, despite claiming to cover EVERY
+	// upstream request).
+	var scanned []string
 	rec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
+		var sb strings.Builder
+		sb.WriteString(r.Method)
+		sb.WriteByte(' ')
+		sb.WriteString(r.URL.String())
+		sb.WriteByte('\n')
+		_ = r.Header.Write(&sb)
+		sb.WriteByte('\n')
+		_, _ = sb.Write(b)
 		mu.Lock()
 		bodies = append(bodies, string(b))
+		scanned = append(scanned, sb.String())
 		mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(b))
 		m.Handler().ServeHTTP(w, r)
@@ -350,7 +365,7 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(bodies) == 0 {
+	if len(scanned) == 0 {
 		t.Fatal("no upstream requests were recorded")
 	}
 
@@ -364,17 +379,20 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 		url.QueryEscape(base64.StdEncoding.EncodeToString(rawDoc)), // form/query-escaped base64
 		hex.EncodeToString(rawDoc),                                 // hex
 	}
-	sawSignHash := false
-	for i, b := range bodies {
-		// Negative: no upstream request may carry the document — verbatim or in any common encoding.
-		if bytes.Contains([]byte(b), rawDoc) {
-			t.Fatalf("upstream request %d carried the raw document (hash-only violated): %.120s", i, b)
+	// Negative: no part of any upstream request — URL (path+query), headers, or body — may carry the
+	// document, verbatim or in any common encoding.
+	for i, s := range scanned {
+		if strings.Contains(s, string(rawDoc)) {
+			t.Fatalf("upstream request %d carried the raw document (hash-only violated): %.120s", i, s)
 		}
 		for _, enc := range encodings {
-			if strings.Contains(b, enc) {
-				t.Fatalf("upstream request %d carried an encoded document (hash-only violated): %.120s", i, b)
+			if strings.Contains(s, enc) {
+				t.Fatalf("upstream request %d carried an encoded document (hash-only violated): %.120s", i, s)
 			}
 		}
+	}
+	sawSignHash := false
+	for i, b := range bodies {
 		// Positive: the only document-derived payload is the signHash request, and its hash must be
 		// exactly a 32-byte SHA-256 digest — not the document.
 		if strings.Contains(b, `"hash"`) {

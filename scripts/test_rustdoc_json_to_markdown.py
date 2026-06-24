@@ -119,6 +119,127 @@ def test_function_signature_extern_c_unsafe():
     )
 
 
+def test_function_signature_with_where_clause():
+    # A `where`-bounded fn must render the `where` clause (from generics.where_predicates) so the
+    # documented signature matches the real Rust API.
+    crate = make_crate({})
+    func = {
+        "header": {"is_const": False, "is_async": False, "is_unsafe": False, "abi": "Rust"},
+        "generics": {
+            "params": [
+                {"name": "T", "kind": {"type": {"bounds": []}}},
+                {"name": "U", "kind": {"type": {"bounds": []}}},
+            ],
+            "where_predicates": [
+                {
+                    "bound_predicate": {
+                        "type": {"generic": "T"},
+                        "bounds": [
+                            {
+                                "trait_bound": {
+                                    "trait": {"path": "Clone", "args": None},
+                                    "generic_params": [],
+                                    "modifier": "none",
+                                }
+                            }
+                        ],
+                        "generic_params": [],
+                    }
+                },
+                {
+                    "bound_predicate": {
+                        "type": {"generic": "U"},
+                        "bounds": [
+                            {
+                                "trait_bound": {
+                                    "trait": {
+                                        "path": "Into",
+                                        "args": {
+                                            "angle_bracketed": {
+                                                "args": [{"type": {"generic": "T"}}],
+                                                "constraints": [],
+                                            }
+                                        },
+                                    },
+                                    "generic_params": [],
+                                    "modifier": "none",
+                                }
+                            }
+                        ],
+                        "generic_params": [],
+                    }
+                },
+            ],
+        },
+        "sig": {
+            "inputs": [["value", {"generic": "U"}]],
+            "output": {"generic": "T"},
+            "is_c_variadic": False,
+        },
+    }
+    assert (
+        r.render_function_signature(crate, "convert", func)
+        == "fn convert<T, U>(value: U) -> T where T: Clone, U: Into<T>"
+    )
+
+
+def _fn_with_where(where_predicates):
+    # A minimal no-arg `fn f` whose generics carry the given where predicates, so a test can assert
+    # on the rendered `where` clause through the public signature renderer.
+    return {
+        "header": {"is_const": False, "is_async": False, "is_unsafe": False, "abi": "Rust"},
+        "generics": {"params": [], "where_predicates": where_predicates},
+        "sig": {"inputs": [], "output": None, "is_c_variadic": False},
+    }
+
+
+def test_where_clause_hrtb_lifetime_and_eq_predicates():
+    # The other predicate shapes: higher-rank trait bounds (`for<'a>`), lifetime predicates
+    # (`'a: 'b`), and equality predicates (`T = u8`).
+    crate = make_crate({})
+    func = _fn_with_where(
+        [
+            {
+                "bound_predicate": {
+                    "type": {"generic": "F"},
+                    "bounds": [
+                        {
+                            "trait_bound": {
+                                "trait": {"path": "Fn", "args": None},
+                                "generic_params": [],
+                                "modifier": "none",
+                            }
+                        }
+                    ],
+                    "generic_params": [{"name": "'a", "kind": {"lifetime": {"outlives": []}}}],
+                }
+            },
+            {"lifetime_predicate": {"lifetime": "'a", "outlives": ["'b"]}},
+            {
+                "eq_predicate": {
+                    "lhs": {"generic": "T"},
+                    "rhs": {"type": {"primitive": "u8"}},
+                }
+            },
+        ]
+    )
+    assert (
+        r.render_function_signature(crate, "f", func)
+        == "fn f() where for<'a> F: Fn, 'a: 'b, T = u8"
+    )
+
+
+def test_where_clause_unknown_predicate_is_skipped_not_crashed():
+    crate = make_crate({})
+    func = _fn_with_where([{"some_future_predicate": {}}])
+    assert r.render_function_signature(crate, "f", func) == "fn f()"
+
+
+def test_where_clause_empty_when_no_predicates():
+    crate = make_crate({})
+    assert r.render_function_signature(crate, "f", _fn_with_where([])) == "fn f()"
+
+
 # --- full-document emission ----------------------------------------------------------------------
 
 
@@ -275,6 +396,50 @@ def test_constant_rendered():
     )
     assert "const `VERSION`" in md
     assert "const VERSION: u32 = 1" in md
+
+
+def test_struct_with_where_clause_is_rendered_in_document():
+    # End-to-end: a public `struct Wrapper<T> where T: Clone` must carry its `where` clause in the
+    # emitted code block so the doc matches the real signature.
+    index = {
+        "0": _doc_module([10]),
+        "10": {
+            "id": 10,
+            "name": "Wrapper",
+            "docs": "wraps a clonable value",
+            "inner": {
+                "struct": {
+                    "kind": {"unit": None},
+                    "generics": {
+                        "params": [{"name": "T", "kind": {"type": {"bounds": []}}}],
+                        "where_predicates": [
+                            {
+                                "bound_predicate": {
+                                    "type": {"generic": "T"},
+                                    "bounds": [
+                                        {
+                                            "trait_bound": {
+                                                "trait": {"path": "Clone", "args": None},
+                                                "generic_params": [],
+                                                "modifier": "none",
+                                            }
+                                        }
+                                    ],
+                                    "generic_params": [],
+                                }
+                            }
+                        ],
+                    },
+                    "impls": [],
+                }
+            },
+        },
+    }
+    md = r.crate_to_markdown(
+        {"format_version": r.SUPPORTED_FORMAT_VERSION, "root": 0, "index": index, "paths": {}}
+    )
+    assert "struct `Wrapper`" in md
+    assert "struct Wrapper<T> where T: Clone" in md
 
 
 def test_reexport_of_module_owned_item_is_not_duplicated():

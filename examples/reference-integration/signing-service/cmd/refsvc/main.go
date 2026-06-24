@@ -78,7 +78,13 @@ func main() {
 	<-sigs
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	err = srv.Shutdown(ctx)
+	cancel()
+	// A failed/timed-out Shutdown means in-flight requests were dropped; surface it (error level +
+	// non-zero exit) rather than masking it behind an unconditional "stopped".
+	if err != nil {
+		logger.Error("shutdown", "err", err.Error())
+		os.Exit(1)
+	}
 	logger.Info("stopped")
 }

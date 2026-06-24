@@ -6,7 +6,7 @@
 
 # Class: SigningHelper
 
-Defined in: [index.ts:67](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L67)
+Defined in: [index.ts:84](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L84)
 
 Drives a Cleverbase signing session from the browser by talking only to the integrator's own
 backend. It performs no cryptography and handles no secrets, tokens, session handles, or private
@@ -18,7 +18,7 @@ keys — it carries only opaque correlation ids, redirect URLs, and the OAuth `c
 
 > **new SigningHelper**(`opts`): `SigningHelper`
 
-Defined in: [index.ts:76](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L76)
+Defined in: [index.ts:93](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L93)
 
 Create a helper bound to the integrator's backend endpoints.
 
@@ -40,7 +40,7 @@ Backend endpoints plus optional injectable `fetch`/navigation primitives.
 
 > **complete**(`code`, `state`): `Promise`\<[`CompleteResult`](../interfaces/CompleteResult.md)\>
 
-Defined in: [index.ts:120](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L120)
+Defined in: [index.ts:137](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L137)
 
 Finalize after the redirect returns with `code`+`state` (forwarded to the backend). Returns the
 current `{ status, redirectUrl? }`: a non-empty `redirectUrl` means a second authorization
@@ -66,7 +66,7 @@ redirect is required (drive it with `goToAuthorization`).
 
 > **goToAuthorization**(`redirectUrl`): `void`
 
-Defined in: [index.ts:111](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L111)
+Defined in: [index.ts:128](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L128)
 
 Send the signer's browser to the authorization URL (same-device redirect / hosted QR page).
 
@@ -86,7 +86,7 @@ Send the signer's browser to the authorization URL (same-device redirect / hoste
 
 > **pollStatus**(`correlationId`): `Promise`\<[`SignStatus`](../type-aliases/SignStatus.md)\>
 
-Defined in: [index.ts:145](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L145)
+Defined in: [index.ts:162](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L162)
 
 Poll the backend for the current status.
 
@@ -106,7 +106,7 @@ Poll the backend for the current status.
 
 > **reportRedirectError**(`error`, `state`): `Promise`\<[`CompleteResult`](../interfaces/CompleteResult.md)\>
 
-Defined in: [index.ts:134](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L134)
+Defined in: [index.ts:151](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L151)
 
 Forward an OAuth error returned to the `redirect_uri` instead of a code (e.g. `access_denied`
 when the signer declines) to the backend, which resolves the session to a terminal outcome.
@@ -131,7 +131,7 @@ when the signer declines) to the backend, which resolves the session to a termin
 
 > **start**(`payload?`): `Promise`\<[`StartResult`](../interfaces/StartResult.md)\>
 
-Defined in: [index.ts:99](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L99)
+Defined in: [index.ts:116](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L116)
 
 Ask the backend to start a signing session; returns the authorization redirect URL.
 

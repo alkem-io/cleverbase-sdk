@@ -6,7 +6,7 @@
 
 # Interface: StartResult
 
-Defined in: [index.ts:40](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L40)
+Defined in: [index.ts:57](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L57)
 
 Result of [SigningHelper.start](../classes/SigningHelper.md#start): where to send the signer next, plus the session id to poll.
 
@@ -16,7 +16,7 @@ Result of [SigningHelper.start](../classes/SigningHelper.md#start): where to sen
 
 > **correlationId**: `string`
 
-Defined in: [index.ts:44](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L44)
+Defined in: [index.ts:61](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L61)
 
 Opaque id for this signing session, used to poll status via [SigningHelper.pollStatus](../classes/SigningHelper.md#pollstatus).
 
@@ -26,6 +26,6 @@ Opaque id for this signing session, used to poll status via [SigningHelper.pollS
 
 > **redirectUrl**: `string`
 
-Defined in: [index.ts:42](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L42)
+Defined in: [index.ts:59](https://github.com/alkem-io/cleverbase-sdk/blob/main/frontend/helper-ts/src/index.ts#L59)
 
 Authorization URL the signer's browser must be sent to (drive it with `goToAuthorization`).

@@ -65,7 +65,9 @@ func main() {
 	mux.Handle("/api/", proxy)
 	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
 
-	logger.Info("reference web listening", "addr", listen, "api_target", target, "static", staticDir)
+	// Log the redacted URL (u.Redacted()) rather than the raw target string so any userinfo
+	// credentials (user:pass@host) configured in REFWEB_API_TARGET cannot leak into the logs.
+	logger.Info("reference web listening", "addr", listen, "api_target", u.Redacted(), "static", staticDir)
 	// WriteTimeout is generous because /api proxies the signing round-trip (multiple upstream calls);
 	// ReadTimeout/IdleTimeout bound slow request bodies and idle keep-alives.
 	srv := &http.Server{
