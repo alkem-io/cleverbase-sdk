@@ -42,18 +42,39 @@ class Crate:
         self.index: dict[str, Any] = data["index"]
         self.paths: dict[str, Any] = data["paths"]
         self.root: str = str(data["root"])
-        # Ids of items that have a canonical home directly inside some module (i.e. they are listed
-        # as a non-`use` member of a `module`). A `pub use` re-export of such an item — common at
-        # the crate root, e.g. `pub use types::ConformanceLevel` — must NOT be expanded again, or
-        # the item would render twice. We expand a re-export only when its target has no module home
-        # of its own in this crate.
-        self.module_owned: set[str] = set()
-        for item in self.index.values():
-            inner = item.get("inner", {})
-            module = inner.get("module")
+        # Ids of items whose canonical home is a module REACHABLE from the crate root (a non-`use`
+        # member of a rendered module). A `pub use` re-export of such an item (e.g. the root's
+        # `pub use types::ConformanceLevel`) must NOT be expanded again, or it renders twice; we
+        # expand a re-export only when its target has no rendered home of its own.
+        #
+        # Reachability matters: `pub use private_mod::Item` re-exports from a PRIVATE module that is
+        # never rendered. If that module's members counted as "owned", the re-export is skipped as a
+        # duplicate yet never emitted (a silent drop). So only modules reachable from the root (via
+        # module members + re-exported modules) contribute owned ids.
+        reachable_modules: set[str] = set()
+        queue: list[str] = [self.root]
+        while queue:
+            mid = str(queue.pop())
+            if mid in reachable_modules:
+                continue
+            module = self.index.get(mid, {}).get("inner", {}).get("module")
             if module is None:
                 continue
-            for member_id in module.get("items", []):
+            reachable_modules.add(mid)
+            for child_id in module.get("items", []):
+                child = self.index.get(str(child_id))
+                if child is None:
+                    continue
+                inner = child.get("inner", {})
+                if "use" in inner:  # follow one re-export hop (a re-exported module is reachable)
+                    child = self.index.get(str(inner["use"].get("id")))
+                    inner = child.get("inner", {}) if child is not None else {}
+                if child is not None and "module" in inner:
+                    queue.append(str(child["id"]))
+
+        self.module_owned: set[str] = set()
+        for mid in reachable_modules:
+            for member_id in self.index[mid]["inner"]["module"].get("items", []):
                 member = self.index.get(str(member_id))
                 if member is not None and "use" not in member.get("inner", {}):
                     self.module_owned.add(str(member_id))

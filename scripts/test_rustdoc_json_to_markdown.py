@@ -319,6 +319,49 @@ def test_reexport_of_module_owned_item_is_not_duplicated():
     assert md.count("struct `Inner`") == 1
 
 
+def test_reexport_from_private_module_is_emitted_not_dropped():
+    # Root re-exports `Inner` from a PRIVATE module `sub` (not a child of root, so never rendered).
+    # The item must still be emitted once at the root, not silently dropped as a dup of a home that
+    # never renders.
+    index = {
+        "0": {
+            "id": 0,
+            "name": "mycrate",
+            "docs": None,
+            "inner": {"module": {"is_crate": True, "items": [40], "is_stripped": False}},
+        },
+        # private module sub { struct Inner } — present in the index but NOT a child of root
+        "1": {
+            "id": 1,
+            "name": "sub",
+            "docs": None,
+            "inner": {"module": {"is_crate": False, "items": [2], "is_stripped": False}},
+        },
+        "2": {
+            "id": 2,
+            "name": "Inner",
+            "docs": "the inner struct",
+            "inner": {
+                "struct": {
+                    "kind": {"unit": None},
+                    "generics": {"params": [], "where_predicates": []},
+                    "impls": [],
+                }
+            },
+        },
+        "40": {
+            "id": 40,
+            "name": "Inner",
+            "docs": None,
+            "inner": {"use": {"source": "sub::Inner", "name": "Inner", "id": 2, "is_glob": False}},
+        },
+    }
+    md = r.crate_to_markdown(
+        {"format_version": r.SUPPORTED_FORMAT_VERSION, "root": 0, "index": index, "paths": {}}
+    )
+    assert md.count("struct `Inner`") == 1
+
+
 def test_format_version_guard():
     with pytest.raises(SystemExit):
         r.crate_to_markdown({"format_version": 1, "root": 0, "index": {}, "paths": {}})
