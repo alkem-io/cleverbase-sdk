@@ -96,9 +96,10 @@ Advance the flow after a browser redirect returns to the registered `redirect_ur
   `complete`.
 - **Multi-redirect (SCAL2)**: this flow has **two** authorization redirects (service-scope login,
   then credential-scope hash authorization). `complete` returns a `redirectUrl` when a further
-  redirect is required, so the helper's `complete()`/`reportRedirectError()` MUST return
-  `{ status, redirectUrl? }` and the page MUST navigate to `redirectUrl` when present (looping back to
-  the return route). The current `frontend/helper-ts` returns only `SignStatus`; it is extended for
-  this (see tasks T012/T017).
+  redirect is required, so the helper's `complete()`/`reportRedirectError()` return a
+  `CompleteResult` (`{ status, redirectUrl? }`) and the page MUST navigate to `redirectUrl` when
+  present (looping back to the return route). `frontend/helper-ts` implements this: both methods
+  resolve to `CompleteResult`, with `redirectUrl` set only while a further redirect is pending and
+  omitted once the session is terminal.
 - A host application can drive the same API directly (the credential-free CI E2E does exactly this,
   with no browser — it follows the `redirectUrl` against the mock to obtain the next `code`/`state`).

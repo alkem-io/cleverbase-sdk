@@ -5,6 +5,7 @@ package sdk
 
 import (
 	"crypto/rand"
+	"fmt"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -35,10 +36,19 @@ func New(p *config.Profile) *Adapter {
 
 func now() int64 { return time.Now().Unix() }
 
-func entropy() []byte {
+// randRead is the entropy source, indirected so tests can exercise the RNG-failure path. It defaults
+// to crypto/rand.Reader.
+var randRead = rand.Read
+
+// entropy draws 16 bytes of per-call randomness for the signing flow. A failed RNG read MUST fail
+// the request: returning zeroed "entropy" would feed predictable bytes into BeginSigning/Resume* (a
+// degraded RNG must never silently produce signatures with guessable nonces).
+func entropy() ([]byte, error) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return b
+	if _, err := randRead(b); err != nil {
+		return nil, fmt.Errorf("generate signing entropy: %w", err)
+	}
+	return b, nil
 }
 
 func toResult(s *bindings.Session) flow.Result {
@@ -54,7 +64,11 @@ func (a *Adapter) Begin(document []byte, conformance string, opts *flow.Options)
 			Value:   opts.ExpectedSignerValue,
 		}}
 	}
-	s, err := bindings.BeginSigning(document, a.cfg, conformance, bopts, now(), entropy())
+	ent, err := entropy()
+	if err != nil {
+		return flow.Result{}, err
+	}
+	s, err := bindings.BeginSigning(document, a.cfg, conformance, bopts, now(), ent)
 	if err != nil {
 		return flow.Result{}, err
 	}
@@ -63,7 +77,11 @@ func (a *Adapter) Begin(document []byte, conformance string, opts *flow.Options)
 
 // ResumeRedirect advances after a redirect return with code+state.
 func (*Adapter) ResumeRedirect(handle []byte, code, state string) (flow.Result, error) {
-	s, err := bindings.ResumeRedirect(cbor.RawMessage(handle), code, state, now(), entropy())
+	ent, err := entropy()
+	if err != nil {
+		return flow.Result{}, err
+	}
+	s, err := bindings.ResumeRedirect(cbor.RawMessage(handle), code, state, now(), ent)
 	if err != nil {
 		return flow.Result{}, err
 	}
@@ -72,7 +90,11 @@ func (*Adapter) ResumeRedirect(handle []byte, code, state string) (flow.Result, 
 
 // ResumeRedirectError advances after a redirect return carrying an OAuth error.
 func (*Adapter) ResumeRedirectError(handle []byte, oauthError, state string) (flow.Result, error) {
-	s, err := bindings.ResumeRedirectError(cbor.RawMessage(handle), oauthError, state, now(), entropy())
+	ent, err := entropy()
+	if err != nil {
+		return flow.Result{}, err
+	}
+	s, err := bindings.ResumeRedirectError(cbor.RawMessage(handle), oauthError, state, now(), ent)
 	if err != nil {
 		return flow.Result{}, err
 	}
@@ -81,7 +103,11 @@ func (*Adapter) ResumeRedirectError(handle []byte, oauthError, state string) (fl
 
 // ResumeHTTP advances after performing an HTTP effect.
 func (*Adapter) ResumeHTTP(handle []byte, status int, body []byte) (flow.Result, error) {
-	s, err := bindings.ResumeHTTP(cbor.RawMessage(handle), status, body, now(), entropy())
+	ent, err := entropy()
+	if err != nil {
+		return flow.Result{}, err
+	}
+	s, err := bindings.ResumeHTTP(cbor.RawMessage(handle), status, body, now(), ent)
 	if err != nil {
 		return flow.Result{}, err
 	}

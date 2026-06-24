@@ -49,7 +49,18 @@ func main() {
 	}
 	svc := &httpapi.Service{Engine: engine, Store: store, Profile: p, Sample: samplePDF, Log: logger}
 
-	srv := &http.Server{Addr: p.Listen, Handler: svc.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:    p.Listen,
+		Handler: svc.Handler(),
+		// Bound every phase of a connection so a slow/stalled client cannot tie up a goroutine
+		// indefinitely. ReadHeaderTimeout guards the request line+headers; ReadTimeout bounds the
+		// full request body (the base64 PDF on /start); WriteTimeout bounds a blocked response write;
+		// IdleTimeout reaps idle keep-alive connections.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	go func() {
 		logger.Info("listening", "addr", p.Listen, "mode", string(p.Mode), "auth", p.AuthEnabled)

@@ -19,11 +19,19 @@
 # Tool prerequisites (versions pinned in the manifests that own them — see docs/README.md):
 #   - Rust toolchain pinned by rust-toolchain.toml (1.92.0); rustup picks it up automatically.
 #     rustdoc JSON is unstable, enabled on stable via RUSTC_BOOTSTRAP=1.
-#   - gomarkdoc: `go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest`
-#       (auto-installed below into $(go env GOPATH)/bin if missing).
-#   - pydoc-markdown: installed into the repo venv (.venv); auto-installed below if missing.
+#   - gomarkdoc: pinned to $GOMARKDOC_VERSION below (auto-installed into $(go env GOPATH)/bin if missing).
+#   - pydoc-markdown: pinned to $PYDOC_MARKDOWN_VERSION below; installed into the repo venv (.venv),
+#       auto-installed if missing. .github/workflows/docs.yml pins the SAME version (single source for
+#       the recipe), so the generated Markdown is byte-deterministic in CI and on a dev machine —
+#       a floating version would re-render docs and falsely trip the workflow's stale-doc diff check.
 #   - typedoc + typedoc-plugin-markdown: devDependencies of frontend/helper-ts; `npm install` provides them.
 set -euo pipefail
+
+# Single source for the doc-generator tool versions. Pinned to EXACT releases so the generated
+# Markdown is deterministic (Constitution Principle III: one authoritative recipe). docs.yml's
+# pydoc-markdown install MUST stay in lockstep with PYDOC_MARKDOWN_VERSION.
+PYDOC_MARKDOWN_VERSION="4.8.2"
+GOMARKDOC_VERSION="v1.1.0"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -72,8 +80,8 @@ cargo build -p cleverbase-ffi
 GOBIN="$(go env GOPATH)/bin"
 GOMARKDOC="$GOBIN/gomarkdoc"
 if [ ! -x "$GOMARKDOC" ]; then
-  echo "    gomarkdoc not found — installing"
-  go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
+  echo "    gomarkdoc not found — installing ${GOMARKDOC_VERSION}"
+  go install "github.com/princjef/gomarkdoc/cmd/gomarkdoc@${GOMARKDOC_VERSION}"
 fi
 (
   cd "$REPO_ROOT/bindings/go"
@@ -95,8 +103,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> [3/5] Python: pydoc-markdown on bindings/python/cleverbase.pyi"
 if ! "$PY" -c "import pydoc_markdown" 2>/dev/null; then
-  echo "    pydoc-markdown not found in .venv — installing"
-  "$PIP" install pydoc-markdown
+  echo "    pydoc-markdown not found in .venv — installing ${PYDOC_MARKDOWN_VERSION}"
+  "$PIP" install "pydoc-markdown==${PYDOC_MARKDOWN_VERSION}"
 fi
 "$PY" "$REPO_ROOT/scripts/pyi_to_markdown.py" \
   "$REPO_ROOT/bindings/python/cleverbase.pyi" "$OUT/python.md"

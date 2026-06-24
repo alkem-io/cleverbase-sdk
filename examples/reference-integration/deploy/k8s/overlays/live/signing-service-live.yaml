@@ -42,7 +42,11 @@ spec:
                 secretKeyRef:
                   name: signing-service-secrets
                   key: REFSVC_REDIRECT_URI
-            # TSA settings — required when REFSVC_DEFAULT_CONFORMANCE=B-T.
+            # TSA settings — a live deployment ALWAYS requires TSA configuration, not only when the
+            # default conformance is B-T: conformance is per-request overridable, so a live profile
+            # must be able to serve B-T on demand. config.go's validateLive therefore fails fast at
+            # startup unless REFSVC_TSA_URL is set, so REFSVC_TSA_URL is mandatory here (with TSA_AUTH
+            # / TSA_POLICY supplying the rest of the TSA configuration).
             - name: REFSVC_TSA_URL
               valueFrom:
                 secretKeyRef:

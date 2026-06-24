@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,18 @@ import (
 
 // keyStatus is the JSON field name carrying a session's status in API responses.
 const keyStatus = "status"
+
+// Request/document size caps for /v1/sign/start. The endpoint accepts a base64-encoded PDF inside a
+// JSON envelope; without a bound, a client could force huge allocations decoding the body.
+const (
+	// maxPDFBytes caps the decoded document. 20 MiB comfortably covers realistic signable PDFs while
+	// bounding per-request memory.
+	maxPDFBytes = 20 << 20 // 20 MiB
+	// maxStartBodyBytes caps the raw JSON request body read before decoding. The document travels
+	// base64-encoded (~4/3 expansion) inside JSON, so the body cap is maxPDFBytes*4/3 plus a small
+	// slack for the surrounding JSON fields.
+	maxStartBodyBytes = maxPDFBytes*4/3 + (1 << 16) // base64 expansion + 64 KiB JSON slack
+)
 
 // Service holds the engine + store + profile and serves the REST API.
 type Service struct {
@@ -90,13 +103,30 @@ type startRequest struct {
 }
 
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
+	// Bound the body before reading it so a client cannot force a huge allocation decoding the JSON
+	// (which carries the base64 document). MaxBytesReader trips the decode with an *http.MaxBytesError
+	// once the cap is exceeded.
+	r.Body = http.MaxBytesReader(w, r.Body, maxStartBodyBytes)
 	var req startRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body too large")
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 		return
 	}
 	doc := s.Sample
 	if req.Document != "" {
+		// Reject an over-large document by its base64 length BEFORE decoding, so we never allocate the
+		// oversized decoded buffer. DecodedLen(n) is the upper bound on the decoded size for an n-byte
+		// encoding, so a payload whose decoded bytes would exceed maxPDFBytes is rejected here; the
+		// actual decoded length can only be ≤ this bound.
+		if base64.StdEncoding.DecodedLen(len(req.Document)) > maxPDFBytes {
+			writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", "document exceeds the size limit")
+			return
+		}
 		b, err := base64.StdEncoding.DecodeString(req.Document)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_request", "document is not valid base64")

@@ -23,6 +23,13 @@ const (
 // ErrNotFound is returned for an unknown/expired correlation id or state.
 var ErrNotFound = errors.New("session not found")
 
+// ErrTerminal is returned when a resume is attempted on an already-terminal session.
+var ErrTerminal = errors.New("session already terminal")
+
+// ErrResuming is returned when a resume is attempted while another resume for the same session is
+// already in flight (a concurrent duplicate callback for the same state).
+var ErrResuming = errors.New("session already resuming")
+
 // Session is the per-journey state. Handle/ResultPDF are sensitive and never leave the backend
 // except the signed PDF on an explicit result fetch.
 type Session struct {
@@ -36,6 +43,11 @@ type Session struct {
 	Evidence      []byte // raw JSON evidence record
 	CreatedAt     time.Time
 	ExpiresAt     time.Time
+	// resuming guards against a concurrent duplicate callback: it is set when a resume is started
+	// (the pending state is consumed) and cleared when the next pending redirect state is indexed.
+	// While set, the SDK handle is "checked out" to one in-flight resume and no other callback may
+	// advance the same session, so non-idempotent upstream/signing effects run at most once.
+	resuming bool
 }
 
 // Terminal reports whether the session has reached an end state.
@@ -126,13 +138,32 @@ func (m *Memory) ViewByID(corr string) (View, error) {
 	return View{Status: s.Status, Reason: s.Reason, ResultPDF: s.ResultPDF, Evidence: s.Evidence}, nil
 }
 
-// ResumeView returns, under the lock, whether the session is terminal and a copy of its current
-// handle — the inputs the flow engine needs before calling the SDK, read race-free. The handle is
-// copied so callers never alias mutable session state.
-func (m *Memory) ResumeView(s *Session) (terminal bool, handle []byte) {
+// ConsumeForResume atomically claims a session for a single resume step and returns a copy of its
+// SDK handle. Under the store lock it: (1) rejects an already-terminal session (ErrTerminal); (2)
+// rejects a session that another caller is already resuming (ErrResuming); (3) marks the session
+// resuming and de-indexes its pending OAuth state, so a concurrent duplicate callback for the same
+// state can neither find the session by state nor pass the resuming check. This is the single
+// authoritative point that serializes redirect callbacks: it guarantees the non-idempotent
+// upstream/signing effects in a resume run at most once per redirect.
+//
+// The pending state is expired-checked first (an expired session is terminal and rejected). The
+// handle is copied so callers never alias mutable session state.
+func (m *Memory) ConsumeForResume(s *Session) (handle []byte, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return s.Terminal(), append([]byte(nil), s.Handle...)
+	m.expireLocked(s)
+	if s.Terminal() {
+		return nil, ErrTerminal
+	}
+	if s.resuming {
+		return nil, ErrResuming
+	}
+	s.resuming = true
+	if s.OAuthState != "" {
+		delete(m.byState, s.OAuthState)
+		s.OAuthState = ""
+	}
+	return append([]byte(nil), s.Handle...), nil
 }
 
 // Update runs mutate (which closes over the session) under the store lock, serializing field writes
@@ -144,6 +175,8 @@ func (m *Memory) Update(_ *Session, mutate func()) {
 }
 
 // SetState re-indexes the session's pending OAuth state (used when the second redirect is issued).
+// Indexing a fresh pending state ends the in-flight resume: the session is again awaiting a callback,
+// so it is cleared of the resuming claim and a subsequent callback for the new state may resume it.
 func (m *Memory) SetState(s *Session, state string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,9 +187,10 @@ func (m *Memory) SetState(s *Session, state string) {
 	if state != "" {
 		m.byState[state] = s.CorrelationID
 	}
+	s.resuming = false
 }
 
-// Finalize marks a terminal session: drops the handle and the state index.
+// Finalize marks a terminal session: drops the handle and the state index, and ends any resume claim.
 func (m *Memory) Finalize(s *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -165,6 +199,7 @@ func (m *Memory) Finalize(s *Session) {
 		s.OAuthState = ""
 	}
 	s.Handle = nil
+	s.resuming = false
 }
 
 func (m *Memory) expireLocked(s *Session) {

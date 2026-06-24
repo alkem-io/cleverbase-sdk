@@ -47,11 +47,15 @@ jobs:
           python-version: "3.12"
       # The Python generator runs from the repo virtualenv (.venv) — the same path gen-docs.sh uses
       # locally — so the recipe is identical in CI and on a developer machine.
+      # pydoc-markdown is pinned to an EXACT version (not floating latest) so the generated Markdown
+      # is byte-deterministic across runs — a floating version would re-render docs and trip the
+      # stale-doc diff check below with false failures. The pin MUST match gen-docs.sh's
+      # PYDOC_MARKDOWN_VERSION (single source for the recipe; Constitution Principle III).
       - name: Create .venv with pydoc-markdown
         run: |
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install pydoc-markdown
+          .venv/bin/pip install 'pydoc-markdown==4.8.2'
       - name: Install TypeScript doc deps (typedoc + markdown plugin)
         working-directory: frontend/helper-ts
         run: npm install

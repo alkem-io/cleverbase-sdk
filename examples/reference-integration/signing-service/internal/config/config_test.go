@@ -64,6 +64,29 @@ func TestAuthOnByDefault(t *testing.T) {
 	}
 }
 
+func TestLiveModeRejectsAuthDisabled(t *testing.T) {
+	// API-key auth is mandatory in live: the fixtures-only opt-out must be a fatal error here, even
+	// with an otherwise fully-configured live profile (so a LIVE deployment can never run unauthed).
+	setEnv(t, map[string]string{
+		"REFSVC_MODE": "live", "REFSVC_AUTH_DISABLED": "true",
+		"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+		"REFSVC_TSA_URL": "https://tsa.example/tsr",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected live-mode REFSVC_AUTH_DISABLED to be a fatal config error")
+	}
+	// A contradictory live config (an API key AND the opt-out) must also fail fast, not silently
+	// ignore the opt-out.
+	setEnv(t, map[string]string{
+		"REFSVC_MODE": "live", "REFSVC_AUTH_DISABLED": "true", "REFSVC_API_KEY": "k",
+		"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+		"REFSVC_TSA_URL": "https://tsa.example/tsr",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected live-mode REFSVC_AUTH_DISABLED=true to fail even with an API key set")
+	}
+}
+
 func TestInvalidTTLAndConformance(t *testing.T) {
 	e := fixturesEnv()
 	e["REFSVC_SESSION_TTL"] = "not-a-duration"

@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,33 @@ import (
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/config"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/flow"
 )
+
+// TestEntropyFailureFailsEveryEntryPoint proves a degraded RNG fails the request on every flow entry
+// point instead of signing with predictable (zeroed) entropy: each Adapter method must surface the
+// error and must NOT reach the binding. Without this, a failed crypto/rand.Read would feed all-zero
+// "entropy" into BeginSigning/Resume*.
+func TestEntropyFailureFailsEveryEntryPoint(t *testing.T) {
+	rngErr := errors.New("rng unavailable")
+	orig := randRead
+	randRead = func([]byte) (int, error) { return 0, rngErr }
+	t.Cleanup(func() { randRead = orig })
+
+	a := New(&config.Profile{Mode: config.ModeFixtures, Environment: "acceptance", CscAPI: "v1_rsa",
+		ClientID: "x", ClientSecret: "y", RedirectURI: "http://app/cb", UpstreamBaseURL: "http://mock:9000"})
+
+	checks := map[string]func() (flow.Result, error){
+		"Begin":               func() (flow.Result, error) { return a.Begin([]byte("%PDF"), "B-B", nil) },
+		"ResumeRedirect":      func() (flow.Result, error) { return a.ResumeRedirect([]byte("h"), "c", "s") },
+		"ResumeRedirectError": func() (flow.Result, error) { return a.ResumeRedirectError([]byte("h"), "e", "s") },
+		"ResumeHTTP":          func() (flow.Result, error) { return a.ResumeHTTP([]byte("h"), 200, []byte("{}")) },
+	}
+	for name, call := range checks {
+		_, err := call()
+		if !errors.Is(err, rngErr) {
+			t.Fatalf("%s: expected the RNG error to propagate, got %v", name, err)
+		}
+	}
+}
 
 // TestAdapterBeginAndResumeGlue exercises the cgo adapter: a real begin (which produces the service
 // authorization redirect) plus the resume wrappers. The resume results are not asserted — the point

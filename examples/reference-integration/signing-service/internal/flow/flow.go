@@ -172,9 +172,9 @@ func (e *Engine) Begin(corr string, document []byte, conformance string, opts *O
 
 // Complete advances a session after a redirect return with code+state.
 func (e *Engine) Complete(s *session.Session, code, state string) (status session.Status, redirectURL, reason string, err error) {
-	terminal, handle := e.Store.ResumeView(s) // read terminal + handle under the store lock
-	if terminal {
-		return "", "", "", ErrTerminal
+	handle, err := e.consume(s)
+	if err != nil {
+		return "", "", "", err
 	}
 	res, err := e.SDK.ResumeRedirect(handle, code, state)
 	if err != nil {
@@ -186,9 +186,9 @@ func (e *Engine) Complete(s *session.Session, code, state string) (status sessio
 
 // CompleteError advances a session after a redirect return carrying an OAuth error.
 func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (status session.Status, redirectURL, reason string, err error) {
-	terminal, handle := e.Store.ResumeView(s)
-	if terminal {
-		return "", "", "", ErrTerminal
+	handle, err := e.consume(s)
+	if err != nil {
+		return "", "", "", err
 	}
 	res, err := e.SDK.ResumeRedirectError(handle, oauthError, state)
 	if err != nil {
@@ -196,6 +196,25 @@ func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (st
 		return "", "", "", err
 	}
 	return e.drive(s, res)
+}
+
+// consume atomically claims the session for this resume and returns its handle. It is the single
+// guard against a concurrent duplicate redirect callback for the same state: the store de-indexes the
+// pending state and marks the session resuming under its lock, so the second concurrent caller is
+// rejected here (with ErrTerminal for an already-finished session, mapped from the store) and never
+// reaches the SDK — the non-idempotent upstream/signing effects run at most once.
+func (e *Engine) consume(s *session.Session) ([]byte, error) {
+	handle, err := e.Store.ConsumeForResume(s)
+	if err != nil {
+		// An already-terminal session keeps the existing ErrTerminal contract; a concurrent
+		// in-flight resume surfaces as the store's ErrResuming. Both are clean rejections that do not
+		// re-finalize or double-resume.
+		if errors.Is(err, session.ErrTerminal) {
+			return nil, ErrTerminal
+		}
+		return nil, err
+	}
+	return handle, nil
 }
 
 // --- Step parsing helpers ---

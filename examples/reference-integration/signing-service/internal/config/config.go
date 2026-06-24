@@ -119,9 +119,14 @@ func Load() (*Profile, error) {
 }
 
 // resolveAuth applies the auth policy: a key turns auth on; auth is on by default and may only be
-// turned off by an explicit opt-out (for local fixtures runs).
+// turned off by an explicit opt-out, and that opt-out is honored in fixtures mode ONLY. API-key auth
+// is mandatory in live mode: a live deployment with REFSVC_AUTH_DISABLED=true is a fatal config error
+// (it would expose the signing REST API with no authentication).
 func (p *Profile) resolveAuth() error {
 	authDisabled := strings.EqualFold(os.Getenv("REFSVC_AUTH_DISABLED"), "true")
+	if authDisabled && p.Mode == ModeLive {
+		return errors.New("REFSVC_AUTH_DISABLED is not allowed in live mode: API-key auth (REFSVC_API_KEY) is mandatory")
+	}
 	switch {
 	case p.APIKey != "":
 		p.AuthEnabled = true

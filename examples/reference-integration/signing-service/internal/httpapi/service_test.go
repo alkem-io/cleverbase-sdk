@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -163,6 +164,28 @@ func TestStartErrors(t *testing.T) {
 	svc.Sample = nil
 	if rec := do(t, svc.Handler(), "POST", "/v1/sign/start", `{}`, ""); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty doc+sample should 400, got %d", rec.Code)
+	}
+}
+
+func TestStartRejectsOversizeBody(t *testing.T) {
+	h := newService(happySteps(), false).Handler()
+
+	// 1) A raw JSON body above the MaxBytesReader cap → 413 (trips during decode, before any
+	//    document allocation).
+	bigBody := `{"document":"` + strings.Repeat("A", maxStartBodyBytes+1) + `"}`
+	if rec := do(t, h, "POST", "/v1/sign/start", bigBody, ""); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize body should 413, got %d", rec.Code)
+	}
+
+	// 2) A body within the raw cap but whose decoded document exceeds maxPDFBytes → 413. Use valid
+	//    base64 (a repeated 'A' is base64 for 0x00 triples) just over the decoded limit.
+	overB64Len := base64.StdEncoding.EncodedLen(maxPDFBytes + 3)
+	if overB64Len >= maxStartBodyBytes {
+		t.Fatalf("test invariant: oversized-document base64 (%d) must fit under the raw body cap (%d)", overB64Len, maxStartBodyBytes)
+	}
+	overDoc := `{"document":"` + strings.Repeat("A", overB64Len) + `"}`
+	if rec := do(t, h, "POST", "/v1/sign/start", overDoc, ""); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize decoded document should 413, got %d", rec.Code)
 	}
 }
 

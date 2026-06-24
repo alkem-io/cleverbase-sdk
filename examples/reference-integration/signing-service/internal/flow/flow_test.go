@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -262,6 +264,88 @@ func TestResumeErrorsPropagate(t *testing.T) {
 	s4, _ := e4.Store.GetByState("s1")
 	if _, _, _, err := e4.CompleteError(s4, "x", "s1"); err == nil {
 		t.Fatal("complete-error resume error should propagate")
+	}
+}
+
+// countingSDK is a thread-safe SDK double that counts how many times each resume entry point is
+// invoked, so a test can assert the non-idempotent resume ran at most once.
+type countingSDK struct {
+	mu          sync.Mutex
+	resumeStep  Result
+	resumeCalls atomic.Int64
+}
+
+func (*countingSDK) Begin([]byte, string, *Options) (Result, error) {
+	return redirect("https://cb/oauth2/authorize?scope=service", "s1"), nil
+}
+func (c *countingSDK) ResumeRedirect([]byte, string, string) (Result, error) {
+	c.resumeCalls.Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resumeStep, nil
+}
+func (c *countingSDK) ResumeRedirectError([]byte, string, string) (Result, error) {
+	c.resumeCalls.Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resumeStep, nil
+}
+func (c *countingSDK) ResumeHTTP([]byte, int, []byte) (Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return done([]byte("%PDF-signed")), nil
+}
+
+// TestConcurrentDuplicateCallbackDoesNotDoubleResume proves (under `go test -race`) that two
+// concurrent /complete callbacks for the SAME pending state advance the SDK resume exactly once: the
+// store's atomic consume lets one win and rejects the other cleanly, so the non-idempotent
+// upstream/signing effects never run twice. Without the atomic consume, both callbacks would snapshot
+// the same handle and both call ResumeRedirect.
+func TestConcurrentDuplicateCallbackDoesNotDoubleResume(t *testing.T) {
+	sdk := &countingSDK{resumeStep: performHTTP("https://cb/oauth2/token")} // resume → token → done
+	e := &Engine{
+		SDK:   sdk,
+		Up:    &fakeEffector{},
+		Store: session.NewMemory(),
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		TTL:   time.Minute,
+	}
+	if _, err := e.Begin("c", []byte("%PDF"), "B-B", nil); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	s, _ := e.Store.GetByState("s1")
+
+	const callers = 2
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var ok, rejected atomic.Int64
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, _, err := e.Complete(s, "code", "s1")
+			switch {
+			case err == nil:
+				ok.Add(1)
+			case errors.Is(err, ErrTerminal) || errors.Is(err, session.ErrResuming):
+				rejected.Add(1)
+			default:
+				t.Errorf("unexpected error from a duplicate callback: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := sdk.resumeCalls.Load(); got != 1 {
+		t.Fatalf("resume must be driven exactly once, got %d (double-resume of non-idempotent effects)", got)
+	}
+	if ok.Load() != 1 || rejected.Load() != callers-1 {
+		t.Fatalf("expected 1 winner + %d clean rejections, got ok=%d rejected=%d", callers-1, ok.Load(), rejected.Load())
+	}
+	if v, err := e.Store.ViewByID("c"); err != nil || v.Status != session.StatusCompleted {
+		t.Fatalf("session should complete once: %v status=%s", err, v.Status)
 	}
 }
 

@@ -74,7 +74,7 @@ jobs:
       - name: Type-check (TypeScript, strict)
         run: npx tsc --noEmit
         working-directory: frontend/helper-ts
-      - name: Install web example deps (links the file: helper so its types resolve)
+      - name: "Install web example deps (links the file: helper so its types resolve)"
         run: npm install
         working-directory: examples/reference-integration/web
       - name: ESLint
