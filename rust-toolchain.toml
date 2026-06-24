@@ -1,6 +1,8 @@
 # Pin the toolchain so the enforcing clippy lint set (pedantic + nursery) is reproducible:
 # a floating `stable` gains new lints each release and would break CI unpredictably. Bump
-# deliberately. 1.92 ≥ the workspace MSRV (1.83). llvm-tools-preview backs the coverage gate.
+# deliberately. 1.94 ≥ the workspace MSRV (1.83). llvm-tools-preview backs the coverage gate.
+# NOTE: the rustdoc-JSON `format_version` tracks this toolchain (1.94.x → 57, consumed by
+# scripts/rustdoc_json_to_markdown.py); bumping the channel can change it — keep the two in lockstep.
 [toolchain]
-channel = "1.92.0"
+channel = "1.94.1"
 components = ["clippy", "rustfmt", "llvm-tools-preview"]

@@ -43,7 +43,7 @@ mkdir -p "$OUT/rust" "$OUT/ts"
 #    converter (scripts/rustdoc_json_to_markdown.py). missing_docs is `deny`,
 #    and we fail on ANY rustdoc warning, so a missing/broken doc breaks the build.
 #    RUSTC_BOOTSTRAP=1 unlocks the unstable `--output-format json` on the pinned
-#    stable toolchain (1.92.0 -> format_version 57).
+#    stable toolchain (1.94.x -> format_version 57; see rust-toolchain.toml).
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Rust: cargo rustdoc --output-format json -> Markdown"
 for crate in cleverbase-core cleverbase-ffi; do
