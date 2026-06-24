@@ -59,7 +59,8 @@ async function returnPage(): Promise<void> {
       if (!corr) {
         // Without the correlation id (lost/cleared session storage) the result/download URL would
         // be broken; fail fast with a clear message instead of rendering a dead link.
-        out.textContent = "Signature completed, but the session id is missing — cannot build the download link. Please start over.";
+        out.textContent =
+          "Signature completed, but the session id is missing — cannot build the download link. Please start over.";
         return;
       }
       const link = document.getElementById("download") as HTMLAnchorElement | null;
