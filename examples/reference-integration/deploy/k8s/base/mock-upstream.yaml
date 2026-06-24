@@ -1,0 +1,102 @@
+# Credential-free stand-in for Cleverbase's CSC/OIDC + RFC 3161 TSA surface, used by
+# fixtures mode. The fixtures are baked into the image at /fixtures. The TSA path drives
+# `openssl ts` against a per-request temp dir created with os.MkdirTemp("", ...), which
+# honors TMPDIR; we point TMPDIR at an emptyDir-backed /tmp so the root filesystem can stay
+# read-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-upstream
+  labels:
+    app.kubernetes.io/name: mock-upstream
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mock-upstream
+      app.kubernetes.io/part-of: cleverbase-reference-integration
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mock-upstream
+        app.kubernetes.io/part-of: cleverbase-reference-integration
+    spec:
+      # Credential-free mock needs no Kubernetes API access, so don't mount the default
+      # service-account token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mock-upstream
+          # Demo: this mutable tag intentionally tracks the latest per-PR build. PRODUCTION deployments
+          # MUST pin an immutable digest (image: ...@sha256:...), e.g. via a kustomize `images:` digest
+          # transformer, so the cluster runs exactly the CI-verified, signed/SBOM-backed artifact.
+          image: ghcr.io/alkem-io/cleverbase-sdk/cleverbase-refmock
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: REFMOCK_FIXTURES_DIR
+              value: "/fixtures"
+            - name: REFMOCK_LISTEN
+              value: ":9000"
+            # openssl ts temp work lands under TMPDIR; keep it on the writable emptyDir so
+            # the container root filesystem can remain read-only.
+            - name: TMPDIR
+              value: "/tmp"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Writable scratch for openssl ts temp files (TMPDIR=/tmp).
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-upstream
+  labels:
+    app.kubernetes.io/name: mock-upstream
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  selector:
+    app.kubernetes.io/name: mock-upstream
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http

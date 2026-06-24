@@ -1,0 +1,12 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "plugin": ["typedoc-plugin-markdown"],
+  "entryPoints": ["index.d.ts"],
+  "tsconfig": "tsconfig.json",
+  "out": "../../docs/api/node",
+  "readme": "none",
+  "name": "Cleverbase Node binding",
+  "hidePageHeader": true,
+  "hideBreadcrumbs": true,
+  "gitRevision": "main"
+}

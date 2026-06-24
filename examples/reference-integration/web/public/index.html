@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cleverbase Reference Signing</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 38rem; margin: 4rem auto; padding: 0 1rem; }
+      button { font-size: 1rem; padding: 0.6rem 1.2rem; cursor: pointer; }
+      .row { margin: 1rem 0; }
+      #out { margin-top: 1.5rem; color: #444; }
+      code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <h1>Cleverbase Reference Signing</h1>
+    <p>
+      This no-crypto page asks the signing service to sign the bundled sample PDF. The browser only
+      ever sees opaque correlation ids and redirect URLs — never secrets, tokens, or keys.
+    </p>
+    <div class="row">
+      <label for="conformance">Conformance:</label>
+      <select id="conformance">
+        <option value="B-B">PAdES B-B</option>
+        <option value="B-T">PAdES B-T (timestamped)</option>
+      </select>
+    </div>
+    <div class="row"><button id="start">Sign the sample PDF</button></div>
+    <p id="out"></p>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

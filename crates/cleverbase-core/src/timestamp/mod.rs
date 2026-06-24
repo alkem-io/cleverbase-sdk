@@ -17,10 +17,13 @@ use crate::crypto::SHA256_OID as ID_SHA256;
 /// Errors from RFC 3161 handling.
 #[derive(Debug, thiserror::Error)]
 pub enum TimestampError {
+    /// A DER encode/decode error.
     #[error("DER error: {0}")]
     Der(#[from] der::Error),
+    /// The TSA did not grant a timestamp (non-granted status or no token in the response).
     #[error("timestamp request was not granted (no token in response)")]
     NotGranted,
+    /// The configured TSA policy OID was not a valid object identifier.
     #[error("invalid TSA policy OID: {0}")]
     InvalidPolicyOid(String),
 }
@@ -121,32 +124,43 @@ fn parse_generalized_time_secs(tlv: &[u8]) -> Option<i64> {
     let (content_len, len_bytes) = read_der_len(tlv.get(1..)?)?;
     let body = tlv.get(1 + len_bytes..1 + len_bytes + content_len)?;
     let s = core::str::from_utf8(body).ok()?;
-    if s.len() < 14 || !s.as_bytes()[..14].iter().all(u8::is_ascii_digit) {
+    let digits = s.as_bytes().get(..14)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let n = |a: usize, b: usize| s[a..b].parse::<i64>().ok();
+    // RFC 3161 TSTInfo `genTime` is `YYYYMMDDHHMMSS`, optionally `.<frac>`, and is ALWAYS terminated
+    // by `Z` (UTC). Reject any other suffix — trailing junk, a numeric offset like `+01:00`, or a
+    // missing `Z` — so a malformed TSA token makes the caller fall back rather than accept a wrong
+    // timestamp. (A fractional part, if present, is intentionally not carried into whole seconds.)
+    match body.get(14..) {
+        Some(b"Z") => {}
+        Some([b'.', frac @ .., b'Z'])
+            if !frac.is_empty() && frac.iter().all(u8::is_ascii_digit) => {}
+        _ => return None,
+    }
+    // Parse a 2/4-digit field by byte range; `.get` (not `[..]`) keeps this off the string-slice
+    // panic path. The all-ASCII-digit check above guarantees each sub-slice parses.
+    let n = |a: usize, b: usize| s.get(a..b).and_then(|t| t.parse::<i64>().ok());
     let (year, month, day) = (n(0, 4)?, n(4, 6)?, n(6, 8)?);
     let (hour, min, sec) = (n(8, 10)?, n(10, 12)?, n(12, 14)?);
     if !(1..=12).contains(&month) {
         return None;
     }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_month = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
+    // Days in each month (1-based), selected without array indexing so there is no panic path.
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
     // Reject impossible dates/times (e.g. Feb 31, hour 25) rather than silently normalizing them.
-    if day < 1 || day > days_in_month[(month - 1) as usize] || hour > 23 || min > 59 || sec > 60 {
+    if day < 1 || day > days_in_month || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
     Some(crate::util::days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec)
@@ -207,7 +221,7 @@ fn first_tlv_with_tag(der: &[u8], tag: u8) -> Option<&[u8]> {
             return None;
         }
         if t == tag {
-            return Some(&der[i..i + total]);
+            return der.get(i..i + total);
         }
         i += total;
     }
@@ -269,6 +283,13 @@ mod tests {
         assert!(parse_generalized_time_secs(&mk("20260229120000Z")).is_none()); // 2026 not a leap year
         assert!(parse_generalized_time_secs(&mk("20240229120000Z")).is_some()); // 2024 IS a leap year
         assert!(parse_generalized_time_secs(&mk("20261301120000Z")).is_none()); // month 13
+                                                                                // Malformed suffixes must be rejected (RFC 3161 genTime is UTC, terminated by `Z`), so a bad
+                                                                                // TSA token falls back to the host clock instead of yielding a wrong gen_time.
+        assert!(parse_generalized_time_secs(&mk("20260622120000")).is_none()); // missing Z
+        assert!(parse_generalized_time_secs(&mk("20260622120000junk")).is_none()); // trailing junk
+        assert!(parse_generalized_time_secs(&mk("20260622120000.123+01:00")).is_none()); // offset, no Z
+        assert!(parse_generalized_time_secs(&mk("20260622120000.Z")).is_none());
+        // empty fraction
     }
 
     #[test]

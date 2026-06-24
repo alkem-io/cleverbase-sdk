@@ -14,9 +14,12 @@ use crate::types::{ExpectedSignerIdentity, MatchOn};
 /// OAuth2 token response (service-scope Bearer, or credential-scope SAD).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TokenResponse {
+    /// The access token (service-scope Bearer, or credential-scope SAD).
     pub access_token: String,
+    /// The token type (e.g. `Bearer` or `SAD`).
     #[serde(default)]
     pub token_type: String,
+    /// Token lifetime in seconds, when reported.
     #[serde(default)]
     pub expires_in: Option<i64>,
 }
@@ -24,6 +27,7 @@ pub struct TokenResponse {
 /// `credentials/list` response.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CredentialList {
+    /// The credential ids available to this service token.
     #[serde(rename = "credentialIDs", default)]
     pub credential_ids: Vec<String>,
 }
@@ -31,13 +35,16 @@ pub struct CredentialList {
 /// Signing key algorithm family, derived from the credential's advertised OIDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeyAlgo {
+    /// RSA (PKCS#1 v1.5 with SHA-256).
     Rsa,
+    /// ECDSA over the NIST P-256 curve with SHA-256.
     EcdsaP256,
+    /// Any other / unsupported algorithm.
     Other,
 }
 
 impl KeyAlgo {
-    /// The `signAlgo` OID to request from CSC `signatures/signHash`.
+    /// The `signAlgo` OID to request from CSC `signatures/signHash` (empty for [`KeyAlgo::Other`]).
     pub fn sign_algo_oid(&self) -> &'static str {
         match self {
             Self::Rsa => "1.2.840.113549.1.1.11", // sha256WithRSAEncryption
@@ -50,6 +57,7 @@ impl KeyAlgo {
 /// `signatures/signHash` response (raw signature values, base64).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SignaturesResponse {
+    /// Raw signature values (base64), one per requested hash.
     #[serde(default)]
     pub signatures: Vec<String>,
 }
@@ -59,9 +67,13 @@ pub struct SignaturesResponse {
 pub struct CredentialInfo {
     /// Certificate chain, base64-encoded DER (leaf first).
     pub certificates: Vec<String>,
+    /// The subject distinguished name (RFC 4514).
     pub subject_dn: String,
+    /// The certificate serial number reported by the service.
     pub serial_number: String,
+    /// The advertised SCAL level (`"2"` for per-signature sole control).
     pub scal: String,
+    /// The detected signing key algorithm family.
     pub key_algo: KeyAlgo,
 }
 
@@ -94,18 +106,22 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, CoreError> {
     serde_json::from_slice(body).map_err(|e| CoreError::ProtocolParse(e.to_string()))
 }
 
+/// Parse an OAuth2 token response body.
 pub fn parse_token_response(body: &[u8]) -> Result<TokenResponse, CoreError> {
     parse(body)
 }
 
+/// Parse a `credentials/list` response body.
 pub fn parse_credentials_list(body: &[u8]) -> Result<CredentialList, CoreError> {
     parse(body)
 }
 
+/// Parse a `signatures/signHash` response body.
 pub fn parse_signatures(body: &[u8]) -> Result<SignaturesResponse, CoreError> {
     parse(body)
 }
 
+/// Parse a `credentials/info` response body into the flattened [`CredentialInfo`].
 pub fn parse_credentials_info(body: &[u8]) -> Result<CredentialInfo, CoreError> {
     let raw: RawInfo = parse(body)?;
     Ok(CredentialInfo {
@@ -157,24 +173,42 @@ fn split_rdns(dn: &str) -> Vec<String> {
 /// `Doe, Jane`) and `\HH` hex escapes (e.g. `\41` → `A`). Consecutive hex escapes can encode a
 /// multi-byte UTF-8 char (`\C3\A9` → `é`), so decode into a byte buffer and interpret as UTF-8.
 fn unescape_rdn_value(s: &str) -> String {
+    /// Hex-digit value (0–15) of an ASCII byte, or `None` if it is not a hex digit. Arithmetic so
+    /// there is no panicking `unwrap` on `to_digit`.
+    const fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            let n1 = bytes[i + 1];
-            if i + 2 < bytes.len() && n1.is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit() {
-                let hi = char::from(n1).to_digit(16).unwrap();
-                let lo = char::from(bytes[i + 2]).to_digit(16).unwrap();
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-            } else {
-                // `\<char>` — the escaped character literally (an ASCII special).
-                out.push(n1);
-                i += 2;
+    while let Some(&cur) = bytes.get(i) {
+        if cur == b'\\' {
+            // `\HH` hex escape (two hex digits) decodes to one byte; `\<char>` keeps the char.
+            match (bytes.get(i + 1), bytes.get(i + 2)) {
+                (Some(&h), Some(&l)) if matches!((hex_val(h), hex_val(l)), (Some(_), Some(_))) => {
+                    // Safe: the guard proved both are hex digits.
+                    let (hi, lo) = (hex_val(h).unwrap_or(0), hex_val(l).unwrap_or(0));
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                }
+                (Some(&n1), _) => {
+                    // `\<char>` — the escaped character literally (an ASCII special).
+                    out.push(n1);
+                    i += 2;
+                }
+                // A trailing lone backslash: keep it verbatim.
+                (None, _) => {
+                    out.push(cur);
+                    i += 1;
+                }
             }
         } else {
-            out.push(bytes[i]);
+            out.push(cur);
             i += 1;
         }
     }
@@ -187,7 +221,11 @@ fn extract_attr(dn: &str, attr: &str) -> Option<String> {
     for part in split_rdns(dn) {
         let trimmed = part.trim();
         if trimmed.to_ascii_uppercase().starts_with(&needle) {
-            return Some(unescape_rdn_value(trimmed[needle.len()..].trim()));
+            // `needle` is ASCII, so `needle.len()` is a valid UTF-8 boundary in `trimmed`; `.get`
+            // (not `[..]`) keeps this off the `string_slice` panic path regardless.
+            if let Some(value) = trimmed.get(needle.len()..) {
+                return Some(unescape_rdn_value(value.trim()));
+            }
         }
     }
     None

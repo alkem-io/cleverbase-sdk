@@ -1,17 +1,51 @@
-# Enforcing Python lint config (ruff). Applies to the Python binding tests and demos.
+# Python lint/format config (ruff) for the Cleverbase Python binding: the PyO3 extension's
+# test suite (bindings/python/tests) and the runnable demo (examples/). The binding itself is a
+# compiled Rust extension (src/lib.rs), so there is no pure-Python package source to lint here.
+#
+# Strictness policy: enable the full rule set ("ALL") and disable only rules that genuinely
+# conflict with each other, fight the formatter, or are nonsensical for this repo. Every disable
+# is justified inline below. This config feeds the API docs (pydocstyle docstrings) and keeps the
+# Python surface production-grade.
 target-version = "py39"
 line-length = 100
 
 [lint]
-# Strong, broad rule set: pycodestyle/pyflakes, imports, bugbear, comprehensions, simplify,
-# pyupgrade, naming, pathlib, pytest-style, ruff-native, return, unused-arguments, pylint subset.
-select = [
-    "E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF", "PT", "N", "PTH", "ARG", "RET",
-    "PLC", "PLE", "PLW",
+select = ["ALL"]
+
+ignore = [
+    # --- pydocstyle: mutually exclusive pairs; ruff warns if both are active. Pick one each. ---
+    "D203", # one-blank-line-before-class. Conflicts with D211 (no blank line); keep D211.
+    "D213", # multi-line-summary-second-line. Conflicts with D212 (summary on first line); keep D212.
+
+    # --- formatter conflicts: `ruff format` owns comma/implicit-concat layout. ---
+    "COM812", # missing-trailing-comma. Handled by `ruff format`; enabling it double-manages commas.
+    "ISC001", # single-line-implicit-string-concatenation. Same: defer to the formatter.
 ]
-# PT011: asserting a `match=` on PyO3-raised ValueErrors couples tests to FFI message wording.
-ignore = ["PT011"]
+# TD (flake8-todos) + FIX (flake8-fixme) stay ENABLED — like Go's godox, a stray TODO/FIXME must be
+# resolved or tracked, never left in source.
+# Note: ANN101/ANN102 (missing-type-self / -cls) are intentionally NOT listed — ruff removed them,
+# so ignoring them only emits a "removed rule" warning. Self/cls need no annotation regardless.
+
+[lint.pydocstyle]
+# Google-style docstrings; the public surface (modules, the demo) documents itself for the API docs.
+convention = "google"
+
+[lint.flake8-pytest-style]
+# PyO3 raises plain ValueError; asserting on `match=` would couple tests to FFI message wording,
+# so allow bare `pytest.raises(ValueError)` (PT011) without forcing a match pattern.
+raises-require-match-for = []
 
 [lint.per-file-ignores]
-# Demos are illustrative scripts, not a package: allow top-level runner style.
-"examples/**" = ["INP001"]
+# Tests: pytest idioms that are noise to forbid in a test module.
+"bindings/python/tests/**" = [
+    "S101",    # assert is the pytest assertion mechanism.
+    "D",       # test functions need no docstrings; their names are the documentation.
+    "ARG",     # pytest fixtures are injected as unused-looking parameters.
+    "PLR2004", # magic values (status codes, indices, expected literals) are the point of a test.
+    "INP001",  # the tests dir is collected by pytest, not imported as a package; no __init__.py.
+]
+# Examples: runnable demonstration scripts, not an importable package.
+"examples/**" = [
+    "INP001", # standalone scripts, deliberately not part of a package.
+    "T201",   # a CLI demo prints its output for the reader to see.
+]

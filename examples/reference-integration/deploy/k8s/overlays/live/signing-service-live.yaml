@@ -1,0 +1,64 @@
+# Live-mode env for the signing service. Strategic-merge patch: env entries merge by
+# `name`, so listed names override the base; REFSVC_BASE_URL is deleted (fixtures-only).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signing-service
+spec:
+  template:
+    spec:
+      containers:
+        - name: signing-service
+          env:
+            - name: REFSVC_MODE
+              value: "live"
+            # Fixtures-only; not valid against live Cleverbase.
+            - name: REFSVC_BASE_URL
+              $patch: delete
+            # Conformance is configurable via the overlay's ConfigMap.
+            - name: REFSVC_DEFAULT_CONFORMANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: signing-service-config
+                  key: REFSVC_DEFAULT_CONFORMANCE
+            # "acceptance" | "production".
+            - name: REFSVC_ENV
+              value: "acceptance"
+            # CSC API selector: "v1_rsa" | "v2_ecdsa".
+            - name: REFSVC_CSC_API
+              value: "v1_rsa"
+            - name: REFSVC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_CLIENT_ID
+            - name: REFSVC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_CLIENT_SECRET
+            - name: REFSVC_REDIRECT_URI
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_REDIRECT_URI
+            # TSA settings — a live deployment ALWAYS requires TSA configuration, not only when the
+            # default conformance is B-T: conformance is per-request overridable, so a live profile
+            # must be able to serve B-T on demand. config.go's validateLive therefore fails fast at
+            # startup unless REFSVC_TSA_URL is set, so REFSVC_TSA_URL is mandatory here (with TSA_AUTH
+            # / TSA_POLICY supplying the rest of the TSA configuration).
+            - name: REFSVC_TSA_URL
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_TSA_URL
+            - name: REFSVC_TSA_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_TSA_AUTH
+            - name: REFSVC_TSA_POLICY
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_TSA_POLICY

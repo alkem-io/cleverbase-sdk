@@ -37,34 +37,54 @@ pub struct HostContext {
 pub enum ResumeInput {
     /// Response to a prior [`Step::PerformHttp`].
     HttpResult {
+        /// HTTP status code.
         status: u16,
+        /// Response headers as `(name, value)` pairs.
         #[serde(default)]
         headers: Vec<(String, String)>,
+        /// Response body bytes.
         #[serde(default, with = "serde_bytes")]
         body: Vec<u8>,
     },
     /// Code+state received at the integrator's `redirect_uri` after a [`Step::Redirect`].
-    RedirectReturn { code: String, state: String },
+    RedirectReturn {
+        /// The OAuth authorization `code`.
+        code: String,
+        /// The `state` echoed back (validated against the pending state for CSRF).
+        state: String,
+    },
     /// An OAuth error received at the `redirect_uri` instead of a code (e.g. `access_denied` when
     /// the signer declines in the wallet), with the `state` for CSRF validation.
-    RedirectError { error: String, state: String },
+    RedirectError {
+        /// The OAuth error code (e.g. `access_denied`).
+        error: String,
+        /// The `state` echoed back (validated against the pending state for CSRF).
+        state: String,
+    },
 }
 
 /// Usage/programmer errors (not protocol outcomes, which are `Step::Failed`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CoreError {
+    /// B-T was requested but no TSA is configured.
     #[error("B-T conformance requires a configured TSA")]
     MissingTsaConfig,
+    /// A required configuration value was missing or invalid.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    /// The returned OAuth `state` did not match the pending one (CSRF check failed).
     #[error("OAuth state mismatch")]
     StateMismatch,
+    /// The session handle was malformed, tampered, or carried an unsupported schema version.
     #[error("unsupported or malformed session handle: {0}")]
     BadHandle(String),
+    /// The supplied [`ResumeInput`] did not match what the current phase expects.
     #[error("unexpected resume input for the current phase")]
     UnexpectedInput,
+    /// A trust-service response could not be parsed.
     #[error("failed to parse trust-service response: {0}")]
     ProtocolParse(String),
+    /// An internal invariant failed while assembling the signature/container.
     #[error("internal signing error: {0}")]
     Internal(String),
 }
@@ -126,11 +146,11 @@ fn build_visible_appearance(
 }
 
 fn correlation_from(ctx: &HostContext) -> String {
-    if ctx.entropy.len() >= 8 {
-        util::to_hex(&ctx.entropy[..8])
-    } else {
-        format!("corr-{}", ctx.now_unix)
-    }
+    // Derive a short correlation id from the first 8 entropy bytes; `.get` avoids a panicking index
+    // and falls back to the host clock when too little entropy was supplied.
+    ctx.entropy
+        .get(..8)
+        .map_or_else(|| format!("corr-{}", ctx.now_unix), util::to_hex)
 }
 
 fn csc_base(config: &TrustServiceConfiguration) -> String {
@@ -149,9 +169,10 @@ fn json_post(url: String, bearer: &str, body: serde_json::Value) -> HttpEffect {
             ("Authorization".into(), format!("Bearer {bearer}")),
             ("Content-Type".into(), "application/json".into()),
         ],
-        // `body` is always a serde_json::Value built from json!(), so serialization is infallible;
-        // expect (not unwrap_or_default) so an impossible failure surfaces rather than silently
-        // producing an empty request body.
+        // `body` is always a serde_json::Value built from json!(), so serialization to a Vec is
+        // infallible; expect (not unwrap_or_default) so an impossible failure surfaces rather than
+        // silently producing an empty request body. There is no error channel on this helper.
+        #[allow(clippy::expect_used)] // infallible: serializing an in-memory Value into a Vec
         body: Some(serde_json::to_vec(&body).expect("json! Value serialization is infallible")),
     }
 }
@@ -566,8 +587,13 @@ pub fn resume(
             // conformance (see docs/limitations.md), so never assert unverified preservation.
             handle.pdf_a =
                 Some(container::is_pdf_a(&prepared.staged_pdf) && request.appearance.is_none());
+            // The empty-chain case failed above, so `first()` is Some; `.get`/`ok_or` avoids a
+            // panicking index while keeping the impossible case a clean error.
+            let leaf_cert = chain
+                .first()
+                .ok_or_else(|| CoreError::BadHandle("empty certificate chain".into()))?;
             let signed_attrs =
-                cms::build_signed_attrs(&prepared.content_hash, &chain[0], ctx.now_unix)
+                cms::build_signed_attrs(&prepared.content_hash, leaf_cert, ctx.now_unix)
                     .map_err(|e| CoreError::Internal(e.to_string()))?;
             let tbs = cms::tbs_hash(&signed_attrs);
 

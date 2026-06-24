@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/cleverbase-ffi"
 description = "Stable C ABI (CBOR request in / result out) over cleverbase-core, for cgo and other consumers."
 
 [lib]

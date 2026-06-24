@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base manifests for the Cleverbase reference signing integration. The base is not
+# deployable on its own: it has no Secret providing REFSVC_API_KEY. Use an overlay
+# (overlays/fixtures or overlays/live), which supplies the secret(s) and mode config.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: cleverbase-reference-integration
+    includeSelectors: false
+
+resources:
+  - signing-service.yaml
+  - web.yaml
+  - mock-upstream.yaml

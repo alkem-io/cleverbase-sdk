@@ -17,7 +17,20 @@
 //! later-phase roadmap (B-LT/B-LTA, full PDF/A, EUDI attestation).
 
 #![forbid(unsafe_code)]
-#![warn(missing_debug_implementations)]
+// The workspace pins a strict `restriction` lint set (unwrap/expect/panic/indexing/…) that targets
+// library code. Test modules use those same constructs as assertions, where a panic IS the intended
+// failure signal, so re-allow them under `cfg(test)` only — `src` stays held to the strict bar.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unwrap_in_result,
+        clippy::string_slice
+    )
+)]
 
 pub mod crypto;
 pub mod effects;

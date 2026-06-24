@@ -1,8 +1,31 @@
-# Enforcing golangci-lint (v2) config for the Go binding and the Go demo.
+# Strict golangci-lint (v2) config for every Go module in this repo: the Cleverbase Go binding
+# (bindings/go), the Go demo (examples/go_demo), and the three reference-integration services
+# (signing-service, mock-upstream, web). This is a production remote-QES signing SDK, so the lint
+# bar is set as strict as is practical: a broad linter set, revive with every rule enabled (only a
+# handful of stylistically-opinionated rules disabled, each documented below), strict complexity
+# thresholds, and zero issue caps. revive's `exported` + `package-comments` stay ON so every
+# exported symbol and package carries a doc comment that feeds the Go API docs.
+#
+# Skipped linters and why (deprecated / external-config / conflicting-by-design):
+#   - depguard:        requires a project-specific import allowlist we do not maintain.
+#   - exhaustruct:     demanding every struct literal set every field is wrong for option structs.
+#   - ireturn:         returning interfaces (e.g. http.Handler) is idiomatic here.
+#   - varnamelen:      name-length heuristics clash with idiomatic short receivers/loop vars.
+#   - wsl / nlreturn:  whitespace-between-statements style is more opinionated than `whitespace`.
+#   - gomnd/mnd:       magic-number reports are noisy for HTTP codes, byte sizes, and durations.
+#   - lll:             line-length is covered by gofmt's intent; revive line-length-limit is off too.
+#   - godox:           we have no TODO/FIXME policy to enforce.
+#   - tagliatelle:     cbor/json tag casing here is deliberate (snake_case wire format).
+#   - testpackage / paralleltest / thelper: not worth their churn for this test layout.
 version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
 
 linters:
   enable:
+    # --- already in use ---
     - bodyclose
     - errorlint
     - gocritic
@@ -12,14 +35,154 @@ linters:
     - revive
     - unconvert
     - unparam
+    # --- requested additions (errcheck/govet/ineffassign/staticcheck/unused are v2 defaults) ---
+    - gocyclo
+    - cyclop
+    - funlen
+    - prealloc
+    - whitespace
+    - gochecknoinits
+    - goconst
+    - dupl
+    - nakedret
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - tparallel
+    - wastedassign
+    - errname
+    - exhaustive
+    - copyloopvar
+    - intrange
+    - perfsprint
+    - usestdlibvars
+    - mirror
+    - fatcontext
+    - makezero
+    - nilnil
+    - reassign
+    - contextcheck
+    # godot: doc-comment sentences must end with a period (these feed the Go API docs). It is a
+    # linter in golangci-lint v2 (it offers auto-fix but is not registered as a formatter).
+    - godot
+    # godox: flag stray TODO/FIXME/BUG markers — a strict-by-default win (the codebase keeps none).
+    - godox
+  settings:
+    gocyclo:
+      min-complexity: 15
+    cyclop:
+      max-complexity: 15
+    funlen:
+      lines: 80
+      statements: 50
+    nakedret:
+      max-func-lines: 0
+    dupl:
+      threshold: 150
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    exhaustive:
+      # Treat a `default:` clause as exhaustive: the flow/mapping switches handle the open set of
+      # SDK step kinds and outcomes via an explicit default, which is the correct pattern here.
+      default-signifies-exhaustive: true
+    staticcheck:
+      checks:
+        - "all"
+    revive:
+      # Enable every revive rule, then disable only the few that are genuinely a poor fit for this
+      # codebase. exported + package-comments stay ON (they feed the Go API docs).
+      enable-all-rules: true
+      rules:
+        # add-constant overlaps goconst and flags every literal (HTTP codes, indices); too noisy.
+        - name: add-constant
+          disabled: true
+        # cognitive-complexity is covered (more predictably) by gocyclo/cyclop thresholds.
+        - name: cognitive-complexity
+          disabled: true
+        # line-length-limit is a formatting concern; gofmt governs layout and lll is off.
+        - name: line-length-limit
+          disabled: true
+        # function-length duplicates funlen, which we already tune above.
+        - name: function-length
+          disabled: true
+        # cyclomatic duplicates gocyclo/cyclop.
+        - name: cyclomatic
+          disabled: true
+        # max-public-structs caps exported structs per file at an arbitrary 5; it is NOT in the org's
+        # apispec/matrix-adapter revive sets, and an SDK binding's public surface (the request/response
+        # option types that mirror the Rust core) legitimately groups >5 structs in one file.
+        - name: max-public-structs
+          disabled: true
+        # banned-characters / file-header / max-control-nesting require project-specific config
+        # we do not maintain.
+        - name: banned-characters
+          disabled: true
+        - name: file-header
+          disabled: true
+        # function-result-limit defaults to 3; the flow engine's Complete/drive methods return a
+        # genuine 4-tuple (status, redirectUrl, reason, error) that the HTTP layer unpacks directly,
+        # so allow 4.
+        - name: function-result-limit
+          arguments: [4]
+        # unhandled-error stays ON, but ignore the small set of stdlib calls whose error return is
+        # conventionally discarded: stdout/stderr prints and the bytes/strings.Builder writers (which
+        # are documented to always return a nil error).
+        - name: unhandled-error
+          arguments:
+            - "fmt\\.Print"
+            - "fmt\\.Printf"
+            - "fmt\\.Println"
+            - "fmt\\.Fprint"
+            - "fmt\\.Fprintf"
+            - "fmt\\.Fprintln"
+            # strings.Builder / bytes.Buffer writers are documented to always return a nil error.
+            - "strings\\.Builder\\.WriteString"
+            - "strings\\.Builder\\.WriteByte"
+            - "strings\\.Builder\\.WriteRune"
+            - "bytes\\.Buffer\\.Write"
+            - "bytes\\.Buffer\\.WriteString"
   exclusions:
+    presets: []
     rules:
-      # The binding is a thin cgo shim: unsafe.Pointer conversions and a C-bytes copy are
-      # inherent to the FFI boundary and are reviewed by hand, not flagged per call site.
-      - path: bindings/go/cleverbase\.go
-        linters: [gosec]
-        text: "G103|G115"
-      # gocritic's dupSubExpr misreads the cgo macro expansion of a C.func call as `x == x`.
-      - path: bindings/go/cleverbase\.go
-        linters: [gocritic]
-        text: "dupSubExpr"
+      # NOTE: there are intentionally NO path-level gosec/gocritic waivers here. Every such
+      # suppression is applied INLINE at its single call site with a `//nolint:<linter> // <reason>`
+      # directive (the cgo unsafe.Pointer ops in bindings/go/cleverbase.go, the mock's fixture reads /
+      # redirect-mirroring / openssl exec, and the signed-PDF response write). That keeps each waiver
+      # isolated to the one line it protects and individually motivated, instead of blanket-disabling
+      # a security linter across a whole file or directory.
+      #
+      # Test files get the same relaxations as the apispec baseline (plus the extra strict linters
+      # this config enables): tests exercise error paths, repeat literal step kinds / wire keys, and
+      # use the two-value `v, _ := x.(T)` assertion idiom in ways that trip these otherwise-strict
+      # linters without indicating a defect. revive stays ON for tests except its
+      # unchecked-type-assertion rule (relaxed below), so exported/doc-comment checks still apply to
+      # exported test helpers.
+      - path: _test\.go
+        linters:
+          - unparam
+          - errcheck
+          - gosec
+          - gocritic
+          - gocyclo
+          - cyclop
+          - funlen
+          - dupl
+          - errorlint
+          - noctx
+          - contextcheck
+          - goconst
+      # The `v, _ := step[k].(string)` idiom is idiomatic in tests (an absent/typed-wrong field
+      # yields the zero value, which the assertion then checks); only relax this one revive rule.
+      - path: _test\.go
+        linters: [revive]
+        text: "unchecked-type-assertion"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/alkem-io/cleverbase-sdk

@@ -1,0 +1,32 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Fixtures overlay: credential-free run. Keeps mock-upstream and points the signing
+# service at it. Renders with: kubectl kustomize overlays/fixtures
+resources:
+  - ../../base
+  - secret.yaml
+
+# Explicitly pin the signing service to fixtures mode against the in-cluster mock.
+# (The base already defaults to these; this keeps the overlay self-documenting.)
+# Strategic-merge patch: env entries merge by `name`, so it stays correct regardless of the
+# order env vars appear in the base (an index-based JSON patch would break on reordering).
+patches:
+  - target:
+      kind: Deployment
+      name: signing-service
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: signing-service
+      spec:
+        template:
+          spec:
+            containers:
+              - name: signing-service
+                env:
+                  - name: REFSVC_MODE
+                    value: "fixtures"
+                  - name: REFSVC_BASE_URL
+                    value: "http://mock-upstream:9000"

@@ -1,0 +1,84 @@
+name: API docs
+
+# Verifies the committed Markdown API docs under docs/api/ are up to date with the public APIs.
+#
+# The reference docs are generated as Markdown and COMMITTED to the repo (browseable directly on
+# GitHub). This workflow does not publish anything: it regenerates the Markdown with the single
+# authoritative recipe (scripts/gen-docs.sh — the very same `make docs` contributors run) and then
+# `git diff --exit-code -- docs/api` FAILS the build if the committed docs are stale. So changing
+# a public API without re-running `make docs` is caught in CI. The generators consume the in-source
+# doc comments the lint gate already enforces (Rust missing_docs, Go revive exported, Python
+# pydocstyle, TS tsdoc/jsdoc) — this workflow generates docs only and never modifies SDK source.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+
+# Generation + a read-only diff check; nothing is published.
+permissions:
+  contents: read
+
+# One docs check per ref; a newer push supersedes an in-flight run.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Docs up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      # Toolchain version + components are pinned by rust-toolchain.toml (1.94.1); rustup honours it.
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.22"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      # The Python generator runs from the repo virtualenv (.venv) — the same path gen-docs.sh uses
+      # locally — so the recipe is identical in CI and on a developer machine.
+      # pydoc-markdown is pinned to an EXACT version (not floating latest) so the generated Markdown
+      # is byte-deterministic across runs — a floating version would re-render docs and trip the
+      # stale-doc diff check below with false failures. The pin MUST match gen-docs.sh's
+      # PYDOC_MARKDOWN_VERSION (single source for the recipe; Constitution Principle III).
+      - name: Create .venv with pydoc-markdown
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install 'pydoc-markdown==4.8.2'
+      - name: Install TypeScript doc deps (typedoc + markdown plugin)
+        working-directory: frontend/helper-ts
+        run: npm install
+      # missing_docs is `deny` and we fail on ANY rustdoc warning too (RUSTDOCFLAGS=-D warnings set
+      # inside the script), so a missing/broken doc breaks this step.
+      - name: Regenerate Markdown docs (same recipe as `make docs`)
+        run: make docs
+      # Fail if regeneration changed anything tracked under docs/api — i.e. the committed docs are
+      # stale. --exit-code returns non-zero on any diff; the preceding --stat just prints what
+      # drifted (it always exits 0). -- pathspec scopes the check to the docs tree.
+      - name: Check committed docs are up to date
+        run: |
+          git diff --stat -- docs/api
+          if ! git diff --exit-code -- docs/api; then
+            echo "::error::docs/api is out of date — run 'make docs' and commit the result."
+            exit 1
+          fi
+      # A new public API would create UNTRACKED files under docs/api that --exit-code above misses.
+      - name: Check for new (untracked) doc files
+        run: |
+          untracked="$(git ls-files --others --exclude-standard -- docs/api)"
+          if [ -n "$untracked" ]; then
+            echo "::error::new files under docs/api are not committed — run 'make docs' and commit them:"
+            echo "$untracked"
+            exit 1
+          fi

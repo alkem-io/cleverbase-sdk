@@ -1,0 +1,101 @@
+# Reference signing service: embeds the Cleverbase SDK and serves the REST API the
+# no-crypto web frontend drives. Mode-specific env (fixtures vs live) is layered by overlays.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signing-service
+  labels:
+    app.kubernetes.io/name: signing-service
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: signing-service
+      app.kubernetes.io/part-of: cleverbase-reference-integration
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: signing-service
+        app.kubernetes.io/part-of: cleverbase-reference-integration
+    spec:
+      # Gets its config via env/Secrets and needs no Kubernetes API access, so don't mount the
+      # default service-account token on this externally reachable pod.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signing-service
+          # Demo: this mutable tag intentionally tracks the latest per-PR build. PRODUCTION deployments
+          # MUST pin an immutable digest (image: ...@sha256:...), e.g. via a kustomize `images:` digest
+          # transformer, so the cluster runs exactly the CI-verified, signed/SBOM-backed artifact.
+          image: ghcr.io/alkem-io/cleverbase-sdk/cleverbase-refsvc
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Defaults assume fixtures mode; overlays patch REFSVC_MODE / REFSVC_BASE_URL and
+            # inject secrets. REFSVC_API_KEY is sourced from a Secret in every overlay.
+            - name: REFSVC_MODE
+              value: "fixtures"
+            - name: REFSVC_BASE_URL
+              value: "http://mock-upstream:9000"
+            - name: REFSVC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: signing-service-secrets
+                  key: REFSVC_API_KEY
+            - name: REFSVC_DEFAULT_CONFORMANCE
+              value: "B-B"
+            - name: REFSVC_SESSION_TTL
+              value: "15m"
+            - name: REFSVC_LISTEN
+              value: ":8080"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signing-service
+  labels:
+    app.kubernetes.io/name: signing-service
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  selector:
+    app.kubernetes.io/name: signing-service
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

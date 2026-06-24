@@ -1,0 +1,39 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Live overlay: drives the real Cleverbase CSC/OIDC surface (+ TSA for B-T). Drops the
+# mock-upstream Deployment and Service entirely. Renders with:
+#   kubectl kustomize overlays/live
+resources:
+  - ../../base
+  - secret.yaml
+  - configmap.yaml
+
+# Conformance is configurable via configmap.yaml (key REFSVC_DEFAULT_CONFORMANCE), which
+# the signing-service env patch reads through a configMapKeyRef. Default keeps B-T off;
+# set it to "B-T" to require RFC 3161 timestamps (which then need REFSVC_TSA_URL et al.).
+patches:
+  # Remove the mock-upstream Deployment — not used against live Cleverbase.
+  - target:
+      kind: Deployment
+      name: mock-upstream
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mock-upstream
+  # Remove the mock-upstream Service.
+  - target:
+      kind: Service
+      name: mock-upstream
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mock-upstream
+  # Switch the signing service to live mode and add the live-only env (CSC/OIDC + TSA).
+  # REFSVC_BASE_URL is fixtures-only, so remove it; REFSVC_DEFAULT_CONFORMANCE comes from
+  # the ConfigMap above; secrets come from signing-service-secrets.
+  - path: signing-service-live.yaml

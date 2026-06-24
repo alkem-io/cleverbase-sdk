@@ -4,6 +4,19 @@
 //! `cleverbase_process`, and `cleverbase_free` to release the returned buffer. The CBOR envelope
 //! is versioned (`schema_version`), so the ABI stays stable within a SemVer major.
 
+// The workspace pins a strict `restriction` lint set (unwrap/expect/panic/indexing/…) for library
+// code. The `#[cfg(test)]` module below uses those constructs as test assertions, where a panic IS
+// the intended failure signal, so re-allow them under `cfg(test)` only.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use cleverbase_core::wire::{decode_request, encode_response, WireOp, WireRequest, WireResult};
 
 /// Pure dispatch from a decoded request to a result — the only logic here; everything else is the

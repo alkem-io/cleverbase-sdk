@@ -7,24 +7,61 @@ edition = "2021"
 license = "EUPL-1.2"
 rust-version = "1.83"
 repository = "https://github.com/alkem-io/cleverbase-sdk"
+# Crate metadata shared by every workspace member (satisfies clippy::cargo_common_metadata and
+# feeds crates.io / docs.rs). `readme` points at the single repo-root README (no per-crate copies).
+readme = "README.md"
+documentation = "https://docs.rs/cleverbase-core"
+keywords = ["qes", "pades", "eidas", "signing", "cleverbase"]
+categories = ["cryptography", "authentication", "api-bindings"]
 
-# Enforcing lint policy (CI runs `clippy --all-targets -- -D warnings`, so every level below is a
-# hard gate). clippy `pedantic` + `nursery` are on; only genuinely noisy/stylistic lints are
-# allowed back, each with a reason. Crates opt in via `[lints] workspace = true`.
+# Enforcing lint policy (CI runs `clippy --all-targets --all-features -- -D warnings`, so every
+# level below is a hard gate). For a production remote-QES signing SDK the bar is deliberately at
+# the strictest practical setting: clippy `all` + `pedantic` + `nursery` + `cargo` are denied, a
+# curated set of `restriction` lints guards crypto/FFI foot-guns, and rustc `missing_docs` forces
+# every public item to be documented (this also feeds rustdoc). Allows are kept ONLY where a lint
+# fights the FFI boundary, a cargo lint reflects a transitive-dependency fact we cannot fix, or a
+# pedantic/nursery lint is pure style noise — each is justified inline. Crates opt in via
+# `[lints] workspace = true`; the bindings (standalone workspaces) re-declare the same set.
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+# `deny(warnings)` is applied per-build on the CLI (`-D warnings`) rather than here, so a local
+# `cargo build` during development still compiles with warnings visible.
+missing_docs = "deny"                  # every public item in core + ffi must be documented (rustdoc)
+unsafe_op_in_unsafe_fn = "deny"        # an `unsafe fn` body must still mark its unsafe operations
+missing_debug_implementations = "deny" # public types are inspectable (none leak secrets via Debug)
 unused_qualifications = "warn"
-missing_debug_implementations = "warn"
+unreachable_pub = "warn"               # `pub` that isn't actually reachable should be `pub(crate)`
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-# Foot-guns we never want, even in tests:
+cargo = { level = "deny", priority = -1 }
+
+# --- Curated `restriction` lints (off by default; each chosen because it hardens a crypto/FFI SDK) ---
+# Panicking paths: in a signing core a stray panic is a correctness/availability defect (and across
+# the C ABI it is UB), so forbid the implicit-panic constructs in `src`. Tests legitimately use
+# them as assertions, so they are allowed back in the per-crate test modules / test targets.
+unwrap_used = "deny"          # surface the error; never `.unwrap()` in library code
+expect_used = "deny"          # likewise — only with a proof-carrying message, re-allowed where used
+panic = "deny"                # no explicit `panic!` on a value-handling path
+indexing_slicing = "deny"     # `a[i]` can panic; use `.get()` and handle the None on untrusted input
+unwrap_in_result = "deny"     # a fn returning Result must not internally unwrap
+# Already-foot-guns we never want, even in tests:
 todo = "deny"
 unimplemented = "deny"
+unreachable = "deny"          # the state machine encodes its invariants in types, not `unreachable!`
 dbg_macro = "deny"
-# Allowed back (noise / deliberate style), each justified:
+print_stdout = "deny"         # a library never prints (the example/bindings re-allow as needed)
+print_stderr = "deny"
+mem_forget = "deny"           # leaking is never intended; the FFI hands ownership over explicitly
+# Crypto/serialization hygiene:
+string_slice = "deny"         # byte-index slicing of `str` can split a UTF-8 char → panic
+lossy_float_literal = "deny"
+rc_buffer = "deny"
+verbose_file_reads = "deny"
+
+# --- Allowed back, each justified ---
+# pedantic / nursery style noise:
 missing_errors_doc = "allow"      # error types are self-describing via thiserror
 missing_panics_doc = "allow"      # panics are documented inline where they matter
 must_use_candidate = "allow"      # not adding #[must_use] to every getter
@@ -44,6 +81,8 @@ derive_partial_eq_without_eq = "allow" # several types carry f64 fields (no Eq)
 unnecessary_wraps = "allow"
 manual_let_else = "allow"          # an explicit match reads clearly in the state machine
 format_push_string = "allow"
+# cargo lints: the only finding is a transitive-dependency fact we cannot resolve.
+multiple_crate_versions = "allow"  # rsa/p256 (rand 0.8) vs lopdf (rand 0.9) pull duplicate rand/getrandom
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

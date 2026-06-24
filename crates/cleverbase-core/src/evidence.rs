@@ -8,13 +8,21 @@ use crate::types::ConformanceLevel;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningOutcome {
+    /// The document was signed successfully (the only success outcome).
     Signed,
+    /// The signer declined in the wallet (OAuth `access_denied`).
     Declined,
+    /// Authorization was not completed in time / expired.
     AuthorizationExpired,
+    /// No usable signing credential was available (or the trust service rejected the request).
     CredentialUnavailable,
+    /// The authorizing signer did not match the expected identity (FR-014).
     IdentityMismatch,
+    /// The B-T timestamp could not be obtained or did not bind to the signature.
     TimestampFailed,
+    /// The input was not a signable PDF (non-PDF, no pages, or already signed).
     InvalidDocument,
+    /// The requested visible-appearance placement was invalid (e.g. page out of range).
     AppearancePlacementError,
     /// The signature returned by the trust service failed verification against the signer's
     /// certificate — the core refuses to report `Signed` for a signature it cannot verify.
@@ -22,6 +30,7 @@ pub enum SigningOutcome {
 }
 
 impl SigningOutcome {
+    /// `true` only for [`SigningOutcome::Signed`].
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Signed)
     }
@@ -30,18 +39,24 @@ impl SigningOutcome {
 /// The signer's identity, derived from their qualified certificate subject.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignerIdentity {
+    /// Certificate serial number as reported by CSC `credentials/info`.
     pub serial_number: String,
+    /// Subject common name (`CN`), or empty if absent.
     pub common_name: String,
+    /// Subject given name (`GN`/`givenName`), if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub given_name: Option<String>,
+    /// Subject surname (`SN`/`surname`), if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surname: Option<String>,
+    /// The raw subject distinguished name (RFC 4514).
     pub raw_subject: String,
 }
 
 /// Trusted-timestamp summary recorded in the evidence (B-T).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimestampInfo {
+    /// The TSA endpoint URL used.
     pub tsa: String,
     /// The TSA's own `genTime` from the timestamp token (Unix seconds).
     pub gen_time: i64,
@@ -55,17 +70,23 @@ pub struct TimestampInfo {
 pub struct SigningEvidenceRecord {
     /// SHA-256 of the to-be-signed content (hex).
     pub request_digest: String,
+    /// Terminal outcome of the attempt.
     pub outcome: SigningOutcome,
+    /// Conformance level that was requested / produced.
     pub conformance_level: ConformanceLevel,
+    /// The derived signer identity, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<SignerIdentity>,
     /// Signing time (Unix seconds), present on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_time: Option<i64>,
+    /// Trusted-timestamp summary (B-T success only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<TimestampInfo>,
+    /// Human-readable failure reason, present on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Correlation id for this attempt (derived from request entropy).
     pub correlation_id: String,
 }
 

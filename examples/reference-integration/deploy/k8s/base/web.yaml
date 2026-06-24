@@ -1,0 +1,84 @@
+# No-crypto web frontend: a static file server. It has NO /healthz endpoint, so the
+# probes hit "/" (the served index), which returns 200.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+      app.kubernetes.io/part-of: cleverbase-reference-integration
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/part-of: cleverbase-reference-integration
+    spec:
+      # Static file server / BFF needs no Kubernetes API access, so don't mount the default
+      # service-account token on this externally reachable pod.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          # Demo: this mutable tag intentionally tracks the latest per-PR build. PRODUCTION deployments
+          # MUST pin an immutable digest (image: ...@sha256:...), e.g. via a kustomize `images:` digest
+          # transformer, so the cluster runs exactly the CI-verified, signed/SBOM-backed artifact.
+          image: ghcr.io/alkem-io/cleverbase-sdk/cleverbase-refweb
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            # Static file server has no /healthz; "/" returns 200.
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+spec:
+  selector:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

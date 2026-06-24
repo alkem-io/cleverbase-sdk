@@ -1,6 +1,6 @@
 {
   "name": "@cleverbase/frontend-helper",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Thin Cleverbase signing frontend helper — redirect orchestration + status polling (no crypto, no secrets).",
   "license": "EUPL-1.2",
   "type": "module",
@@ -11,6 +11,8 @@
     "test": "node --test test/helper.test.mjs"
   },
   "devDependencies": {
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-markdown": "^4.12.0",
     "typescript": "^5.6.0"
   }
 }

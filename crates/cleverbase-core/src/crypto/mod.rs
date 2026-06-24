@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 /// `signHash` request, the CMS digest algorithm, and the RFC 3161 message imprint (Principle VIII).
 /// SHA-256 is the only hash Cleverbase's CSC service advertises.
 pub const SHA256_OID_STR: &str = "2.16.840.1.101.3.4.2.1";
+/// The SHA-256 algorithm OID, parsed form of [`SHA256_OID_STR`].
 pub const SHA256_OID: der::oid::ObjectIdentifier =
     der::oid::ObjectIdentifier::new_unwrap(SHA256_OID_STR);
 

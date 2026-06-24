@@ -15,16 +15,26 @@ use crate::SCHEMA_VERSION;
 /// A decoded operation request from a non-native binding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+// Wire protocol enum: the size gap between variants is inherent to their op payloads; boxing a
+// variant would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireOp {
+    /// Begin a new signing flow.
     Begin {
+        /// The signing request.
         request: SigningRequest,
+        /// The trust-service configuration.
         config: TrustServiceConfiguration,
+        /// Host-provided context (clock + entropy).
         ctx: HostContext,
     },
+    /// Resume an existing signing flow.
     Resume {
+        /// The session handle returned by a prior call.
         handle: SigningSessionHandle,
+        /// The result of the last effect.
         input: ResumeInput,
+        /// Host-provided context (clock + entropy).
         ctx: HostContext,
     },
 }
@@ -32,26 +42,38 @@ pub enum WireOp {
 /// Versioned request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireRequest {
+    /// Wire schema version of this envelope.
     pub schema_version: u32,
+    /// The operation to perform.
     pub op: WireOp,
 }
 
 /// Versioned response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireResponse {
+    /// Wire schema version of this envelope.
     pub schema_version: u32,
+    /// The operation result.
     pub result: WireResult,
 }
 
+/// The result of a wire operation: a `(handle, step)` pair on success, or an error message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// Wire protocol enum: the ok variant (handle + step) is naturally larger than the err variant;
+// boxing would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireResult {
+    /// Success: the updated session handle plus the next step.
     Ok {
+        /// The updated session handle.
         handle: SigningSessionHandle,
+        /// The next step to perform.
         step: Step,
     },
+    /// A usage/protocol error, rendered as a message.
     Err {
+        /// Human-readable error message.
         message: String,
     },
 }
@@ -75,8 +97,13 @@ pub fn encode_response(result: WireResult) -> Vec<u8> {
         result,
     };
     let mut buf = Vec::new();
-    ciborium::into_writer(&resp, &mut buf)
-        .expect("CBOR serialization of WireResponse is infallible");
+    // Infallible: writing CBOR into an in-memory Vec cannot fail, and WireResponse is a plain
+    // serde type. There is no error channel on this helper, so an impossible failure should surface.
+    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
+    {
+        ciborium::into_writer(&resp, &mut buf)
+            .expect("CBOR serialization of WireResponse is infallible");
+    }
     buf
 }
 
@@ -92,15 +119,24 @@ struct HandleStepPair {
 
 /// Encode `(handle, step)` as the binding envelope CBOR.
 pub fn encode_handle_step(handle: &SigningSessionHandle, step: &Step) -> Vec<u8> {
+    // Both writes are infallible (CBOR into an in-memory Vec of plain serde types) and this helper
+    // has no error channel, so an impossible failure should surface rather than be swallowed.
     let mut handle_cbor = Vec::new();
-    ciborium::into_writer(handle, &mut handle_cbor)
-        .expect("CBOR serialization of the session handle is infallible");
+    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
+    {
+        ciborium::into_writer(handle, &mut handle_cbor)
+            .expect("CBOR serialization of the session handle is infallible");
+    }
     let pair = HandleStepPair {
         handle: handle_cbor,
         step: step.clone(),
     };
     let mut out = Vec::new();
-    ciborium::into_writer(&pair, &mut out).expect("CBOR serialization of the pair is infallible");
+    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
+    {
+        ciborium::into_writer(&pair, &mut out)
+            .expect("CBOR serialization of the pair is infallible");
+    }
     out
 }
 

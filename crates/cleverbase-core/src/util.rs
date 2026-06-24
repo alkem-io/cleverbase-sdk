@@ -29,38 +29,52 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Map a nibble to its lowercase hex ASCII char by arithmetic (no table indexing, no `unwrap`):
+/// `0..=9` → `'0'..='9'`, `10..=15` → `'a'..='f'`. Infallible — the low nibble is always 0–15.
+/// Single source for nibble→hex, shared by `to_hex`/`percent_encode` and the PAdES `/Contents`
+/// hex writer (Constitution Principle III/VIII).
+pub(crate) const fn hex_digit(nibble: u8) -> char {
+    let n = nibble & 0x0f;
+    (if n < 10 { b'0' + n } else { b'a' + n - 10 }) as char
+}
+
 /// Lowercase hex encoding.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
-        s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
+        s.push(hex_digit(b >> 4));
+        s.push(hex_digit(b & 0x0f));
     }
     s
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Map a 6-bit value to its standard-base64 ASCII char. Uses `.get` (not `[]`) so there is no
+/// panicking index; the `& 63` mask keeps the lookup in range, and the unreachable fallback (`'='`,
+/// never produced for a real sextet) keeps the function total without an `unwrap`.
+fn b64_char(sextet: u32) -> char {
+    B64.get((sextet & 63) as usize).map_or('=', |&b| b as char)
+}
+
 /// Standard (padded) base64 encoding.
 pub fn base64_std(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
+        // `chunks(3)` never yields an empty chunk, so `first()` is Some; default the absent
+        // tail bytes to 0 (the standard base64 padding rule) without indexing.
+        let b0 = chunk.first().copied().unwrap_or(0);
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
         let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
-        out.push(B64[((n >> 18) & 63) as usize] as char);
-        out.push(B64[((n >> 12) & 63) as usize] as char);
+        out.push(b64_char(n >> 18));
+        out.push(b64_char(n >> 12));
         out.push(if chunk.len() > 1 {
-            B64[((n >> 6) & 63) as usize] as char
+            b64_char(n >> 6)
         } else {
             '='
         });
-        out.push(if chunk.len() > 2 {
-            B64[(n & 63) as usize] as char
-        } else {
-            '='
-        });
+        out.push(if chunk.len() > 2 { b64_char(n) } else { '=' });
     }
     out
 }
@@ -75,16 +89,8 @@ pub fn percent_encode(s: &str) -> String {
             }
             _ => {
                 out.push('%');
-                out.push(
-                    char::from_digit(u32::from(b >> 4), 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit(u32::from(b & 0x0f), 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
+                out.push(hex_digit(b >> 4).to_ascii_uppercase());
+                out.push(hex_digit(b & 0x0f).to_ascii_uppercase());
             }
         }
     }
@@ -111,29 +117,36 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
             _ => Err("invalid base64 character"),
         }
     }
-    let mut quad = [0u8; 4];
-    let mut n = 0;
+    // Accumulate decoded sextets in four named slots (no array indexing → no panicking `[]`).
+    let (mut q0, mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8, 0u8);
+    let mut n = 0u8;
     let mut out = Vec::with_capacity(input.len() / 4 * 3);
     for &b in input.as_bytes() {
         // Skip padding and any ASCII whitespace (space, tab, CR, LF, form feed, vertical tab).
         if b == b'=' || b.is_ascii_whitespace() {
             continue;
         }
-        quad[n] = val(b)?;
+        let v = val(b)?;
+        match n {
+            0 => q0 = v,
+            1 => q1 = v,
+            2 => q2 = v,
+            _ => q3 = v,
+        }
         n += 1;
         if n == 4 {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
-            out.push((quad[2] << 6) | quad[3]);
+            out.push((q0 << 2) | (q1 >> 4));
+            out.push((q1 << 4) | (q2 >> 2));
+            out.push((q2 << 6) | q3);
             n = 0;
         }
     }
     match n {
         0 => {}
-        2 => out.push((quad[0] << 2) | (quad[1] >> 4)),
+        2 => out.push((q0 << 2) | (q1 >> 4)),
         3 => {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
+            out.push((q0 << 2) | (q1 >> 4));
+            out.push((q1 << 4) | (q2 >> 2));
         }
         _ => return Err("invalid base64 length"),
     }

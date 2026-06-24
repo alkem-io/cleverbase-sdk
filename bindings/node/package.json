@@ -13,10 +13,14 @@
   },
   "scripts": {
     "build": "napi build --platform",
-    "test": "node --test test/signing.test.cjs"
+    "test": "node --test test/signing.test.cjs",
+    "docs": "typedoc"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
-    "cbor": "^9.0.2"
+    "@types/node": "^22.0.0",
+    "cbor": "^9.0.2",
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-markdown": "^4.12.0"
   }
 }

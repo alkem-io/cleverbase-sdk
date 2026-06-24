@@ -1,0 +1,15 @@
+# Non-secret, environment-specific config for the live signing service. The default
+# conformance level lives here so it can be changed without touching secrets or images.
+# The signing-service env patch reads REFSVC_DEFAULT_CONFORMANCE from this ConfigMap.
+#
+# Valid values: "B-B" (baseline) | "B-T" (baseline + RFC 3161 timestamp). Selecting B-T
+# requires the REFSVC_TSA_* secrets to be populated.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signing-service-config
+  labels:
+    app.kubernetes.io/name: signing-service
+    app.kubernetes.io/part-of: cleverbase-reference-integration
+data:
+  REFSVC_DEFAULT_CONFORMANCE: "B-B"

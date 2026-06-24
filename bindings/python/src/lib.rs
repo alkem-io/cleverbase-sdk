@@ -19,6 +19,8 @@ fn err(e: impl ToString) -> PyErr {
 
 #[pyfunction]
 #[pyo3(signature = (document, environment, csc_api, client_id, client_secret, redirect_uri, conformance, now_unix, entropy, tsa_url=None, options_json=None))]
+// FFI entry point: the individual scalar args cross the pyo3 boundary cleanly, where a params
+// struct would not; the signature mirrors the SDK's begin inputs.
 #[allow(clippy::too_many_arguments)]
 fn begin_signing(
     document: Vec<u8>,

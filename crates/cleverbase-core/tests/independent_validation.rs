@@ -6,6 +6,16 @@
 //! signature over the signed attributes is valid, the `message-digest` matches the ByteRange
 //! content, and the signer certificate chains to the test CA. Skipped if `openssl` is unavailable.
 
+// This is a test binary: unwrap/expect/panic/indexing are the intended assertion mechanism,
+// matching the `cfg(test)` allow the library crates apply to their inline test modules.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::print_stderr // the openssl-unavailable skip notices print to stderr
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -106,18 +116,8 @@ fn produce_signed_pdf() -> SignedDocument {
         ctx(),
     )
     .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(serde_json::json!({"access_token": "bearer", "token_type": "Bearer"})),
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(serde_json::json!({"credentialIDs": ["cred-1"]})),
-        ctx(),
-    )
-    .unwrap();
+    let (h, _) = resume(h, http_ok(upstream_fixture("service_token")), ctx()).unwrap();
+    let (h, _) = resume(h, http_ok(upstream_fixture("credentials_list")), ctx()).unwrap();
     let (h, s) = resume(h, http_ok(info), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
@@ -132,12 +132,7 @@ fn produce_signed_pdf() -> SignedDocument {
         ctx(),
     )
     .unwrap();
-    let (h, s) = resume(
-        h,
-        http_ok(serde_json::json!({"access_token": "SAD", "token_type": "SAD"})),
-        ctx(),
-    )
-    .unwrap();
+    let (h, s) = resume(h, http_ok(upstream_fixture("credential_token")), ctx()).unwrap();
     let sign_req = match &s {
         Step::PerformHttp(e) => e.clone(),
         _ => panic!(),
@@ -250,13 +245,24 @@ fn produced_b_b_signature_verifies_with_openssl() {
     );
 }
 
+fn upstream_dir() -> PathBuf {
+    PathBuf::from(format!(
+        "{}/../../tests/fixtures/upstream",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+}
+
+/// Load a shared upstream-response fixture (the single source the Go mock also reads — FR-015),
+/// substituting the synthetic signer certificate for the `{{signer_rsa_cert_b64}}` placeholder.
+fn upstream_fixture(name: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(upstream_dir().join(format!("{name}.json")))
+        .unwrap_or_else(|e| panic!("read upstream fixture {name}: {e}"));
+    let substituted = raw.replace("{{signer_rsa_cert_b64}}", &base64_std(RSA_CERT));
+    serde_json::from_str(&substituted).unwrap()
+}
+
 fn signer_info() -> serde_json::Value {
-    let cert_b64 = base64_std(RSA_CERT);
-    serde_json::json!({
-        "key": {"algo": ["1.2.840.113549.1.1.1"]},
-        "cert": {"certificates": [cert_b64], "subjectDN": "CN=Jane Doe,serialNumber=PNONL-123", "serialNumber": "PNONL-123"},
-        "SCAL": "2"
-    })
+    upstream_fixture("credentials_info")
 }
 
 fn http_ok_bytes(body: Vec<u8>) -> ResumeInput {
@@ -429,18 +435,8 @@ fn drive_bt_to_timestamp() -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
         ctx(),
     )
     .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(serde_json::json!({"access_token": "bearer", "token_type": "Bearer"})),
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(serde_json::json!({"credentialIDs": ["cred-1"]})),
-        ctx(),
-    )
-    .unwrap();
+    let (h, _) = resume(h, http_ok(upstream_fixture("service_token")), ctx()).unwrap();
+    let (h, _) = resume(h, http_ok(upstream_fixture("credentials_list")), ctx()).unwrap();
     let (h, s) = resume(h, http_ok(signer_info()), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
@@ -455,12 +451,7 @@ fn drive_bt_to_timestamp() -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
         ctx(),
     )
     .unwrap();
-    let (h, s) = resume(
-        h,
-        http_ok(serde_json::json!({"access_token": "SAD", "token_type": "SAD"})),
-        ctx(),
-    )
-    .unwrap();
+    let (h, s) = resume(h, http_ok(upstream_fixture("credential_token")), ctx()).unwrap();
     let sign_req = match &s {
         Step::PerformHttp(e) => e.clone(),
         _ => panic!("expected signHash"),
