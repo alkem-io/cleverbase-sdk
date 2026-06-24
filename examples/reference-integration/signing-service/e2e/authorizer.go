@@ -65,9 +65,11 @@ func codeStateFromLocation(loc string) (code, state string, err error) {
 	if loc == "" {
 		return "", "", errors.New("authorize response carried no Location redirect")
 	}
+	// FR-010: url.Parse's *url.Error embeds the FULL raw URL (including code=<secret>) in its message,
+	// so it MUST NOT be wrapped/propagated. Report a structural-only failure with no raw URL/code/state.
 	u, err := url.Parse(loc)
 	if err != nil {
-		return "", "", fmt.Errorf("parse redirect callback: %w", err)
+		return "", "", errors.New("parse redirect callback: malformed URL")
 	}
 	q := u.Query()
 	if e := q.Get("error"); e != "" {
@@ -126,9 +128,11 @@ func (i Interactive) Authorize(ctx context.Context, authorizeURL, expectState st
 			return "", "", err
 		}
 		// CSRF: Cleverbase must echo back the state the flow issued. A mismatch is surfaced loudly,
-		// never silently accepted (contracts/authorizer.md).
+		// never silently accepted (contracts/authorizer.md). The state is a per-session secret echoed
+		// alongside the code, so the error MUST NOT interpolate the raw got/expected values (FR-010) —
+		// report only the lengths so a live state token can never reach a log via t.Fatalf.
 		if expectState != "" && state != expectState {
-			return "", "", fmt.Errorf("authorize state mismatch: got %q, expected %q (possible CSRF)", state, expectState)
+			return "", "", fmt.Errorf("authorize state mismatch (possible CSRF): got state of length %d, expected length %d", len(state), len(expectState))
 		}
 		return code, state, nil
 	}
@@ -144,11 +148,12 @@ func parseCapturedCallback(raw string) (code, state string, err error) {
 	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "/") {
 		return codeStateFromLocation(raw)
 	}
-	// FR-010: the raw query carries the live `code`/`state` (secrets) — report only the parse failure,
-	// never the raw query string.
+	// FR-010: the raw query carries the live `code`/`state` (secrets). url.ParseQuery's error can echo
+	// the offending fragment of the query (e.g. a bad %-escape), so it MUST NOT be wrapped/propagated —
+	// report a structural-only failure with no raw query/code/state.
 	q, perr := url.ParseQuery(strings.TrimPrefix(raw, "?"))
 	if perr != nil {
-		return "", "", fmt.Errorf("parse callback query: %w", perr)
+		return "", "", errors.New("parse callback query: malformed query string")
 	}
 	if e := q.Get("error"); e != "" {
 		if e == "access_denied" {

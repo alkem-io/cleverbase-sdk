@@ -38,22 +38,20 @@ if [ ! -x "$GATE" ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------
-# Self-skip when the opt-in toolchain is absent. We ask the gate itself (single source of truth) by
-# running it against a throwaway empty arg set is not meaningful; instead we mirror its detection:
-# pyHanko on PATH / in $PYHANKO_VENV (the primary AdES backend), and a container engine for EU DSS.
+# Self-skip when the opt-in toolchain is absent. pyHanko is the IRREDUCIBLE requirement: the contract's
+# central assertions — a tampered PDF fails AdES validation, and the AdES half of "PASS at B-B" — can
+# only be exercised by pyHanko (EU DSS alone asserts the structural level, not AdES). So if pyHanko is
+# absent we self-skip the whole harness even if a container engine happens to be present (there is no
+# meaningful assertion left to make). This is the normal dev-machine state; the full matrix runs in CI
+# (profile-conformance.yml).
 #
-# pyHanko is the IRREDUCIBLE requirement: the contract's central assertions — a tampered PDF fails
-# AdES validation, and the AdES half of "PASS at B-B" — can only be exercised by pyHanko (EU DSS alone
-# asserts the structural level, not AdES). So if pyHanko is absent we self-skip the whole harness even
-# if a container engine happens to be present (there is no meaningful assertion left to make). This is
-# the normal dev-machine state; the full matrix runs in CI (profile-conformance.yml).
+# We do NOT separately detect the EU DSS container engine here: whether the level half actually ran is
+# the gate's own determination (it depends on the pinned DSS image being pullable, not merely on docker
+# being installed), so assertion 2 reads the gate's "baseline level confirmed" report (single source of
+# truth) rather than re-implementing DSS detection — see gate_level_was_asserted below.
 # ---------------------------------------------------------------------------------------------------
 have_pyhanko() {
   { [ -n "${PYHANKO_VENV:-}" ] && [ -x "$PYHANKO_VENV/bin/pyhanko" ]; } || command -v pyhanko >/dev/null 2>&1
-}
-have_engine() {
-  if [ -n "${CONTAINER_ENGINE:-}" ]; then command -v "$CONTAINER_ENGINE" >/dev/null 2>&1; return; fi
-  command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1
 }
 
 if ! have_pyhanko; then
@@ -103,11 +101,28 @@ if [ -z "$TRUST_PEM" ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------
-# Assertion helpers. run_gate succeeds (returns 0) iff the gate exits 0.
+# Assertion helpers. run_gate succeeds (returns 0) iff the gate exits 0. It captures the gate's
+# combined stdout+stderr into GATE_OUTPUT so callers can distinguish WHAT the gate asserted (the gate
+# prints "baseline level confirmed = X" only when the EU DSS level half actually ran, and
+# "level NOT asserted" when DSS was unavailable). run_gate must keep its own exit status under `set -e`,
+# so we capture into a variable without a pipeline that would mask it.
 # ---------------------------------------------------------------------------------------------------
+GATE_OUTPUT=""
 run_gate() {
   # $1 = expect-level, $2 = pdf
-  "$GATE" --expect-level "$1" --trust "$TRUST_PEM" "$2"
+  local rc=0
+  GATE_OUTPUT="$("$GATE" --expect-level "$1" --trust "$TRUST_PEM" "$2" 2>&1)" || rc=$?
+  printf '%s\n' "$GATE_OUTPUT" >&2
+  return "$rc"
+}
+
+# gate_level_was_asserted: true iff the LAST run_gate call's output shows the EU DSS level half
+# actually ran and confirmed a level. The gate prints "baseline level confirmed" on a real level
+# assertion and "level NOT asserted" when DSS was unavailable (image unpullable / no engine). This is
+# the single source of truth for "did the level half run" — we read the gate's own report rather than
+# re-detecting DSS reachability here (which would duplicate validate-pades.sh and could drift).
+gate_level_was_asserted() {
+  printf '%s' "$GATE_OUTPUT" | grep -q 'baseline level confirmed'
 }
 
 PASS=0
@@ -122,18 +137,27 @@ else
 fi
 
 # Assertion 2: the same B-B PDF asserted as B-T fails (it has no timestamp → not BASELINE-T). This
-# assertion is only meaningful when the DSS level half actually runs (that is what distinguishes
-# B-B from B-T); if only pyHanko is available the level is not asserted, so we note + skip this leg.
+# assertion is ONLY meaningful when the EU DSS level half actually runs — that is what distinguishes
+# B-B from B-T (pyHanko's adesverify is level-agnostic). A present container engine does NOT guarantee
+# the pinned DSS image is pullable: if the engine exists but DSS is unreachable, the gate correctly
+# self-skips the level half, the level-agnostic AdES half PASSES the valid B-B PDF, and run_gate exits
+# 0 — which is the gate behaving CORRECTLY ("level NOT asserted"), not a wrong-accept. So we gate this
+# assertion on the gate's OWN report that the level was confirmed (gate_level_was_asserted), never on
+# the exit code alone, to avoid a false CI failure when DSS is merely unavailable.
 note "assert 2: $BB_PDF FAILS --expect-level B-T"
-if have_engine; then
-  if run_gate "B-T" "$BB_PDF"; then
-    fail "a B-B PDF (no timestamp) was wrongly ACCEPTED at --expect-level B-T"
+if run_gate "B-T" "$BB_PDF"; then
+  # Exit 0. Only a wrong-accept IF the DSS level half actually asserted the level; otherwise this is
+  # the correct level-agnostic AdES pass with the level explicitly NOT asserted — skip, don't fail.
+  if gate_level_was_asserted; then
+    fail "a B-B PDF (no timestamp) was wrongly ACCEPTED at --expect-level B-T (DSS confirmed the level)"
   else
-    note "  ok: B-B PDF correctly rejected at B-T"
-    PASS=$((PASS + 1))
+    skip "EU DSS level half did not run (engine present but DSS unavailable) — the B-B-as-B-T mismatch was NOT asserted here (CI asserts it)"
   fi
 else
-  skip "no container engine — EU DSS level half not running, so the B-B-as-B-T mismatch cannot be asserted here (CI asserts it)"
+  # Non-zero exit: the gate rejected the B-B PDF at B-T. This is the level mismatch being caught — it
+  # can only happen when the DSS level half ran (the AdES half alone is level-agnostic and would pass).
+  note "  ok: B-B PDF correctly rejected at B-T"
+  PASS=$((PASS + 1))
 fi
 
 # Assertion 3: a tampered PDF fails AdES validation. Flip a byte deep in the /Contents CMS region so

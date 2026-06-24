@@ -40,8 +40,8 @@ const maxRequestBody = 1 << 20 // 1 MiB
 // p256ScalarLen is the fixed width (bytes) of each of r and s in a P-256 raw r‖s signature.
 const p256ScalarLen = 32
 
-// Per-route signer algorithm labels — one authoritative string each (Constitution III), reused as
-// both the signer's keyAlgo tag and the key-load error label.
+// Per-route signer algorithm labels — one authoritative string each (Constitution III), used as the
+// key-load error label.
 const (
 	algoRSA   = "RSA"
 	algoECDSA = "EcdsaP256"
@@ -62,7 +62,6 @@ func bodyErrorStatus(err error) int {
 // signs the 32-byte to-be-signed digest. RSA → PKCS#1 v1.5(SHA-256); ECDSA P-256 → raw 64-byte r‖s
 // (the real CSC-v2 wire form; the SDK core's ecdsa_signature_to_der normalizes it).
 type signer struct {
-	keyAlgo   string // "RSA" | "EcdsaP256"
 	certDER   []byte // signer-<algo>.cert.der
 	algoOID   string // credentials/info key.algo OID
 	subjectDN string // credentials/info cert.subjectDN
@@ -81,7 +80,6 @@ func rsaSigner(pkiDir string) (*signer, error) {
 		return nil, err
 	}
 	return &signer{
-		keyAlgo:   algoRSA,
 		certDER:   certDER,
 		algoOID:   "1.2.840.113549.1.1.1", // rsaEncryption
 		subjectDN: "CN=Jane Doe,serialNumber=PNONL-123",
@@ -104,7 +102,6 @@ func ecSigner(pkiDir string) (*signer, error) {
 		return nil, err
 	}
 	return &signer{
-		keyAlgo:   algoECDSA,
 		certDER:   certDER,
 		algoOID:   "1.2.840.10045.2.1", // id-ecPublicKey
 		subjectDN: "CN=John Roe,serialNumber=PNONL-456",

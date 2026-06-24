@@ -107,7 +107,6 @@ jobs:
           REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           # B-T is exercised only when a TSA URL secret is present (a missing TSA must NOT block B-B).
           REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
-          REFSVC_API_KEY: ${{ secrets.LIVE_API_KEY }}
         run: |
           export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
           # -run Live covers exactly the configured REFSVC_CSC_API algorithm for this leg; "both" is

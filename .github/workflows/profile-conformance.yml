@@ -123,7 +123,10 @@ jobs:
           SVC_PORT=8080
 
           # Boot the mock upstream once (it serves both /csc/v1 RSA and /csc/v2 ECDSA routes + TSA).
-          REFMOCK_FIXTURES_DIR="$GITHUB_WORKSPACE/tests/fixtures/upstream" \
+          # REFMOCK_FIXTURES_DIR is the dir that CONTAINS upstream/ and pki/ (the mock joins those
+          # subdirs itself — see mock.New/readFixturesAndPKI), so point it at tests/fixtures, NOT
+          # tests/fixtures/upstream (matching findFixtures in the in-process tests).
+          REFMOCK_FIXTURES_DIR="$GITHUB_WORKSPACE/tests/fixtures" \
           REFMOCK_LISTEN=":$MOCK_PORT" \
             "$RUNNER_TEMP/mockupstream" &
           MOCK_PID=$!

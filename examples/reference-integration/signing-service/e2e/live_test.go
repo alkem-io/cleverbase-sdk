@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,10 +72,10 @@ func liveAuthorizer(t *testing.T, e liveEnv) Authorizer {
 	case config.AuthorizerHeadless:
 		return Headless{}
 	case config.AuthorizerInteractive, "":
-		// Per-leg capture: runFlow calls Authorize twice (service-scope, then SCAL2). Each call must
-		// stand up its OWN one-shot capture so a leg-1 callback (state=S1) can never be read by leg-2
-		// and trip the CSRF guard. liveInteractive builds a fresh Interactive (fresh listener) per
-		// Authorize call.
+		// runFlow calls Authorize twice (service-scope, then SCAL2). The listener is bound ONCE for the
+		// whole flow and reused across both legs (no per-leg rebind on the same host:port → no EADDRINUSE
+		// race), while a FRESH one-shot capture channel is installed per leg so a leg-1 callback (state=S1)
+		// can never be read by leg-2 and trip the CSRF guard.
 		return &liveInteractive{
 			t:           t,
 			redirectURI: e.redirectURI,
@@ -89,33 +90,132 @@ func liveAuthorizer(t *testing.T, e liveEnv) Authorizer {
 	}
 }
 
-// liveInteractive is the live-harness Authorizer that wraps Interactive with a fresh per-call capture.
-// runFlow drives two redirects (service-scope, then SCAL2) by calling Authorize twice; a single shared
-// buffered capture channel would let a stale leg-1 callback be read by leg-2, tripping the CSRF
-// state-mismatch guard. liveInteractive instead stands up a brand-new one-shot capture on each call so
-// every leg sees only its own callback, and it surfaces a listener/bind failure promptly (rather than
-// blaming the signer for a timeout).
+// liveInteractive is the live-harness Authorizer that wraps Interactive. runFlow drives two redirects
+// (service-scope, then SCAL2) by calling Authorize twice. The redirect-capture listener is bound ONCE
+// for the whole flow (lazily, on the first Authorize) and REUSED across both legs — re-binding a fresh
+// listener per leg on the same loopback host:port races leg-1's asynchronous close and hits EADDRINUSE.
+// Cross-leg CSRF poisoning is still prevented by installing a FRESH one-shot capture channel per leg:
+// the listener lifecycle (per-flow, closed at t.Cleanup) is decoupled from the per-leg callback channel,
+// so a stale leg-1 callback can never be read by leg-2. A listener/bind failure is surfaced promptly as
+// a distinct error (rather than blaming the signer for a timeout).
 type liveInteractive struct {
 	t           *testing.T
 	redirectURI string
 	surface     func(authorizeURL string)
 	timeout     time.Duration
+
+	cap *redirectCapture // bound once, lazily, on the first Authorize and reused across legs
 }
 
-// Authorize stands up a fresh one-shot redirect capture for THIS leg, then delegates to Interactive.
-// A listener/bind failure is surfaced immediately as a distinct error (never waited out as a signer
-// timeout). The capture is bound to the call's context so its listener is closed (no leak) on timeout.
+// Authorize binds the shared redirect-capture listener once (on the first call), then installs a FRESH
+// one-shot capture channel for THIS leg and delegates to Interactive. A bind failure is surfaced before
+// the URL is surfaced so it fails fast (FR-011) rather than being waited out as a signer timeout.
 func (l *liveInteractive) Authorize(ctx context.Context, authorizeURL, expectState string) (code, state string, err error) {
-	// Bind/start the capture before surfacing the URL so a bind failure fails fast (FR-011) rather than
-	// after the human has already been pointed at the authorize URL.
-	capCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ch, bindErr := startRedirectCapture(capCtx, l.t, l.redirectURI)
-	if bindErr != nil {
-		return "", "", bindErr
+	if l.cap == nil {
+		c, bindErr := startRedirectCapture(l.t, l.redirectURI)
+		if bindErr != nil {
+			return "", "", bindErr
+		}
+		l.cap = c
 	}
+	// Fresh per-leg channel: the long-lived handler routes the next callback here, so a leg-1 callback
+	// can never bleed into leg-2 (no cross-leg CSRF poisoning).
+	ch := l.cap.nextLeg()
 	i := Interactive{Surface: l.surface, CaptureCallback: ch, Timeout: l.timeout}
 	return i.Authorize(ctx, authorizeURL, expectState)
+}
+
+// redirectCapture owns the single per-flow loopback HTTP listener and routes each browser callback to
+// the CURRENT leg's one-shot channel (swapped between legs via nextLeg). Decoupling the listener
+// lifecycle (bound once, closed at t.Cleanup) from the per-leg channel is what kills both the per-leg
+// rebind race (no re-Listen on the same port) and cross-leg CSRF poisoning (each leg sees only its own
+// callback).
+type redirectCapture struct {
+	active atomic.Pointer[chan string] // the current leg's one-shot capture channel
+}
+
+// nextLeg installs and returns a FRESH one-shot (buffered, cap 1) capture channel for the next leg,
+// replacing any previous one. The handler reads the active pointer per request, so the swap takes effect
+// without re-binding the listener.
+func (c *redirectCapture) nextLeg() <-chan string {
+	ch := make(chan string, 1)
+	c.active.Store(&ch)
+	return ch
+}
+
+// isLoopbackHost reports whether host is a loopback target: localhost, or an IP in 127.0.0.0/8 or ::1.
+// A non-loopback host (e.g. 0.0.0.0 / all interfaces, or a routable address) is rejected so the capture
+// listener is never exposed off-box.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// startRedirectCapture binds the single per-flow loopback HTTP listener on REFSVC_REDIRECT_URI's
+// host:port and returns a redirectCapture that routes each callback to the leg's current one-shot
+// channel. The handler reconstructs the full callback URL with the request's ACTUAL scheme (http for a
+// loopback listener, so it matches reality).
+//
+// The loopback listener is the only supported capture path: a non-loopback host, a non-http(s) scheme,
+// or a bind failure is returned synchronously as a distinct error so the caller fails FAST (a silent
+// no-callback would otherwise be misread as "the signer did not approve in time", FR-011). The listener
+// is closed at test cleanup, so nothing leaks.
+func startRedirectCapture(t *testing.T, redirectURI string) (*redirectCapture, error) {
+	t.Helper()
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		return nil, errors.New("REFSVC_REDIRECT_URI is not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("redirect-capture requires an http(s) loopback REFSVC_REDIRECT_URI (got scheme %q)", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("redirect-capture requires an http(s) loopback REFSVC_REDIRECT_URI with a host")
+	}
+	// Enforce loopback: scheme + non-empty host is NOT enough — 0.0.0.0 (all interfaces) or a routable
+	// host would expose the capture listener off-box. Only a loopback host may be bound.
+	if !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("redirect-capture requires a LOOPBACK host (127.0.0.0/8, ::1, or localhost), got %q", u.Hostname())
+	}
+	// Bind eagerly so a bind error surfaces NOW (a distinct listener error), not as a silent timeout the
+	// signer gets blamed for.
+	ln, lerr := net.Listen("tcp", u.Host)
+	if lerr != nil {
+		return nil, fmt.Errorf("redirect-capture listener bind failed on %s: %w", u.Host, lerr)
+	}
+	c := &redirectCapture{}
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			// Only a real OIDC callback carries a `code` or an `error`. Ignore everything else (favicon,
+			// preflight, stray probes) so a non-callback request can never win the buffered channel and
+			// feed a code-less callback that drops the real one (A4 capture-handler poisoning).
+			if q.Get("code") == "" && q.Get("error") == "" {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
+			if ap := c.active.Load(); ap != nil {
+				select {
+				case *ap <- scheme + "://" + r.Host + r.URL.RequestURI():
+				default:
+				}
+			}
+			_, _ = io.WriteString(w, "authorization received — you may close this tab")
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return c, nil
 }
 
 // liveAuthTimeout reads REFSVC_LIVE_AUTH_TIMEOUT (default 3m): the window a human has to approve.
@@ -126,55 +226,6 @@ func liveAuthTimeout() time.Duration {
 		}
 	}
 	return 3 * time.Minute
-}
-
-// startRedirectCapture stands up a fresh ONE-SHOT capture for a single Authorize leg. It binds a
-// loopback HTTP listener on REFSVC_REDIRECT_URI's host:port and returns a channel that yields the full
-// callback request URL — reconstructed with the request's ACTUAL scheme (http for a loopback listener,
-// so it matches reality) — when Cleverbase redirects the browser back.
-//
-// The loopback listener is the only supported capture path: a non-loopback / non-http(s) redirect URI,
-// or a bind failure, is returned synchronously as a distinct error so the caller fails FAST (a silent
-// no-callback would otherwise be misread as "the signer did not approve in time", FR-011). The listener
-// is closed when ctx is done (the leg's timeout) or at test cleanup, so nothing leaks — there is no
-// uninterruptible stdin reader to strand.
-func startRedirectCapture(ctx context.Context, t *testing.T, redirectURI string) (<-chan string, error) {
-	t.Helper()
-	u, err := url.Parse(redirectURI)
-	if err != nil {
-		return nil, fmt.Errorf("REFSVC_REDIRECT_URI is not a valid URL: %w", err)
-	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("redirect-capture requires an http(s) loopback REFSVC_REDIRECT_URI with a host (got scheme %q, host %q)", u.Scheme, u.Host)
-	}
-	// Bind eagerly so a bind error surfaces NOW (a distinct listener error), not as a silent timeout the
-	// signer gets blamed for.
-	ln, lerr := net.Listen("tcp", u.Host)
-	if lerr != nil {
-		return nil, fmt.Errorf("redirect-capture listener bind failed on %s: %w", u.Host, lerr)
-	}
-	ch := make(chan string, 1)
-	srv := &http.Server{
-		ReadHeaderTimeout: 10 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			scheme := "http"
-			if r.TLS != nil {
-				scheme = "https"
-			}
-			select {
-			case ch <- scheme + "://" + r.Host + r.URL.RequestURI():
-			default:
-			}
-			_, _ = io.WriteString(w, "authorization received — you may close this tab")
-		}),
-	}
-	go func() { _ = srv.Serve(ln) }()
-	go func() {
-		<-ctx.Done()
-		_ = srv.Close()
-	}()
-	t.Cleanup(func() { _ = srv.Close() })
-	return ch, nil
 }
 
 // buildLiveService wires the SAME service used in fixtures mode but in live mode (no host rewrite):
