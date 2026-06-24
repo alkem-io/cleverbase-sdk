@@ -7,8 +7,18 @@
  * carries are opaque correlation ids, redirect URLs, and the OAuth `code`/`state`.
  */
 
+/**
+ * Terminal or in-progress status of a signing session, as reported by the integrator's backend.
+ *
+ * - `pending` — session created, signer has not yet authorized.
+ * - `authorizing` — signer is in an authorization redirect (service- or credential-scope step).
+ * - `completed` — the signature was produced.
+ * - `declined` — the signer declined (e.g. OAuth `access_denied`).
+ * - `failed` — the session failed for any other reason.
+ */
 export type SignStatus = "pending" | "authorizing" | "completed" | "declined" | "failed";
 
+/** Configuration for a {@link SigningHelper}: the integrator's backend endpoints plus injectable browser primitives. */
 export interface SigningHelperOptions {
   /** Backend endpoint that starts a signing session and returns `{ redirectUrl, correlationId }`. */
   startUrl: string;
@@ -26,8 +36,11 @@ export interface SigningHelperOptions {
   navigate?: (url: string) => void;
 }
 
+/** Result of {@link SigningHelper.start}: where to send the signer next, plus the session id to poll. */
 export interface StartResult {
+  /** Authorization URL the signer's browser must be sent to (drive it with `goToAuthorization`). */
   redirectUrl: string;
+  /** Opaque id for this signing session, used to poll status via {@link SigningHelper.pollStatus}. */
   correlationId: string;
 }
 
@@ -37,21 +50,39 @@ export interface StartResult {
  * complete; the frontend drives it with `goToAuthorization(result.redirectUrl)`.
  */
 export interface CompleteResult {
+  /** Current status of the signing session after the redirect return was processed. */
   status: SignStatus;
+  /**
+   * When present, a SECOND authorization redirect (credential-scope / SCAL2 step) is required;
+   * drive it with `goToAuthorization(redirectUrl)`. Absent once no further redirect is needed.
+   */
   redirectUrl?: string;
 }
 
+/**
+ * Drives a Cleverbase signing session from the browser by talking only to the integrator's own
+ * backend. It performs no cryptography and handles no secrets, tokens, session handles, or private
+ * keys — it carries only opaque correlation ids, redirect URLs, and the OAuth `code`/`state`.
+ */
 export class SigningHelper {
   private readonly fetchImpl: typeof fetch;
   private readonly navigate: (url: string) => void;
 
+  /**
+   * Create a helper bound to the integrator's backend endpoints.
+   *
+   * @param opts - Backend endpoints plus optional injectable `fetch`/navigation primitives.
+   */
   constructor(private readonly opts: SigningHelperOptions) {
     // Resolve global fetch lazily: a caller that only uses goToAuthorization/navigate must not be
     // forced to have a global fetch at construction time (Node <18, some SSR/test runtimes).
     this.fetchImpl =
       opts.fetchImpl ??
       ((input: RequestInfo | URL, init?: RequestInit) => {
-        const f = globalThis.fetch;
+        // The DOM lib types `globalThis.fetch` as always present, but at runtime it can be absent
+        // (Node <18, some SSR/test runtimes). Read it through a type that admits `undefined` so the
+        // runtime guard below is genuine rather than flagged as a dead branch.
+        const f = (globalThis as { fetch?: typeof fetch }).fetch;
         if (!f) throw new Error("no global fetch available; pass opts.fetchImpl");
         return f(input, init);
       });
@@ -125,5 +156,7 @@ export class SigningHelper {
  * when absent (so the shape is exact under `exactOptionalPropertyTypes`).
  */
 function toCompleteResult(data: CompleteResult): CompleteResult {
-  return data.redirectUrl ? { status: data.status, redirectUrl: data.redirectUrl } : { status: data.status };
+  return data.redirectUrl
+    ? { status: data.status, redirectUrl: data.redirectUrl }
+    : { status: data.status };
 }

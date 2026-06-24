@@ -65,13 +65,13 @@ func TestConcurrentViewAndUpdateRaceFree(t *testing.T) {
 	s := m.New("c", "st", "B-B", time.Minute)
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 2000; i++ {
+		for range 2000 {
 			m.Update(s, func() { s.Status = StatusCompleted; s.ResultPDF = []byte("pdf") })
 			m.ResumeView(s)
 		}
 		close(done)
 	}()
-	for i := 0; i < 2000; i++ {
+	for range 2000 {
 		_, _ = m.ViewByID("c")
 	}
 	<-done

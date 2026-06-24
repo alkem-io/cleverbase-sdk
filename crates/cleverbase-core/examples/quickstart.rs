@@ -6,6 +6,11 @@
 //! redirect). A real integrator then performs each emitted HTTP effect / redirect and calls
 //! `resume` with the result until it gets `Step::Done { signed, evidence }`.
 
+// A runnable usage example: printing to stdout and `expect`-ing on a hard-coded happy path is the
+// point of the demo, so the library's strict no-print / no-expect restriction lints are relaxed
+// here only.
+#![allow(clippy::print_stdout, clippy::expect_used)]
+
 use cleverbase_core::{
     begin, ConformanceLevel, CscApi, Environment, HostContext, Secret, SigningRequest, Step,
     TrustServiceConfiguration,

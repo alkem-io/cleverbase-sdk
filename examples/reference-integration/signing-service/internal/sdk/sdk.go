@@ -7,10 +7,11 @@ import (
 	"crypto/rand"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
+
 	bindings "github.com/alkem-io/cleverbase-sdk/bindings/go"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/config"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/flow"
-	"github.com/fxamacker/cbor/v2"
 )
 
 // Adapter wraps the binding with a fixed trust-service config.
@@ -61,7 +62,7 @@ func (a *Adapter) Begin(document []byte, conformance string, opts *flow.Options)
 }
 
 // ResumeRedirect advances after a redirect return with code+state.
-func (a *Adapter) ResumeRedirect(handle []byte, code, state string) (flow.Result, error) {
+func (*Adapter) ResumeRedirect(handle []byte, code, state string) (flow.Result, error) {
 	s, err := bindings.ResumeRedirect(cbor.RawMessage(handle), code, state, now(), entropy())
 	if err != nil {
 		return flow.Result{}, err
@@ -70,7 +71,7 @@ func (a *Adapter) ResumeRedirect(handle []byte, code, state string) (flow.Result
 }
 
 // ResumeRedirectError advances after a redirect return carrying an OAuth error.
-func (a *Adapter) ResumeRedirectError(handle []byte, oauthError, state string) (flow.Result, error) {
+func (*Adapter) ResumeRedirectError(handle []byte, oauthError, state string) (flow.Result, error) {
 	s, err := bindings.ResumeRedirectError(cbor.RawMessage(handle), oauthError, state, now(), entropy())
 	if err != nil {
 		return flow.Result{}, err
@@ -79,7 +80,7 @@ func (a *Adapter) ResumeRedirectError(handle []byte, oauthError, state string) (
 }
 
 // ResumeHTTP advances after performing an HTTP effect.
-func (a *Adapter) ResumeHTTP(handle []byte, status int, body []byte) (flow.Result, error) {
+func (*Adapter) ResumeHTTP(handle []byte, status int, body []byte) (flow.Result, error) {
 	s, err := bindings.ResumeHTTP(cbor.RawMessage(handle), status, body, now(), entropy())
 	if err != nil {
 		return flow.Result{}, err

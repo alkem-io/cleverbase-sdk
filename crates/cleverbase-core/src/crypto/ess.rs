@@ -8,12 +8,14 @@ use der::Sequence;
 /// issuerSerial. `cert_hash` is `sha256(DER(signer certificate))`.
 #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
 pub struct EssCertIdV2 {
+    /// `sha256(DER(signer certificate))`.
     pub cert_hash: OctetString,
 }
 
 /// `SigningCertificateV2 ::= SEQUENCE { certs SEQUENCE OF ESSCertIDv2 }` (policies omitted).
 #[derive(Clone, Debug, Eq, PartialEq, Sequence)]
 pub struct SigningCertificateV2 {
+    /// The `ESSCertIDv2` entries (the signer leaf certificate).
     pub certs: Vec<EssCertIdV2>,
 }
 

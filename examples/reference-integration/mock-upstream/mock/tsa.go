@@ -8,6 +8,14 @@ import (
 	"path/filepath"
 )
 
+// openssl flags reused across the DER→PEM materialization steps.
+const (
+	flagInform = "-inform"
+	flagIn     = "-in"
+	flagOut    = "-out"
+	formatDER  = "DER"
+)
+
 // tsaConfig is an openssl `ts` configuration referencing PEMs materialized into the work dir.
 const tsaConfig = `[tsa]
 default_tsa = tsa_config1
@@ -44,11 +52,12 @@ func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = os.RemoveAll(work) }()
 
-	der2pem := func(args ...string) error { return exec.Command("openssl", args...).Run() }
+	ctx := r.Context()
+	der2pem := func(args ...string) error { return exec.CommandContext(ctx, "openssl", args...).Run() }
 	steps := [][]string{
-		{"x509", "-inform", "DER", "-in", filepath.Join(s.pkiDir, "tsa.cert.der"), "-out", filepath.Join(work, "tsa.cert.pem")},
-		{"x509", "-inform", "DER", "-in", filepath.Join(s.pkiDir, "ca.cert.der"), "-out", filepath.Join(work, "ca.cert.pem")},
-		{"pkey", "-inform", "DER", "-in", filepath.Join(s.pkiDir, "tsa.key.pk8"), "-out", filepath.Join(work, "tsa.key.pem")},
+		{"x509", flagInform, formatDER, flagIn, filepath.Join(s.pkiDir, "tsa.cert.der"), flagOut, filepath.Join(work, "tsa.cert.pem")},
+		{"x509", flagInform, formatDER, flagIn, filepath.Join(s.pkiDir, "ca.cert.der"), flagOut, filepath.Join(work, "ca.cert.pem")},
+		{"pkey", flagInform, formatDER, flagIn, filepath.Join(s.pkiDir, "tsa.key.pk8"), flagOut, filepath.Join(work, "tsa.key.pem")},
 	}
 	for _, st := range steps {
 		if err := der2pem(st...); err != nil {
@@ -68,7 +77,7 @@ func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsa query", http.StatusInternalServerError)
 		return
 	}
-	cmd := exec.Command("openssl", "ts", "-reply", "-config", "tsa.cnf", "-queryfile", "req.tsq", "-out", "resp.tsr")
+	cmd := exec.CommandContext(ctx, "openssl", "ts", "-reply", "-config", "tsa.cnf", "-queryfile", "req.tsq", flagOut, "resp.tsr")
 	cmd.Dir = work
 	if out, err := cmd.CombinedOutput(); err != nil {
 		http.Error(w, "openssl ts -reply: "+string(out), http.StatusInternalServerError)

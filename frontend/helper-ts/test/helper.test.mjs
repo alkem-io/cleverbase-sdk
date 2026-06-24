@@ -83,7 +83,8 @@ test("complete returns a second authorization redirect; the page drives it", asy
     if (url.includes("/complete")) {
       return {
         status: "authorizing",
-        redirectUrl: "https://connect.acc.cleverbase.com/oauth2/authorize?scope=credential&state=s2",
+        redirectUrl:
+          "https://connect.acc.cleverbase.com/oauth2/authorize?scope=credential&state=s2",
       };
     }
     return {};

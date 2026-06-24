@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	"github.com/fxamacker/cbor/v2"
@@ -31,19 +32,31 @@ import (
 
 const schemaVersion = 1
 
-// Decode nested CBOR maps as map[string]interface{} (not the default map[interface{}]interface{}),
-// so callers can index Step fields with string keys.
-var decMode cbor.DecMode
+// Wire-envelope keys shared across the op requests, factored out so the request shape has a single
+// authoritative spelling (Constitution Principle III).
+const (
+	keyOp      = "op"
+	keyHandle  = "handle"
+	keyInput   = "input"
+	keyCtx     = "ctx"
+	keyKind    = "kind"
+	keyEntropy = "entropy"
+	keyNowUnix = "now_unix"
+	opResume   = "resume"
+)
 
-func init() {
-	var err error
-	decMode, err = cbor.DecOptions{
-		DefaultMapType: reflect.TypeOf(map[string]interface{}(nil)),
+// decMode decodes nested CBOR maps as map[string]any (not the default map[any]any), so callers can
+// index Step fields with string keys. It is built once on first use; the options are static and
+// cannot fail at runtime, but the error is surfaced as a panic rather than ignored.
+var decMode = sync.OnceValue(func() cbor.DecMode {
+	m, err := cbor.DecOptions{
+		DefaultMapType: reflect.TypeOf(map[string]any(nil)),
 	}.DecMode()
 	if err != nil {
 		panic(err)
 	}
-}
+	return m
+})
 
 // Config identifies the Cleverbase environment and OAuth client.
 type Config struct {
@@ -102,7 +115,7 @@ type RequestOptions struct {
 }
 
 // Step is the next action the host must perform (a decoded CBOR map: "kind" plus fields).
-type Step = map[string]interface{}
+type Step = map[string]any
 
 // Session is the opaque, serializable handle plus the latest Step.
 type Session struct {
@@ -115,14 +128,18 @@ type okResult struct {
 	Step   Step            `cbor:"step"`
 }
 
+type wireError struct {
+	Message string `cbor:"message"`
+}
+
+type wireResult struct {
+	Ok  *okResult  `cbor:"ok"`
+	Err *wireError `cbor:"err"`
+}
+
 type wireResponse struct {
-	SchemaVersion int `cbor:"schema_version"`
-	Result        struct {
-		Ok  *okResult `cbor:"ok"`
-		Err *struct {
-			Message string `cbor:"message"`
-		} `cbor:"err"`
-	} `cbor:"result"`
+	SchemaVersion int        `cbor:"schema_version"`
+	Result        wireResult `cbor:"result"`
 }
 
 // process calls the Rust core with a CBOR request envelope and returns the CBOR response.
@@ -144,8 +161,8 @@ func process(input []byte) ([]byte, error) {
 	return C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen)), nil
 }
 
-func dispatch(op map[string]interface{}) (*Session, error) {
-	req := map[string]interface{}{"schema_version": schemaVersion, "op": op}
+func dispatch(op map[string]any) (*Session, error) {
+	req := map[string]any{"schema_version": schemaVersion, keyOp: op}
 	in, err := cbor.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -155,7 +172,7 @@ func dispatch(op map[string]interface{}) (*Session, error) {
 		return nil, err
 	}
 	var resp wireResponse
-	if err := decMode.Unmarshal(out, &resp); err != nil {
+	if err := decMode().Unmarshal(out, &resp); err != nil {
 		return nil, err
 	}
 	// Refuse a response from an unexpected schema version rather than silently mis-decoding it
@@ -175,7 +192,7 @@ func dispatch(op map[string]interface{}) (*Session, error) {
 // BeginSigning starts a signing flow and returns the first Step. Pass opts (or nil) for the
 // optional expected-signer / appearance / signature-metadata parts of the request.
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error) {
-	config := map[string]interface{}{
+	config := map[string]any{
 		"environment":   cfg.Environment,
 		"csc_api":       cfg.CscAPI,
 		"client_id":     cfg.ClientID,
@@ -183,7 +200,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 		"redirect_uri":  cfg.RedirectURI,
 	}
 	if cfg.TsaURL != "" {
-		tsa := map[string]interface{}{"url": cfg.TsaURL}
+		tsa := map[string]any{"url": cfg.TsaURL}
 		if cfg.TsaAuth != "" {
 			tsa["auth"] = cfg.TsaAuth
 		}
@@ -192,7 +209,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 		}
 		config["tsa"] = tsa
 	}
-	request := map[string]interface{}{"document": document, "conformance_level": conformance}
+	request := map[string]any{"document": document, "conformance_level": conformance}
 	if opts != nil {
 		if opts.ExpectedSigner != nil {
 			request["expected_signer"] = opts.ExpectedSigner
@@ -204,21 +221,21 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 			request["signature_meta"] = opts.SignatureMeta
 		}
 	}
-	return dispatch(map[string]interface{}{
-		"op":      "begin",
+	return dispatch(map[string]any{
+		keyOp:     "begin",
 		"request": request,
 		"config":  config,
-		"ctx":     map[string]interface{}{"now_unix": nowUnix, "entropy": entropy},
+		keyCtx:    map[string]any{keyNowUnix: nowUnix, keyEntropy: entropy},
 	})
 }
 
 // ResumeRedirect advances the flow with the OAuth code+state from a redirect return.
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error) {
-	return dispatch(map[string]interface{}{
-		"op":     "resume",
-		"handle": handle,
-		"input":  map[string]interface{}{"kind": "redirect_return", "code": code, "state": state},
-		"ctx":    map[string]interface{}{"now_unix": nowUnix, "entropy": entropy},
+	return dispatch(map[string]any{
+		keyOp:     opResume,
+		keyHandle: handle,
+		keyInput:  map[string]any{keyKind: "redirect_return", "code": code, "state": state},
+		keyCtx:    map[string]any{keyNowUnix: nowUnix, keyEntropy: entropy},
 	})
 }
 
@@ -226,20 +243,20 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 // of a code (e.g. "access_denied" when the signer declines), yielding a terminal Declined or
 // AuthorizationExpired outcome.
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error) {
-	return dispatch(map[string]interface{}{
-		"op":     "resume",
-		"handle": handle,
-		"input":  map[string]interface{}{"kind": "redirect_error", "error": oauthError, "state": state},
-		"ctx":    map[string]interface{}{"now_unix": nowUnix, "entropy": entropy},
+	return dispatch(map[string]any{
+		keyOp:     opResume,
+		keyHandle: handle,
+		keyInput:  map[string]any{keyKind: "redirect_error", "error": oauthError, "state": state},
+		keyCtx:    map[string]any{keyNowUnix: nowUnix, keyEntropy: entropy},
 	})
 }
 
 // ResumeHTTP advances the flow with the result of a performed HTTP effect.
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error) {
-	return dispatch(map[string]interface{}{
-		"op":     "resume",
-		"handle": handle,
-		"input":  map[string]interface{}{"kind": "http_result", "status": status, "headers": []interface{}{}, "body": body},
-		"ctx":    map[string]interface{}{"now_unix": nowUnix, "entropy": entropy},
+	return dispatch(map[string]any{
+		keyOp:     opResume,
+		keyHandle: handle,
+		keyInput:  map[string]any{keyKind: "http_result", "status": status, "headers": []any{}, "body": body},
+		keyCtx:    map[string]any{keyNowUnix: nowUnix, keyEntropy: entropy},
 	})
 }

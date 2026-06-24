@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	mock "github.com/alkem-io/cleverbase-sdk/examples/reference-integration/mock-upstream/mock"
+	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/mock-upstream/mock"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/config"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/flow"
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/httpapi"
@@ -38,7 +38,7 @@ const apiKey = "e2e-key"
 func repoFixtures(t *testing.T) string {
 	t.Helper()
 	dir, _ := os.Getwd()
-	for i := 0; i < 12; i++ {
+	for range 12 {
 		cand := filepath.Join(dir, "tests", "fixtures")
 		if st, err := os.Stat(filepath.Join(cand, "upstream")); err == nil && st.IsDir() {
 			return cand
@@ -91,20 +91,20 @@ func stack(t *testing.T, conformance string) *httptest.Server {
 	return buildService(t, conformance, mockSrv.URL)
 }
 
-func postJSON(t *testing.T, url, body string) map[string]any {
+func postJSON(t *testing.T, rawURL, body string) map[string]any {
 	t.Helper()
-	req, _ := http.NewRequest("POST", url, strings.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("post %s: %v", url, err)
+		t.Fatalf("post %s: %v", rawURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var m map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&m)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("post %s: status %d body %v", url, resp.StatusCode, m)
+		t.Fatalf("post %s: status %d body %v", rawURL, resp.StatusCode, m)
 	}
 	return m
 }
@@ -151,7 +151,7 @@ func runFlow(t *testing.T, svc *httptest.Server, startBody string) (pdf []byte, 
 		return nil, "", status, reason
 	}
 
-	req, _ := http.NewRequest("GET", svc.URL+"/v1/sign/result?correlationId="+corr, nil)
+	req, _ := http.NewRequest(http.MethodGet, svc.URL+"/v1/sign/result?correlationId="+corr, nil)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -169,11 +169,11 @@ var byteRangeRE = regexp.MustCompile(`/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+
 
 // validateCMS extracts the PAdES ByteRange + /Contents and verifies the detached CMS with OpenSSL
 // against the synthetic CA. Returns an error describing any failure.
-func validateCMS(t *testing.T, pdf []byte, requireTimestamp bool) {
+func validateCMS(t *testing.T, pdf []byte) {
 	t.Helper()
 	m := byteRangeRE.FindSubmatch(pdf)
 	if m == nil {
-		t.Fatalf("no /ByteRange in signed PDF")
+		t.Fatal("no /ByteRange in signed PDF")
 	}
 	n := func(b []byte) int { v, _ := strconv.Atoi(string(b)); return v }
 	a, b, c, d := n(m[1]), n(m[2]), n(m[3]), n(m[4])
@@ -205,12 +205,20 @@ func validateCMS(t *testing.T, pdf []byte, requireTimestamp bool) {
 	if err != nil {
 		t.Fatalf("openssl cms -verify failed: %v\n%s", err, out)
 	}
-	if requireTimestamp {
-		// A B-T signature embeds an RFC 3161 token as an unsigned attribute (1.2.840.113549.1.9.16.2.14).
-		info, _ := exec.Command("openssl", "cms", "-cmsout", "-inform", "DER", "-in", sigDER, "-print").CombinedOutput()
-		if !strings.Contains(string(info), "1.2.840.113549.1.9.16.2.14") {
-			t.Fatalf("B-T signature missing timestamp token attribute:\n%s", info)
-		}
+}
+
+// assertTimestampToken checks that a B-T signature embeds an RFC 3161 signature-timestamp token as
+// an unsigned attribute (OID 1.2.840.113549.1.9.16.2.14).
+func assertTimestampToken(t *testing.T, pdf []byte) {
+	t.Helper()
+	work := t.TempDir()
+	sigDER := filepath.Join(work, "sig.der")
+	if err := os.WriteFile(sigDER, extractContents(t, pdf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := exec.Command("openssl", "cms", "-cmsout", "-inform", "DER", "-in", sigDER, "-print").CombinedOutput()
+	if !strings.Contains(string(info), "1.2.840.113549.1.9.16.2.14") {
+		t.Fatalf("B-T signature missing timestamp token attribute:\n%s", info)
 	}
 }
 
@@ -222,12 +230,12 @@ func extractContents(t *testing.T, pdf []byte) []byte {
 	if k < 0 {
 		t.Fatal("no /Contents in signed PDF")
 	}
-	lt := strings.IndexByte(string(pdf[k:]), '<')
+	lt := bytes.IndexByte(pdf[k:], '<')
 	if lt < 0 {
 		t.Fatal("no '<' after /Contents")
 	}
 	lt += k + 1
-	gt := strings.IndexByte(string(pdf[lt:]), '>')
+	gt := bytes.IndexByte(pdf[lt:], '>')
 	if gt < 0 {
 		t.Fatal("no '>' closing /Contents")
 	}
@@ -256,7 +264,7 @@ func derTotalLen(b []byte) int {
 		return len(b)
 	}
 	length := 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		length = length<<8 | int(b[2+i])
 	}
 	return 2 + n + length
@@ -291,7 +299,7 @@ func TestCredentialFreeBB(t *testing.T) {
 	if _, err := base64.StdEncoding.DecodeString(evidence); err != nil {
 		t.Fatalf("evidence header not base64: %v", err)
 	}
-	validateCMS(t, pdf, false)
+	validateCMS(t, pdf)
 }
 
 func TestCredentialFreeBT(t *testing.T) {
@@ -304,7 +312,8 @@ func TestCredentialFreeBT(t *testing.T) {
 	if status != "completed" || len(pdf) == 0 {
 		t.Fatalf("expected completed B-T PDF, got status=%s len=%d", status, len(pdf))
 	}
-	validateCMS(t, pdf, true)
+	validateCMS(t, pdf)
+	assertTimestampToken(t, pdf)
 }
 
 // TestUpstreamReceivesHashOnly proves the document never leaves the backend: every request the
@@ -343,12 +352,12 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 	rawDoc := samplePDF(t)
 	// Every common encoding a regression could smuggle the document in as.
 	encodings := []string{
-		base64.StdEncoding.EncodeToString(rawDoc),       // padded standard base64
-		base64.RawStdEncoding.EncodeToString(rawDoc),    // unpadded standard base64
-		base64.URLEncoding.EncodeToString(rawDoc),       // padded base64url
-		base64.RawURLEncoding.EncodeToString(rawDoc),    // unpadded base64url
+		base64.StdEncoding.EncodeToString(rawDoc),                  // padded standard base64
+		base64.RawStdEncoding.EncodeToString(rawDoc),               // unpadded standard base64
+		base64.URLEncoding.EncodeToString(rawDoc),                  // padded base64url
+		base64.RawURLEncoding.EncodeToString(rawDoc),               // unpadded base64url
 		url.QueryEscape(base64.StdEncoding.EncodeToString(rawDoc)), // form/query-escaped base64
-		hex.EncodeToString(rawDoc),                      // hex
+		hex.EncodeToString(rawDoc),                                 // hex
 	}
 	sawSignHash := false
 	for i, b := range bodies {

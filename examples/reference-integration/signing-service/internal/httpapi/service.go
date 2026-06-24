@@ -15,6 +15,9 @@ import (
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/session"
 )
 
+// keyStatus is the JSON field name carrying a session's status in API responses.
+const keyStatus = "status"
+
 // Service holds the engine + store + profile and serves the REST API.
 type Service struct {
 	Engine  *flow.Engine
@@ -55,13 +58,16 @@ func newCorrelationID() string {
 	return hex.EncodeToString(b)
 }
 
+// expectedSignerInput binds the request to a signer identity (FR-014).
+type expectedSignerInput struct {
+	MatchOn string `json:"matchOn"`
+	Value   string `json:"value"`
+}
+
 type startRequest struct {
-	Document         string `json:"document"` // base64 PDF; omit to use the bundled sample
-	ConformanceLevel string `json:"conformanceLevel"`
-	ExpectedSigner   *struct {
-		MatchOn string `json:"matchOn"`
-		Value   string `json:"value"`
-	} `json:"expectedSigner"`
+	Document         string               `json:"document"` // base64 PDF; omit to use the bundled sample
+	ConformanceLevel string               `json:"conformanceLevel"`
+	ExpectedSigner   *expectedSignerInput `json:"expectedSigner"`
 }
 
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +146,7 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "resume_failed", err.Error())
 		return
 	}
-	resp := map[string]any{"status": string(status)}
+	resp := map[string]any{keyStatus: string(status)}
 	if redirectURL != "" {
 		resp["redirectUrl"] = redirectURL
 	}
@@ -158,7 +164,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "unknown correlation id")
 		return
 	}
-	resp := map[string]any{"status": string(v.Status)}
+	resp := map[string]any{keyStatus: string(v.Status)}
 	// Per the API contract, `reason` is present only for a failed status.
 	if v.Status == session.StatusFailed && v.Reason != "" {
 		resp["reason"] = v.Reason
@@ -186,6 +192,6 @@ func (s *Service) handleResult(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(v.ResultPDF)
 }
 
-func (s *Service) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+func (*Service) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{keyStatus: "ok"})
 }

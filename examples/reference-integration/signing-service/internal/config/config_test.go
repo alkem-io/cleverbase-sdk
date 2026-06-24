@@ -37,7 +37,7 @@ func TestLoadFixturesDefaults(t *testing.T) {
 		t.Fatalf("default TTL = %v, want 15m", p.SessionTTL)
 	}
 	if !p.AuthEnabled {
-		t.Fatalf("auth should be enabled when API key is set")
+		t.Fatal("auth should be enabled when API key is set")
 	}
 }
 

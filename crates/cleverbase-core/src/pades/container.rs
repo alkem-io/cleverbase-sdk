@@ -23,18 +23,25 @@ const BYTE_RANGE_DUMMY: i64 = 9_999_999_999;
 /// Errors from PAdES container operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PadesError {
+    /// An error from the underlying PDF library.
     #[error("PDF error: {0}")]
     Pdf(#[from] lopdf::Error),
+    /// An I/O error while (re-)serializing the PDF.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The document has no pages to attach a signature to.
     #[error("document has no pages")]
     NoPages,
+    /// The requested visible-appearance placement was invalid (page or rectangle).
     #[error("invalid signature appearance placement")]
     InvalidPlacement,
+    /// A required placeholder (named) could not be located in the serialized PDF.
     #[error("could not locate {0} placeholder in serialized PDF")]
     Placeholder(&'static str),
+    /// The assembled CMS does not fit the `/Contents` placeholder (`actual` > `capacity` bytes).
     #[error("CMS too large for the /Contents placeholder ({0} > {1} bytes)")]
     CmsTooLarge(usize, usize),
+    /// The input document already carries a signature (multi-signature is a later phase).
     #[error("document already contains a signature")]
     AlreadySigned,
 }
@@ -77,17 +84,17 @@ pub struct PreparedSignature {
 }
 
 fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if from >= hay.len() {
-        return None;
-    }
-    hay[from..]
+    hay.get(from..)?
         .windows(needle.len())
         .position(|w| w == needle)
         .map(|p| p + from)
 }
 
 fn find_byte_from(hay: &[u8], b: u8, from: usize) -> Option<usize> {
-    hay[from..].iter().position(|&x| x == b).map(|p| p + from)
+    hay.get(from..)?
+        .iter()
+        .position(|&x| x == b)
+        .map(|p| p + from)
 }
 
 /// Find the first run of at least `min_len` ASCII `'0'` bytes starting at/after `from` — our
@@ -96,10 +103,10 @@ fn find_byte_from(hay: &[u8], b: u8, from: usize) -> Option<usize> {
 /// never be mistaken for the placeholder.
 fn find_zero_run(hay: &[u8], from: usize, min_len: usize) -> Option<(usize, usize)> {
     let mut i = from;
-    while i < hay.len() {
-        if hay[i] == b'0' {
+    while let Some(&b) = hay.get(i) {
+        if b == b'0' {
             let start = i;
-            while i < hay.len() && hay[i] == b'0' {
+            while hay.get(i) == Some(&b'0') {
                 i += 1;
             }
             if i - start >= min_len {
@@ -218,7 +225,9 @@ pub fn prepare(
     }
     let page_id = match appearance {
         Some(a) => *pages.get(&a.page).ok_or(PadesError::InvalidPlacement)?,
-        None => *pages.values().next().unwrap(),
+        // The empty-pages case returned NoPages above, so `next()` is Some; `ok_or` keeps the
+        // impossible case a clean error rather than a panicking `unwrap`.
+        None => *pages.values().next().ok_or(PadesError::NoPages)?,
     };
 
     // Signature dictionary (PAdES detached).
@@ -359,7 +368,13 @@ pub fn prepare(
     // pre-existing zero run in the original document content cannot be mistaken for it.
     let (z0, z1) = find_zero_run(&buf, br_key, MIN_CONTENTS_ZERO_RUN)
         .ok_or(PadesError::Placeholder("/Contents"))?;
-    if z0 == 0 || buf[z0 - 1] != b'<' || buf.get(z1) != Some(&b'>') {
+    // The zero run must be delimited by `< … >`. `.get` (not `[]`) keeps this off any panic path:
+    // the `'<'` immediately precedes z0 and the `'>'` sits at z1.
+    if z0 == 0
+        || buf.get(z0 - 1) != Some(&b'<')
+        || buf.get(z1) != Some(&b'>')
+        || br_close <= br_open + 1
+    {
         return Err(PadesError::Placeholder("/Contents delimiters"));
     }
 
@@ -373,11 +388,17 @@ pub fn prepare(
     }
     let mut padded = inner.into_bytes();
     padded.resize(span, b' ');
-    buf[br_open + 1..br_close].copy_from_slice(&padded);
+    // Patch the ByteRange integers in place; the slot is `(br_open, br_close)` exclusive, validated
+    // above. `get_mut` avoids a panicking index on a possibly-short buffer.
+    buf.get_mut(br_open + 1..br_close)
+        .ok_or(PadesError::Placeholder("/ByteRange slot"))?
+        .copy_from_slice(&padded);
 
-    let mut hasher_input = Vec::with_capacity(region1_len + region2_len);
-    hasher_input.extend_from_slice(&buf[..region1_len]);
-    hasher_input.extend_from_slice(&buf[region2_start..]);
+    let head = buf.get(..region1_len).unwrap_or_default();
+    let tail = buf.get(region2_start..).unwrap_or_default();
+    let mut hasher_input = Vec::with_capacity(head.len() + tail.len());
+    hasher_input.extend_from_slice(head);
+    hasher_input.extend_from_slice(tail);
     let content_hash = sha256(&hasher_input);
 
     Ok(PreparedSignature {
@@ -433,10 +454,16 @@ pub fn embed_cms(
     if hex_len > capacity {
         return Err(PadesError::CmsTooLarge(cms_der.len(), capacity / 2));
     }
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for (i, byte) in cms_der.iter().enumerate() {
-        staged_pdf[start + i * 2] = HEX[(byte >> 4) as usize];
-        staged_pdf[start + i * 2 + 1] = HEX[(byte & 0x0f) as usize];
+    // Write the hex into the validated `[start, end)` slot. `get_mut` (not `[]`) plus chunked
+    // iteration keeps this off any panic path even on a corrupted span.
+    let slot = staged_pdf
+        .get_mut(start..start + hex_len)
+        .ok_or(PadesError::Placeholder("/Contents span"))?;
+    for (pair, byte) in slot.chunks_exact_mut(2).zip(cms_der) {
+        if let [hi, lo] = pair {
+            *hi = crate::util::hex_digit(byte >> 4) as u8;
+            *lo = crate::util::hex_digit(byte & 0x0f) as u8;
+        }
     }
     Ok(())
 }

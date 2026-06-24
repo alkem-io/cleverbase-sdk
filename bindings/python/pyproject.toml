@@ -11,3 +11,21 @@ requires-python = ">=3.9"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[tool.mypy]
+# Strictest practical type checking for the Python binding (tests + stub). Run from this
+# directory: `mypy .`. The `cleverbase` runtime module is a compiled PyO3 extension with no
+# importable types, so it is type-checked against the hand-written `cleverbase.pyi` stub in this
+# directory; `mypy_path = "."` puts that stub on the search path. All other settings mirror
+# `--strict` and add a few extra-strict toggles. `python_version` is intentionally unset: the
+# 3.9 floor is already enforced by `requires-python` and ruff's `target-version`, and current
+# mypy refuses 3.9 as a checking target (it requires >=3.10).
+mypy_path = "."
+strict = true
+# Extra strictness beyond the `strict` preset.
+warn_unreachable = true
+strict_equality = true
+extra_checks = true
+# `cleverbase.pyi` is a stub for a compiled module with no runtime .py source; that is expected
+# and must not be flagged as a missing implementation.
+disable_error_code = ["empty-body"]

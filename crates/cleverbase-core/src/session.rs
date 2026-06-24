@@ -30,45 +30,61 @@ pub enum SigningPhase {
     SignPending,
     /// Awaiting the timestamp-authority HTTP response (B-T only).
     TimestampPending,
+    /// Terminal: the flow completed successfully.
     Completed,
+    /// Terminal: the flow failed (see the evidence record's outcome).
     Failed,
 }
 
 /// Opaque-to-the-integrator, serializable session state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SigningSessionHandle {
+    /// Wire schema version this handle was produced at ([`crate::SCHEMA_VERSION`]).
     pub schema_version: u32,
+    /// Current phase of the signing state machine.
     pub phase: SigningPhase,
     /// SHA-256 of the document bytes (hex), for correlation.
     pub request_digest: String,
+    /// Conformance level requested for this session.
     pub conformance_level: ConformanceLevel,
+    /// Correlation id for this session (derived from the begin-call entropy).
     pub correlation_id: String,
     /// OAuth `state` for the currently pending redirect, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// The selected CSC credential id, once discovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
 
     // ---- carried signing state (sensitive; encrypt at rest) ----
+    /// Service-scope Bearer token (sensitive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_token: Option<Secret>,
+    /// Signer certificate chain (DER, leaf first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_chain: Option<Vec<Vec<u8>>>,
+    /// Signing key algorithm family, from `credentials/info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_algo: Option<KeyAlgo>,
+    /// DER of the CMS signed attributes (the bytes whose hash is signed).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub signed_attrs_der: Option<Vec<u8>>,
+    /// The staged PDF (with ByteRange + `/Contents` placeholder) awaiting CMS embedding.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub staged_pdf: Option<Vec<u8>>,
+    /// Byte span (start, end) of the `/Contents` hex placeholder in `staged_pdf`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contents_span: Option<(usize, usize)>,
     /// Assembled CMS (without timestamp), carried from signing to the B-T timestamp step.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub cms_der: Option<Vec<u8>>,
+    /// Signing time (Unix seconds) recorded at the prepare step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_time_unix: Option<i64>,
+    /// The derived signer identity, once known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<SignerIdentity>,
+    /// Best-effort PDF/A indicator for the staged output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_a: Option<bool>,
 

@@ -23,7 +23,7 @@ func findFixtures(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 12; i++ {
+	for range 12 {
 		cand := filepath.Join(dir, "tests", "fixtures")
 		if st, err := os.Stat(filepath.Join(cand, "upstream")); err == nil && st.IsDir() {
 			return cand

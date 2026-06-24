@@ -16,7 +16,10 @@ fn e(msg: impl ToString) -> Error {
     Error::from_reason(msg.to_string())
 }
 
+/// Begin a signing flow. Returns a CBOR `{handle, step}` Buffer (decode-only for the caller).
 #[napi]
+// FFI entry point: the individual scalar args cross the napi boundary cleanly, where a params
+// struct would not; the signature mirrors the SDK's begin inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn begin_signing(
     document: Buffer,
@@ -55,6 +58,7 @@ pub fn begin_signing(
     Ok(encode_handle_step(&handle, &step).into())
 }
 
+/// Resume after a redirect return (OAuth `code` + `state`). Returns a CBOR `{handle, step}` Buffer.
 #[napi]
 pub fn resume_redirect(handle: Buffer, code: String, state: String, now_unix: f64, entropy: Buffer) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;
@@ -63,6 +67,7 @@ pub fn resume_redirect(handle: Buffer, code: String, state: String, now_unix: f6
     Ok(encode_handle_step(&handle, &step).into())
 }
 
+/// Resume after a redirect OAuth error (`error` + `state`). Returns a CBOR `{handle, step}` Buffer.
 #[napi]
 pub fn resume_redirect_error(handle: Buffer, error: String, state: String, now_unix: f64, entropy: Buffer) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;
@@ -71,6 +76,7 @@ pub fn resume_redirect_error(handle: Buffer, error: String, state: String, now_u
     Ok(encode_handle_step(&handle, &step).into())
 }
 
+/// Resume after performing an HTTP effect (status + body). Returns a CBOR `{handle, step}` Buffer.
 #[napi]
 pub fn resume_http(handle: Buffer, status: u16, body: Buffer, now_unix: f64, entropy: Buffer) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;

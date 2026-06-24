@@ -14,3 +14,7 @@ specs/**
 .claude/**
 *.md
 *.lock
+# Non-JS/TS assets outside the formatted surface (static demo HTML, CI workflows).
+*.yml
+*.yaml
+*.html

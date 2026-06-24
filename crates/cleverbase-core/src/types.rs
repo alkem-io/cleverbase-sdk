@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Secret(String);
 
 impl Secret {
+    /// Wrap a value as a redacted secret.
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
@@ -33,8 +34,10 @@ impl From<&str> for Secret {
 /// PAdES conformance level requested for a signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConformanceLevel {
+    /// PAdES-B-B (basic): signed attributes, signing certificate, no trusted timestamp.
     #[serde(rename = "B-B")]
     BB,
+    /// PAdES-B-T: B-B plus an RFC 3161 signature timestamp from a qualified TSA.
     #[serde(rename = "B-T")]
     BT,
 }
@@ -43,7 +46,9 @@ pub enum ConformanceLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Environment {
+    /// Cleverbase acceptance (test) environment.
     Acceptance,
+    /// Cleverbase production environment.
     Production,
 }
 
@@ -62,6 +67,7 @@ pub enum CscApi {
 // These mirror the `#[serde(rename = ...)]` values above; the `from_wire_matches_serde` test
 // asserts they stay in sync (Constitution Principle VIII).
 impl ConformanceLevel {
+    /// Parse the wire string (`"B-B"` / `"B-T"`) used by the language bindings. `None` if unknown.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "B-B" => Some(Self::BB),
@@ -72,6 +78,7 @@ impl ConformanceLevel {
 }
 
 impl Environment {
+    /// Parse the wire string (`"acceptance"` / `"production"`). `None` if unknown.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "acceptance" => Some(Self::Acceptance),
@@ -82,6 +89,7 @@ impl Environment {
 }
 
 impl CscApi {
+    /// Parse the wire string (`"v1_rsa"` / `"v2_ecdsa"`). `None` if unknown.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
             "v1_rsa" => Some(Self::V1Rsa),
@@ -108,8 +116,10 @@ pub enum MatchOn {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedSignerIdentity {
+    /// Which identity field the `value` is compared against.
     #[serde(default)]
     pub match_on: MatchOn,
+    /// The expected value (e.g. a certificate serial number or a `PNONL-…` subject identifier).
     pub value: String,
 }
 
@@ -117,9 +127,13 @@ pub struct ExpectedSignerIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rect {
+    /// Lower-left x coordinate, in PDF points.
     pub x: f64,
+    /// Lower-left y coordinate, in PDF points.
     pub y: f64,
+    /// Width, in PDF points.
     pub w: f64,
+    /// Height, in PDF points.
     pub h: f64,
 }
 
@@ -127,12 +141,16 @@ pub struct Rect {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppearanceShow {
+    /// Render the signer's name (common name, or the raw subject DN as fallback).
     #[serde(default)]
     pub signer_name: bool,
+    /// Render the signing reason (from [`SignatureMeta::reason`]).
     #[serde(default)]
     pub reason: bool,
+    /// Render the signing location (from [`SignatureMeta::location`]).
     #[serde(default)]
     pub location: bool,
+    /// Render the signing time (UTC).
     #[serde(default)]
     pub signing_time: bool,
 }
@@ -143,7 +161,9 @@ pub struct AppearanceShow {
 pub struct SignatureAppearance {
     /// 1-based page number.
     pub page: u32,
+    /// Where to draw the appearance, in PDF points.
     pub rect: Rect,
+    /// Which fields to render inside the rectangle.
     #[serde(default)]
     pub show: AppearanceShow,
 }
@@ -152,8 +172,10 @@ pub struct SignatureAppearance {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignatureMeta {
+    /// Optional signing reason (PDF signature dictionary `/Reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional signing location (PDF signature dictionary `/Location`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
 }
@@ -164,12 +186,16 @@ pub struct SigningRequest {
     /// The PDF to sign. Stays in the integrator's infra; only its hash leaves (FR-002).
     #[serde(with = "serde_bytes")]
     pub document: Vec<u8>,
+    /// Requested PAdES conformance level (defaults to B-B).
     #[serde(default = "default_level")]
     pub conformance_level: ConformanceLevel,
+    /// Optional binding to a specific expected signer (FR-014).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_signer: Option<ExpectedSignerIdentity>,
+    /// Optional visible signature appearance; absent ⇒ invisible signature (FR-016).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<SignatureAppearance>,
+    /// Optional signature dictionary metadata (`/Reason`, `/Location`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_meta: Option<SignatureMeta>,
 }
@@ -181,9 +207,12 @@ fn default_level() -> ConformanceLevel {
 /// Configuration for reaching an external qualified Time-Stamping Authority (required for B-T).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TsaConfiguration {
+    /// RFC 3161 TSA endpoint URL the host POSTs the timestamp query to.
     pub url: String,
+    /// Optional `Authorization` header value for the TSA (sent verbatim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Secret>,
+    /// Optional TSA policy OID to constrain the timestamp request to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_oid: Option<String>,
 }
@@ -191,11 +220,17 @@ pub struct TsaConfiguration {
 /// How to reach the Cleverbase trust service (data-model: TrustServiceConfiguration).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustServiceConfiguration {
+    /// Which Cleverbase environment to target.
     pub environment: Environment,
+    /// Which CSC API generation (selects host + signature algorithm).
     pub csc_api: CscApi,
+    /// OAuth2 client id issued by Cleverbase.
     pub client_id: String,
+    /// OAuth2 client secret (redacted in `Debug`).
     pub client_secret: Secret,
+    /// OAuth2 redirect URI registered for this client.
     pub redirect_uri: String,
+    /// TSA configuration; required when requesting B-T.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tsa: Option<TsaConfiguration>,
 }
@@ -211,10 +246,12 @@ impl TrustServiceConfiguration {
         }
     }
 
+    /// The OAuth2 authorization endpoint for the selected API generation and environment.
     pub fn authorize_url(&self) -> String {
         format!("{}/oauth2/authorize", self.base_url())
     }
 
+    /// The OAuth2 token endpoint for the selected API generation and environment.
     pub fn token_url(&self) -> String {
         format!("{}/oauth2/token", self.base_url())
     }
@@ -226,10 +263,13 @@ impl TrustServiceConfiguration {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestOptions {
+    /// Optional expected-signer binding (FR-014).
     #[serde(default)]
     pub expected_signer: Option<ExpectedSignerIdentity>,
+    /// Optional visible signature appearance (FR-016).
     #[serde(default)]
     pub appearance: Option<SignatureAppearance>,
+    /// Optional signature dictionary metadata.
     #[serde(default)]
     pub signature_meta: Option<SignatureMeta>,
 }
@@ -247,8 +287,10 @@ impl RequestOptions {
 /// The signed result returned on success (data-model: SignedDocument).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedDocument {
+    /// The signed PDF bytes (signature embedded into the `/Contents` placeholder).
     #[serde(with = "serde_bytes")]
     pub pdf: Vec<u8>,
+    /// The conformance level actually produced.
     pub conformance_level: ConformanceLevel,
     /// Best-effort PDF/A indicator: true when the signed output still carries the PDF/A marker and
     /// an invisible signature was used. Conformance is NOT independently validated in Phase 1 (no

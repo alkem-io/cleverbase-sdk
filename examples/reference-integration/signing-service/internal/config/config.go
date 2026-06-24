@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -16,6 +17,20 @@ type Mode string
 const (
 	ModeFixtures Mode = "fixtures"
 	ModeLive     Mode = "live"
+)
+
+// Supported PAdES conformance levels (a request may override the profile default).
+const (
+	ConformanceBB = "B-B"
+	ConformanceBT = "B-T"
+)
+
+// Harmless placeholders so a fixtures run needs no Cleverbase credentials: the SDK requires a
+// non-empty client_id/secret/redirect_uri even though the mock upstream ignores them.
+const (
+	fixturesClientID    = "refsvc-fixtures"
+	fixturesSecret      = "fixtures"
+	fixturesRedirectURI = "http://localhost:8080/return"
 )
 
 // Profile is the validated run configuration (data-model: RunProfile).
@@ -69,7 +84,7 @@ func Load() (*Profile, error) {
 		UpstreamBaseURL:       os.Getenv("REFSVC_BASE_URL"),
 		PublicUpstreamBaseURL: os.Getenv("REFSVC_PUBLIC_BASE_URL"),
 		APIKey:                os.Getenv("REFSVC_API_KEY"),
-		DefaultConformance:    env("REFSVC_DEFAULT_CONFORMANCE", "B-B"),
+		DefaultConformance:    env("REFSVC_DEFAULT_CONFORMANCE", ConformanceBB),
 		Listen:                env("REFSVC_LISTEN", ":8080"),
 	}
 
@@ -80,7 +95,32 @@ func Load() (*Profile, error) {
 	}
 	p.SessionTTL = ttl
 
-	// API auth is ON by default: require a key unless explicitly disabled for local runs.
+	if err := p.resolveAuth(); err != nil {
+		return nil, err
+	}
+	if p.DefaultConformance != ConformanceBB && p.DefaultConformance != ConformanceBT {
+		return nil, fmt.Errorf("invalid REFSVC_DEFAULT_CONFORMANCE %q (%s|%s)", p.DefaultConformance, ConformanceBB, ConformanceBT)
+	}
+
+	switch p.Mode {
+	case ModeFixtures:
+		if err := p.applyFixturesDefaults(); err != nil {
+			return nil, err
+		}
+	case ModeLive:
+		if err := p.validateLive(); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("invalid REFSVC_MODE %q (%s|%s)", p.Mode, ModeFixtures, ModeLive)
+	}
+
+	return p, nil
+}
+
+// resolveAuth applies the auth policy: a key turns auth on; auth is on by default and may only be
+// turned off by an explicit opt-out (for local fixtures runs).
+func (p *Profile) resolveAuth() error {
 	authDisabled := strings.EqualFold(os.Getenv("REFSVC_AUTH_DISABLED"), "true")
 	switch {
 	case p.APIKey != "":
@@ -88,57 +128,54 @@ func Load() (*Profile, error) {
 	case authDisabled:
 		p.AuthEnabled = false
 	default:
-		return nil, fmt.Errorf("API auth is on by default: set REFSVC_API_KEY, or REFSVC_AUTH_DISABLED=true for local fixtures runs")
+		return errors.New("API auth is on by default: set REFSVC_API_KEY, or REFSVC_AUTH_DISABLED=true for local fixtures runs")
 	}
+	return nil
+}
 
-	if p.DefaultConformance != "B-B" && p.DefaultConformance != "B-T" {
-		return nil, fmt.Errorf("invalid REFSVC_DEFAULT_CONFORMANCE %q (B-B|B-T)", p.DefaultConformance)
+// applyFixturesDefaults fills the credential-free defaults for fixtures mode and points the TSA +
+// redirect rewrites at the mock upstream.
+func (p *Profile) applyFixturesDefaults() error {
+	if p.UpstreamBaseURL == "" {
+		return errors.New("fixtures mode requires REFSVC_BASE_URL (the mock upstream URL)")
 	}
-
-	switch p.Mode {
-	case ModeFixtures:
-		if p.UpstreamBaseURL == "" {
-			return nil, fmt.Errorf("fixtures mode requires REFSVC_BASE_URL (the mock upstream URL)")
-		}
-		// The SDK requires a non-empty client_id/redirect_uri even though the mock ignores them;
-		// supply harmless defaults so fixtures runs need no Cleverbase credentials.
-		if p.ClientID == "" {
-			p.ClientID = "refsvc-fixtures"
-		}
-		if p.ClientSecret == "" {
-			p.ClientSecret = "fixtures"
-		}
-		if p.RedirectURI == "" {
-			p.RedirectURI = "http://localhost:8080/return"
-		}
-		// B-T fixtures: the mock serves an RFC 3161 TSA at /tsr.
-		if p.TsaURL == "" {
-			p.TsaURL = strings.TrimRight(p.UpstreamBaseURL, "/") + "/tsr"
-		}
-		// Browser-facing redirect rewrites default to the internal base unless a public one is set.
-		if p.PublicUpstreamBaseURL == "" {
-			p.PublicUpstreamBaseURL = p.UpstreamBaseURL
-		}
-	case ModeLive:
-		var missing []string
-		if p.ClientID == "" {
-			missing = append(missing, "REFSVC_CLIENT_ID")
-		}
-		if p.ClientSecret == "" {
-			missing = append(missing, "REFSVC_CLIENT_SECRET")
-		}
-		if p.RedirectURI == "" {
-			missing = append(missing, "REFSVC_REDIRECT_URI")
-		}
-		if p.DefaultConformance == "B-T" && p.TsaURL == "" {
-			missing = append(missing, "REFSVC_TSA_URL (B-T)")
-		}
-		if len(missing) > 0 {
-			return nil, fmt.Errorf("live mode requires: %s", strings.Join(missing, ", "))
-		}
-	default:
-		return nil, fmt.Errorf("invalid REFSVC_MODE %q (fixtures|live)", p.Mode)
+	if p.ClientID == "" {
+		p.ClientID = fixturesClientID
 	}
+	if p.ClientSecret == "" {
+		p.ClientSecret = fixturesSecret
+	}
+	if p.RedirectURI == "" {
+		p.RedirectURI = fixturesRedirectURI
+	}
+	// B-T fixtures: the mock serves an RFC 3161 TSA at /tsr.
+	if p.TsaURL == "" {
+		p.TsaURL = strings.TrimRight(p.UpstreamBaseURL, "/") + "/tsr"
+	}
+	// Browser-facing redirect rewrites default to the internal base unless a public one is set.
+	if p.PublicUpstreamBaseURL == "" {
+		p.PublicUpstreamBaseURL = p.UpstreamBaseURL
+	}
+	return nil
+}
 
-	return p, nil
+// validateLive fails fast on a half-configured live profile (missing credentials / B-T TSA).
+func (p *Profile) validateLive() error {
+	var missing []string
+	if p.ClientID == "" {
+		missing = append(missing, "REFSVC_CLIENT_ID")
+	}
+	if p.ClientSecret == "" {
+		missing = append(missing, "REFSVC_CLIENT_SECRET")
+	}
+	if p.RedirectURI == "" {
+		missing = append(missing, "REFSVC_REDIRECT_URI")
+	}
+	if p.DefaultConformance == ConformanceBT && p.TsaURL == "" {
+		missing = append(missing, "REFSVC_TSA_URL (B-T)")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("live mode requires: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }

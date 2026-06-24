@@ -1,5 +1,6 @@
 # Standalone workspace (detached from the core workspace so `cargo test --workspace`
-# at the repo root does not try to build the Python extension module).
+# at the repo root does not try to build the Python extension module). Because it is detached, the
+# strict lint gate from the repo-root [workspace.lints] is re-declared below for this crate.
 [workspace]
 
 [package]
@@ -7,6 +8,11 @@ name = "cleverbase-py"
 version = "0.1.0"
 edition = "2021"
 license = "EUPL-1.2"
+repository = "https://github.com/alkem-io/cleverbase-sdk"
+readme = "../../README.md"
+documentation = "https://docs.rs/cleverbase-py"
+keywords = ["qes", "pades", "eidas", "signing", "pyo3"]
+categories = ["cryptography", "api-bindings"]
 description = "Python (PyO3) binding for the Cleverbase SDK core."
 
 [lib]
@@ -16,3 +22,41 @@ crate-type = ["cdylib"]
 [dependencies]
 cleverbase-core = { path = "../../crates/cleverbase-core" }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+
+[lints]
+workspace = true
+
+# Mirror of the repo-root strict lint gate (this is a detached workspace). See
+# `cleverbase-sdk/Cargo.toml` for the authoritative rationale on each level/allow.
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# restriction lints that harden the FFI surface:
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+# allowed back (same justifications as the core workspace):
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow" # pyfunction args are owned by the generated wrapper
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+multiple_crate_versions = "allow" # transitive dup versions in the PyO3 dependency tree

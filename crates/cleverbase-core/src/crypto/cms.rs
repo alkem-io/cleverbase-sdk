@@ -39,12 +39,16 @@ const UTC_TIME_UPPER_BOUND_SECS: u64 = 2_524_608_000;
 /// Errors from CMS assembly/verification.
 #[derive(Debug, thiserror::Error)]
 pub enum CmsError {
+    /// A DER encode/decode error.
     #[error("DER error: {0}")]
     Der(#[from] der::Error),
+    /// The key algorithm is not supported for CMS assembly.
     #[error("unsupported key algorithm for CMS assembly")]
     UnsupportedAlgo,
+    /// The certificate chain was empty.
     #[error("empty certificate chain")]
     EmptyChain,
+    /// Signature verification failed.
     #[error("verification failed: {0}")]
     Verify(String),
 }
@@ -133,11 +137,13 @@ fn ecdsa_signature_to_der(signature: &[u8]) -> Result<Vec<u8>, CmsError> {
     if EcdsaSigValue::from_der(signature).is_ok() {
         return Ok(signature.to_vec());
     }
-    // CSC v2 returns raw fixed-width r‖s (64 bytes for P-256); DER-encode it.
+    // CSC v2 returns raw fixed-width r‖s (64 bytes for P-256); DER-encode it. Split with `.split_at`
+    // guarded by the length check (no panicking `[..]` index).
     if signature.len() == 64 {
+        let (r_bytes, s_bytes) = signature.split_at(32);
         let sig = EcdsaSigValue {
-            r: der::asn1::Uint::new(&signature[..32])?,
-            s: der::asn1::Uint::new(&signature[32..])?,
+            r: der::asn1::Uint::new(r_bytes)?,
+            s: der::asn1::Uint::new(s_bytes)?,
         };
         return Ok(sig.to_der()?);
     }
@@ -216,6 +222,8 @@ pub fn assemble_signed_data(
 
 /// Re-parse an assembled CMS, returning `(signed_attrs_der, message_digest, signature, cert_chain)`
 /// — the SET OF re-encoding is exactly what was signed.
+// The 4-tuple is exactly the re-parsed CMS material; a named struct would obscure the 1:1 mapping
+// to the values the caller verifies and is used only at this single call site.
 #[allow(clippy::type_complexity)]
 pub fn reparse_for_verify(
     content_info_der: &[u8],

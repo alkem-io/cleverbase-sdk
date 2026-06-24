@@ -12,7 +12,9 @@ use crate::types::SignedDocument;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
+    /// HTTP GET.
     Get,
+    /// HTTP POST.
     Post,
 }
 
@@ -23,9 +25,13 @@ pub enum HttpMethod {
 /// retry those only on a pure transport failure (no response received), never after a server reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpEffect {
+    /// HTTP method to use.
     pub method: HttpMethod,
+    /// Absolute request URL.
     pub url: String,
+    /// Request headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
+    /// Optional request body bytes.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
 }
@@ -33,7 +39,9 @@ pub struct HttpEffect {
 /// A browser redirect the host must issue to the signer; on return, resume with the `code`+`state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedirectEffect {
+    /// URL to send the signer's browser to.
     pub url: String,
+    /// OAuth `state` (CSRF token); echoed back on return and validated by `resume`.
     pub state: String,
 }
 
@@ -47,14 +55,20 @@ pub enum Step {
     Redirect(RedirectEffect),
     /// Terminal success.
     Done {
+        /// The signed PDF and its produced conformance level.
         signed: SignedDocument,
+        /// Structured signing evidence (FR-015).
         evidence: SigningEvidenceRecord,
     },
     /// Terminal failure; `evidence.outcome` is never `Signed`.
-    Failed { evidence: SigningEvidenceRecord },
+    Failed {
+        /// Structured signing evidence describing the failure (FR-015).
+        evidence: SigningEvidenceRecord,
+    },
 }
 
 impl Step {
+    /// `true` for terminal steps ([`Step::Done`] / [`Step::Failed`]); the flow does not resume past them.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Failed { .. })
     }

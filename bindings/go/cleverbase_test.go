@@ -106,7 +106,7 @@ func TestResumeRedirectErrorYieldsDeclined(t *testing.T) {
 	if sess2.Step["kind"] != "failed" {
 		t.Fatalf("expected failed, got %v", sess2.Step["kind"])
 	}
-	evidence, _ := sess2.Step["evidence"].(map[string]interface{})
+	evidence, _ := sess2.Step["evidence"].(map[string]any)
 	if evidence["outcome"] != "declined" {
 		t.Fatalf("expected declined, got %v", evidence["outcome"])
 	}
@@ -160,7 +160,7 @@ func TestInvalidDocumentFails(t *testing.T) {
 	if sess.Step["kind"] != "failed" {
 		t.Fatalf("expected failed, got %v", sess.Step["kind"])
 	}
-	evidence, _ := sess.Step["evidence"].(map[string]interface{})
+	evidence, _ := sess.Step["evidence"].(map[string]any)
 	if evidence["outcome"] != "invalid_document" {
 		t.Fatalf("expected invalid_document, got %v", evidence["outcome"])
 	}

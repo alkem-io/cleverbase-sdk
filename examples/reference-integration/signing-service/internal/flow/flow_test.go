@@ -92,7 +92,7 @@ func TestFullHappyFlow(t *testing.T) {
 	}
 	s, _ := e.Store.GetByState("s1")
 	if s == nil || s.Status != session.StatusAuthorizing {
-		t.Fatalf("session not stored at s1")
+		t.Fatal("session not stored at s1")
 	}
 
 	st, url2, _, err := e.Complete(s, "code1", "s1")
@@ -171,7 +171,7 @@ func TestCompleteErrorDeclined(t *testing.T) {
 		t.Fatalf("decline: st=%s reason=%s err=%v", st, reason, err)
 	}
 	if _, _, _, err := e.CompleteError(s, "x", "s1"); !errors.Is(err, ErrTerminal) {
-		t.Fatalf("expected ErrTerminal on terminal CompleteError")
+		t.Fatal("expected ErrTerminal on terminal CompleteError")
 	}
 }
 
@@ -216,13 +216,13 @@ func TestRedactHandlesBadURL(t *testing.T) {
 }
 
 func TestStepHelpers(t *testing.T) {
-	method, url, headers, body := stepHTTP(map[string]any{
+	ef := stepHTTP(map[string]any{
 		"method": "POST", "url": "u",
 		"headers": []any{[]any{"K", "V"}, "bad", []any{"only-one"}},
 		"body":    []byte("b"),
 	})
-	if method != "POST" || url != "u" || len(headers) != 1 || headers[0] != [2]string{"K", "V"} || string(body) != "b" {
-		t.Fatalf("stepHTTP: %s %s %v %q", method, url, headers, body)
+	if ef.method != "POST" || ef.rawURL != "u" || len(ef.headers) != 1 || ef.headers[0] != [2]string{"K", "V"} || string(ef.body) != "b" {
+		t.Fatalf("stepHTTP: %s %s %v %q", ef.method, ef.rawURL, ef.headers, ef.body)
 	}
 	if stepEvidence(map[string]any{}) != nil {
 		t.Fatal("missing evidence should be nil")

@@ -14,8 +14,8 @@ const CORR_KEY = "cleverbase.correlationId";
 function startPage(): void {
   const btn = document.getElementById("start") as HTMLButtonElement | null;
   if (!btn) return;
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
+  async function onStart(button: HTMLButtonElement): Promise<void> {
+    button.disabled = true;
     try {
       const conformance =
         (document.getElementById("conformance") as HTMLSelectElement | null)?.value ?? "B-B";
@@ -25,9 +25,12 @@ function startPage(): void {
     } catch (e) {
       const out = document.getElementById("out");
       if (out) out.textContent = `Error: ${(e as Error).message}`;
-      btn.disabled = false;
+      button.disabled = false;
     }
-  });
+  }
+  // The click handler must return void; `onStart` handles all its own errors internally, so the
+  // promise is intentionally not awaited here.
+  btn.addEventListener("click", () => void onStart(btn));
 }
 
 async function returnPage(): Promise<void> {

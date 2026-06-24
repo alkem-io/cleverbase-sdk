@@ -176,7 +176,8 @@ func TestStartDefaultsAndExpectedSigner(t *testing.T) {
 }
 
 func TestCompleteErrorDeclinedHTTP(t *testing.T) {
-	steps := []flow.Result{redirect("https://cb/a", "s1")}
+	steps := make([]flow.Result, 0, 2)
+	steps = append(steps, redirect("https://cb/a", "s1"))
 	steps = append(steps, flow.Result{Handle: []byte("h"), Step: map[string]any{"kind": "failed",
 		"evidence": map[string]any{"outcome": "declined"}}})
 	h := newService(steps, false).Handler()

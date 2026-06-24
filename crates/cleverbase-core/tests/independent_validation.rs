@@ -6,6 +6,16 @@
 //! signature over the signed attributes is valid, the `message-digest` matches the ByteRange
 //! content, and the signer certificate chains to the test CA. Skipped if `openssl` is unavailable.
 
+// This is a test binary: unwrap/expect/panic/indexing are the intended assertion mechanism,
+// matching the `cfg(test)` allow the library crates apply to their inline test modules.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::print_stderr // the openssl-unavailable skip notices print to stderr
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

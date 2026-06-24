@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -18,6 +19,10 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// codeCredential is the OAuth code the mock returns for the credential-scope authorization (and the
+// token endpoint switches on it to serve the credential SAD instead of the service token).
+const codeCredential = "cred"
 
 // Server holds the loaded PKI + fixtures and routes the mock endpoints.
 type Server struct {
@@ -44,7 +49,7 @@ func readFixturesAndPKI(fixturesDir string) (*Server, error) {
 	}
 	rsaKey, ok := keyAny.(*rsa.PrivateKey)
 	if !ok {
-		return nil, fmt.Errorf("signer key is not RSA")
+		return nil, errors.New("signer key is not RSA")
 	}
 	certDER, err := os.ReadFile(filepath.Join(pki, "signer-rsa.cert.der"))
 	if err != nil {
@@ -110,13 +115,13 @@ func writeRaw(w http.ResponseWriter, b []byte) {
 
 // handleAuthorize 302-redirects back to the request's redirect_uri with a scope-tagged code+state,
 // auto-completing the human authorization step for credential-free runs.
-func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+func (*Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	redirectURI := q.Get("redirect_uri")
 	state := q.Get("state")
 	code := "svc"
 	if q.Get("scope") == "credential" {
-		code = "cred"
+		code = codeCredential
 	}
 	if redirectURI == "" {
 		http.Error(w, "missing redirect_uri", http.StatusBadRequest)
@@ -129,7 +134,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 // handleToken returns the service Bearer token or the credential SAD based on the code.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
-	if r.Form.Get("code") == "cred" {
+	if r.Form.Get("code") == codeCredential {
 		writeRaw(w, s.credSAD)
 		return
 	}

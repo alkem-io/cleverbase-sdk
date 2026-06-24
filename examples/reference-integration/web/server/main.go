@@ -24,8 +24,10 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	listen := env("REFWEB_LISTEN", ":8080")
-	target := env("REFWEB_API_TARGET", "http://signing-service:8080")
-	apiKey := os.Getenv("REFWEB_API_KEY") // injected into proxied requests; never sent to the browser
+	// The default targets the signing service over the in-cluster/compose network; that hop is plain
+	// HTTP by design (TLS terminates at the ingress), so the http:// scheme is correct here.
+	target := env("REFWEB_API_TARGET", "http://signing-service:8080") //nolint:revive // unsecure-url-scheme: internal cluster target, TLS at ingress
+	apiKey := os.Getenv("REFWEB_API_KEY")                             // injected into proxied requests; never sent to the browser
 	staticDir := env("REFWEB_STATIC_DIR", "/web")
 
 	u, err := url.Parse(target)
