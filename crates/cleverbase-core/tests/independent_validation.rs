@@ -21,8 +21,8 @@ use std::process::Command;
 
 use cleverbase_core::util::{base64_decode, base64_std};
 use cleverbase_core::{
-    begin, resume, ConformanceLevel, CscApi, Environment, HostContext, ResumeInput, Secret,
-    SignedDocument, SigningRequest, Step, TrustServiceConfiguration, TsaConfiguration,
+    begin, resume, ConformanceLevel, CscApi, Environment, HostContext, HttpEffect, ResumeInput,
+    Secret, SignedDocument, SigningRequest, Step, TrustServiceConfiguration, TsaConfiguration,
 };
 use lopdf::{Dictionary, Document, Object};
 use pkcs8::DecodePrivateKey;
@@ -170,25 +170,44 @@ fn http_ok(json: serde_json::Value) -> ResumeInput {
     }
 }
 
-fn produce_signed_pdf(algo: KeyAlgo) -> SignedDocument {
-    let cfg = TrustServiceConfiguration {
+/// Build the trust-service configuration for the requested algorithm and conformance level. B-T
+/// pins a TSA (so the flow requests a timestamp); B-B leaves `tsa: None`. Single source for the
+/// otherwise-identical config block every flow driver needs.
+fn trust_service_config(algo: KeyAlgo, conformance: ConformanceLevel) -> TrustServiceConfiguration {
+    TrustServiceConfiguration {
         environment: Environment::Acceptance,
         csc_api: algo.csc_api(),
         client_id: "client-123".into(),
         client_secret: Secret::new("shh"),
         redirect_uri: "https://app.example/cb".into(),
-        tsa: None,
-    };
+        tsa: match conformance {
+            ConformanceLevel::BB => None,
+            ConformanceLevel::BT => Some(TsaConfiguration {
+                url: "https://tsa.example/tsr".into(),
+                auth: None,
+                policy_oid: None,
+            }),
+        },
+    }
+}
+
+/// Drive the shared protocol prefix: `begin` → redirect return → `service_token` →
+/// `credentials_list`, leaving the handle ready to receive the `credentials/info` (signer_info)
+/// response. This is the single point through which every flow driver (and the unsupported-OID
+/// test, which then feeds a DIFFERENT `credentials/info`) routes — parametrized by algorithm AND
+/// conformance so RSA/ECDSA and B-B/B-T share one path (no twins).
+fn drive_to_credentials_info(
+    algo: KeyAlgo,
+    conformance: ConformanceLevel,
+) -> cleverbase_core::SigningSessionHandle {
     let request = SigningRequest {
         document: minimal_pdf(),
-        conformance_level: ConformanceLevel::BB,
+        conformance_level: conformance,
         expected_signer: None,
         appearance: None,
         signature_meta: None,
     };
-    let info = signer_info(algo);
-
-    let (h, s) = begin(request, cfg, ctx()).unwrap();
+    let (h, s) = begin(request, trust_service_config(algo, conformance), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
         _ => panic!(),
@@ -209,6 +228,19 @@ fn produce_signed_pdf(algo: KeyAlgo) -> SignedDocument {
         ctx(),
     )
     .unwrap();
+    h
+}
+
+/// Continue from `credentials/info` through the credential-scope redirect return + `credential_token`
+/// to the point where the `signHash` REQUEST is emitted: feed the supplied `info` (the producers pass
+/// the normal signer_info), then return the handle together with the to-be-signed `signHash` request
+/// so the caller can inject its own `signHash` RESPONSE (a real signature, or a bad-length one).
+fn drive_to_sign_request(
+    algo: KeyAlgo,
+    conformance: ConformanceLevel,
+    info: serde_json::Value,
+) -> (cleverbase_core::SigningSessionHandle, HttpEffect) {
+    let h = drive_to_credentials_info(algo, conformance);
     let (h, s) = resume(h, http_ok(info), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
@@ -231,11 +263,21 @@ fn produce_signed_pdf(algo: KeyAlgo) -> SignedDocument {
     .unwrap();
     let sign_req = match &s {
         Step::PerformHttp(e) => e.clone(),
-        _ => panic!(),
+        _ => panic!("expected signHash"),
     };
+    (h, sign_req)
+}
+
+/// The to-be-signed digest the core asks `signHash` to sign (the SHA-256 of the signedAttrs),
+/// extracted from the emitted `signHash` request — the input every `signHash` simulator signs.
+fn tbs_from_sign_request(sign_req: &HttpEffect) -> Vec<u8> {
     let body: serde_json::Value = serde_json::from_slice(sign_req.body.as_ref().unwrap()).unwrap();
-    let tbs = base64_decode(body["hash"][0].as_str().unwrap()).unwrap();
-    let sig = algo.sign_hash(&tbs);
+    base64_decode(body["hash"][0].as_str().unwrap()).unwrap()
+}
+
+fn produce_signed_pdf(algo: KeyAlgo) -> SignedDocument {
+    let (h, sign_req) = drive_to_sign_request(algo, ConformanceLevel::BB, signer_info(algo));
+    let sig = algo.sign_hash(&tbs_from_sign_request(&sign_req));
     let (_h, step) = resume(
         h,
         http_ok(serde_json::json!({"signatures": [base64_std(&sig)]})),
@@ -581,73 +623,8 @@ fn tsa_token_gen_time_is_parsed() {
 
 /// Drive a B-T flow up to the TSA request; return the handle (at TimestampPending) + the TSA query.
 fn drive_bt_to_timestamp(algo: KeyAlgo) -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
-    let cfg = TrustServiceConfiguration {
-        environment: Environment::Acceptance,
-        csc_api: algo.csc_api(),
-        client_id: "client-123".into(),
-        client_secret: Secret::new("shh"),
-        redirect_uri: "https://app.example/cb".into(),
-        tsa: Some(TsaConfiguration {
-            url: "https://tsa.example/tsr".into(),
-            auth: None,
-            policy_oid: None,
-        }),
-    };
-    let request = SigningRequest {
-        document: minimal_pdf(),
-        conformance_level: ConformanceLevel::BT,
-        expected_signer: None,
-        appearance: None,
-        signature_meta: None,
-    };
-    let (h, s) = begin(request, cfg, ctx()).unwrap();
-    let state = match &s {
-        Step::Redirect(r) => r.state.clone(),
-        _ => panic!(),
-    };
-    let (h, _) = resume(
-        h,
-        ResumeInput::RedirectReturn {
-            code: "c".into(),
-            state,
-        },
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(h, http_ok(upstream_fixture("service_token", algo)), ctx()).unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(upstream_fixture("credentials_list", algo)),
-        ctx(),
-    )
-    .unwrap();
-    let (h, s) = resume(h, http_ok(signer_info(algo)), ctx()).unwrap();
-    let state = match &s {
-        Step::Redirect(r) => r.state.clone(),
-        _ => panic!(),
-    };
-    let (h, _) = resume(
-        h,
-        ResumeInput::RedirectReturn {
-            code: "c2".into(),
-            state,
-        },
-        ctx(),
-    )
-    .unwrap();
-    let (h, s) = resume(
-        h,
-        http_ok(upstream_fixture("credential_token", algo)),
-        ctx(),
-    )
-    .unwrap();
-    let sign_req = match &s {
-        Step::PerformHttp(e) => e.clone(),
-        _ => panic!("expected signHash"),
-    };
-    let body: serde_json::Value = serde_json::from_slice(sign_req.body.as_ref().unwrap()).unwrap();
-    let tbs = base64_decode(body["hash"][0].as_str().unwrap()).unwrap();
-    let sig = algo.sign_hash(&tbs);
+    let (h, sign_req) = drive_to_sign_request(algo, ConformanceLevel::BT, signer_info(algo));
+    let sig = algo.sign_hash(&tbs_from_sign_request(&sign_req));
     let (h, s) = resume(
         h,
         http_ok(serde_json::json!({"signatures": [base64_std(&sig)]})),
@@ -758,50 +735,12 @@ fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
 /// `KeyAlgo::Other` rejection end-to-end; no `src/` change.
 #[test]
 fn unsupported_key_oid_fails_with_no_signature() {
-    let request = SigningRequest {
-        document: minimal_pdf(),
-        conformance_level: ConformanceLevel::BB,
-        expected_signer: None,
-        appearance: None,
-        signature_meta: None,
-    };
-    let cfg = TrustServiceConfiguration {
-        environment: Environment::Acceptance,
-        csc_api: CscApi::V2Ecdsa,
-        client_id: "client-123".into(),
-        client_secret: Secret::new("shh"),
-        redirect_uri: "https://app.example/cb".into(),
-        tsa: None,
-    };
     // Ed25519 (id-Ed25519, 1.3.101.112) is a valid key OID the SDK does not support in this phase.
     let info = signer_info_with_oid("1.3.101.112", EC_CERT);
 
-    let (h, s) = begin(request, cfg, ctx()).unwrap();
-    let state = match &s {
-        Step::Redirect(r) => r.state.clone(),
-        _ => panic!(),
-    };
-    let (h, _) = resume(
-        h,
-        ResumeInput::RedirectReturn {
-            code: "c".into(),
-            state,
-        },
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(upstream_fixture("service_token", KeyAlgo::EcdsaP256)),
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(
-        h,
-        http_ok(upstream_fixture("credentials_list", KeyAlgo::EcdsaP256)),
-        ctx(),
-    )
-    .unwrap();
+    // Share the begin → … → credentials_list prefix; this test diverges by feeding a DIFFERENT
+    // credentials/info (the bad OID) at the signer_info step, where it must fail before any signHash.
+    let h = drive_to_credentials_info(KeyAlgo::EcdsaP256, ConformanceLevel::BB);
     // The credentials/info advertising the unsupported OID must terminate the flow immediately.
     let (handle, step) = resume(h, http_ok(info), ctx()).unwrap();
     assert_eq!(
@@ -837,62 +776,9 @@ fn unsupported_key_oid_fails_with_no_signature() {
 fn malformed_raw_ecdsa_length_is_rejected_by_core() {
     for bad_len in [63usize, 64, 65] {
         let algo = KeyAlgo::EcdsaP256;
-        let cfg = TrustServiceConfiguration {
-            environment: Environment::Acceptance,
-            csc_api: algo.csc_api(),
-            client_id: "client-123".into(),
-            client_secret: Secret::new("shh"),
-            redirect_uri: "https://app.example/cb".into(),
-            tsa: None,
-        };
-        let request = SigningRequest {
-            document: minimal_pdf(),
-            conformance_level: ConformanceLevel::BB,
-            expected_signer: None,
-            appearance: None,
-            signature_meta: None,
-        };
-        let (h, s) = begin(request, cfg, ctx()).unwrap();
-        let state = match &s {
-            Step::Redirect(r) => r.state.clone(),
-            _ => panic!(),
-        };
-        let (h, _) = resume(
-            h,
-            ResumeInput::RedirectReturn {
-                code: "c".into(),
-                state,
-            },
-            ctx(),
-        )
-        .unwrap();
-        let (h, _) = resume(h, http_ok(upstream_fixture("service_token", algo)), ctx()).unwrap();
-        let (h, _) = resume(
-            h,
-            http_ok(upstream_fixture("credentials_list", algo)),
-            ctx(),
-        )
-        .unwrap();
-        let (h, s) = resume(h, http_ok(signer_info(algo)), ctx()).unwrap();
-        let state = match &s {
-            Step::Redirect(r) => r.state.clone(),
-            _ => panic!(),
-        };
-        let (h, _) = resume(
-            h,
-            ResumeInput::RedirectReturn {
-                code: "c2".into(),
-                state,
-            },
-            ctx(),
-        )
-        .unwrap();
-        let (h, _s) = resume(
-            h,
-            http_ok(upstream_fixture("credential_token", algo)),
-            ctx(),
-        )
-        .unwrap();
+        // Share the full begin → … → signHash-request drive; this test diverges only by injecting a
+        // bad-length signHash RESPONSE below (instead of a real signature).
+        let (h, _sign_req) = drive_to_sign_request(algo, ConformanceLevel::BB, signer_info(algo));
         // Return a bad raw signature. 63/65 bytes: wrong length — not 64, not valid DER — cannot be
         // normalized. 64 bytes of garbage: correct length but a cryptographically wrong r‖s that DOES
         // normalize to a DER ECDSA-Sig-Value yet fails the post-assembly self-verify. Either way the

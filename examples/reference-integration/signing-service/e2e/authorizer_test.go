@@ -239,3 +239,97 @@ func TestMockAutoApproveDeclined(t *testing.T) {
 		t.Fatalf("expected errAuthDeclined, got %v", err)
 	}
 }
+
+// TestCodeStateFromLocationNonAccessDeniedError covers the non-access_denied OIDC error branch in
+// codeStateFromLocation (authorizer.go:79): a callback whose `error=` is NOT access_denied (e.g.
+// server_error, invalid_request) MUST surface a clear "authorization error: <code>" — never be
+// mistaken for a success (empty code/state, nil err). The interpolated value is the bounded OIDC
+// error code only (not a secret). This guards the silent-success regression where an OIDC error
+// would be POSTed to /complete as an empty (code,state).
+func TestCodeStateFromLocationNonAccessDeniedError(t *testing.T) {
+	for _, code := range []string{"server_error", "invalid_request", "temporarily_unavailable"} {
+		t.Run(code, func(t *testing.T) {
+			loc := "https://app.example/cb?error=" + code + "&state=somestate"
+			gotCode, gotState, err := codeStateFromLocation(loc)
+			if err == nil {
+				t.Fatalf("non-access_denied error %q must NOT be a success; got (code=%q,state=%q,nil) — empty would be POSTed to /complete", code, gotCode, gotState)
+			}
+			// It must NOT be the access_denied decline path — that's a distinct outcome.
+			if errors.Is(err, errAuthDeclined) {
+				t.Fatalf("error %q wrongly mapped to errAuthDeclined: %v", code, err)
+			}
+			if !strings.Contains(err.Error(), "authorization error") || !strings.Contains(err.Error(), code) {
+				t.Fatalf("expected an 'authorization error: %s' message, got %q", code, err.Error())
+			}
+			if gotCode != "" || gotState != "" {
+				t.Fatalf("an OIDC error must return empty (code,state), got (code=%q,state=%q)", gotCode, gotState)
+			}
+		})
+	}
+}
+
+// TestParseCapturedCallbackNonAccessDeniedError covers the non-access_denied OIDC error branch in
+// parseCapturedCallback (authorizer.go:183) via the bare-query-string path (so it exercises the
+// branch in parseCapturedCallback itself, not its delegation to codeStateFromLocation): a bare
+// `error=<code>` query whose code is NOT access_denied MUST surface "authorization error: <code>",
+// never a silent success.
+func TestParseCapturedCallbackNonAccessDeniedError(t *testing.T) {
+	for _, code := range []string{"server_error", "invalid_request"} {
+		t.Run(code, func(t *testing.T) {
+			// A bare query string (no "://", no leading "/") routes through parseCapturedCallback's own
+			// url.ParseQuery branch rather than delegating to codeStateFromLocation.
+			gotCode, gotState, err := parseCapturedCallback("error=" + code + "&state=somestate")
+			if err == nil {
+				t.Fatalf("non-access_denied error %q must NOT be a success; got (code=%q,state=%q,nil)", code, gotCode, gotState)
+			}
+			if errors.Is(err, errAuthDeclined) {
+				t.Fatalf("error %q wrongly mapped to errAuthDeclined: %v", code, err)
+			}
+			if !strings.Contains(err.Error(), "authorization error") || !strings.Contains(err.Error(), code) {
+				t.Fatalf("expected an 'authorization error: %s' message, got %q", code, err.Error())
+			}
+			if gotCode != "" || gotState != "" {
+				t.Fatalf("an OIDC error must return empty (code,state), got (code=%q,state=%q)", gotCode, gotState)
+			}
+		})
+	}
+}
+
+// TestInteractiveNonAccessDeniedError drives the non-access_denied OIDC error end-to-end through the
+// Interactive Authorizer's capture path: a captured callback carrying ?error=server_error MUST yield
+// a clear "authorization error" rather than completing the leg with an empty (code,state).
+func TestInteractiveNonAccessDeniedError(t *testing.T) {
+	ch := make(chan string, 1)
+	ch <- "https://app.example/cb?error=server_error&state=abc"
+	auth := Interactive{CaptureCallback: ch, Timeout: time.Second}
+	code, state, err := auth.Authorize(context.Background(), "https://issuer.example/authorize?state=abc", "abc")
+	if err == nil {
+		t.Fatalf("server_error callback must NOT complete the leg; got (code=%q,state=%q,nil)", code, state)
+	}
+	if errors.Is(err, errAuthDeclined) {
+		t.Fatalf("server_error wrongly mapped to errAuthDeclined: %v", err)
+	}
+	if !strings.Contains(err.Error(), "authorization error") || !strings.Contains(err.Error(), "server_error") {
+		t.Fatalf("expected an 'authorization error: server_error' message, got %q", err.Error())
+	}
+	if code != "" || state != "" {
+		t.Fatalf("an OIDC error must return empty (code,state), got (code=%q,state=%q)", code, state)
+	}
+}
+
+// TestCodeStateFromLocationNoLocation covers the empty-Location branch in codeStateFromLocation
+// (authorizer.go:66): when the authorize response carries no Location redirect, the function MUST
+// return the specific "authorize response carried no Location redirect" error — never a false
+// success with empty (code,state) that would be POSTed to /complete (the silent-success regression).
+func TestCodeStateFromLocationNoLocation(t *testing.T) {
+	gotCode, gotState, err := codeStateFromLocation("")
+	if err == nil {
+		t.Fatalf("an empty Location must NOT be a success; got (code=%q,state=%q,nil) — empty would be POSTed to /complete", gotCode, gotState)
+	}
+	if !strings.Contains(err.Error(), "carried no Location redirect") {
+		t.Fatalf("expected the specific 'authorize response carried no Location redirect' error, got %q", err.Error())
+	}
+	if gotCode != "" || gotState != "" {
+		t.Fatalf("a no-Location response must return empty (code,state), got (code=%q,state=%q)", gotCode, gotState)
+	}
+}

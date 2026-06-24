@@ -301,16 +301,16 @@ EOF
 # Drive the gate over every input PDF.
 # ---------------------------------------------------------------------------------------------------
 FAILED=0
-RAN=0            # set to 1 once at least one backend actually validated a PDF (vs. self-skipped)
 ADES_RAN=0       # set to 1 once pyHanko actually ran AdES validation
 LEVEL_ASSERTED=0 # set to 1 ONLY when EU DSS actually confirmed the baseline level (--expect-level)
+# "Did any backend run?" is derivable: it is exactly (ADES_RAN==1 || LEVEL_ASSERTED==1), so we do NOT
+# keep a separate flag — the single read site below derives it from these two.
 
 # --- AdES half (pyHanko) ---
 if [ "$HAVE_PYHANKO" -eq 1 ]; then
   note "pyHanko AdES validation ($("$PYHANKO_BIN" --version 2>/dev/null || echo "$PYHANKO_BIN"))"
   for pdf in "${PDFS[@]}"; do
     note "adesverify: $pdf"
-    RAN=1
     ADES_RAN=1
     if pyhanko_validate "$pdf"; then
       printf 'PASS (AdES): %s\n' "$pdf" >&2
@@ -329,7 +329,6 @@ if [ "$HAVE_DSS" -eq 1 ]; then
     note "EU DSS baseline-level assertion (expect ${DSS_EXPECT_FORMAT})"
     for pdf in "${PDFS[@]}"; do
       note "dss level: $pdf"
-      RAN=1
       LEVEL_ASSERTED=1
       if dss_assert_level "$pdf"; then
         printf 'PASS (level %s): %s\n' "$DSS_EXPECT_FORMAT" "$pdf" >&2
@@ -355,7 +354,8 @@ fi
 # If neither backend was actually available, every PDF was self-skipped — report a clean SKIP rather
 # than a misleading PASS (exit 0 either way: a self-skip never fails the gate). This only happens when
 # the opt-in toolchain is absent; the real validation runs in CI (profile-conformance.yml).
-if [ "$RAN" -eq 0 ]; then
+# "Nothing ran" is exactly "neither half ran" = ADES_RAN==0 AND LEVEL_ASSERTED==0 (derived, no flag).
+if [ "$ADES_RAN" -eq 0 ] && [ "$LEVEL_ASSERTED" -eq 0 ]; then
   skip "profile-gate toolchain not installed — every PDF was self-skipped (no AdES/level assertion made)"
   exit 0
 fi
@@ -376,8 +376,8 @@ if [ "$LEVEL_ASSERTED" -eq 1 ]; then
   fi
   exit 0
 fi
-# DSS did not run: the baseline level was NOT asserted. Only the AdES half ran here (RAN=1 with
-# LEVEL_ASSERTED=0 implies ADES_RAN=1). Report the AdES PASS and the level as explicitly SKIPPED — never
-# claim "at level ${EXPECT_LEVEL}".
+# DSS did not run: the baseline level was NOT asserted. We reach here only past the all-skipped guard
+# above, so with LEVEL_ASSERTED=0 the only way something ran is ADES_RAN=1 — the AdES half ran. Report
+# the AdES PASS and the level as explicitly SKIPPED — never claim "at level ${EXPECT_LEVEL}".
 note "profile-conformance gate: AdES PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (EU DSS unavailable — level NOT asserted)"
 exit 0
