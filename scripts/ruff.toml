@@ -1,0 +1,29 @@
+# Ruff config for the repo's docs-tooling scripts (this directory only).
+#
+# These are standalone build/tooling utilities, not part of the shipped Python package (which is
+# the PyO3 binding under bindings/python). It extends the root ruff.toml so the same strict rule
+# set and formatter settings apply, and relaxes only the handful of rules that are noise for a
+# CLI tool / its pytest module — mirroring the test/example carve-outs the root config already
+# makes. It does NOT alter the root config or any SDK source.
+extend = "../ruff.toml"
+
+[lint.per-file-ignores]
+# The unit-test module: the same pytest idioms the root config waives for bindings/python/tests.
+"test_*.py" = [
+    "S101",    # assert is the pytest assertion mechanism.
+    "D",       # test functions document themselves through their names.
+    "ANN",     # test functions/fixtures need no type annotations.
+    "ARG",     # pytest passes fixtures as unused-looking parameters.
+    "PLR2004", # magic literals (expected values, ids) are the point of a test.
+    "PT006",   # parametrize names as a single comma-string is fine and conventional.
+    "INP001",  # collected by pytest, not imported as a package; no __init__.py.
+]
+# The converter walks an inherently variant JSON tree, so a few rules are a poor fit:
+"rustdoc_json_to_markdown.py" = [
+    "ANN401", # rustdoc JSON nodes are heterogeneous dicts; `Any` is the honest type here.
+    "C901",   # the type/dispatch walkers branch per JSON shape by nature.
+    "PLR0911", # ditto: one return per shape is clearer than nesting.
+    "PLR0912", # ditto: many branches, each a distinct, documented shape.
+    "TRY003", # the format-version guard's message is specific and one-off, not reused.
+    "EM102",  # same: an f-string in the guard's exception is clearest here.
+]

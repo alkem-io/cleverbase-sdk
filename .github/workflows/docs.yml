@@ -1,34 +1,33 @@
 name: API docs
 
-# Generates the multi-language API documentation site (Rust rustdoc, Go gomarkdoc, Python pdoc,
-# TypeScript typedoc), aggregates it under one directory with a landing index, and publishes it to
-# GitHub Pages. The four generators consume the in-source doc comments that the lint gate already
-# enforces (Rust missing_docs, Go revive exported, Python pydocstyle, TS tsdoc/jsdoc) — this
-# workflow generates docs only and never modifies SDK source.
+# Verifies the committed Markdown API docs under docs/api/ are up to date with the public APIs.
 #
-# The generation commands mirror scripts/gen-docs.sh exactly (one authoritative recipe); the build
-# is split into per-language jobs so each language's toolchain is set up independently, then a
-# `publish` job aggregates the artifacts and deploys.
+# The reference docs are generated as Markdown and COMMITTED to the repo (browseable directly on
+# GitHub). This workflow does not publish anything: it regenerates the Markdown with the single
+# authoritative recipe (scripts/gen-docs.sh — the very same `make docs` contributors run) and then
+# `git diff --exit-code -- docs/api` FAILS the build if the committed docs are stale. So changing
+# a public API without re-running `make docs` is caught in CI. The generators consume the in-source
+# doc comments the lint gate already enforces (Rust missing_docs, Go revive exported, Python
+# pydocstyle, TS tsdoc/jsdoc) — this workflow generates docs only and never modifies SDK source.
 
 on:
   push:
     branches: [develop, main]
+  pull_request:
   workflow_dispatch:
 
-# GitHub Pages deploy needs pages:write + id-token:write; everything else is read-only.
+# Generation + a read-only diff check; nothing is published.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Only one Pages deployment at a time; let an in-progress run finish (don't cancel a deploy).
+# One docs check per ref; a newer push supersedes an in-flight run.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust (rustdoc)
+  check:
+    name: Docs up to date
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -37,182 +36,45 @@ jobs:
       # Toolchain version + components are pinned by rust-toolchain.toml (1.92.0); rustup honours it.
       - name: Set up Rust (pinned via rust-toolchain.toml)
         run: rustup show
-      # missing_docs is `deny` and we fail on ANY rustdoc warning too, so a missing/broken doc breaks CI.
-      - name: cargo doc (no-deps, workspace)
-        run: cargo doc --no-deps --workspace
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Stage rust section
-        run: |
-          mkdir -p site/rust
-          cp -R target/doc/. site/rust/
-          # Drop rustdoc's zero-byte build lock (not part of the docs; its 0700 perms upset packers).
-          rm -f site/rust/.lock
-          cat > site/rust/index.html <<'HTML'
-          <!doctype html><meta charset="utf-8">
-          <title>Cleverbase SDK — Rust API</title>
-          <meta http-equiv="refresh" content="0; url=cleverbase_core/index.html">
-          <a href="cleverbase_core/index.html">cleverbase_core</a>
-          HTML
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: docs-rust
-          path: site/rust
-
-  go:
-    name: Go (gomarkdoc)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-      - name: Set up Rust (pinned via rust-toolchain.toml)
-        run: rustup show
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.22"
-      # gomarkdoc renders the package via cgo, so the cleverbase-ffi library must be built and on
-      # the link/runtime path first.
-      - name: Build cleverbase-ffi (cgo link target)
-        run: cargo build -p cleverbase-ffi
-      - name: Install gomarkdoc
-        run: go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
-      - name: gomarkdoc -> go.md
-        working-directory: bindings/go
-        env:
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/site"
-          "$(go env GOPATH)/bin/gomarkdoc" --output "$GITHUB_WORKSPACE/site/go.md" ./...
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: docs-go
-          path: site/go.md
-
-  python:
-    name: Python (pdoc)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-      - name: Install pdoc
-        run: pip install pdoc
-      # The runtime extension's functions carry no __doc__ and PEP 484 stubs hold no docstrings, but
-      # cleverbase.pyi carries the full mypy-strict-enforced type signatures for the 4 public
-      # functions + SCHEMA_VERSION — the durable documented contract. pdoc renders it directly.
-      - name: pdoc -> python/
-        run: pdoc -o site/python bindings/python/cleverbase.pyi
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: docs-python
-          path: site/python
-
-  ts:
-    name: TypeScript (typedoc)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "20"
-      - name: Install deps (typedoc is a devDependency)
-        run: npm install
-        working-directory: frontend/helper-ts
-      - name: typedoc -> ts/
-        working-directory: frontend/helper-ts
-        run: npx typedoc --out "$GITHUB_WORKSPACE/site/ts" src/index.ts
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          name: docs-ts
-          path: site/ts
-
-  publish:
-    name: Aggregate + publish to Pages
-    needs: [rust, go, python, ts]
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - name: Download Rust section
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: docs-rust
-          path: site/rust
-      - name: Download Go section
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: docs-go
-          path: site
-      - name: Download Python section
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: docs-python
-          path: site/python
-      - name: Download TypeScript section
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
-        with:
-          name: docs-ts
-          path: site/ts
-      # Landing index (identical content to the one scripts/gen-docs.sh writes locally).
-      - name: Write landing index
+          python-version: "3.12"
+      # The Python generator runs from the repo virtualenv (.venv) — the same path gen-docs.sh uses
+      # locally — so the recipe is identical in CI and on a developer machine.
+      - name: Create .venv with pydoc-markdown
         run: |
-          cat > site/index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Cleverbase SDK — API documentation</title>
-            <style>
-              :root { color-scheme: light dark; }
-              body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 3rem auto; padding: 0 1.25rem; }
-              h1 { margin-bottom: .25rem; }
-              p.lead { color: #666; margin-top: 0; }
-              ul { list-style: none; padding: 0; }
-              li { margin: .75rem 0; padding: 1rem 1.25rem; border: 1px solid #8884; border-radius: .5rem; }
-              li a { font-size: 1.1rem; font-weight: 600; text-decoration: none; }
-              li span { display: block; color: #777; font-size: .9rem; margin-top: .25rem; }
-              code { background: #8882; padding: .1rem .35rem; border-radius: .25rem; }
-            </style>
-          </head>
-          <body>
-            <h1>Cleverbase SDK — API documentation</h1>
-            <p class="lead">Generated from the in-source doc comments of each language surface.</p>
-            <ul>
-              <li>
-                <a href="rust/cleverbase_core/index.html">Rust &mdash; <code>cleverbase-core</code> + <code>cleverbase-ffi</code></a>
-                <span>rustdoc for the protocol/crypto core and the stable C ABI.
-                See also <a href="rust/cleverbase_ffi/index.html"><code>cleverbase_ffi</code></a>.</span>
-              </li>
-              <li>
-                <a href="go.md">Go &mdash; <code>bindings/go</code></a>
-                <span>godoc of the typed Go binding, rendered to Markdown by gomarkdoc.</span>
-              </li>
-              <li>
-                <a href="python/cleverbase.html">Python &mdash; <code>cleverbase</code></a>
-                <span>The public PyO3 surface (4 functions + <code>SCHEMA_VERSION</code>), from the typed <code>cleverbase.pyi</code> stub.</span>
-              </li>
-              <li>
-                <a href="ts/index.html">TypeScript &mdash; <code>@cleverbase/frontend-helper</code></a>
-                <span>TSDoc for the no-crypto frontend signing helper.</span>
-              </li>
-            </ul>
-          </body>
-          </html>
-          HTML
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install pydoc-markdown
+      - name: Install TypeScript doc deps (typedoc + markdown plugin)
+        working-directory: frontend/helper-ts
+        run: npm install
+      # missing_docs is `deny` and we fail on ANY rustdoc warning too (RUSTDOCFLAGS=-D warnings set
+      # inside the script), so a missing/broken doc breaks this step.
+      - name: Regenerate Markdown docs (same recipe as `make docs`)
+        run: make docs
+      # Fail if regeneration changed anything tracked under docs/api — i.e. the committed docs are
+      # stale. --exit-code returns non-zero on any diff; the preceding --stat just prints what
+      # drifted (it always exits 0). -- pathspec scopes the check to the docs tree.
+      - name: Check committed docs are up to date
+        run: |
+          git diff --stat -- docs/api
+          if ! git diff --exit-code -- docs/api; then
+            echo "::error::docs/api is out of date — run 'make docs' and commit the result."
+            exit 1
+          fi
+      # A new public API would create UNTRACKED files under docs/api that --exit-code above misses.
+      - name: Check for new (untracked) doc files
+        run: |
+          untracked="$(git ls-files --others --exclude-standard -- docs/api)"
+          if [ -n "$untracked" ]; then
+            echo "::error::new files under docs/api are not committed — run 'make docs' and commit them:"
+            echo "$untracked"
+            exit 1
+          fi

@@ -6,8 +6,8 @@
 help: ## list targets
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
 
-docs: ## generate the multi-language API docs site into docs/api/
+docs: ## regenerate the multi-language API docs (Markdown) into docs/api/ — commit the result
 	./scripts/gen-docs.sh
 
-docs-clean: ## remove the generated API docs site
+docs-clean: ## remove the generated API docs Markdown
 	rm -rf docs/api

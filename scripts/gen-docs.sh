@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# Generate the multi-language API documentation site into docs/api/.
+# Generate the multi-language API documentation as Markdown into docs/api/.
 #
-# Runs all four language generators and aggregates them under a single directory with a landing
-# index.html that links each language section. This is the single authoritative recipe — the
-# `docs` GitHub Actions workflow (.github/workflows/docs.yml) runs the very same commands so local
-# and CI output match (Constitution Principle III: one source of truth for the recipe).
+# The generated Markdown is COMMITTED to the repo so the reference docs are browseable directly on
+# GitHub (GitHub renders .md in its file viewer). This is the single authoritative recipe — the
+# `docs` GitHub Actions workflow (.github/workflows/docs.yml) runs the very same commands and then
+# fails if the committed output is stale, so contributors must re-run `make docs` after changing a
+# public API (Constitution Principle III: one source of truth for the recipe).
 #
-# Generators (each consumes the doc-comments the lint gate already enforces — this script does NOT
-# touch any SDK source):
-#   Rust   rustdoc (`cargo doc`)   -> docs/api/rust/   (missing_docs is deny; built with -D warnings)
-#   Go     gomarkdoc               -> docs/api/go.md   (renders godoc of the public binding package)
-#   Python pdoc                    -> docs/api/python/ (renders the cleverbase.pyi public stub)
-#   TS     typedoc                 -> docs/api/ts/     (renders the TSDoc of the frontend helper)
+# Every generator consumes the in-source doc comments the lint gate already enforces; this script
+# does NOT touch any SDK source or lint config.
+#
+#   Rust   rustdoc JSON -> Markdown  -> docs/api/rust/   (cargo rustdoc --output-format json,
+#                                                          converted by scripts/rustdoc_json_to_markdown.py)
+#   Go     gomarkdoc                 -> docs/api/go.md    (godoc of the public binding package)
+#   Python pydoc-markdown            -> docs/api/python.md(the cleverbase.pyi public stub)
+#   TS     typedoc + markdown plugin -> docs/api/ts/      (TSDoc of the frontend helper)
 #
 # Tool prerequisites (versions pinned in the manifests that own them — see docs/README.md):
 #   - Rust toolchain pinned by rust-toolchain.toml (1.92.0); rustup picks it up automatically.
+#     rustdoc JSON is unstable, enabled on stable via RUSTC_BOOTSTRAP=1.
 #   - gomarkdoc: `go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest`
 #       (auto-installed below into $(go env GOPATH)/bin if missing).
-#   - pdoc: installed into the repo venv (.venv); auto-installed below if missing.
-#   - typedoc: a devDependency of frontend/helper-ts (package.json); `npm install` provides it.
+#   - pydoc-markdown: installed into the repo venv (.venv); auto-installed below if missing.
+#   - typedoc + typedoc-plugin-markdown: devDependencies of frontend/helper-ts; `npm install` provides them.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,33 +30,41 @@ cd "$REPO_ROOT"
 
 OUT="$REPO_ROOT/docs/api"
 LIB_DIR="$REPO_ROOT/target/debug"
+PY="$REPO_ROOT/.venv/bin/python"
+PIP="$REPO_ROOT/.venv/bin/pip"
 
 echo "==> Cleaning previous output ($OUT)"
 rm -rf "$OUT"
-mkdir -p "$OUT"
+mkdir -p "$OUT/rust" "$OUT/ts"
 
 # ---------------------------------------------------------------------------
-# 1. RUST — rustdoc for the workspace (core + C ABI). missing_docs is `deny`,
-#    and we additionally fail the build on ANY rustdoc warning so a doc-link
-#    typo or a missing doc cannot slip through.
+# 1. RUST — rustdoc is HTML-native, so we emit rustdoc's machine-readable JSON
+#    and convert it to Markdown with our own format-version-pinned, unit-tested
+#    converter (scripts/rustdoc_json_to_markdown.py). missing_docs is `deny`,
+#    and we fail on ANY rustdoc warning, so a missing/broken doc breaks the build.
+#    RUSTC_BOOTSTRAP=1 unlocks the unstable `--output-format json` on the pinned
+#    stable toolchain (1.92.0 -> format_version 57).
 # ---------------------------------------------------------------------------
-echo "==> [1/4] Rust: cargo doc --no-deps --workspace"
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-rm -rf "$OUT/rust"
-cp -R "$REPO_ROOT/target/doc" "$OUT/rust"
-# Drop rustdoc's zero-byte build lock — it's not part of the docs and its 0700 perms upset some
-# artifact packers.
-rm -f "$OUT/rust/.lock"
-# Land on the core crate's index when the section is opened directly.
-cat > "$OUT/rust/index.html" <<'HTML'
-<!doctype html><meta charset="utf-8">
-<title>Cleverbase SDK — Rust API</title>
-<meta http-equiv="refresh" content="0; url=cleverbase_core/index.html">
-<a href="cleverbase_core/index.html">cleverbase_core</a>
-HTML
+echo "==> [1/4] Rust: cargo rustdoc --output-format json -> Markdown"
+for crate in cleverbase-core cleverbase-ffi; do
+  json="${crate//-/_}.json"
+  RUSTDOCFLAGS="-D warnings" RUSTC_BOOTSTRAP=1 \
+    cargo rustdoc -p "$crate" -- -Z unstable-options --output-format json
+  "$PY" "$REPO_ROOT/scripts/rustdoc_json_to_markdown.py" \
+    "$REPO_ROOT/target/doc/$json" "$OUT/rust/${crate//-/_}.md"
+done
+cat > "$OUT/rust/README.md" <<'MD'
+# Rust API
+
+Generated from the in-source rustdoc comments of the Rust workspace (rustdoc JSON → Markdown).
+
+- [`cleverbase_core`](cleverbase_core.md) — the sans-IO protocol/crypto core (the state machine,
+  PAdES/CMS assembly, RFC 3161 timestamping, the session handle).
+- [`cleverbase_ffi`](cleverbase_ffi.md) — the stable C ABI over the core.
+MD
 
 # ---------------------------------------------------------------------------
-# 2. GO — gomarkdoc renders the public binding package's godoc to markdown.
+# 2. GO — gomarkdoc renders the public binding package's godoc to Markdown.
 #    cgo needs the cleverbase-ffi library on the link path, so build it first.
 # ---------------------------------------------------------------------------
 echo "==> [2/4] Go: build cleverbase-ffi + gomarkdoc"
@@ -72,85 +84,57 @@ fi
 )
 
 # ---------------------------------------------------------------------------
-# 3. PYTHON — pdoc renders the public surface. The runtime module is a compiled
-#    PyO3 extension whose functions carry no __doc__, and PEP 484 stubs (ruff
-#    PYI021) carry no docstrings either — but the cleverbase.pyi stub carries
-#    the full, mypy-strict-enforced TYPE SIGNATURES for the 4 public functions
-#    + SCHEMA_VERSION, which is the durable documented contract. So we point
-#    pdoc straight at the stub (no build/import needed).
+# 3. PYTHON — pydoc-markdown renders the public surface to Markdown. The runtime
+#    module is a compiled PyO3 extension whose functions carry no __doc__, and
+#    PEP 484 stubs (ruff PYI021) carry no docstrings either — but cleverbase.pyi
+#    carries the full, mypy-strict-enforced TYPE SIGNATURES for the 4 public
+#    functions + SCHEMA_VERSION, the durable documented contract. pydoc-markdown's
+#    bundled loader resolves modules by import name and only finds `.py`, so we
+#    drive it through scripts/pyi_to_markdown.py, which parses the `.pyi` with the
+#    same docspec-python parser and renders Markdown (no build/import needed).
 # ---------------------------------------------------------------------------
-echo "==> [3/4] Python: pdoc on bindings/python/cleverbase.pyi"
-PDOC="$REPO_ROOT/.venv/bin/pdoc"
-PIP="$REPO_ROOT/.venv/bin/pip"
-if [ ! -x "$PDOC" ]; then
-  echo "    pdoc not found in .venv — installing"
-  "$PIP" install pdoc
+echo "==> [3/4] Python: pydoc-markdown on bindings/python/cleverbase.pyi"
+if ! "$PY" -c "import pydoc_markdown" 2>/dev/null; then
+  echo "    pydoc-markdown not found in .venv — installing"
+  "$PIP" install pydoc-markdown
 fi
-"$PDOC" -o "$OUT/python" "$REPO_ROOT/bindings/python/cleverbase.pyi"
+"$PY" "$REPO_ROOT/scripts/pyi_to_markdown.py" \
+  "$REPO_ROOT/bindings/python/cleverbase.pyi" "$OUT/python.md"
 
 # ---------------------------------------------------------------------------
-# 4. TYPESCRIPT — typedoc renders the TSDoc of the no-crypto frontend helper.
+# 4. TYPESCRIPT — typedoc + typedoc-plugin-markdown render the TSDoc of the
+#    no-crypto frontend helper to Markdown (config in frontend/helper-ts/typedoc.json).
 # ---------------------------------------------------------------------------
-echo "==> [4/4] TypeScript: typedoc on frontend/helper-ts/src/index.ts"
+echo "==> [4/4] TypeScript: typedoc (markdown) on frontend/helper-ts/src/index.ts"
 (
   cd "$REPO_ROOT/frontend/helper-ts"
-  if [ ! -x node_modules/.bin/typedoc ]; then
-    echo "    typedoc not found — npm install"
+  if [ ! -x node_modules/.bin/typedoc ] || [ ! -d node_modules/typedoc-plugin-markdown ]; then
+    echo "    typedoc/plugin not found — npm install"
     npm install
   fi
-  npx typedoc --out "$OUT/ts" src/index.ts
+  npx typedoc --out "$OUT/ts"
 )
 
 # ---------------------------------------------------------------------------
-# Landing index — links every section. Kept as a single static file (no build
-# step) so the aggregated site is self-contained.
+# Landing index — links every language section. Plain Markdown so it renders on
+# GitHub directly.
 # ---------------------------------------------------------------------------
-echo "==> Writing landing index ($OUT/index.html)"
-cat > "$OUT/index.html" <<'HTML'
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cleverbase SDK — API documentation</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 3rem auto; padding: 0 1.25rem; }
-    h1 { margin-bottom: .25rem; }
-    p.lead { color: #666; margin-top: 0; }
-    ul { list-style: none; padding: 0; }
-    li { margin: .75rem 0; padding: 1rem 1.25rem; border: 1px solid #8884; border-radius: .5rem; }
-    li a { font-size: 1.1rem; font-weight: 600; text-decoration: none; }
-    li span { display: block; color: #777; font-size: .9rem; margin-top: .25rem; }
-    code { background: #8882; padding: .1rem .35rem; border-radius: .25rem; }
-  </style>
-</head>
-<body>
-  <h1>Cleverbase SDK — API documentation</h1>
-  <p class="lead">Generated from the in-source doc comments of each language surface.</p>
-  <ul>
-    <li>
-      <a href="rust/cleverbase_core/index.html">Rust &mdash; <code>cleverbase-core</code> + <code>cleverbase-ffi</code></a>
-      <span>rustdoc for the protocol/crypto core and the stable C ABI.
-      See also <a href="rust/cleverbase_ffi/index.html"><code>cleverbase_ffi</code></a>.</span>
-    </li>
-    <li>
-      <a href="go.md">Go &mdash; <code>bindings/go</code></a>
-      <span>godoc of the typed Go binding, rendered to Markdown by gomarkdoc.</span>
-    </li>
-    <li>
-      <a href="python/cleverbase.html">Python &mdash; <code>cleverbase</code></a>
-      <span>The public PyO3 surface (4 functions + <code>SCHEMA_VERSION</code>), from the typed <code>cleverbase.pyi</code> stub.</span>
-    </li>
-    <li>
-      <a href="ts/index.html">TypeScript &mdash; <code>@cleverbase/frontend-helper</code></a>
-      <span>TSDoc for the no-crypto frontend signing helper.</span>
-    </li>
-  </ul>
-</body>
-</html>
-HTML
+echo "==> Writing landing index ($OUT/README.md)"
+cat > "$OUT/README.md" <<'MD'
+# Cleverbase SDK — API documentation
+
+Reference documentation for every language surface, generated as Markdown from the in-source doc
+comments and committed to the repo so it is browseable directly on GitHub. Regenerate with
+`make docs` (see [`docs/README.md`](../README.md)).
+
+| Language   | Source                                               | Section |
+| ---------- | ---------------------------------------------------- | ------- |
+| Rust       | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | [`rust/`](rust/README.md) |
+| Go         | `bindings/go` (the public binding package)           | [`go.md`](go.md) |
+| Python     | `bindings/python/cleverbase.pyi` (the public stub)   | [`python.md`](python.md) |
+| TypeScript | `frontend/helper-ts/src/index.ts` (no-crypto helper) | [`ts/`](ts/README.md) |
+MD
 
 echo ""
-echo "==> Done. Site at: $OUT"
-echo "    Open: $OUT/index.html"
+echo "==> Done. Markdown docs under: $OUT"
+echo "    Open: $OUT/README.md"
