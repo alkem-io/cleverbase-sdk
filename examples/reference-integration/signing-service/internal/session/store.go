@@ -232,7 +232,13 @@ func (m *Memory) expireLocked(s *Session) {
 func (m *Memory) evictExpiredLocked() {
 	now := m.clock()
 	for id, s := range m.byID {
-		if now.After(s.ExpiresAt.Add(evictGrace)) {
+		// Never evict a session that is checked out for an in-flight resume (resuming==true, its state
+		// already de-indexed). That resume runs outside the store lock and will re-index a fresh pending
+		// state via SetState when it emits the next redirect; evicting it here would strand that callback
+		// (GetByState → ErrNotFound, the in-flight signing session lost mid-flow) and leak the re-added
+		// byState entry. `resuming` is transient — cleared by SetState/Finalize when the resume advances
+		// or terminates — so skipping it cannot leak memory.
+		if !s.resuming && now.After(s.ExpiresAt.Add(evictGrace)) {
 			if s.OAuthState != "" {
 				delete(m.byState, s.OAuthState)
 			}

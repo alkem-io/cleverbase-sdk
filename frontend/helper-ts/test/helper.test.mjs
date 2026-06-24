@@ -163,3 +163,20 @@ test("complete throws on a malformed backend status (not a recognized SignStatus
     /malformed backend response: status is not a recognized SignStatus value/,
   );
 });
+
+test("pollStatus throws on a malformed backend status (symmetric with complete)", async () => {
+  const { fetchImpl } = mockFetch((url) => {
+    if (url.includes("/status")) return { status: "complete" }; // not a SignStatus
+    return {};
+  });
+  const helper = new SigningHelper({
+    startUrl: "x",
+    completeUrl: "x",
+    statusUrl: "https://app.example/api/sign/status",
+    fetchImpl,
+  });
+  await assert.rejects(
+    () => helper.pollStatus("corr-1"),
+    /malformed backend response: status is not a recognized SignStatus value/,
+  );
+});

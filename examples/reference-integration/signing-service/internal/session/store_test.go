@@ -208,3 +208,22 @@ func TestEvictsLongExpiredSessionsOnNew(t *testing.T) {
 		t.Fatalf("fresh session must remain: %v", err)
 	}
 }
+
+func TestEvictionSparesResumingSession(t *testing.T) {
+	m := NewMemory()
+	base := time.Now()
+	m.clock = func() time.Time { return base }
+	s := m.New("resuming-1", "s1", "B-B", time.Minute)
+	// Check the session out for an in-flight resume (sets resuming=true, de-indexes its state).
+	if _, err := m.ConsumeForResume(s); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	// Advance past TTL + evictGrace and create a new session (which sweeps). A session checked out for
+	// resume must NOT be evicted — its resume could still re-index a fresh state via SetState, and
+	// evicting it would strand that callback + leak a byState entry.
+	m.clock = func() time.Time { return base.Add(time.Minute + evictGrace + time.Minute) }
+	m.New("new-1", "s2", "B-B", time.Minute)
+	if _, err := m.Get("resuming-1"); err != nil {
+		t.Fatalf("a checked-out (resuming) session must not be evicted, got %v", err)
+	}
+}

@@ -163,7 +163,12 @@ export class SigningHelper {
     const url = `${this.opts.statusUrl}?correlationId=${encodeURIComponent(correlationId)}`;
     const res = await this.fetchImpl(url, { method: "GET" });
     if (!res.ok) throw new Error(`status failed: ${res.status}`);
-    const data = (await res.json()) as { status: SignStatus };
+    const data = (await res.json()) as { status: unknown };
+    // Validate the untyped runtime value against the closed SignStatus union (symmetric with
+    // toCompleteResult), so a malformed backend status can't leak through the typed return.
+    if (!isSignStatus(data.status)) {
+      throw new Error("malformed backend response: status is not a recognized SignStatus value");
+    }
     return data.status;
   }
 }
