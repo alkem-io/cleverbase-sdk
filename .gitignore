@@ -51,6 +51,12 @@ coverage/
 *.profraw
 lcov.info
 
+# Generated API documentation. The committed docs are the hand-written .md sources
+# (docs/README.md, docs/limitations.md, ...); the rustdoc/gomarkdoc/pdoc/typedoc output under
+# docs/api/ is produced by scripts/gen-docs.sh (and the docs workflow) and must never be tracked.
+# (target/ for rustdoc and node_modules/ for typedoc are already ignored above.)
+/docs/api/
+
 # Env / secrets (never commit Cleverbase client secrets, TSA creds, etc.)
 .env*
 !.env.example
