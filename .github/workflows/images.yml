@@ -4,28 +4,39 @@
 # Follows the org's container build pattern (alkem-io/github-workflows: container-pr.yml /
 # container-release.yml): build each arch on a NATIVE runner (no QEMU), push BY DIGEST, then
 # assemble a multi-arch manifest list with `docker buildx imagetools create`. SBOM + SLSA provenance
-# attestations are produced natively by build-push-action (cosign-verifiable), so there is no
-# separate cosign/syft wiring. Action versions are pinned to the same versions the shared workflows
-# use.
+# attestations are produced natively by build-push-action (cosign-verifiable). Action versions are
+# pinned to the same versions the shared workflows use.
+#
+# Triggers, like the org workflows:
+#   - pull_request  → build + push `pr-<N>` images so each PR's stack is deployable/testable
+#                     (fork PRs build-only; GITHUB_TOKEN is read-only for them).
+#   - push develop/main + tags v* → release images (sha-/branch/semver/latest).
+#   - workflow_dispatch → manual build.
 #
 # All three Dockerfiles take the repository ROOT as the build context (`context: .`): the signing
 # service build needs crates/ + bindings/go, and the mock image bakes tests/fixtures.
 name: Images
 
 on:
+  pull_request:
   push:
-    # NOTE: feature/reference-integration is a TEMPORARY entry to build images for the live demo
-    # deploy before merge (workflow_dispatch requires the workflow on the default branch). Remove it
-    # before/at merge — squash-merge drops it anyway.
-    branches: [develop, main, feature/reference-integration]
+    branches: [develop, main]
     tags: ["v*"]
-  workflow_dispatch: # manual build (e.g. to publish images for a feature-branch deploy)
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# A PR that pushes new commits supersedes its in-flight image build.
+concurrency:
+  group: images-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
+  # Whether to push (and run the merge/smoke jobs): always for push/dispatch, and for same-repo PRs
+  # only (fork PRs get a read-only token, so they validate the build without pushing).
+  PUSH_ENABLED: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
   build:
@@ -63,6 +74,7 @@ jobs:
         uses: docker/setup-buildx-action@v4.1.0
 
       - name: Login to GHCR
+        if: env.PUSH_ENABLED == 'true'
         uses: docker/login-action@v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -77,19 +89,21 @@ jobs:
           file: ${{ matrix.image.dockerfile }}
           platforms: ${{ matrix.platform.os }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=${{ env.PUSH_ENABLED }}
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.pair }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform.pair }}
 
       - name: Export digest
+        if: env.PUSH_ENABLED == 'true'
         run: |
           mkdir -p "${{ runner.temp }}/digests"
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
+        if: env.PUSH_ENABLED == 'true'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: digests-${{ matrix.image.name }}-${{ matrix.platform.pair }}
@@ -98,9 +112,10 @@ jobs:
           retention-days: 1
 
   merge:
-    name: merge ${{ matrix.image.name }}
+    name: merge ${{ matrix.image }}
     runs-on: ubuntu-latest
     needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
     permissions:
       contents: read
@@ -118,6 +133,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
+            type=ref,event=pr
             type=ref,event=branch
             type=sha,prefix=sha-
             type=semver,pattern=v{{version}}
@@ -158,7 +174,6 @@ jobs:
           while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           while IFS= read -r ann; do args+=(--annotation "$ann"); done < <(jq -cr '.annotations[]?' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           docker buildx imagetools create "${args[@]}" $(printf "${IMAGE}@sha256:%s " *)
-          docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA::7}" --format '{{json .Manifest.MediaType}}'
 
   smoke:
     name: smoke ${{ matrix.image.name }} (${{ matrix.platform.arch }})
@@ -192,7 +207,14 @@ jobs:
       - name: Pull native-arch image + smoke
         env:
           SMOKE_RUN_ARGS: ${{ matrix.image.run_args }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          ref="${REGISTRY}/${{ github.repository_owner }}/${{ matrix.image.name }}:sha-${GITHUB_SHA::7}"
+          if [ "$EVENT" = "pull_request" ]; then
+            tag="pr-${PR_NUMBER}"
+          else
+            tag="sha-${GITHUB_SHA::7}"
+          fi
+          ref="${REGISTRY}/${{ github.repository_owner }}/${{ matrix.image.name }}:${tag}"
           docker pull "$ref"
           bash examples/reference-integration/scripts/smoke.sh "$ref" "${{ matrix.image.type }}" "${{ matrix.image.port }}"
