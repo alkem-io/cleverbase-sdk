@@ -43,8 +43,9 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
   helper.goToAuthorization(redirectUrl);
   assert.strictEqual(navigatedTo, redirectUrl);
 
-  const status = await helper.complete("code-xyz", "state-abc");
+  const { status, redirectUrl: secondRedirect } = await helper.complete("code-xyz", "state-abc");
   assert.strictEqual(status, "completed");
+  assert.strictEqual(secondRedirect, undefined);
 
   const polled = await helper.pollStatus(correlationId);
   assert.strictEqual(polled, "completed");
@@ -75,4 +76,51 @@ test("start -> authorize -> complete -> poll, and no secret material leaves the 
       assert.ok(!re.test(haystack), `request to ${c.url} leaked '${word}'`);
     }
   }
+});
+
+test("complete returns a second authorization redirect; the page drives it", async () => {
+  const { fetchImpl } = mockFetch((url) => {
+    if (url.includes("/complete")) {
+      return {
+        status: "authorizing",
+        redirectUrl: "https://connect.acc.cleverbase.com/oauth2/authorize?scope=credential&state=s2",
+      };
+    }
+    return {};
+  });
+  let navigatedTo = null;
+  const helper = new SigningHelper({
+    startUrl: "x",
+    completeUrl: "https://app.example/api/sign/complete",
+    statusUrl: "x",
+    fetchImpl,
+    navigate: (u) => {
+      navigatedTo = u;
+    },
+  });
+
+  const result = await helper.complete("code-1", "state-1");
+  assert.strictEqual(result.status, "authorizing");
+  assert.ok(result.redirectUrl.includes("scope=credential"));
+
+  // The frontend drives the second (credential-scope) authorization redirect.
+  helper.goToAuthorization(result.redirectUrl);
+  assert.strictEqual(navigatedTo, result.redirectUrl);
+});
+
+test("reportRedirectError forwards a decline and returns the terminal status", async () => {
+  const { fetchImpl, calls } = mockFetch((url) => {
+    if (url.includes("/complete")) return { status: "declined" };
+    return {};
+  });
+  const helper = new SigningHelper({
+    startUrl: "x",
+    completeUrl: "https://app.example/api/sign/complete",
+    statusUrl: "x",
+    fetchImpl,
+  });
+  const { status, redirectUrl } = await helper.reportRedirectError("access_denied", "state-1");
+  assert.strictEqual(status, "declined");
+  assert.strictEqual(redirectUrl, undefined);
+  assert.ok(calls[0].init.body.includes("access_denied"));
 });

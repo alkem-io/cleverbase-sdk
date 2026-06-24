@@ -53,6 +53,8 @@ type Config struct {
 	ClientSecret string
 	RedirectURI  string
 	TsaURL       string // optional; "" means none (required for B-T)
+	TsaAuth      string // optional TSA request Authorization header value
+	TsaPolicy    string // optional TSA policy OID
 }
 
 // ExpectedSigner binds the request to a signer identity (FR-014). MatchOn is
@@ -181,7 +183,14 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 		"redirect_uri":  cfg.RedirectURI,
 	}
 	if cfg.TsaURL != "" {
-		config["tsa"] = map[string]interface{}{"url": cfg.TsaURL}
+		tsa := map[string]interface{}{"url": cfg.TsaURL}
+		if cfg.TsaAuth != "" {
+			tsa["auth"] = cfg.TsaAuth
+		}
+		if cfg.TsaPolicy != "" {
+			tsa["policy_oid"] = cfg.TsaPolicy
+		}
+		config["tsa"] = tsa
 	}
 	request := map[string]interface{}{"document": document, "conformance_level": conformance}
 	if opts != nil {

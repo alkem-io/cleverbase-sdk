@@ -31,6 +31,16 @@ export interface StartResult {
   correlationId: string;
 }
 
+/**
+ * Result of `complete`/`reportRedirectError`. When `redirectUrl` is present the signer must be sent
+ * to a SECOND authorization redirect (the credential-scope / SCAL2 step) before the signature can
+ * complete; the frontend drives it with `goToAuthorization(result.redirectUrl)`.
+ */
+export interface CompleteResult {
+  status: SignStatus;
+  redirectUrl?: string;
+}
+
 export class SigningHelper {
   private readonly fetchImpl: typeof fetch;
   private readonly navigate: (url: string) => void;
@@ -71,31 +81,33 @@ export class SigningHelper {
     this.navigate(redirectUrl);
   }
 
-  /** Finalize after the redirect returns with `code`+`state` (forwarded to the backend). */
-  async complete(code: string, state: string): Promise<SignStatus> {
+  /**
+   * Finalize after the redirect returns with `code`+`state` (forwarded to the backend). Returns the
+   * current `{ status, redirectUrl? }`: a non-empty `redirectUrl` means a second authorization
+   * redirect is required (drive it with `goToAuthorization`).
+   */
+  async complete(code: string, state: string): Promise<CompleteResult> {
     const res = await this.fetchImpl(this.opts.completeUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ code, state }),
     });
     if (!res.ok) throw new Error(`complete failed: ${res.status}`);
-    const data = (await res.json()) as { status: SignStatus };
-    return data.status;
+    return toCompleteResult((await res.json()) as CompleteResult);
   }
 
   /**
    * Forward an OAuth error returned to the `redirect_uri` instead of a code (e.g. `access_denied`
    * when the signer declines) to the backend, which resolves the session to a terminal outcome.
    */
-  async reportRedirectError(error: string, state: string): Promise<SignStatus> {
+  async reportRedirectError(error: string, state: string): Promise<CompleteResult> {
     const res = await this.fetchImpl(this.opts.completeUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ error, state }),
     });
     if (!res.ok) throw new Error(`reportRedirectError failed: ${res.status}`);
-    const data = (await res.json()) as { status: SignStatus };
-    return data.status;
+    return toCompleteResult((await res.json()) as CompleteResult);
   }
 
   /** Poll the backend for the current status. */
@@ -106,4 +118,12 @@ export class SigningHelper {
     const data = (await res.json()) as { status: SignStatus };
     return data.status;
   }
+}
+
+/**
+ * Normalize a backend complete/error response into a CompleteResult, omitting `redirectUrl` entirely
+ * when absent (so the shape is exact under `exactOptionalPropertyTypes`).
+ */
+function toCompleteResult(data: CompleteResult): CompleteResult {
+  return data.redirectUrl ? { status: data.status, redirectUrl: data.redirectUrl } : { status: data.status };
 }
