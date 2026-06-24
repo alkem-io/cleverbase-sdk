@@ -114,3 +114,43 @@ jobs:
         working-directory: frontend/helper-ts
       - run: npm test
         working-directory: frontend/helper-ts
+
+  reference-integration:
+    name: Reference integration (service + mock + credential-free E2E)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          persist-credentials: false
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.0.2
+        with:
+          go-version: "1.22"
+      - name: Build the cleverbase-ffi library
+        run: cargo build -p cleverbase-ffi
+      - name: Signing service unit tests + ≥95% coverage gate
+        working-directory: examples/reference-integration/signing-service
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          # Coverage scoped to the signing-service packages only (mock/web/deploy exempt — FR-024).
+          go test -coverprofile=cover.out ./internal/...
+          total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          echo "signing-service statement coverage: ${total}%"
+          awk "BEGIN { exit !(${total} >= 95) }" || { echo "coverage ${total}% < 95%"; exit 1; }
+      - name: Mock upstream tests
+        working-directory: examples/reference-integration/mock-upstream
+        run: go test ./...
+      - name: Web BFF build
+        working-directory: examples/reference-integration/web
+        run: go build -o /dev/null ./server
+      # The credential-free E2E spins up the mock + service in-process (no Cleverbase credentials) and
+      # OpenSSL-validates the produced B-B and B-T signatures; auth stays enabled (FR-021/SC-002).
+      - name: Credential-free E2E (OpenSSL-validated B-B + B-T)
+        working-directory: examples/reference-integration/signing-service
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: go test ./e2e/...

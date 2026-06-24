@@ -90,7 +90,7 @@ jobs:
         run: cargo build -p cleverbase-ffi
       - name: gofmt
         run: |
-          unformatted="$(gofmt -l bindings/go examples/go_demo)"
+          unformatted="$(gofmt -l bindings/go examples/go_demo examples/reference-integration/signing-service examples/reference-integration/mock-upstream examples/reference-integration/web)"
           if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
       - name: go vet (binding)
         working-directory: bindings/go
@@ -114,3 +114,21 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
           CGO_LDFLAGS: "-L${{ github.workspace }}/target/debug"
+      - name: golangci-lint (reference signing service)
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.12.2
+          working-directory: examples/reference-integration/signing-service
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          CGO_LDFLAGS: "-L${{ github.workspace }}/target/debug"
+      - name: golangci-lint (reference mock upstream)
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.12.2
+          working-directory: examples/reference-integration/mock-upstream
+      - name: golangci-lint (reference web BFF)
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.12.2
+          working-directory: examples/reference-integration/web

@@ -1,0 +1,51 @@
+# Credential-free reference stack: mock upstream + signing service + web frontend, all in fixtures
+# mode (no Cleverbase credentials). Build context is the repository root so the images can reach
+# crates/, bindings/go, and tests/fixtures.
+#
+#   docker compose -f examples/reference-integration/deploy/compose.yml up --build
+#   open http://localhost:8090
+#
+# The DEMO api key is intentionally trivial. The browser never sees it: the web BFF injects it when
+# proxying /api/* to the signing service.
+name: cleverbase-reference
+
+services:
+  mock-upstream:
+    build:
+      context: ../../..
+      dockerfile: examples/reference-integration/mock-upstream/Dockerfile
+    image: cleverbase-refmock:dev
+    ports:
+      - "9000:9000" # browser-reachable for the authorization redirects
+
+  signing-service:
+    build:
+      context: ../../..
+      dockerfile: examples/reference-integration/signing-service/Dockerfile
+    image: cleverbase-refsvc:dev
+    environment:
+      REFSVC_MODE: fixtures
+      REFSVC_BASE_URL: http://mock-upstream:9000 # server-side effects (internal)
+      REFSVC_PUBLIC_BASE_URL: http://localhost:9000 # browser-facing redirects
+      REFSVC_REDIRECT_URI: http://localhost:8090/return.html
+      REFSVC_API_KEY: demo-key
+      REFSVC_DEFAULT_CONFORMANCE: B-B
+      REFSVC_LISTEN: ":8080"
+    ports:
+      - "8080:8080" # optional: direct REST access
+    depends_on:
+      - mock-upstream
+
+  web:
+    build:
+      context: ../../..
+      dockerfile: examples/reference-integration/web/Dockerfile
+    image: cleverbase-refweb:dev
+    environment:
+      REFWEB_API_TARGET: http://signing-service:8080
+      REFWEB_API_KEY: demo-key # injected server-side; never sent to the browser
+      REFWEB_LISTEN: ":8080"
+    ports:
+      - "8090:8080"
+    depends_on:
+      - signing-service

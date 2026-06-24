@@ -23,3 +23,18 @@ linters:
       - path: bindings/go/cleverbase\.go
         linters: [gocritic]
         text: "dupSubExpr"
+      # The reference E2E intentionally shells out to `openssl` to validate produced signatures;
+      # the arguments are test-controlled fixture paths, not external input.
+      - path: examples/reference-integration/.*_test\.go
+        linters: [gosec]
+        text: "G204"
+      # The mock upstream is a deliberate test double: it loads fixtures by configured path (G304),
+      # mirrors the OAuth redirect_uri back to the caller (G710), and drives openssl for the RFC 3161
+      # TSA (G204). These patterns are inherent to standing in for Cleverbase, not production risks.
+      - path: examples/reference-integration/mock-upstream/
+        linters: [gosec]
+      # The result endpoint streams the SDK-produced signed PDF as application/pdf; gosec's XSS taint
+      # check (G705) does not apply to a non-HTML binary response.
+      - path: examples/reference-integration/signing-service/internal/httpapi/service\.go
+        linters: [gosec]
+        text: "G705"
