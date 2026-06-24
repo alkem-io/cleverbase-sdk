@@ -7,5 +7,6 @@
   "readme": "none",
   "name": "Cleverbase Node binding",
   "hidePageHeader": true,
-  "hideBreadcrumbs": true
+  "hideBreadcrumbs": true,
+  "gitRevision": "main"
 }

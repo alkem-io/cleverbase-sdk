@@ -145,34 +145,13 @@ linters:
   exclusions:
     presets: []
     rules:
-      # The binding is a thin cgo shim: unsafe.Pointer conversions and a C-bytes copy are
-      # inherent to the FFI boundary and are reviewed by hand, not flagged per call site.
-      - path: bindings/go/cleverbase\.go
-        linters: [gosec]
-        text: "G103|G115"
-      # gocritic's dupSubExpr misreads the cgo macro expansion of a C.func call as `x == x`.
-      - path: bindings/go/cleverbase\.go
-        linters: [gocritic]
-        text: "dupSubExpr"
-      # The reference E2E intentionally shells out to `openssl` to validate produced signatures;
-      # the arguments are test-controlled fixture paths, not external input.
-      - path: examples/reference-integration/.*_test\.go
-        linters: [gosec]
-        text: "G204"
-      # The mock upstream is a deliberate test double: it loads fixtures by configured path (G304),
-      # mirrors the OAuth redirect_uri back to the caller (G710), and drives openssl for the RFC 3161
-      # TSA — both the legacy subprocess rule (G204) and gosec's taint-analysis rule (G702), whose
-      # only "tainted" inputs are the committed fixture PKI paths, never request data. Scope the
-      # waiver to exactly those rules so a new gosec finding still surfaces (the mock is published to
-      # GHCR, so its security posture is load-bearing).
-      - path: examples/reference-integration/mock-upstream/
-        linters: [gosec]
-        text: "G304|G710|G204|G702"
-      # The result endpoint streams the SDK-produced signed PDF as application/pdf; gosec's XSS taint
-      # check (G705) does not apply to a non-HTML binary response.
-      - path: examples/reference-integration/signing-service/internal/httpapi/service\.go
-        linters: [gosec]
-        text: "G705"
+      # NOTE: there are intentionally NO path-level gosec/gocritic waivers here. Every such
+      # suppression is applied INLINE at its single call site with a `//nolint:<linter> // <reason>`
+      # directive (the cgo unsafe.Pointer ops in bindings/go/cleverbase.go, the mock's fixture reads /
+      # redirect-mirroring / openssl exec, and the signed-PDF response write). That keeps each waiver
+      # isolated to the one line it protects and individually motivated, instead of blanket-disabling
+      # a security linter across a whole file or directory.
+      #
       # Test files get the same relaxations as the apispec baseline (plus the extra strict linters
       # this config enables): tests exercise error paths, repeat literal step kinds / wire keys, and
       # use the two-value `v, _ := x.(T)` assertion idiom in ways that trip these otherwise-strict

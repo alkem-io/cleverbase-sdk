@@ -128,6 +128,15 @@ fn parse_generalized_time_secs(tlv: &[u8]) -> Option<i64> {
     if !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
+    // RFC 3161 TSTInfo `genTime` is `YYYYMMDDHHMMSS`, optionally `.<frac>`, and is ALWAYS terminated
+    // by `Z` (UTC). Reject any other suffix — trailing junk, a numeric offset like `+01:00`, or a
+    // missing `Z` — so a malformed TSA token makes the caller fall back rather than accept a wrong
+    // timestamp. (A fractional part, if present, is intentionally not carried into whole seconds.)
+    match body.get(14..) {
+        Some(b"Z") => {}
+        Some([b'.', frac @ .., b'Z']) if !frac.is_empty() && frac.iter().all(u8::is_ascii_digit) => {}
+        _ => return None,
+    }
     // Parse a 2/4-digit field by byte range; `.get` (not `[..]`) keeps this off the string-slice
     // panic path. The all-ASCII-digit check above guarantees each sub-slice parses.
     let n = |a: usize, b: usize| s.get(a..b).and_then(|t| t.parse::<i64>().ok());
@@ -273,6 +282,12 @@ mod tests {
         assert!(parse_generalized_time_secs(&mk("20260229120000Z")).is_none()); // 2026 not a leap year
         assert!(parse_generalized_time_secs(&mk("20240229120000Z")).is_some()); // 2024 IS a leap year
         assert!(parse_generalized_time_secs(&mk("20261301120000Z")).is_none()); // month 13
+        // Malformed suffixes must be rejected (RFC 3161 genTime is UTC, terminated by `Z`), so a bad
+        // TSA token falls back to the host clock instead of yielding a wrong gen_time.
+        assert!(parse_generalized_time_secs(&mk("20260622120000")).is_none()); // missing Z
+        assert!(parse_generalized_time_secs(&mk("20260622120000junk")).is_none()); // trailing junk
+        assert!(parse_generalized_time_secs(&mk("20260622120000.123+01:00")).is_none()); // offset, no Z
+        assert!(parse_generalized_time_secs(&mk("20260622120000.Z")).is_none()); // empty fraction
     }
 
     #[test]

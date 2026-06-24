@@ -149,6 +149,7 @@ func process(input []byte) ([]byte, error) {
 	}
 	var outPtr *C.uint8_t
 	var outLen C.size_t
+	//nolint:gocritic // dupSubExpr: cgo expands the C.cleverbase_process call into a macro form gocritic misreads as an identical LHS==RHS comparison.
 	rc := C.cleverbase_process((*C.uint8_t)(unsafe.Pointer(&input[0])), C.size_t(len(input)), &outPtr, &outLen)
 	if rc != 0 {
 		return nil, fmt.Errorf("cleverbase_process returned a non-zero status: %d", int(rc))

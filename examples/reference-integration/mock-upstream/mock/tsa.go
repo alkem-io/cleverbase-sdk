@@ -53,6 +53,7 @@ func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = os.RemoveAll(work) }()
 
 	ctx := r.Context()
+	//nolint:gosec // G204: openssl is invoked with fixed flags + per-request temp-file paths the handler controls, never request input.
 	der2pem := func(args ...string) error { return exec.CommandContext(ctx, "openssl", args...).Run() }
 	steps := [][]string{
 		{"x509", flagInform, formatDER, flagIn, filepath.Join(s.pkiDir, "tsa.cert.der"), flagOut, filepath.Join(work, "tsa.cert.pem")},
@@ -77,12 +78,14 @@ func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tsa query", http.StatusInternalServerError)
 		return
 	}
+	//nolint:gosec // G702: same as above — fixed openssl flags + temp-file paths the handler wrote, never request data.
 	cmd := exec.CommandContext(ctx, "openssl", "ts", "-reply", "-config", "tsa.cnf", "-queryfile", "req.tsq", flagOut, "resp.tsr")
 	cmd.Dir = work
 	if out, err := cmd.CombinedOutput(); err != nil {
 		http.Error(w, "openssl ts -reply: "+string(out), http.StatusInternalServerError)
 		return
 	}
+	//nolint:gosec // G304: reads the openssl-written reply from the handler's own per-request temp dir, never request input.
 	resp, err := os.ReadFile(filepath.Join(work, "resp.tsr"))
 	if err != nil {
 		http.Error(w, "tsa read reply", http.StatusInternalServerError)

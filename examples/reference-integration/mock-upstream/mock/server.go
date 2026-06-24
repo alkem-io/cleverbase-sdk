@@ -39,6 +39,7 @@ func readFixturesAndPKI(fixturesDir string) (*Server, error) {
 	upstream := filepath.Join(fixturesDir, "upstream")
 	pki := filepath.Join(fixturesDir, "pki")
 
+	//nolint:gosec // G304: fixture path under the operator-set REFMOCK_FIXTURES_DIR, never request input.
 	keyDER, err := os.ReadFile(filepath.Join(pki, "signer-rsa.key.pk8"))
 	if err != nil {
 		return nil, fmt.Errorf("read signer key: %w", err)
@@ -51,12 +52,14 @@ func readFixturesAndPKI(fixturesDir string) (*Server, error) {
 	if !ok {
 		return nil, errors.New("signer key is not RSA")
 	}
+	//nolint:gosec // G304: fixture path under the operator-set REFMOCK_FIXTURES_DIR, never request input.
 	certDER, err := os.ReadFile(filepath.Join(pki, "signer-rsa.cert.der"))
 	if err != nil {
 		return nil, fmt.Errorf("read signer cert: %w", err)
 	}
 	certB64 := base64.StdEncoding.EncodeToString(certDER)
 
+	//nolint:gosec // G304: fixture filenames are internal constants under REFMOCK_FIXTURES_DIR, never request input.
 	read := func(name string) ([]byte, error) { return os.ReadFile(filepath.Join(upstream, name)) }
 	info, err := read("credentials_info.json")
 	if err != nil {
@@ -128,6 +131,7 @@ func (*Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loc := redirectURI + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	//nolint:gosec // G710: this is a credential-free OAuth MOCK; mirroring the caller's redirect_uri back is exactly its job (no real sessions/tokens are at risk).
 	http.Redirect(w, r, loc, http.StatusFound)
 }
 

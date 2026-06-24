@@ -45,7 +45,7 @@ mkdir -p "$OUT/rust" "$OUT/ts"
 #    RUSTC_BOOTSTRAP=1 unlocks the unstable `--output-format json` on the pinned
 #    stable toolchain (1.92.0 -> format_version 57).
 # ---------------------------------------------------------------------------
-echo "==> [1/4] Rust: cargo rustdoc --output-format json -> Markdown"
+echo "==> [1/5] Rust: cargo rustdoc --output-format json -> Markdown"
 for crate in cleverbase-core cleverbase-ffi; do
   json="${crate//-/_}.json"
   RUSTDOCFLAGS="-D warnings" RUSTC_BOOTSTRAP=1 \
@@ -67,7 +67,7 @@ MD
 # 2. GO — gomarkdoc renders the public binding package's godoc to Markdown.
 #    cgo needs the cleverbase-ffi library on the link path, so build it first.
 # ---------------------------------------------------------------------------
-echo "==> [2/4] Go: build cleverbase-ffi + gomarkdoc"
+echo "==> [2/5] Go: build cleverbase-ffi + gomarkdoc"
 cargo build -p cleverbase-ffi
 GOBIN="$(go env GOPATH)/bin"
 GOMARKDOC="$GOBIN/gomarkdoc"
@@ -93,7 +93,7 @@ fi
 #    drive it through scripts/pyi_to_markdown.py, which parses the `.pyi` with the
 #    same docspec-python parser and renders Markdown (no build/import needed).
 # ---------------------------------------------------------------------------
-echo "==> [3/4] Python: pydoc-markdown on bindings/python/cleverbase.pyi"
+echo "==> [3/5] Python: pydoc-markdown on bindings/python/cleverbase.pyi"
 if ! "$PY" -c "import pydoc_markdown" 2>/dev/null; then
   echo "    pydoc-markdown not found in .venv — installing"
   "$PIP" install pydoc-markdown
