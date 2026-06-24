@@ -57,6 +57,18 @@ const (
 // outcomeDeclined is the terminal evidence outcome for a signer-declined flow.
 const outcomeDeclined = "declined"
 
+// Service-operational failure reasons this engine emits on a `failed` status, alongside the SDK's
+// SigningOutcome failure codes (passed through verbatim from the evidence `outcome`). These are the
+// single authoritative spelling for the snake_case wire codes; they MUST stay in sync with the
+// `failed` reason set documented in specs/002-reference-integration/contracts/reference-service-api.md
+// (the authoritative API definition). The session store emits one further code, "session_expired",
+// on TTL expiry (see internal/session/store.go).
+const (
+	reasonUpstreamError = "upstream_error" // an upstream HTTP call failed
+	reasonResumeError   = "resume_error"   // the SDK could not advance the state machine
+	reasonUnknown       = "unknown"        // defensive catch-all for an unmapped/future SDK outcome
+)
+
 // Engine ties the SDK, effector, and session store together.
 type Engine struct {
 	SDK   SDK
@@ -87,15 +99,15 @@ func (e *Engine) drive(s *session.Session, res Result) (status session.Status, r
 			e.Log.Info("effect.perform_http", "method", ef.method, "url", redact(ef.rawURL))
 			httpStatus, respBody, doErr := e.Up.Do(ef.method, ef.rawURL, ef.headers, ef.body)
 			if doErr != nil {
-				e.fail(s, session.StatusFailed, "upstream_error", nil)
+				e.fail(s, session.StatusFailed, reasonUpstreamError, nil)
 				e.Log.Error("effect.http_error", "url", redact(ef.rawURL), "err", doErr.Error())
-				return session.StatusFailed, "", "upstream_error", nil
+				return session.StatusFailed, "", reasonUpstreamError, nil
 			}
 			e.Log.Info("effect.http_result", "status", httpStatus)
 			next, resumeErr := e.SDK.ResumeHTTP(handle, httpStatus, respBody)
 			if resumeErr != nil {
 				// Scrub + de-index now rather than letting the handle linger until the TTL.
-				e.fail(s, session.StatusFailed, "resume_error", nil)
+				e.fail(s, session.StatusFailed, reasonResumeError, nil)
 				return "", "", "", fmt.Errorf("resume http: %w", resumeErr)
 			}
 			res = next
@@ -121,7 +133,7 @@ func (e *Engine) drive(s *session.Session, res Result) (status session.Status, r
 			e.Log.Info("transition.failed", "reason", failReason)
 			return failStatus, "", failReason, nil
 		default:
-			e.fail(s, session.StatusFailed, "resume_error", nil)
+			e.fail(s, session.StatusFailed, reasonResumeError, nil)
 			return "", "", "", fmt.Errorf("unexpected step kind %q", stepKind(res.Step))
 		}
 	}
@@ -166,7 +178,7 @@ func (e *Engine) Complete(s *session.Session, code, state string) (status sessio
 	}
 	res, err := e.SDK.ResumeRedirect(handle, code, state)
 	if err != nil {
-		e.fail(s, session.StatusFailed, "resume_error", nil)
+		e.fail(s, session.StatusFailed, reasonResumeError, nil)
 		return "", "", "", err
 	}
 	return e.drive(s, res)
@@ -180,7 +192,7 @@ func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (st
 	}
 	res, err := e.SDK.ResumeRedirectError(handle, oauthError, state)
 	if err != nil {
-		e.fail(s, session.StatusFailed, "resume_error", nil)
+		e.fail(s, session.StatusFailed, reasonResumeError, nil)
 		return "", "", "", err
 	}
 	return e.drive(s, res)
@@ -265,7 +277,7 @@ func mapFailed(step map[string]any) (session.Status, string) {
 		return session.StatusDeclined, outcomeDeclined
 	}
 	if outcome == "" {
-		outcome = "unknown"
+		outcome = reasonUnknown
 	}
 	return session.StatusFailed, outcome
 }

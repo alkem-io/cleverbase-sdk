@@ -171,8 +171,11 @@ func (p *Profile) validateLive() error {
 	if p.RedirectURI == "" {
 		missing = append(missing, "REFSVC_REDIRECT_URI")
 	}
-	if p.DefaultConformance == ConformanceBT && p.TsaURL == "" {
-		missing = append(missing, "REFSVC_TSA_URL (B-T)")
+	// Conformance is per-request overridable, so a live profile that defaults to B-B can still
+	// receive a B-T request and would otherwise fail late (mid-flow) for want of a TSA. Require the
+	// TSA up front regardless of the default: a live deployment must always be able to serve B-T.
+	if p.TsaURL == "" {
+		missing = append(missing, "REFSVC_TSA_URL")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("live mode requires: %s", strings.Join(missing, ", "))

@@ -28,8 +28,13 @@ func TestNoSecretInFrontendBoundResponses(t *testing.T) {
 	rec := do(t, h, "POST", "/v1/sign/start", `{"conformanceLevel":"B-B"}`, "test-key")
 	record(rec)
 	var sr map[string]string
-	_ = json.Unmarshal(rec.Body.Bytes(), &sr)
+	if err := json.Unmarshal(rec.Body.Bytes(), &sr); err != nil {
+		t.Fatalf("start response is not JSON: %v (body %q)", err, rec.Body)
+	}
 	corr := sr["correlationId"]
+	if corr == "" {
+		t.Fatalf("start did not return a correlationId, so /status and /result are never exercised: %s", rec.Body)
+	}
 
 	record(do(t, h, "POST", "/v1/sign/complete", `{"code":"c1","state":"s1"}`, "test-key"))
 	record(do(t, h, "POST", "/v1/sign/complete", `{"code":"c2","state":"s2"}`, "test-key"))

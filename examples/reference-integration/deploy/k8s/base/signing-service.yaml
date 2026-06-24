@@ -19,6 +19,9 @@ spec:
         app.kubernetes.io/name: signing-service
         app.kubernetes.io/part-of: cleverbase-reference-integration
     spec:
+      # Gets its config via env/Secrets and needs no Kubernetes API access, so don't mount the
+      # default service-account token on this externally reachable pod.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

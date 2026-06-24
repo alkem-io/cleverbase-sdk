@@ -18,7 +18,7 @@ The default in-memory `SessionStore` holds session state — including the SDK h
 ## Supply chain
 
 - Published images are **cosign-signed** (keyless) and carry **SBOM attestations**; verify both before deploying (see the README's "Verify image provenance").
-- Images are non-root and distroless.
+- All images run as a non-root user. The signing-service and web images are distroless (`gcr.io/distroless/cc-debian12:nonroot` and `gcr.io/distroless/static-debian12:nonroot`). The mock-upstream image is a slim Debian non-root image (`debian:bookworm-slim`) that bundles `openssl`, which it needs at runtime to run the test RFC 3161 TSA; it is therefore not distroless.
 
 ## Fixtures PKI
 

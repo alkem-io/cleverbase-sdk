@@ -19,6 +19,9 @@ spec:
         app.kubernetes.io/name: web
         app.kubernetes.io/part-of: cleverbase-reference-integration
     spec:
+      # Static file server / BFF needs no Kubernetes API access, so don't mount the default
+      # service-account token on this externally reachable pod.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

@@ -4,7 +4,7 @@
 
 **Created**: 2026-06-23
 
-**Status**: Draft
+**Status**: Implemented
 
 **Input**: User description: "specify development of those services, assuming they will run in k8s or in docker. So far in this repo, setup also CI for building images (to ghcr, amd64 and arm64 with native GH runners). Include cred-free fixtures, so it is CI-able/runnable"
 
@@ -178,9 +178,13 @@ native architecture.
 - **FR-008**: The backend MUST emit structured logs of the effect loop (each upstream request/result and
   each state transition) with secrets redacted, sufficient to diff fixtures-mode behavior against live.
 - **FR-009**: The backend MUST surface terminal outcomes distinctly — matching the SDK's
-  `SigningOutcome` set: `completed`, `declined`, and the seven failure reasons `authorization-expired`,
-  `credential-unavailable`, `identity-mismatch`, `invalid-document`, `timestamp-failed`,
-  `appearance-placement-error`, `signature-invalid` — so the frontend can reflect them accurately.
+  `SigningOutcome` set: `completed`, `declined`, and the seven failure reasons (snake_case, as the
+  Rust core serializes them) `authorization_expired`, `credential_unavailable`, `identity_mismatch`,
+  `invalid_document`, `timestamp_failed`, `appearance_placement_error`, `signature_invalid` — so the
+  frontend can reflect them accurately. The complete authoritative `failed` `reason` set (these seven
+  SDK codes plus the service-operational codes `upstream_error`, `resume_error`, `session_expired`,
+  and the defensive catch-all `unknown`) is defined in
+  `contracts/reference-service-api.md`, the authoritative API definition.
 - **FR-025**: The backend REST API MUST support a **configurable API key** (env-supplied bearer/key),
   **enabled by default** so a deployed image is not an open signing-initiation endpoint; it MAY be
   disabled for local fixtures runs. Requests without a valid key MUST be rejected (401) before any

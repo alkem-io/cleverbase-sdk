@@ -125,9 +125,12 @@ Unauthenticated. `200 { "status": "ok" }` when healthy/ready (ready = config val
 | `declined` | The signer declined or an OAuth error ended the flow. |
 | `failed` | Terminal error; `reason` is set. |
 
-When `status` is `failed`, `reason` is exactly one of:
-
-`authorization_expired` · `credential_unavailable` · `identity_mismatch` · `invalid_document` · `timestamp_failed` · `appearance_placement_error` · `signature_invalid`
+When `status` is `failed`, `reason` is a snake_case code from the authoritative `failed` reason set
+defined in [`specs/002-reference-integration/contracts/reference-service-api.md`](../../specs/002-reference-integration/contracts/reference-service-api.md):
+the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `credential_unavailable` ·
+`identity_mismatch` · `invalid_document` · `timestamp_failed` · `appearance_placement_error` ·
+`signature_invalid` — plus the service-operational codes `upstream_error`, `resume_error`,
+`session_expired`, and the defensive catch-all `unknown`.
 
 ## Configuration
 

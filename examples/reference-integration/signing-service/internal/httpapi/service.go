@@ -8,6 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/alkem-io/cleverbase-sdk/examples/reference-integration/signing-service/internal/config"
@@ -25,6 +28,17 @@ type Service struct {
 	Profile *config.Profile
 	// Sample is the bundled PDF used when a start request omits a document.
 	Sample []byte
+	// Log records server-side errors whose details must not reach the client. Defaults to a
+	// discard logger when nil so handlers never panic on a partially-wired Service (tests).
+	Log *slog.Logger
+}
+
+// log returns the configured logger, or a no-op discard logger when none was wired.
+func (s *Service) log() *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // Handler returns the routed, auth-wrapped HTTP handler.
@@ -52,10 +66,15 @@ func writeErr(w http.ResponseWriter, code int, errCode, msg string) {
 	writeJSON(w, code, map[string]string{"error": errCode, "message": msg})
 }
 
-func newCorrelationID() string {
+// newCorrelationID returns a 128-bit random correlation ID. It propagates a failed RNG read
+// instead of silently returning a predictable/zero ID (a degraded RNG must fail the request,
+// not hand out a guessable correlation handle).
+func newCorrelationID() (string, error) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate correlation id: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // expectedSignerInput binds the request to a signer identity (FR-014).
@@ -100,10 +119,18 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 			ExpectedSignerValue:   req.ExpectedSigner.Value,
 		}
 	}
-	corr := newCorrelationID()
+	corr, err := newCorrelationID()
+	if err != nil {
+		s.log().Error("correlation id generation failed", "err", err.Error())
+		writeErr(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
 	redirectURL, err := s.Engine.Begin(corr, doc, conformance, opts)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "begin_failed", err.Error())
+		// Do not surface the upstream/SDK error text to the client (it can leak internal/session
+		// detail); log it server-side and return a stable generic message with the same status.
+		s.log().Error("begin failed", "correlation_id", corr, "err", err.Error())
+		writeErr(w, http.StatusInternalServerError, "begin_failed", "could not start signing session")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"redirectUrl": redirectURL, "correlationId": corr})
@@ -142,8 +169,10 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		// A terminal session is already de-indexed by its state, so GetByState (above) returns
-		// "unknown_state" for a re-complete; any error here is an internal resume failure.
-		writeErr(w, http.StatusInternalServerError, "resume_failed", err.Error())
+		// "unknown_state" for a re-complete; any error here is an internal resume failure. Do not
+		// surface the SDK/upstream error text to the client; log it and return a generic message.
+		s.log().Error("resume failed", "err", err.Error())
+		writeErr(w, http.StatusInternalServerError, "resume_failed", "could not complete signing session")
 		return
 	}
 	resp := map[string]any{keyStatus: string(status)}

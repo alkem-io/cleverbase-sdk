@@ -287,6 +287,11 @@ func decodeHex(t *testing.T, s string) []byte {
 }
 
 func TestCredentialFreeBB(t *testing.T) {
+	// validateCMS execs `openssl cms -verify`; skip (don't hard-fail) when it is absent, matching
+	// TestCredentialFreeBT.
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl required to validate the CMS signature")
+	}
 	svc := stack(t, "B-B")
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
 	pdf, evidence, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)

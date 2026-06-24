@@ -145,8 +145,8 @@ func TestFullFlowOverHTTP(t *testing.T) {
 	}
 	// Status reports completed.
 	rec = do(t, h, "GET", "/v1/sign/status?correlationId="+corr, "", "test-key")
-	if !strings.Contains(rec.Body.String(), `"completed"`) {
-		t.Fatalf("status: %s", rec.Body)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"completed"`) {
+		t.Fatalf("status: %d %s", rec.Code, rec.Body)
 	}
 }
 

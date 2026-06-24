@@ -32,7 +32,10 @@ func TestAdapterBeginAndResumeGlue(t *testing.T) {
 	if res.Step["kind"] != "redirect" {
 		t.Fatalf("expected a redirect step, got %v", res.Step["kind"])
 	}
-	state, _ := res.Step["state"].(string)
+	state, ok := res.Step["state"].(string)
+	if !ok || state == "" {
+		t.Fatalf("redirect step has no usable state, resume paths would not be exercised: %v", res.Step)
+	}
 
 	// Begin with the expected-signer option (covers the opts path).
 	if _, err := a.Begin(sample, "B-B", &flow.Options{ExpectedSignerMatchOn: "certificate_serial_number", ExpectedSignerValue: "X"}); err != nil {
@@ -63,7 +66,11 @@ func TestAdapterBeginAndResumeGlue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh begin: %v", err)
 	}
-	if _, err := a.ResumeRedirectError(fresh.Handle, "access_denied", fresh.Step["state"].(string)); err != nil {
+	freshState, ok := fresh.Step["state"].(string)
+	if !ok || freshState == "" {
+		t.Fatalf("fresh redirect step has no usable state: %v", fresh.Step)
+	}
+	if _, err := a.ResumeRedirectError(fresh.Handle, "access_denied", freshState); err != nil {
 		t.Fatalf("resume redirect error: %v", err)
 	}
 	if _, err := a.ResumeRedirectError(garbage, "x", "y"); err == nil {

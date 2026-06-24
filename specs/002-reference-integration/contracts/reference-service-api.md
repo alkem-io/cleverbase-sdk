@@ -63,12 +63,15 @@ Advance the flow after a browser redirect returns to the registered `redirect_ur
 ## `GET /v1/sign/status?correlationId=…`
 
 - **Response 200**: `{ "status": "pending" | "authorizing" | "completed" | "declined" | "failed", "reason": "<code>" }`
-- `reason` is present (and required) **only** when `status == "failed"`, and is one of:
+- `reason` is present (and required) **only** when `status == "failed"`. This is the **authoritative**
+  `failed` reason set: all codes are **snake_case** (matching the Rust core's `SigningOutcome`
+  serialization), and the service emits exactly one of these eleven:
   - the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `credential_unavailable`
     · `identity_mismatch` · `invalid_document` · `timestamp_failed` · `appearance_placement_error` ·
-    `signature_invalid`; or
+    `signature_invalid` (passed through verbatim from the evidence `outcome`); or
   - a service-operational failure code — `upstream_error` (an upstream call failed),
-    `resume_error` (the SDK could not advance), or `session_expired` (the session TTL elapsed).
+    `resume_error` (the SDK could not advance), or `session_expired` (the session TTL elapsed); or
+  - `unknown` — a defensive catch-all the flow engine emits for an unmapped/future SDK outcome.
 
   `completed` and `declined` are their own statuses and carry **no** `reason`; `reason` is absent for
   every non-failed status. All nine SDK terminal outcomes thus stay distinguishable.

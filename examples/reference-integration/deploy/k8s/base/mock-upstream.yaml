@@ -22,6 +22,9 @@ spec:
         app.kubernetes.io/name: mock-upstream
         app.kubernetes.io/part-of: cleverbase-reference-integration
     spec:
+      # Credential-free mock needs no Kubernetes API access, so don't mount the default
+      # service-account token.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

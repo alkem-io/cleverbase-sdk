@@ -154,9 +154,16 @@ export class SigningHelper {
 /**
  * Normalize a backend complete/error response into a CompleteResult, omitting `redirectUrl` entirely
  * when absent (so the shape is exact under `exactOptionalPropertyTypes`).
+ *
+ * Presence — not truthiness — decides whether a second redirect is required: a field that is absent
+ * (`undefined`) legitimately means "no further redirect". A present-but-empty `redirectUrl` is a
+ * malformed backend response (the contract is a non-empty authorization URL), so we surface it as an
+ * error rather than silently dropping it and treating the session as needing no redirect.
  */
 function toCompleteResult(data: CompleteResult): CompleteResult {
-  return data.redirectUrl
-    ? { status: data.status, redirectUrl: data.redirectUrl }
-    : { status: data.status };
+  if (data.redirectUrl === undefined) return { status: data.status };
+  if (typeof data.redirectUrl !== "string" || data.redirectUrl === "") {
+    throw new Error("malformed backend response: redirectUrl present but not a non-empty string");
+  }
+  return { status: data.status, redirectUrl: data.redirectUrl };
 }

@@ -101,10 +101,20 @@ func TestLiveModeFailFast(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("expected B-T-without-TSA fail-fast")
 	}
+	// A live profile defaulting to B-B but lacking a TSA must also fail fast: conformance is
+	// per-request overridable, so such a deployment could still receive B-T and fail mid-flow.
+	setEnv(t, map[string]string{
+		"REFSVC_MODE": "live", "REFSVC_API_KEY": "k", "REFSVC_DEFAULT_CONFORMANCE": "B-B",
+		"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+	})
+	if _, err := Load(); err == nil {
+		t.Fatal("expected B-B-without-TSA fail-fast (live must always be able to serve B-T)")
+	}
 	// Fully configured live profile loads (explicit B-B so a prior subtest's B-T does not bleed).
 	setEnv(t, map[string]string{
 		"REFSVC_MODE": "live", "REFSVC_API_KEY": "k", "REFSVC_DEFAULT_CONFORMANCE": "B-B",
 		"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+		"REFSVC_TSA_URL": "https://tsa.example/tsr",
 	})
 	if _, err := Load(); err != nil {
 		t.Fatalf("valid live profile should load: %v", err)

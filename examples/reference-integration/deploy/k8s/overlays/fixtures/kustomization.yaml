@@ -9,18 +9,24 @@ resources:
 
 # Explicitly pin the signing service to fixtures mode against the in-cluster mock.
 # (The base already defaults to these; this keeps the overlay self-documenting.)
+# Strategic-merge patch: env entries merge by `name`, so it stays correct regardless of the
+# order env vars appear in the base (an index-based JSON patch would break on reordering).
 patches:
   - target:
       kind: Deployment
       name: signing-service
     patch: |-
-      - op: replace
-        path: /spec/template/spec/containers/0/env/0
-        value:
-          name: REFSVC_MODE
-          value: "fixtures"
-      - op: replace
-        path: /spec/template/spec/containers/0/env/1
-        value:
-          name: REFSVC_BASE_URL
-          value: "http://mock-upstream:9000"
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: signing-service
+      spec:
+        template:
+          spec:
+            containers:
+              - name: signing-service
+                env:
+                  - name: REFSVC_MODE
+                    value: "fixtures"
+                  - name: REFSVC_BASE_URL
+                    value: "http://mock-upstream:9000"

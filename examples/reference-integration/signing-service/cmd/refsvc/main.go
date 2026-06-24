@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -46,13 +47,13 @@ func main() {
 		TTL:             p.SessionTTL,
 		RedirectRewrite: upstream.New(publicRewrite).Rewrite,
 	}
-	svc := &httpapi.Service{Engine: engine, Store: store, Profile: p, Sample: samplePDF}
+	svc := &httpapi.Service{Engine: engine, Store: store, Profile: p, Sample: samplePDF, Log: logger}
 
 	srv := &http.Server{Addr: p.Listen, Handler: svc.Handler(), ReadHeaderTimeout: 10 * time.Second}
 
 	go func() {
 		logger.Info("listening", "addr", p.Listen, "mode", string(p.Mode), "auth", p.AuthEnabled)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("serve", "err", err.Error())
 			os.Exit(1)
 		}
