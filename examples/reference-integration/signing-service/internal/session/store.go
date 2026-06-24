@@ -127,11 +127,12 @@ func (m *Memory) ViewByID(corr string) (View, error) {
 }
 
 // ResumeView returns, under the lock, whether the session is terminal and a copy of its current
-// handle — the inputs the flow engine needs before calling the SDK, read race-free.
+// handle — the inputs the flow engine needs before calling the SDK, read race-free. The handle is
+// copied so callers never alias mutable session state.
 func (m *Memory) ResumeView(s *Session) (terminal bool, handle []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return s.Terminal(), s.Handle
+	return s.Terminal(), append([]byte(nil), s.Handle...)
 }
 
 // Update runs mutate (which closes over the session) under the store lock, serializing field writes

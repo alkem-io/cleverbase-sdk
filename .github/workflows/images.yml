@@ -1,263 +1,167 @@
-# Multi-arch container build + publish for the reference integration.
+# Multi-arch container build + publish for the reference integration's three images
+# (signing service, web frontend, mock upstream).
 #
-# Replace each <COMMIT_SHA> placeholder with the real pinned commit for the version in the
-# trailing comment before enabling.
+# Follows the org's container build pattern (alkem-io/github-workflows: container-pr.yml /
+# container-release.yml): build each arch on a NATIVE runner (no QEMU), push BY DIGEST, then
+# assemble a multi-arch manifest list with `docker buildx imagetools create`. SBOM + SLSA provenance
+# attestations are produced natively by build-push-action (cosign-verifiable), so there is no
+# separate cosign/syft wiring. Action versions are pinned to the same versions the shared workflows
+# use.
 #
-# Build context: ALL three Dockerfiles use the repository ROOT as the build context
-# (`context: .`). The signing-service build needs `crates/`, `bindings/go`, and
-# `tests/fixtures`; the mock image bakes `tests/fixtures`. Each build therefore sets
-# `context: .` and selects the component via `file:`.
-#
-# Strategy: build each image once per architecture on a NATIVE runner (no QEMU), push by
-# digest, then fan-in to assemble a multi-arch manifest list with `docker buildx imagetools
-# create`. The manifest list is then signed (cosign keyless), gets an SBOM attestation
-# (Syft), and emits build provenance.
-
+# All three Dockerfiles take the repository ROOT as the build context (`context: .`): the signing
+# service build needs crates/ + bindings/go, and the mock image bakes tests/fixtures.
 name: Images
 
-# Triggers are limited to MANUAL dispatch until the placeholder action SHAs below are replaced with
-# real pinned commits (an all-zero SHA fails to resolve, so an automatic push trigger would turn every
-# default-branch build red). Once pinned, uncomment the push/tag triggers so images publish on
-# default-branch pushes and version tags.
 on:
-  workflow_dispatch:
-  # push:
-  #   branches: [develop, main]
-  #   tags: ["v*"]
+  push:
+    branches: [develop, main]
+    tags: ["v*"]
+  workflow_dispatch: # manual build (e.g. to publish images for a feature-branch deploy)
+
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  # ---------------------------------------------------------------------------------------
-  # Per-arch build. Matrix over {runner, arch} x {image}. Each leg builds on a native runner
-  # and pushes BY DIGEST only (no tags yet); the digest is exported as an artifact so the
-  # merge job can assemble the manifest list.
-  # ---------------------------------------------------------------------------------------
   build:
-    name: build ${{ matrix.image.name }} (${{ matrix.platform.arch }})
+    name: build ${{ matrix.image.name }} (${{ matrix.platform.pair }})
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - runner: ubuntu-24.04
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-        image:
-          - name: cleverbase-refsvc
-            dockerfile: examples/reference-integration/signing-service/Dockerfile
-          - name: cleverbase-refweb
-            dockerfile: examples/reference-integration/web/Dockerfile
-          - name: cleverbase-refmock
-            dockerfile: examples/reference-integration/mock-upstream/Dockerfile
-    steps:
-      - name: Checkout
-        uses: actions/checkout@0000000000000000000000000000000000000000 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000 # v3.7.1
-
-      - name: Log in to GHCR
-        uses: docker/login-action@0000000000000000000000000000000000000000 # v3.3.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image name
-        id: image
-        run: echo "ref=${REGISTRY}/${OWNER}/${NAME}" >> "$GITHUB_OUTPUT"
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          OWNER: ${{ github.repository_owner }}
-          NAME: ${{ matrix.image.name }}
-
-      # Labels only here; the tags are applied later on the manifest list, not on the
-      # per-arch image (which is referenced purely by digest).
-      - name: Docker metadata (labels)
-        id: meta
-        uses: docker/metadata-action@0000000000000000000000000000000000000000 # v5.6.1
-        with:
-          images: ${{ steps.image.outputs.ref }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@0000000000000000000000000000000000000000 # v6.9.0
-        with:
-          context: .
-          file: ${{ matrix.image.dockerfile }}
-          platforms: linux/${{ matrix.platform.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true,name=${{ steps.image.outputs.ref }}
-          provenance: true
-          sbom: false
-
-      # Write the bare digest (sha256:...) to a file named for the image, so each artifact is
-      # uniquely keyed by image + arch and the merge job can group them.
-      - name: Export digest
-        run: |
-          mkdir -p "${RUNNER_TEMP}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          echo -n "$digest" > "${RUNNER_TEMP}/digests/${{ matrix.image.name }}-${{ matrix.platform.arch }}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@0000000000000000000000000000000000000000 # v4.4.3
-        with:
-          name: digest-${{ matrix.image.name }}-${{ matrix.platform.arch }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  # ---------------------------------------------------------------------------------------
-  # Fan-in: per image, assemble the multi-arch manifest list from the per-arch digests, tag
-  # it via metadata-action, then sign it (cosign keyless), attach an SBOM attestation, and
-  # emit build provenance attestations.
-  # ---------------------------------------------------------------------------------------
-  merge:
-    name: merge + sign ${{ matrix.image.name }}
-    runs-on: ubuntu-24.04
-    needs: build
-    permissions:
-      contents: read
-      packages: write
-      id-token: write # cosign keyless (OIDC) + provenance attestations
+      id-token: write
       attestations: write
     strategy:
       fail-fast: false
       matrix:
         image:
-          - name: cleverbase-refsvc
-          - name: cleverbase-refweb
-          - name: cleverbase-refmock
+          - { name: cleverbase-refsvc, dockerfile: examples/reference-integration/signing-service/Dockerfile }
+          - { name: cleverbase-refweb, dockerfile: examples/reference-integration/web/Dockerfile }
+          - { name: cleverbase-refmock, dockerfile: examples/reference-integration/mock-upstream/Dockerfile }
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, pair: linux-amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, pair: linux-arm64 }
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@0000000000000000000000000000000000000000 # v3.7.1
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+        with:
+          persist-credentials: false
 
-      - name: Log in to GHCR
-        uses: docker/login-action@0000000000000000000000000000000000000000 # v3.3.0
+      - name: Docker meta (labels)
+        id: meta
+        uses: docker/metadata-action@v6.1.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image name
-        id: image
-        run: echo "ref=${REGISTRY}/${OWNER}/${NAME}" >> "$GITHUB_OUTPUT"
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          OWNER: ${{ github.repository_owner }}
-          NAME: ${{ matrix.image.name }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform.os }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform.pair }}
 
-      - name: Download digests for this image
-        uses: actions/download-artifact@0000000000000000000000000000000000000000 # v4.1.8
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: digests-${{ matrix.image.name }}-${{ matrix.platform.pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [cleverbase-refsvc, cleverbase-refweb, cleverbase-refmock]
+    steps:
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6.1.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Download digests
+        uses: actions/download-artifact@v8.0.1
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digest-${{ matrix.image.name }}-*
+          pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
 
-      # Tags for the manifest list:
-      #   default branch -> sha-<short> and the branch name
-      #   v* tags        -> the semver version and `latest`
-      - name: Docker metadata (tags)
-        id: meta
-        uses: docker/metadata-action@0000000000000000000000000000000000000000 # v5.6.1
-        with:
-          images: ${{ steps.image.outputs.ref }}
-          tags: |
-            type=sha,prefix=sha-,enable=${{ github.ref_type != 'tag' }}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+      - name: Verify digest set (amd64 + arm64)
+        run: |
+          count=$(ls -1 "${{ runner.temp }}/digests" 2>/dev/null | wc -l)
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected 2 digests (amd64 + arm64) for ${{ matrix.image }}, found ${count}."
+            exit 1
+          fi
 
-      # Build the `imagetools create` argument list: one `--tag` per computed tag, one
-      # canonical `name@digest` source per per-arch digest file. Capture the resulting
-      # manifest-list digest for cosign/attestations.
-      - name: Create and push manifest list
-        id: manifest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest and push
         working-directory: ${{ runner.temp }}/digests
         env:
-          REF: ${{ steps.image.outputs.ref }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
-          set -euo pipefail
-          tag_args=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && tag_args+=("--tag" "$tag")
-          done <<< "$TAGS"
+          declare -a args
+          while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          while IFS= read -r ann; do args+=(--annotation "$ann"); done < <(jq -cr '.annotations[]?' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${args[@]}" $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA::7}" --format '{{json .Manifest.MediaType}}'
 
-          source_args=()
-          for f in *; do
-            [ -f "$f" ] || continue
-            digest="$(cat "$f")"
-            source_args+=("${REF}@${digest}")
-          done
-
-          docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
-
-          # Resolve the manifest-list digest from the first tag (all tags share it).
-          first_tag="$(printf '%s\n' "$TAGS" | head -n1)"
-          digest="$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@0000000000000000000000000000000000000000 # v3.7.0
-
-      # Keyless (OIDC) signature over the manifest-list digest. Signing the digest covers
-      # every tag that points at it.
-      - name: Sign image (keyless)
-        env:
-          COSIGN_EXPERIMENTAL: "true"
-          REF: ${{ steps.image.outputs.ref }}
-          DIGEST: ${{ steps.manifest.outputs.digest }}
-        run: cosign sign --yes "${REF}@${DIGEST}"
-
-      - name: Generate SBOM (SPDX JSON)
-        id: sbom
-        uses: anchore/sbom-action@0000000000000000000000000000000000000000 # v0.17.7
-        with:
-          image: ${{ steps.image.outputs.ref }}@${{ steps.manifest.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-          upload-artifact: false
-
-      # Attach the SBOM as an in-toto attestation, signed keylessly and bound to the digest.
-      - name: Attest SBOM
-        env:
-          COSIGN_EXPERIMENTAL: "true"
-          REF: ${{ steps.image.outputs.ref }}
-          DIGEST: ${{ steps.manifest.outputs.digest }}
-        run: |
-          cosign attest --yes \
-            --predicate sbom.spdx.json \
-            --type spdxjson \
-            "${REF}@${DIGEST}"
-
-      # Native GitHub build provenance for the published manifest list (SLSA).
-      - name: Generate build provenance
-        uses: actions/attest-build-provenance@0000000000000000000000000000000000000000 # v2.1.0
-        with:
-          subject-name: ${{ steps.image.outputs.ref }}
-          subject-digest: ${{ steps.manifest.outputs.digest }}
-          push-to-registry: true
-
-  # ---------------------------------------------------------------------------------------
-  # Per-arch smoke. On a NATIVE runner, pull the just-published manifest (Docker selects the
-  # runner's architecture) and assert the container is healthy: Go services answer /healthz,
-  # the static web answers GET / (a static server has no /healthz). Runs on branch pushes /
-  # manual dispatch; tag releases reuse the already-smoked images. (T040/T045)
-  # ---------------------------------------------------------------------------------------
   smoke:
     name: smoke ${{ matrix.image.name }} (${{ matrix.platform.arch }})
     runs-on: ${{ matrix.platform.runner }}
     needs: merge
-    if: github.ref_type == 'branch'
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: read
@@ -265,7 +169,7 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: ubuntu-latest, arch: amd64 }
           - { runner: ubuntu-24.04-arm, arch: arm64 }
         image:
           - { name: cleverbase-refsvc, type: go, port: "8080", run_args: "-e REFSVC_AUTH_DISABLED=true -e REFSVC_BASE_URL=http://mock:9000" }
@@ -273,11 +177,11 @@ jobs:
           - { name: cleverbase-refweb, type: web, port: "8080", run_args: "" }
     steps:
       - name: Checkout
-        uses: actions/checkout@0000000000000000000000000000000000000000 # v4.2.2
+        uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
-      - name: Log in to GHCR
-        uses: docker/login-action@0000000000000000000000000000000000000000 # v3.3.0
+      - name: Login to GHCR
+        uses: docker/login-action@v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -286,6 +190,6 @@ jobs:
         env:
           SMOKE_RUN_ARGS: ${{ matrix.image.run_args }}
         run: |
-          ref="${REGISTRY}/${{ github.repository_owner }}/${{ matrix.image.name }}:sha-$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          ref="${REGISTRY}/${{ github.repository_owner }}/${{ matrix.image.name }}:sha-${GITHUB_SHA::7}"
           docker pull "$ref"
           bash examples/reference-integration/scripts/smoke.sh "$ref" "${{ matrix.image.type }}" "${{ matrix.image.port }}"

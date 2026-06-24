@@ -7,6 +7,7 @@ package e2e
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -340,14 +341,25 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 	}
 
 	rawDoc := samplePDF(t)
-	docB64 := base64.StdEncoding.EncodeToString(rawDoc)
-	docB64URL := base64.RawURLEncoding.EncodeToString(rawDoc)
+	// Every common encoding a regression could smuggle the document in as.
+	encodings := []string{
+		base64.StdEncoding.EncodeToString(rawDoc),       // padded standard base64
+		base64.RawStdEncoding.EncodeToString(rawDoc),    // unpadded standard base64
+		base64.URLEncoding.EncodeToString(rawDoc),       // padded base64url
+		base64.RawURLEncoding.EncodeToString(rawDoc),    // unpadded base64url
+		url.QueryEscape(base64.StdEncoding.EncodeToString(rawDoc)), // form/query-escaped base64
+		hex.EncodeToString(rawDoc),                      // hex
+	}
 	sawSignHash := false
 	for i, b := range bodies {
-		// Negative: no upstream request may carry the document — verbatim, base64, or base64url
-		// encoded (the common ways a regression could smuggle it past a plaintext-marker scan).
-		if bytes.Contains([]byte(b), rawDoc) || strings.Contains(b, docB64) || strings.Contains(b, docB64URL) {
-			t.Fatalf("upstream request %d carried the document (hash-only violated): %.120s", i, b)
+		// Negative: no upstream request may carry the document — verbatim or in any common encoding.
+		if bytes.Contains([]byte(b), rawDoc) {
+			t.Fatalf("upstream request %d carried the raw document (hash-only violated): %.120s", i, b)
+		}
+		for _, enc := range encodings {
+			if strings.Contains(b, enc) {
+				t.Fatalf("upstream request %d carried an encoded document (hash-only violated): %.120s", i, b)
+			}
 		}
 		// Positive: the only document-derived payload is the signHash request, and its hash must be
 		// exactly a 32-byte SHA-256 digest — not the document.
