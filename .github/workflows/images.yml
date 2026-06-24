@@ -14,7 +14,10 @@ name: Images
 
 on:
   push:
-    branches: [develop, main]
+    # NOTE: feature/reference-integration is a TEMPORARY entry to build images for the live demo
+    # deploy before merge (workflow_dispatch requires the workflow on the default branch). Remove it
+    # before/at merge — squash-merge drops it anyway.
+    branches: [develop, main, feature/reference-integration]
     tags: ["v*"]
   workflow_dispatch: # manual build (e.g. to publish images for a feature-branch deploy)
 
