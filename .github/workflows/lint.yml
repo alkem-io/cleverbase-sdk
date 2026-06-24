@@ -80,6 +80,9 @@ jobs:
       - name: "Install web example deps (links the file: helper so its types resolve)"
         run: npm install
         working-directory: examples/reference-integration/web
+      - name: Type-check web example (TypeScript, strict)
+        run: npx tsc --noEmit
+        working-directory: examples/reference-integration/web
       - name: ESLint
         run: npx eslint .
       - name: Prettier

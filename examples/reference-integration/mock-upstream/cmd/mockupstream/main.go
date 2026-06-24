@@ -30,7 +30,17 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("mock upstream listening", "addr", listen, "fixtures", dir)
-	httpSrv := &http.Server{Addr: listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	// Bound every connection phase: /oauth2/token, signHash, and /tsr read request bodies, so a slow
+	// client must not be able to pin a handler goroutine. The mock's handlers are sub-second (openssl
+	// TSA included), so 30s write / 15s read are generous.
+	httpSrv := &http.Server{
+		Addr:              listen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	if err := httpSrv.ListenAndServe(); err != nil {
 		logger.Error("serve", "err", err.Error())
 		os.Exit(1)

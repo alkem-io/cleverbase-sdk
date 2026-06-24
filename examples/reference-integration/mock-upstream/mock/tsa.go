@@ -1,11 +1,13 @@
 package mock
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 // openssl flags reused across the DER→PEM materialization steps.
@@ -40,9 +42,11 @@ ess_cert_id_alg = sha256
 // TSA PKI (materialized per-request from the committed DER/PKCS#8 into a temp dir, as the SDK test
 // does). Requires `openssl` on PATH.
 func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
+	// A DER timestamp request is tiny; cap the body so a large request cannot exhaust memory.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16) // 64 KiB
 	reqDER, err := io.ReadAll(r.Body)
 	if err != nil || len(reqDER) == 0 {
-		http.Error(w, "empty timestamp request", http.StatusBadRequest)
+		http.Error(w, "empty or oversize timestamp request", http.StatusBadRequest)
 		return
 	}
 	work, err := os.MkdirTemp("", "mocktsa")
@@ -52,7 +56,9 @@ func (s *Server) handleTSA(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = os.RemoveAll(work) }()
 
-	ctx := r.Context()
+	// Bound the openssl subprocesses so a hung binary cannot pin this goroutine until client/shutdown.
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
 	//nolint:gosec // G204: openssl is invoked with fixed flags + per-request temp-file paths the handler controls, never request input.
 	der2pem := func(args ...string) error { return exec.CommandContext(ctx, "openssl", args...).Run() }
 	steps := [][]string{

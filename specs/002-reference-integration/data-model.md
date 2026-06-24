@@ -127,5 +127,7 @@ The recorded upstream response shapes the mock serves, sourced from the SDK's au
 
 - Transitions are driven entirely by SDK `resume(...)` results; the service never decides protocol
   outcomes, only maps them to `SessionStatus` and performs the emitted I/O.
-- `complete` is rejected (409/400) if the session is already terminal or the `state` does not match a
-  pending session (CSRF) — the SDK also enforces `state`, this is defense-in-depth at the edge.
+- `complete` is rejected with `400` when the `state` does not match a pending session (unknown,
+  expired, or already consumed — the pending `state` is one-shot and de-indexed when the session
+  becomes terminal, so a replay resolves as `400` unknown; there is no separate `409`). This matches
+  the REST contract; the SDK also enforces `state`, so this is defense-in-depth at the edge.

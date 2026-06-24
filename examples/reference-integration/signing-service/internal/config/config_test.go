@@ -5,9 +5,22 @@ import (
 	"time"
 )
 
-// setEnv sets env vars for a test and clears them afterward.
+// knownEnvKeys is every REFSVC_* variable config.Load reads. setEnv clears them all before applying a
+// scenario so a test that runs multiple scenarios cannot inherit stale values from a previous one.
+var knownEnvKeys = []string{
+	"REFSVC_API_KEY", "REFSVC_AUTH_DISABLED", "REFSVC_BASE_URL", "REFSVC_CLIENT_ID",
+	"REFSVC_CLIENT_SECRET", "REFSVC_CSC_API", "REFSVC_DEFAULT_CONFORMANCE", "REFSVC_ENV",
+	"REFSVC_LISTEN", "REFSVC_MODE", "REFSVC_PUBLIC_BASE_URL", "REFSVC_REDIRECT_URI",
+	"REFSVC_SESSION_TTL", "REFSVC_TSA_AUTH", "REFSVC_TSA_POLICY", "REFSVC_TSA_URL",
+}
+
+// setEnv sets env vars for a test (restored afterward by t.Setenv), clearing every known REFSVC_* key
+// first so each scenario starts from a clean, hermetic environment. config.Load treats "" as unset.
 func setEnv(t *testing.T, kv map[string]string) {
 	t.Helper()
+	for _, k := range knownEnvKeys {
+		t.Setenv(k, "")
+	}
 	for k, v := range kv {
 		t.Setenv(k, v)
 	}

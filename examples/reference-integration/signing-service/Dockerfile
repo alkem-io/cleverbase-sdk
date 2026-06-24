@@ -4,7 +4,7 @@
 # syntax=docker/dockerfile:1
 
 # --- Stage 1: build the cleverbase-ffi staticlib ---
-FROM rust:1.92-bookworm AS rust
+FROM rust:1.94-bookworm AS rust
 WORKDIR /src
 # rust-toolchain.toml is intentionally NOT copied: the base image pins the toolchain and the
 # pinned components (clippy/llvm-tools) are not needed for `cargo build`.

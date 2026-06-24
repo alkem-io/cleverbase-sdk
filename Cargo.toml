@@ -9,7 +9,7 @@ rust-version = "1.83"
 repository = "https://github.com/alkem-io/cleverbase-sdk"
 # Crate metadata shared by every workspace member (satisfies clippy::cargo_common_metadata and
 # feeds crates.io / docs.rs). `readme` points at the single repo-root README (no per-crate copies).
-readme = "../../README.md"
+readme = "README.md"
 documentation = "https://docs.rs/cleverbase-core"
 keywords = ["qes", "pades", "eidas", "signing", "cleverbase"]
 categories = ["cryptography", "authentication", "api-bindings"]

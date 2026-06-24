@@ -29,6 +29,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: signing-service
+          # Demo: this mutable tag intentionally tracks the latest per-PR build. PRODUCTION deployments
+          # MUST pin an immutable digest (image: ...@sha256:...), e.g. via a kustomize `images:` digest
+          # transformer, so the cluster runs exactly the CI-verified, signed/SBOM-backed artifact.
           image: ghcr.io/alkem-io/cleverbase-sdk/cleverbase-refsvc
           ports:
             - name: http

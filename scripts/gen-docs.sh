@@ -41,6 +41,13 @@ LIB_DIR="$REPO_ROOT/target/debug"
 PY="$REPO_ROOT/.venv/bin/python"
 PIP="$REPO_ROOT/.venv/bin/pip"
 
+# Bootstrap the repo virtualenv on a clean clone so `make docs` is runnable from scratch (the Python
+# generator below drives $PY/$PIP). CI creates this venv too; this makes the local path self-contained.
+if [ ! -x "$PY" ]; then
+  echo "==> Creating repo virtualenv (.venv) for the Python doc generator"
+  python3 -m venv "$REPO_ROOT/.venv"
+fi
+
 echo "==> Cleaning previous output ($OUT)"
 rm -rf "$OUT"
 mkdir -p "$OUT/rust" "$OUT/ts"

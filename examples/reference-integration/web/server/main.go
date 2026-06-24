@@ -5,6 +5,7 @@ package main
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -43,9 +44,21 @@ func main() {
 		// /api/v1/sign/start -> /v1/sign/start on the signing service.
 		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
 		r.Host = u.Host
+		// Strip any caller-supplied credentials so the browser can never inject upstream auth: the
+		// server-injected API key is the ONLY auth that reaches the signing service. Done
+		// unconditionally (even when apiKey is empty) so an empty key cannot let a client header pass.
+		r.Header.Del("Authorization")
+		r.Header.Del("Cookie")
 		if apiKey != "" {
 			r.Header.Set("Authorization", "Bearer "+apiKey)
 		}
+	}
+	// Bound the upstream hop so a wedged signing service cannot pin proxy handler goroutines forever.
+	proxy.Transport = &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 150 * time.Second, // accommodates the multi-call signing round-trip
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
 	}
 
 	mux := http.NewServeMux()
@@ -53,7 +66,16 @@ func main() {
 	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
 
 	logger.Info("reference web listening", "addr", listen, "api_target", target, "static", staticDir)
-	srv := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// WriteTimeout is generous because /api proxies the signing round-trip (multiple upstream calls);
+	// ReadTimeout/IdleTimeout bound slow request bodies and idle keep-alives.
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      150 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	if err := srv.ListenAndServe(); err != nil {
 		logger.Error("serve", "err", err.Error())
 		os.Exit(1)
