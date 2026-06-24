@@ -69,10 +69,9 @@ cargo build -p cleverbase-ffi
 
 Generated API reference (Markdown, browseable on GitHub) lives under [`docs/api/`](docs/api/):
 
-- [Rust core (`cleverbase-core`)](docs/api/rust/cleverbase_core.md) · [C ABI (`cleverbase-ffi`)](docs/api/rust/cleverbase_ffi.md)
-- [Go binding](docs/api/go.md)
-- [Python binding](docs/api/python.md)
-- [TypeScript frontend helper](docs/api/ts/)
+- Rust: [core (`cleverbase-core`)](docs/api/rust/cleverbase_core.md) · [C ABI (`cleverbase-ffi`)](docs/api/rust/cleverbase_ffi.md)
+- Backend bindings: [Go](docs/api/go.md) · [Python](docs/api/python.md) · [Node/TypeScript](docs/api/node/)
+- Frontend: [TypeScript helper (no-crypto)](docs/api/ts/)
 
 Regenerate after any public-API change with `make docs` (CI fails if `docs/api/` is stale). See
 [`docs/README.md`](docs/README.md) for the generation flow.

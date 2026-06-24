@@ -102,10 +102,10 @@ fi
   "$REPO_ROOT/bindings/python/cleverbase.pyi" "$OUT/python.md"
 
 # ---------------------------------------------------------------------------
-# 4. TYPESCRIPT — typedoc + typedoc-plugin-markdown render the TSDoc of the
-#    no-crypto frontend helper to Markdown (config in frontend/helper-ts/typedoc.json).
+# 4. TYPESCRIPT (frontend) — typedoc + typedoc-plugin-markdown render the TSDoc
+#    of the no-crypto frontend helper to Markdown (config in frontend/helper-ts/typedoc.json).
 # ---------------------------------------------------------------------------
-echo "==> [4/4] TypeScript: typedoc (markdown) on frontend/helper-ts/src/index.ts"
+echo "==> [4/5] TypeScript (frontend helper): typedoc (markdown) on frontend/helper-ts/src/index.ts"
 (
   cd "$REPO_ROOT/frontend/helper-ts"
   if [ ! -x node_modules/.bin/typedoc ] || [ ! -d node_modules/typedoc-plugin-markdown ]; then
@@ -113,6 +113,23 @@ echo "==> [4/4] TypeScript: typedoc (markdown) on frontend/helper-ts/src/index.t
     npm install
   fi
   npx typedoc --out "$OUT/ts"
+)
+
+# ---------------------------------------------------------------------------
+# 5. NODE BINDING (backend) — the napi binding that backend Node/TS services use.
+#    Its public API is the napi-generated index.d.ts; napi propagates the Rust `///`
+#    doc comments into it as JSDoc, which typedoc renders to Markdown
+#    (config in bindings/node/typedoc.json). Regenerate index.d.ts with `napi build`
+#    if the binding's Rust signatures/docs change.
+# ---------------------------------------------------------------------------
+echo "==> [5/5] TypeScript (Node backend binding): typedoc (markdown) on bindings/node/index.d.ts"
+(
+  cd "$REPO_ROOT/bindings/node"
+  if [ ! -x node_modules/.bin/typedoc ] || [ ! -d node_modules/typedoc-plugin-markdown ]; then
+    echo "    typedoc/plugin not found — npm install"
+    npm install
+  fi
+  npx typedoc
 )
 
 # ---------------------------------------------------------------------------
@@ -127,12 +144,13 @@ Reference documentation for every language surface, generated as Markdown from t
 comments and committed to the repo so it is browseable directly on GitHub. Regenerate with
 `make docs` (see [`docs/README.md`](../README.md)).
 
-| Language   | Source                                               | Section |
-| ---------- | ---------------------------------------------------- | ------- |
-| Rust       | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | [`rust/`](rust/README.md) |
-| Go         | `bindings/go` (the public binding package)           | [`go.md`](go.md) |
-| Python     | `bindings/python/cleverbase.pyi` (the public stub)   | [`python.md`](python.md) |
-| TypeScript | `frontend/helper-ts/src/index.ts` (no-crypto helper) | [`ts/`](ts/README.md) |
+| Surface                    | Source                                               | Section |
+| -------------------------- | ---------------------------------------------------- | ------- |
+| Rust core + C ABI          | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | [`rust/`](rust/README.md) |
+| Go binding (backend)       | `bindings/go` (the public binding package)           | [`go.md`](go.md) |
+| Python binding (backend)   | `bindings/python/cleverbase.pyi` (the public stub)   | [`python.md`](python.md) |
+| Node binding (backend)     | `bindings/node/index.d.ts` (the napi binding)        | [`node/`](node/README.md) |
+| TypeScript frontend helper | `frontend/helper-ts/src/index.ts` (no-crypto)        | [`ts/`](ts/README.md) |
 MD
 
 echo ""
