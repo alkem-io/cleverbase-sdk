@@ -2,6 +2,7 @@ package flow
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strings"
 	"testing"
@@ -25,7 +26,7 @@ func TestEffectLoggingRedactsSecrets(t *testing.T) {
 	}
 	_, _ = e.Begin("c", []byte("%PDF"), "B-B", nil)
 	s, _ := e.Store.GetByState("s1")
-	if _, _, _, err := e.Complete(s, "code", "s1"); err != nil {
+	if _, _, _, err := e.Complete(context.Background(), s, "code", "s1"); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 

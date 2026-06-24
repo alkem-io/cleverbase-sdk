@@ -7,6 +7,7 @@
 package flow
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,9 +39,10 @@ type SDK interface {
 }
 
 // Effector performs a single HTTP effect (the upstream client rewrites the host internally in
-// fixtures mode).
+// fixtures mode). The request context is threaded through so a client disconnect or server shutdown
+// cancels in-flight upstream calls rather than letting them run to the per-call timeout.
 type Effector interface {
-	Do(method, rawURL string, headers [][2]string, body []byte) (int, []byte, error)
+	Do(ctx context.Context, method, rawURL string, headers [][2]string, body []byte) (int, []byte, error)
 }
 
 // ErrTerminal is returned when an already-terminal session is advanced again.
@@ -89,7 +91,7 @@ func (e *Engine) rewriteRedirect(u string) string {
 }
 
 // drive runs the perform-http loop until the next redirect or a terminal step.
-func (e *Engine) drive(s *session.Session, res Result) (status session.Status, redirectURL, reason string, err error) {
+func (e *Engine) drive(ctx context.Context, s *session.Session, res Result) (status session.Status, redirectURL, reason string, err error) {
 	for {
 		handle := res.Handle
 		e.Store.Update(s, func() { s.Handle = handle })
@@ -101,7 +103,7 @@ func (e *Engine) drive(s *session.Session, res Result) (status session.Status, r
 				return "", "", "", fmt.Errorf("malformed perform_http step: %w", perr)
 			}
 			e.Log.Info("effect.perform_http", "method", ef.method, "url", redact(ef.rawURL))
-			httpStatus, respBody, doErr := e.Up.Do(ef.method, ef.rawURL, ef.headers, ef.body)
+			httpStatus, respBody, doErr := e.Up.Do(ctx, ef.method, ef.rawURL, ef.headers, ef.body)
 			if doErr != nil {
 				e.fail(s, session.StatusFailed, reasonUpstreamError, nil)
 				e.Log.Error("effect.http_error", "url", redact(ef.rawURL), "err", doErr.Error())
@@ -185,8 +187,9 @@ func (e *Engine) Begin(corr string, document []byte, conformance string, opts *O
 	return e.rewriteRedirect(rawURL), nil
 }
 
-// Complete advances a session after a redirect return with code+state.
-func (e *Engine) Complete(s *session.Session, code, state string) (status session.Status, redirectURL, reason string, err error) {
+// Complete advances a session after a redirect return with code+state. ctx is the request context,
+// threaded to the upstream effector so a client disconnect cancels in-flight calls.
+func (e *Engine) Complete(ctx context.Context, s *session.Session, code, state string) (status session.Status, redirectURL, reason string, err error) {
 	handle, err := e.consume(s)
 	if err != nil {
 		return "", "", "", err
@@ -196,11 +199,12 @@ func (e *Engine) Complete(s *session.Session, code, state string) (status sessio
 		e.fail(s, session.StatusFailed, reasonResumeError, nil)
 		return "", "", "", err
 	}
-	return e.drive(s, res)
+	return e.drive(ctx, s, res)
 }
 
-// CompleteError advances a session after a redirect return carrying an OAuth error.
-func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (status session.Status, redirectURL, reason string, err error) {
+// CompleteError advances a session after a redirect return carrying an OAuth error. ctx is the
+// request context, threaded to the upstream effector (see Complete).
+func (e *Engine) CompleteError(ctx context.Context, s *session.Session, oauthError, state string) (status session.Status, redirectURL, reason string, err error) {
 	handle, err := e.consume(s)
 	if err != nil {
 		return "", "", "", err
@@ -210,7 +214,7 @@ func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (st
 		e.fail(s, session.StatusFailed, reasonResumeError, nil)
 		return "", "", "", err
 	}
-	return e.drive(s, res)
+	return e.drive(ctx, s, res)
 }
 
 // consume atomically claims the session for this resume and returns its handle. It is the single

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -38,7 +39,7 @@ func (s *scriptSDK) ResumeHTTP([]byte, int, []byte) (flow.Result, error)        
 
 type nopEffector struct{}
 
-func (nopEffector) Do(string, string, [][2]string, []byte) (int, []byte, error) {
+func (nopEffector) Do(context.Context, string, string, [][2]string, []byte) (int, []byte, error) {
 	return 200, []byte("{}"), nil
 }
 func (nopEffector) Rewrite(u string) string { return u }

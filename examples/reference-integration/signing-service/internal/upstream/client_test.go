@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,23 +39,23 @@ func TestDo(t *testing.T) {
 	defer srv.Close()
 
 	// Direct (no rewrite), with header + body.
-	status, body, err := New("").Do("POST", srv.URL+"/x", [][2]string{{"K", "V"}}, []byte("hi"))
+	status, body, err := New("").Do(context.Background(), "POST", srv.URL+"/x", [][2]string{{"K", "V"}}, []byte("hi"))
 	if err != nil || status != 200 || string(body) != "ok:hi" {
 		t.Fatalf("Do: status=%d body=%q err=%v", status, body, err)
 	}
 
 	// Rewritten host → still reaches srv.
-	status, _, err = New(srv.URL).Do("POST", "https://other.example/x", [][2]string{{"K", "V"}}, nil)
+	status, _, err = New(srv.URL).Do(context.Background(), "POST", "https://other.example/x", [][2]string{{"K", "V"}}, nil)
 	if err != nil || status != 200 {
 		t.Fatalf("rewritten Do: status=%d err=%v", status, err)
 	}
 
 	// Transport error surfaces.
-	if _, _, err := New("").Do("GET", "http://127.0.0.1:1/x", nil, nil); err == nil {
+	if _, _, err := New("").Do(context.Background(), "GET", "http://127.0.0.1:1/x", nil, nil); err == nil {
 		t.Fatal("expected a transport error")
 	}
 	// Bad method → request build error.
-	if _, _, err := New("").Do("bad method", srv.URL, nil, nil); err == nil {
+	if _, _, err := New("").Do(context.Background(), "bad method", srv.URL, nil, nil); err == nil {
 		t.Fatal("expected a request-construction error")
 	}
 }

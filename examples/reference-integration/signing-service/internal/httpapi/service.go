@@ -199,9 +199,9 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 	)
 	switch {
 	case req.Error != "":
-		status, redirectURL, reason, err = s.Engine.CompleteError(sess, req.Error, req.State)
+		status, redirectURL, reason, err = s.Engine.CompleteError(r.Context(), sess, req.Error, req.State)
 	case req.Code != "":
-		status, redirectURL, reason, err = s.Engine.Complete(sess, req.Code, req.State)
+		status, redirectURL, reason, err = s.Engine.Complete(r.Context(), sess, req.Code, req.State)
 	default:
 		writeErr(w, http.StatusBadRequest, "bad_request", "neither code nor error present")
 		return

@@ -41,16 +41,16 @@ func (c *Client) Rewrite(rawURL string) string {
 	return in.String()
 }
 
-// Do performs one request and returns the response status code + body. The Effector contract is
-// context-free (the SDK's sans-IO state machine drives effects synchronously), so the request is
-// bound to context.Background(); the http.Client.Timeout still bounds each call.
-func (c *Client) Do(method, rawURL string, headers [][2]string, body []byte) (int, []byte, error) {
+// Do performs one request and returns the response status code + body. The request is bound to the
+// caller's context (threaded from the HTTP handler through the flow engine), so a client disconnect or
+// server shutdown cancels an in-flight call; the http.Client.Timeout still bounds each call.
+func (c *Client) Do(ctx context.Context, method, rawURL string, headers [][2]string, body []byte) (int, []byte, error) {
 	target := c.Rewrite(rawURL)
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, target, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, target, rdr)
 	if err != nil {
 		return 0, nil, err
 	}

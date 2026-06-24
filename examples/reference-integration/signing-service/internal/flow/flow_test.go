@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -38,7 +39,7 @@ type fakeEffector struct {
 	calls         []string
 }
 
-func (f *fakeEffector) Do(_, rawURL string, _ [][2]string, _ []byte) (int, []byte, error) {
+func (f *fakeEffector) Do(_ context.Context, _, rawURL string, _ [][2]string, _ []byte) (int, []byte, error) {
 	f.calls = append(f.calls, rawURL)
 	return 200, []byte("{}"), nil
 }
@@ -97,7 +98,7 @@ func TestFullHappyFlow(t *testing.T) {
 		t.Fatal("session not stored at s1")
 	}
 
-	st, url2, _, err := e.Complete(s, "code1", "s1")
+	st, url2, _, err := e.Complete(context.Background(), s, "code1", "s1")
 	if err != nil || st != session.StatusAuthorizing || url2 == "" {
 		t.Fatalf("first complete: st=%s url=%q err=%v", st, url2, err)
 	}
@@ -105,7 +106,7 @@ func TestFullHappyFlow(t *testing.T) {
 		t.Fatalf("state should be re-indexed to s2, got %q", s.OAuthState)
 	}
 
-	st, _, _, err = e.Complete(s, "code2", "s2")
+	st, _, _, err = e.Complete(context.Background(), s, "code2", "s2")
 	if err != nil || st != session.StatusCompleted {
 		t.Fatalf("second complete: st=%s err=%v", st, err)
 	}
@@ -142,7 +143,7 @@ func TestOutcomeMappingAllDistinct(t *testing.T) {
 		})
 		_, _ = e.Begin("c", []byte("%PDF"), "B-B", nil)
 		s, _ := e.Store.GetByState("s1")
-		st, _, reason, err := e.Complete(s, "code", "s1")
+		st, _, reason, err := e.Complete(context.Background(), s, "code", "s1")
 		if err != nil {
 			t.Fatalf("%s: %v", outcome, err)
 		}
@@ -159,7 +160,7 @@ func TestOutcomeMappingAllDistinct(t *testing.T) {
 
 type errEffector struct{}
 
-func (errEffector) Do(string, string, [][2]string, []byte) (int, []byte, error) {
+func (errEffector) Do(context.Context, string, string, [][2]string, []byte) (int, []byte, error) {
 	return 0, nil, io.ErrUnexpectedEOF
 }
 func (errEffector) Rewrite(u string) string { return u }
@@ -168,11 +169,11 @@ func TestCompleteErrorDeclined(t *testing.T) {
 	e, _ := newEngine([]Result{redirect("https://cb/a", "s1"), failed("declined")})
 	_, _ = e.Begin("c", []byte("%PDF"), "B-B", nil)
 	s, _ := e.Store.GetByState("s1")
-	st, _, reason, err := e.CompleteError(s, "access_denied", "s1")
+	st, _, reason, err := e.CompleteError(context.Background(), s, "access_denied", "s1")
 	if err != nil || st != session.StatusDeclined || reason != "declined" {
 		t.Fatalf("decline: st=%s reason=%s err=%v", st, reason, err)
 	}
-	if _, _, _, err := e.CompleteError(s, "x", "s1"); !errors.Is(err, ErrTerminal) {
+	if _, _, _, err := e.CompleteError(context.Background(), s, "x", "s1"); !errors.Is(err, ErrTerminal) {
 		t.Fatal("expected ErrTerminal on terminal CompleteError")
 	}
 }
@@ -187,7 +188,7 @@ func TestUpstreamErrorBecomesFailed(t *testing.T) {
 	}
 	_, _ = e.Begin("c", []byte("%PDF"), "B-B", nil)
 	s, _ := e.Store.GetByState("s1")
-	st, _, reason, err := e.Complete(s, "code", "s1")
+	st, _, reason, err := e.Complete(context.Background(), s, "code", "s1")
 	if err != nil || st != session.StatusFailed || reason != "upstream_error" {
 		t.Fatalf("upstream error: st=%s reason=%s err=%v", st, reason, err)
 	}
@@ -259,21 +260,21 @@ func TestResumeErrorsPropagate(t *testing.T) {
 	e2, _ := newEngine([]Result{redirect("https://cb/a", "s1")})
 	_, _ = e2.Begin("c", []byte("%PDF"), "B-B", nil)
 	s2, _ := e2.Store.GetByState("s1")
-	if _, _, _, err := e2.Complete(s2, "code", "s1"); err == nil {
+	if _, _, _, err := e2.Complete(context.Background(), s2, "code", "s1"); err == nil {
 		t.Fatal("complete resume error should propagate")
 	}
 	// ResumeHTTP error inside drive (begin redirect, one perform_http, then exhausted).
 	e3, _ := newEngine([]Result{redirect("https://cb/a", "s1"), performHTTP("https://cb/t")})
 	_, _ = e3.Begin("c", []byte("%PDF"), "B-B", nil)
 	s3, _ := e3.Store.GetByState("s1")
-	if _, _, _, err := e3.Complete(s3, "code", "s1"); err == nil {
+	if _, _, _, err := e3.Complete(context.Background(), s3, "code", "s1"); err == nil {
 		t.Fatal("resume-http error should propagate")
 	}
 	// CompleteError resume error.
 	e4, _ := newEngine([]Result{redirect("https://cb/a", "s1")})
 	_, _ = e4.Begin("c", []byte("%PDF"), "B-B", nil)
 	s4, _ := e4.Store.GetByState("s1")
-	if _, _, _, err := e4.CompleteError(s4, "x", "s1"); err == nil {
+	if _, _, _, err := e4.CompleteError(context.Background(), s4, "x", "s1"); err == nil {
 		t.Fatal("complete-error resume error should propagate")
 	}
 }
@@ -335,7 +336,7 @@ func TestConcurrentDuplicateCallbackDoesNotDoubleResume(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, _, _, err := e.Complete(s, "code", "s1")
+			_, _, _, err := e.Complete(context.Background(), s, "code", "s1")
 			switch {
 			case err == nil:
 				ok.Add(1)
@@ -364,8 +365,8 @@ func TestCompleteOnTerminalRejected(t *testing.T) {
 	e, _ := newEngine([]Result{redirect("https://cb/a", "s1"), failed("invalid_document")})
 	_, _ = e.Begin("c", []byte("%PDF"), "B-B", nil)
 	s, _ := e.Store.GetByState("s1")
-	_, _, _, _ = e.Complete(s, "code", "s1") // → terminal failed
-	if _, _, _, err := e.Complete(s, "code", "s1"); !errors.Is(err, ErrTerminal) {
+	_, _, _, _ = e.Complete(context.Background(), s, "code", "s1") // → terminal failed
+	if _, _, _, err := e.Complete(context.Background(), s, "code", "s1"); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("expected ErrTerminal, got %v", err)
 	}
 }
@@ -390,7 +391,7 @@ func TestDriveFailsFastOnMalformedSteps(t *testing.T) {
 				t.Fatalf("begin: %v", err)
 			}
 			s, _ := e.Store.GetByState("s1")
-			if _, _, _, err := e.Complete(s, "code", "s1"); err == nil {
+			if _, _, _, err := e.Complete(context.Background(), s, "code", "s1"); err == nil {
 				t.Fatal("expected a fail-fast error for the malformed step")
 			}
 			if s.Status != session.StatusFailed {
