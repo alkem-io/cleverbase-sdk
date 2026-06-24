@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -58,11 +59,12 @@ func samplePDF(t *testing.T) []byte {
 	return b
 }
 
-// buildService wires the signing service (fixtures mode) against the given upstream URL.
-func buildService(t *testing.T, conformance, upstreamURL string) *httptest.Server {
+// buildService wires the signing service (fixtures mode) against the given upstream URL with the
+// given CSC API (v1_rsa → /csc/v1 RSA signer, v2_ecdsa → /csc/v2 ECDSA P-256 signer).
+func buildService(t *testing.T, conformance, cscAPI, upstreamURL string) *httptest.Server {
 	t.Helper()
 	p := &config.Profile{
-		Mode: config.ModeFixtures, Environment: "acceptance", CscAPI: "v1_rsa",
+		Mode: config.ModeFixtures, Environment: "acceptance", CscAPI: cscAPI,
 		ClientID: "refsvc-fixtures", ClientSecret: "fixtures", RedirectURI: "http://app/return",
 		UpstreamBaseURL: upstreamURL, TsaURL: upstreamURL + "/tsr",
 		APIKey: apiKey, AuthEnabled: true, DefaultConformance: conformance, SessionTTL: time.Minute,
@@ -79,8 +81,9 @@ func buildService(t *testing.T, conformance, upstreamURL string) *httptest.Serve
 	return svcSrv
 }
 
-// stack spins up the mock upstream + the signing service (fixtures mode) in-process.
-func stack(t *testing.T, conformance string) *httptest.Server {
+// stack spins up the mock upstream + the signing service (fixtures mode) in-process for the given
+// CSC API.
+func stack(t *testing.T, conformance, cscAPI string) *httptest.Server {
 	t.Helper()
 	m, err := mock.New(repoFixtures(t))
 	if err != nil {
@@ -88,7 +91,15 @@ func stack(t *testing.T, conformance string) *httptest.Server {
 	}
 	mockSrv := httptest.NewServer(m.Handler())
 	t.Cleanup(mockSrv.Close)
-	return buildService(t, conformance, mockSrv.URL)
+	return buildService(t, conformance, cscAPI, mockSrv.URL)
+}
+
+// cscAPIs is the algorithm table both credential-free flows run over: v1_rsa (RSA) and v2_ecdsa
+// (ECDSA P-256). validateCMS / assertTimestampToken are algorithm-agnostic OpenSSL and reused
+// unchanged for both (FR-004 / FR-005).
+var cscAPIs = []struct{ name, api string }{
+	{"v1_rsa", "v1_rsa"},
+	{"v2_ecdsa", "v2_ecdsa"},
 }
 
 func postJSON(t *testing.T, rawURL, body string) map[string]any {
@@ -168,8 +179,19 @@ func runFlow(t *testing.T, svc *httptest.Server, startBody string) (pdf []byte, 
 var byteRangeRE = regexp.MustCompile(`/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]`)
 
 // validateCMS extracts the PAdES ByteRange + /Contents and verifies the detached CMS with OpenSSL
-// against the synthetic CA. Returns an error describing any failure.
+// against the synthetic CA, failing the test on any verification error. Algorithm-agnostic (RSA +
+// ECDSA), reused unchanged across both arms.
 func validateCMS(t *testing.T, pdf []byte) {
+	t.Helper()
+	if err := verifyCMS(t, pdf, extractContents(t, pdf)); err != nil {
+		t.Fatalf("openssl cms -verify failed: %v", err)
+	}
+}
+
+// verifyCMS runs `openssl cms -verify` over the PDF's ByteRange content against the given CMS DER
+// and returns the error (nil on accept). Splitting the CMS bytes out lets a caller verify a tampered
+// CMS and assert rejection (F1 / no-false-accept).
+func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
 	t.Helper()
 	m := byteRangeRE.FindSubmatch(pdf)
 	if m == nil {
@@ -181,10 +203,6 @@ func validateCMS(t *testing.T, pdf []byte) {
 		t.Fatalf("ByteRange out of bounds: [%d %d %d %d] len=%d", a, b, c, d, len(pdf))
 	}
 	signed := append(append([]byte{}, pdf[a:a+b]...), pdf[c:c+d]...)
-	// /Contents is a separate dict field: find the keyword, then the <hex> after it. The hex is
-	// zero-padded to a fixed size, so decode it all then trim to the DER object's true length —
-	// the same extraction the SDK's own independent-validation test uses.
-	cmsDER := extractContents(t, pdf)
 
 	work := t.TempDir()
 	caPEM := filepath.Join(work, "ca.pem")
@@ -203,8 +221,9 @@ func validateCMS(t *testing.T, pdf []byte) {
 	out, err := exec.Command("openssl", "cms", "-verify", "-binary", "-inform", "DER",
 		"-in", sigDER, "-content", dataBin, "-CAfile", caPEM, "-purpose", "any", "-no_check_time").CombinedOutput()
 	if err != nil {
-		t.Fatalf("openssl cms -verify failed: %v\n%s", err, out)
+		return fmt.Errorf("%w\n%s", err, out)
 	}
+	return nil
 }
 
 // assertTimestampToken checks that a B-T signature embeds an RFC 3161 signature-timestamp token as
@@ -292,33 +311,138 @@ func TestCredentialFreeBB(t *testing.T) {
 	if _, err := exec.LookPath("openssl"); err != nil {
 		t.Skip("openssl required to validate the CMS signature")
 	}
-	svc := stack(t, "B-B")
-	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-	pdf, evidence, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
-	if status != "completed" || len(pdf) == 0 {
-		t.Fatalf("expected completed with a PDF, got status=%s len=%d", status, len(pdf))
+	// Table over {v1_rsa, v2_ecdsa}: the same credential-free B-B flow + the same algorithm-agnostic
+	// OpenSSL validator, for both algorithms (FR-004 / FR-005).
+	for _, tc := range cscAPIs {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := stack(t, "B-B", tc.api)
+			doc := base64.StdEncoding.EncodeToString(samplePDF(t))
+			pdf, evidence, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
+			if status != "completed" || len(pdf) == 0 {
+				t.Fatalf("expected completed with a PDF, got status=%s len=%d", status, len(pdf))
+			}
+			if evidence == "" {
+				t.Fatal("missing X-Signature-Evidence header")
+			}
+			if _, err := base64.StdEncoding.DecodeString(evidence); err != nil {
+				t.Fatalf("evidence header not base64: %v", err)
+			}
+			validateCMS(t, pdf)
+		})
 	}
-	if evidence == "" {
-		t.Fatal("missing X-Signature-Evidence header")
-	}
-	if _, err := base64.StdEncoding.DecodeString(evidence); err != nil {
-		t.Fatalf("evidence header not base64: %v", err)
-	}
-	validateCMS(t, pdf)
 }
 
 func TestCredentialFreeBT(t *testing.T) {
 	if _, err := exec.LookPath("openssl"); err != nil {
 		t.Skip("openssl required for B-T")
 	}
-	svc := stack(t, "B-T")
-	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-	pdf, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
-	if status != "completed" || len(pdf) == 0 {
-		t.Fatalf("expected completed B-T PDF, got status=%s len=%d", status, len(pdf))
+	for _, tc := range cscAPIs {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := stack(t, "B-T", tc.api)
+			doc := base64.StdEncoding.EncodeToString(samplePDF(t))
+			pdf, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
+			if status != "completed" || len(pdf) == 0 {
+				t.Fatalf("expected completed B-T PDF, got status=%s len=%d", status, len(pdf))
+			}
+			validateCMS(t, pdf)
+			assertTimestampToken(t, pdf)
+		})
 	}
-	validateCMS(t, pdf)
-	assertTimestampToken(t, pdf)
+}
+
+// TestCredentialFreeECDSATamperRejected (F1 / FR-012 / SC-006): a produced ECDSA CMS with one
+// signature byte flipped MUST be REJECTED by the always-on validator — proving no false-accept. The
+// flip targets the /Contents CMS DER; the surrounding PDF/ByteRange is untouched so the failure is
+// the signature check, not a structural parse error.
+func TestCredentialFreeECDSATamperRejected(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl required to validate the CMS signature")
+	}
+	svc := stack(t, "B-B", "v2_ecdsa")
+	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
+	pdf, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
+	if status != "completed" || len(pdf) == 0 {
+		t.Fatalf("expected completed ECDSA PDF, got status=%s len=%d", status, len(pdf))
+	}
+	cmsDER := extractContents(t, pdf)
+	// Baseline: the untampered CMS verifies, so a later rejection is attributable to the tamper.
+	if err := verifyCMS(t, pdf, cmsDER); err != nil {
+		t.Fatalf("baseline ECDSA CMS should verify before tampering: %v", err)
+	}
+	tampered := tamperSignature(t, cmsDER)
+	if err := verifyCMS(t, pdf, tampered); err == nil {
+		t.Fatal("validateCMS MUST reject a tampered ECDSA signature (no false-accept)")
+	}
+}
+
+// tamperSignature locates the CMS SignerInfo.signature OCTET STRING and flips its last content byte,
+// leaving the surrounding DER structurally intact (parse still succeeds; only the signature value
+// changes).
+func tamperSignature(t *testing.T, cmsDER []byte) []byte {
+	t.Helper()
+	sig := signerInfoSignature(t, cmsDER)
+	pos := bytes.LastIndex(cmsDER, sig)
+	if pos < 0 {
+		t.Fatal("signature bytes not found in CMS DER")
+	}
+	out := append([]byte{}, cmsDER...)
+	out[pos+len(sig)-1] ^= 0x01
+	return out
+}
+
+// signerInfoSignature parses the CMS and returns the first SignerInfo's raw signature value, using
+// `openssl asn1parse` to avoid pulling a DER library into the test — the signature is the OCTET
+// STRING that immediately follows the signatureAlgorithm; we find it by parsing the CMS and reading
+// the last OCTET STRING primitive, which in a single-signer detached CMS is the signature value.
+func signerInfoSignature(t *testing.T, cmsDER []byte) []byte {
+	t.Helper()
+	work := t.TempDir()
+	in := filepath.Join(work, "cms.der")
+	if err := os.WriteFile(in, cmsDER, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("openssl", "asn1parse", "-inform", "DER", "-in", in).CombinedOutput()
+	if err != nil {
+		t.Fatalf("asn1parse: %v\n%s", err, out)
+	}
+	// Each line: " <offset>:d=.. hl=.. l=.. prim: <TYPE> ...". The SignerInfo.signature is the last
+	// OCTET STRING primitive in a single-signer detached CMS (after the cert + signed attrs).
+	var lastOff, lastHL, lastLen int
+	found := false
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "OCTET STRING") || !strings.Contains(line, "prim:") {
+			continue
+		}
+		off, hl, l, ok := parseASN1Line(line)
+		if !ok {
+			continue
+		}
+		lastOff, lastHL, lastLen = off, hl, l
+		found = true
+	}
+	if !found {
+		t.Fatalf("no OCTET STRING primitive in CMS:\n%s", out)
+	}
+	start := lastOff + lastHL
+	if start+lastLen > len(cmsDER) {
+		t.Fatalf("signature span out of range: %d+%d > %d", start, lastLen, len(cmsDER))
+	}
+	return cmsDER[start : start+lastLen]
+}
+
+// asn1OffsetRE captures the offset, header length (hl), and content length (l) from an
+// `openssl asn1parse` line: "  <off>:d=.. hl=<hl> l=  <l> prim: OCTET STRING ...".
+var asn1OffsetRE = regexp.MustCompile(`^\s*(\d+):d=\s*\d+\s+hl=\s*(\d+)\s+l=\s*(\d+)`)
+
+func parseASN1Line(line string) (off, hl, l int, ok bool) {
+	m := asn1OffsetRE.FindStringSubmatch(line)
+	if m == nil {
+		return 0, 0, 0, false
+	}
+	off, _ = strconv.Atoi(m[1])
+	hl, _ = strconv.Atoi(m[2])
+	l, _ = strconv.Atoi(m[3])
+	return off, hl, l, true
 }
 
 // TestUpstreamReceivesHashOnly proves the document never leaves the backend: every request the
@@ -356,7 +480,7 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 	}))
 	defer rec.Close()
 
-	svc := buildService(t, "B-T", rec.URL) // B-T exercises the TSA request too
+	svc := buildService(t, "B-T", "v1_rsa", rec.URL) // B-T exercises the TSA request too
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
 	_, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
 	if status != "completed" {
@@ -415,7 +539,7 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 }
 
 func TestExpectedSignerMismatch(t *testing.T) {
-	svc := stack(t, "B-B")
+	svc := stack(t, "B-B", "v1_rsa")
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
 	body := `{"document":"` + doc + `","expectedSigner":{"matchOn":"certificate_serial_number","value":"DOES-NOT-MATCH"}}`
 	_, _, status, reason := runFlow(t, svc, body)

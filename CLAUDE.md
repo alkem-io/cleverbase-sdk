@@ -1,9 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan at
-`specs/002-reference-integration/plan.md` (with its research.md, data-model.md,
-contracts/, and quickstart.md in the same directory). The SDK itself is
-specified in `specs/001-remote-qes-signing/plan.md` (and siblings).
+shell commands, and other important information, read the current plan
+at specs/003-ecdsa-and-live-signing/plan.md
 <!-- SPECKIT END -->
 
 ## Engineering rules (MUST)

@@ -2,11 +2,13 @@ package mock
 
 import (
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -87,13 +89,11 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	}
 }
 
-func TestSignHashProducesVerifiableSignature(t *testing.T) {
-	ts := newTestServer(t)
-	defer ts.Close()
-
-	digest := sha256.Sum256([]byte("to-be-signed attributes"))
-	body, _ := json.Marshal(map[string]any{"hash": []string{base64.StdEncoding.EncodeToString(digest[:])}})
-	resp, err := http.Post(ts.URL+"/csc/v1/signatures/signHash", "application/json", strings.NewReader(string(body)))
+// signHash POSTs a SHA-256 digest to the given CSC route and returns the decoded signature bytes.
+func signHash(t *testing.T, baseURL, route string, digest []byte) []byte {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"hash": []string{base64.StdEncoding.EncodeToString(digest)}})
+	resp, err := http.Post(baseURL+route+"/signatures/signHash", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,40 +108,134 @@ func TestSignHashProducesVerifiableSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sig base64: %v", err)
 	}
+	return sig
+}
 
-	// Verify against the signer cert's public key — the same trust anchor the SDK embeds.
-	certDER, _ := os.ReadFile(filepath.Join(findFixtures(t), "pki", "signer-rsa.cert.der"))
+// parseCert loads a signer cert (DER) from the PKI fixtures.
+func parseCert(t *testing.T, name string) *x509.Certificate {
+	t.Helper()
+	certDER, err := os.ReadFile(filepath.Join(findFixtures(t), "pki", name))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub, ok := cert.PublicKey.(*rsa.PublicKey)
+	return cert
+}
+
+// TestSignHashV1ProducesVerifiableRSASignature asserts the /csc/v1 route signs with RSA (PKCS#1
+// v1.5 over SHA-256) verifiable against signer-rsa — the route's expected algorithm (T014).
+func TestSignHashV1ProducesVerifiableRSASignature(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	digest := sha256.Sum256([]byte("to-be-signed attributes"))
+	sig := signHash(t, ts.URL, "/csc/v1", digest[:])
+
+	pub, ok := parseCert(t, "signer-rsa.cert.der").PublicKey.(*rsa.PublicKey)
 	if !ok {
-		t.Fatal("signer cert is not RSA")
+		t.Fatal("signer-rsa cert is not RSA")
 	}
 	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], sig); err != nil {
-		t.Fatalf("signature does not verify: %v", err)
+		t.Fatalf("v1 RSA signature does not verify: %v", err)
 	}
 }
 
-func TestInfoCarriesSubstitutedCert(t *testing.T) {
+// TestSignHashV2ProducesVerifiableECDSASignature asserts the /csc/v2 route signs with ECDSA P-256
+// and returns the raw 64-byte r‖s wire form, verifiable against signer-ec after reconstructing
+// (r, s) — exercising the real CSC-v2 path the SDK core normalizes (T004).
+func TestSignHashV2ProducesVerifiableECDSASignature(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
-	resp, err := http.Get(ts.URL + "/csc/v1/credentials/info")
-	if err != nil {
-		t.Fatal(err)
+
+	digest := sha256.Sum256([]byte("to-be-signed attributes"))
+	sig := signHash(t, ts.URL, "/csc/v2", digest[:])
+
+	// The v2 wire form is raw fixed-width r‖s (64 bytes for P-256), NOT a DER ECDSA-Sig-Value.
+	if len(sig) != 2*p256ScalarLen {
+		t.Fatalf("v2 signature must be raw 64-byte r‖s, got %d bytes", len(sig))
 	}
-	defer func() { _ = resp.Body.Close() }()
-	var m map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		t.Fatalf("info decode: %v", err)
+	pub, ok := parseCert(t, "signer-ec.cert.der").PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatal("signer-ec cert is not ECDSA")
 	}
-	cert := m["cert"].(map[string]any)
-	certs := cert["certificates"].([]any)
-	if len(certs) != 1 || strings.Contains(certs[0].(string), "{{") {
-		t.Fatalf("cert placeholder not substituted: %v", certs)
+	r := new(big.Int).SetBytes(sig[:p256ScalarLen])
+	s := new(big.Int).SetBytes(sig[p256ScalarLen:])
+	if !ecdsa.Verify(pub, digest[:], r, s) {
+		t.Fatal("v2 ECDSA signature does not verify against signer-ec")
 	}
-	if _, err := base64.StdEncoding.DecodeString(certs[0].(string)); err != nil {
-		t.Fatalf("substituted cert is not base64: %v", err)
+}
+
+// credentialsInfoKey / Cert / Info mirror the credentials/info response shape we assert on (named
+// types so the test carries no nested anonymous structs).
+type credentialsInfoKey struct {
+	Algo []string `json:"algo"`
+}
+
+type credentialsInfoCert struct {
+	Certificates []string `json:"certificates"`
+	SerialNumber string   `json:"serialNumber"`
+}
+
+type credentialsInfo struct {
+	Key  credentialsInfoKey  `json:"key"`
+	Cert credentialsInfoCert `json:"cert"`
+}
+
+// rsaPub / ecdsaPub report whether a parsed certificate's public key is of that type — used to
+// assert the advertised cert matches the route's algorithm.
+func rsaPub(c *x509.Certificate) bool   { _, ok := c.PublicKey.(*rsa.PublicKey); return ok }
+func ecdsaPub(c *x509.Certificate) bool { _, ok := c.PublicKey.(*ecdsa.PublicKey); return ok }
+
+// TestInfoCarriesRouteSignerCertAndAlgo asserts each route's credentials/info advertises the cert +
+// key.algo OID of THAT route's signer — RSA on v1, ECDSA P-256 on v2 (one template, per-route
+// substitution; T011/T014).
+func TestInfoCarriesRouteSignerCertAndAlgo(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	cases := []struct {
+		route, wantOID, wantSerial string
+		pubMatches                 func(*x509.Certificate) bool // the advertised cert's key type
+		pubName                    string
+	}{
+		{"/csc/v1", "1.2.840.113549.1.1.1", "PNONL-123", rsaPub, "RSA"},
+		{"/csc/v2", "1.2.840.10045.2.1", "PNONL-456", ecdsaPub, "ECDSA"},
+	}
+	for _, c := range cases {
+		resp, err := http.Get(ts.URL + c.route + "/credentials/info")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m credentialsInfo
+		err = json.NewDecoder(resp.Body).Decode(&m)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("%s info decode: %v", c.route, err)
+		}
+		if len(m.Key.Algo) != 1 || m.Key.Algo[0] != c.wantOID {
+			t.Fatalf("%s key.algo = %v, want [%s]", c.route, m.Key.Algo, c.wantOID)
+		}
+		if m.Cert.SerialNumber != c.wantSerial {
+			t.Fatalf("%s serialNumber = %q, want %q", c.route, m.Cert.SerialNumber, c.wantSerial)
+		}
+		if len(m.Cert.Certificates) != 1 || strings.Contains(m.Cert.Certificates[0], "{{") {
+			t.Fatalf("%s cert placeholder not substituted: %v", c.route, m.Cert.Certificates)
+		}
+		certDER, err := base64.StdEncoding.DecodeString(m.Cert.Certificates[0])
+		if err != nil {
+			t.Fatalf("%s substituted cert is not base64: %v", c.route, err)
+		}
+		cert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			t.Fatalf("%s substituted cert does not parse: %v", c.route, err)
+		}
+		// The advertised cert's public-key type must match the route's algorithm (no drift between
+		// the cert and the OID/signature).
+		if !c.pubMatches(cert) {
+			t.Fatalf("%s cert is not %s", c.route, c.pubName)
+		}
 	}
 }
