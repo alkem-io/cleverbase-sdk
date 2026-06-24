@@ -136,6 +136,37 @@ func TestResumeHTTPAdvancesFlow(t *testing.T) {
 	}
 }
 
+func TestBeginWithTsaConfigEmitsRedirect(t *testing.T) {
+	// A B-T request needs a TSA configured. Setting TsaURL, TsaAuth, and TsaPolicy exercises the
+	// whole `if cfg.TsaURL != ""` block (including the nested auth / policy_oid appends) in
+	// BeginSigning; the core accepts the shape and returns the service-auth redirect Step. A wrong
+	// CBOR spelling for any TSA field would fail to deserialize and surface as an error here.
+	cfg := testConfig()
+	cfg.TsaURL = "https://tsa.example/rfc3161"
+	cfg.TsaAuth = "Bearer tsa-token"
+	cfg.TsaPolicy = "1.3.6.1.4.1.601.10.3.1"
+	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), cfg, "B-T", nil, 1_700_000_000, testEntropy())
+	if err != nil {
+		t.Fatalf("begin with TSA config: %v", err)
+	}
+	if sess.Step["kind"] != "redirect" {
+		t.Fatalf("expected redirect, got %v", sess.Step["kind"])
+	}
+	url, _ := sess.Step["url"].(string)
+	if !strings.Contains(url, "scope=service") {
+		t.Fatalf("expected service scope, got %s", url)
+	}
+}
+
+func TestBeginBTWithoutTsaReturnsError(t *testing.T) {
+	// A B-T request with no TSA configured makes the core return MissingTsaConfig → WireResult::Err,
+	// which dispatch surfaces as a Go error (the resp.Result.Err != nil arm).
+	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), testConfig(), "B-T", nil, 1_700_000_000, testEntropy())
+	if err == nil {
+		t.Fatalf("expected an error for B-T without a TSA, got session %+v", sess)
+	}
+}
+
 func TestBeginWithBadConfigReturnsError(t *testing.T) {
 	// An empty client_id makes the core return InvalidConfig → WireResult::Err → a Go error.
 	cfg := testConfig()

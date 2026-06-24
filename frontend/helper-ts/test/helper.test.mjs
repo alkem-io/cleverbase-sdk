@@ -125,3 +125,22 @@ test("reportRedirectError forwards a decline and returns the terminal status", a
   assert.strictEqual(redirectUrl, undefined);
   assert.ok(calls[0].init.body.includes("access_denied"));
 });
+
+test("complete throws on a malformed backend response (redirectUrl present but empty)", async () => {
+  // A present-but-empty redirectUrl is a backend contract violation; it must surface as an error,
+  // not be silently treated as "no second redirect required".
+  const { fetchImpl } = mockFetch((url) => {
+    if (url.includes("/complete")) return { status: "authorizing", redirectUrl: "" };
+    return {};
+  });
+  const helper = new SigningHelper({
+    startUrl: "x",
+    completeUrl: "https://app.example/api/sign/complete",
+    statusUrl: "x",
+    fetchImpl,
+  });
+  await assert.rejects(
+    () => helper.complete("code-1", "state-1"),
+    /malformed backend response: redirectUrl present but not a non-empty string/,
+  );
+});

@@ -29,3 +29,10 @@ extra_checks = true
 # `cleverbase.pyi` is a stub for a compiled module with no runtime .py source; that is expected
 # and must not be flagged as a missing implementation.
 disable_error_code = ["empty-body"]
+
+# `cbor2` is a compiled C extension that ships no type stubs (no `py.typed`), and the contract test
+# suite imports it. Scope the missing-stub waiver to exactly that one module so strict checking still
+# applies to everything else.
+[[tool.mypy.overrides]]
+module = ["cbor2"]
+ignore_missing_imports = true
