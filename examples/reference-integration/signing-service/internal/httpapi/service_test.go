@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -314,5 +317,90 @@ func TestCompleteMissingStateAndNeitherCodeNorError(t *testing.T) {
 	do(t, h, "POST", "/v1/sign/start", `{"conformanceLevel":"B-B"}`, "")
 	if rec := do(t, h, "POST", "/v1/sign/complete", `{"state":"s1"}`, ""); rec.Code != http.StatusBadRequest {
 		t.Fatalf("neither code nor error should 400, got %d", rec.Code)
+	}
+}
+
+// TestClassifyCompleteError pins the handleComplete error mapping deterministically: a raced
+// duplicate callback (rejected by flow.consume() with flow.ErrTerminal when the winner already
+// finished, or session.ErrResuming when the winner is still in-flight) is a CLIENT condition that
+// MUST map to 409 already_processing (conflict) — never the SDK/upstream-error 500 reserved for a
+// genuine internal resume failure. The two duplicate-conflict errors are wrapped to prove the mapping
+// uses errors.Is (not ==), since flow.consume()/Engine.Complete may return a wrapped error.
+func TestClassifyCompleteError(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantCode   int
+		wantErrStr string
+		wantConfl  bool
+	}{
+		{"in-flight duplicate (ErrResuming)", session.ErrResuming, http.StatusConflict, errCodeAlreadyProcessing, true},
+		{"already terminal (flow.ErrTerminal)", flow.ErrTerminal, http.StatusConflict, errCodeAlreadyProcessing, true},
+		{"wrapped ErrResuming", fmt.Errorf("resume: %w", session.ErrResuming), http.StatusConflict, errCodeAlreadyProcessing, true},
+		{"wrapped flow.ErrTerminal", fmt.Errorf("advance: %w", flow.ErrTerminal), http.StatusConflict, errCodeAlreadyProcessing, true},
+		{"internal failure", errors.New("upstream 502"), http.StatusInternalServerError, "resume_failed", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, errCode, msg, conflict := classifyCompleteError(c.err)
+			if code != c.wantCode || errCode != c.wantErrStr || conflict != c.wantConfl {
+				t.Fatalf("classify(%v) = (%d, %q, conflict=%v), want (%d, %q, conflict=%v)",
+					c.err, code, errCode, conflict, c.wantCode, c.wantErrStr, c.wantConfl)
+			}
+			if msg == "" {
+				t.Fatal("classify must return a non-empty generic client message (no leaked internal text)")
+			}
+			if strings.Contains(msg, c.err.Error()) {
+				t.Fatalf("client message %q must not leak the internal error text %q", msg, c.err.Error())
+			}
+		})
+	}
+}
+
+// TestCompleteConcurrentDuplicateNeverFivehundred drives many concurrent duplicate callbacks for the
+// SAME pending state through the real HTTP handler and asserts the regression the 409 mapping fixed:
+// a raced/duplicate callback is NEVER answered with a 500. Exactly one callback wins the resume
+// (drives the non-idempotent effects once); every loser is a 4xx client condition — a 409
+// already_processing if it raced past GetByState and lost the consume, or a 400 unknown_state if it
+// arrived after the winner de-indexed the state. (Run under `go test -race`, this also proves the
+// concurrent callbacks do not corrupt shared store state.)
+func TestCompleteConcurrentDuplicateNeverFivehundred(t *testing.T) {
+	svc := newService([]flow.Result{
+		redirect("https://cb/a", "s1"),
+		performHTTP("https://cb/token"),
+		done([]byte("%PDF-signed")),
+	}, false)
+	h := svc.Handler()
+	if rec := do(t, h, "POST", "/v1/sign/start", `{}`, ""); rec.Code != http.StatusOK {
+		t.Fatalf("start: %d %s", rec.Code, rec.Body)
+	}
+
+	const callers = 8
+	start := make(chan struct{})
+	codes := make([]int, callers)
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			codes[idx] = do(t, h, "POST", "/v1/sign/complete", `{"code":"c1","state":"s1"}`, "").Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for _, c := range codes {
+		switch c {
+		case http.StatusOK:
+			winners++
+		case http.StatusConflict, http.StatusBadRequest: // 4xx client conditions are fine
+		default:
+			t.Fatalf("a raced duplicate callback must never be a 5xx, got %d (codes=%v)", c, codes)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("exactly one callback should win the resume, got %d (codes=%v)", winners, codes)
 	}
 }

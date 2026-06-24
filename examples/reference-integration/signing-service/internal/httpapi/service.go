@@ -22,6 +22,10 @@ import (
 // keyStatus is the JSON field name carrying a session's status in API responses.
 const keyStatus = "status"
 
+// errCodeAlreadyProcessing is the machine-readable error code returned when a duplicate/in-flight
+// callback for a session is rejected (HTTP 409). Defined once so the handler and its tests agree.
+const errCodeAlreadyProcessing = "already_processing"
+
 // Request/document size caps for /v1/sign/start. The endpoint accepts a base64-encoded PDF inside a
 // JSON envelope; without a bound, a client could force huge allocations decoding the body.
 const (
@@ -210,11 +214,16 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		// A terminal session is already de-indexed by its state, so GetByState (above) returns
-		// "unknown_state" for a re-complete; any error here is an internal resume failure. Do not
-		// surface the SDK/upstream error text to the client; log it and return a generic message.
-		s.log().Error("resume failed", "err", err.Error())
-		writeErr(w, http.StatusInternalServerError, "resume_failed", "could not complete signing session")
+		code, errCode, msg, conflict := classifyCompleteError(err)
+		// Never surface the SDK/upstream error text to the client; log it and return a generic message.
+		// A conflict is a client condition (a duplicate/in-flight callback), logged at info; a genuine
+		// internal resume failure is logged as an error.
+		if conflict {
+			s.log().Info("duplicate or in-flight complete rejected", "err", err.Error())
+		} else {
+			s.log().Error("resume failed", "err", err.Error())
+		}
+		writeErr(w, code, errCode, msg)
 		return
 	}
 	resp := map[string]any{keyStatus: string(status)}
@@ -226,6 +235,21 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 		resp["reason"] = reason
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// classifyCompleteError maps an Engine.Complete/CompleteError failure to its HTTP response. A
+// sequential re-complete is already screened out by GetByState (a terminal session is de-indexed by
+// its state → "unknown_state"), but two callbacks for the same state can race past GetByState before
+// either consumes the session: flow.consume() then lets exactly one win and rejects the loser with
+// flow.ErrTerminal (the winner already finished) or session.ErrResuming (the winner is still
+// in-flight). Both are CLIENT conditions (a duplicate/in-flight callback), so they map to 409
+// already_processing (conflict == true) — never the SDK/upstream-error 500 reserved for a genuine
+// internal resume failure.
+func classifyCompleteError(err error) (code int, errCode, msg string, conflict bool) {
+	if errors.Is(err, flow.ErrTerminal) || errors.Is(err, session.ErrResuming) {
+		return http.StatusConflict, errCodeAlreadyProcessing, "session is already being completed", true
+	}
+	return http.StatusInternalServerError, "resume_failed", "could not complete signing session", false
 }
 
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {

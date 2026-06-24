@@ -10,7 +10,7 @@ WORKDIR /src
 # pinned components (clippy/llvm-tools) are not needed for `cargo build`.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p cleverbase-ffi
+RUN cargo build --locked --release -p cleverbase-ffi
 
 # --- Stage 2: build the Go service, statically linking the staticlib ---
 FROM golang:1.26-bookworm AS go

@@ -17,7 +17,7 @@
 #   TS     typedoc + markdown plugin -> docs/api/ts/      (TSDoc of the frontend helper)
 #
 # Tool prerequisites (versions pinned in the manifests that own them — see docs/README.md):
-#   - Rust toolchain pinned by rust-toolchain.toml (1.92.0); rustup picks it up automatically.
+#   - Rust toolchain pinned by rust-toolchain.toml (1.94.1); rustup picks it up automatically.
 #     rustdoc JSON is unstable, enabled on stable via RUSTC_BOOTSTRAP=1.
 #   - gomarkdoc: pinned to $GOMARKDOC_VERSION below (auto-installed into $(go env GOPATH)/bin if missing).
 #   - pydoc-markdown: pinned to $PYDOC_MARKDOWN_VERSION below; installed into the repo venv (.venv),
@@ -37,9 +37,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT="$REPO_ROOT/docs/api"
-LIB_DIR="$REPO_ROOT/target/debug"
 PY="$REPO_ROOT/.venv/bin/python"
 PIP="$REPO_ROOT/.venv/bin/pip"
+
+# Cargo honors a configured target dir (CARGO_TARGET_DIR or a workspace target-dir), so the FFI
+# staticlib and the rustdoc JSON do NOT necessarily land under $REPO_ROOT/target. Ask cargo where
+# its target dir actually is instead of hardcoding the default layout. (jq may be absent; the repo
+# ships python3, so extract .target_directory with it.)
+TARGET_DIR="$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["target_directory"])')"
+LIB_DIR="$TARGET_DIR/debug"
 
 # Bootstrap the repo virtualenv on a clean clone so `make docs` is runnable from scratch (the Python
 # generator below drives $PY/$PIP). CI creates this venv too; this makes the local path self-contained.
@@ -66,7 +73,7 @@ for crate in cleverbase-core cleverbase-ffi; do
   RUSTDOCFLAGS="-D warnings" RUSTC_BOOTSTRAP=1 \
     cargo rustdoc -p "$crate" -- -Z unstable-options --output-format json
   "$PY" "$REPO_ROOT/scripts/rustdoc_json_to_markdown.py" \
-    "$REPO_ROOT/target/doc/$json" "$OUT/rust/${crate//-/_}.md"
+    "$TARGET_DIR/doc/$json" "$OUT/rust/${crate//-/_}.md"
 done
 cat > "$OUT/rust/README.md" <<'MD'
 # Rust API

@@ -31,9 +31,17 @@ func main() {
 	apiKey := os.Getenv("REFWEB_API_KEY")                             // injected into proxied requests; never sent to the browser
 	staticDir := env("REFWEB_STATIC_DIR", "/web")
 
+	// url.Parse alone only rejects syntax errors, so "http://" (no host) or "signing-service:8080"
+	// (parsed as scheme "signing-service", opaque "8080", no host) would pass startup and then break
+	// every proxied request. Require an absolute URL with an http/https scheme AND a host so a
+	// misconfigured target fails fast at startup rather than at the first proxy hop.
 	u, err := url.Parse(target)
 	if err != nil {
 		logger.Error("bad REFWEB_API_TARGET", "err", err.Error())
+		os.Exit(1)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		logger.Error("bad REFWEB_API_TARGET: must be an absolute http(s) URL with a host", "target", target)
 		os.Exit(1)
 	}
 

@@ -145,9 +145,9 @@ the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `cre
 | `REFSVC_CLIENT_ID` | — | OAuth client id (**required in live**). |
 | `REFSVC_CLIENT_SECRET` | — | OAuth client secret (**required in live**). |
 | `REFSVC_REDIRECT_URI` | — | Registered redirect URI (**required in live**). |
-| `REFSVC_TSA_URL` | — | RFC 3161 TSA endpoint (required in live for B-T). |
+| `REFSVC_TSA_URL` | — | RFC 3161 TSA endpoint (**required in live** — conformance is per-request, so a live deployment must always be able to serve B-T). |
 | `REFSVC_TSA_AUTH` | — | Optional TSA authorization header value. |
-| `REFSVC_TSA_POLICY` | — | Optional TSA policy OID (live B-T). |
+| `REFSVC_TSA_POLICY` | — | Optional TSA policy OID. |
 | `REFSVC_API_KEY` | — | Bearer key for the service's REST API; auth is on by default. |
 | `REFSVC_AUTH_DISABLED` | `false` | Set `true` to run without a key in local fixtures only. |
 | `REFSVC_DEFAULT_CONFORMANCE` | `B-B` | `B-B` or `B-T` when a request omits `conformanceLevel`. |
@@ -219,7 +219,7 @@ Switching to live Cleverbase acceptance is **configuration only** — no code or
 1. Set `REFSVC_MODE=live`.
 2. Provide `REFSVC_CLIENT_ID`, `REFSVC_CLIENT_SECRET`, and `REFSVC_REDIRECT_URI`.
 3. Register that redirect URI with Cleverbase.
-4. For B-T, set `REFSVC_TSA_URL` (plus `REFSVC_TSA_AUTH` / `REFSVC_TSA_POLICY` if your TSA requires them).
+4. Set `REFSVC_TSA_URL` (required in live; conformance is per-request, so the deployment must always be able to serve B-T) — plus `REFSVC_TSA_AUTH` / `REFSVC_TSA_POLICY` if your TSA requires them.
 
 `REFSVC_BASE_URL` and the mock-upstream are dropped in live; everything else is unchanged.
 

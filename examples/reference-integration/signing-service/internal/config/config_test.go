@@ -122,6 +122,46 @@ func TestInvalidMode(t *testing.T) {
 	}
 }
 
+func TestMalformedURLsFailFast(t *testing.T) {
+	// A URL-shaped var with no scheme/host must fail Load() rather than pass and break at runtime
+	// (e.g. upstream.Rewrite silently falling back). Exercise each URL-shaped var with a value that is
+	// syntactically a URL but not an absolute one.
+	cases := []struct {
+		name string
+		env  map[string]string
+	}{
+		{"REFSVC_BASE_URL", map[string]string{"REFSVC_MODE": "fixtures", "REFSVC_API_KEY": "k", "REFSVC_BASE_URL": "mock:9000"}},
+		{"REFSVC_PUBLIC_BASE_URL", map[string]string{"REFSVC_MODE": "fixtures", "REFSVC_API_KEY": "k", "REFSVC_BASE_URL": "http://mock:9000", "REFSVC_PUBLIC_BASE_URL": "no-scheme-host"}},
+		{"REFSVC_REDIRECT_URI", map[string]string{
+			"REFSVC_MODE": "live", "REFSVC_API_KEY": "k",
+			"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "//missing-scheme/cb",
+			"REFSVC_TSA_URL": "https://tsa.example/tsr",
+		}},
+		{"REFSVC_TSA_URL", map[string]string{
+			"REFSVC_MODE": "live", "REFSVC_API_KEY": "k",
+			"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+			"REFSVC_TSA_URL": "tsa.example/tsr",
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setEnv(t, c.env)
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected malformed %s to fail Load()", c.name)
+			}
+		})
+	}
+	// A well-formed absolute URL for every var still loads (guards against over-rejecting).
+	setEnv(t, map[string]string{
+		"REFSVC_MODE": "fixtures", "REFSVC_API_KEY": "k",
+		"REFSVC_BASE_URL": "http://mock:9000", "REFSVC_PUBLIC_BASE_URL": "https://public.example",
+		"REFSVC_REDIRECT_URI": "https://a/cb", "REFSVC_TSA_URL": "https://tsa.example/tsr",
+	})
+	if _, err := Load(); err != nil {
+		t.Fatalf("well-formed URLs should load: %v", err)
+	}
+}
+
 func TestLiveModeFailFast(t *testing.T) {
 	// Missing all live credentials.
 	setEnv(t, map[string]string{"REFSVC_MODE": "live", "REFSVC_API_KEY": "k"})

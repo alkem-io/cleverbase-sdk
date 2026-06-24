@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -31,6 +32,15 @@ const (
 	fixturesClientID    = "refsvc-fixtures"
 	fixturesSecret      = "fixtures"
 	fixturesRedirectURI = "http://localhost:8080/return"
+)
+
+// Environment variable names for the URL-shaped vars, named once so the read, the required-checks,
+// and the URL validation all reference one authoritative source (DRY) rather than repeating literals.
+const (
+	envBaseURL       = "REFSVC_BASE_URL"
+	envPublicBaseURL = "REFSVC_PUBLIC_BASE_URL"
+	envRedirectURI   = "REFSVC_REDIRECT_URI"
+	envTsaURL        = "REFSVC_TSA_URL"
 )
 
 // Profile is the validated run configuration (data-model: RunProfile).
@@ -77,12 +87,12 @@ func Load() (*Profile, error) {
 		CscAPI:                env("REFSVC_CSC_API", "v1_rsa"),
 		ClientID:              os.Getenv("REFSVC_CLIENT_ID"),
 		ClientSecret:          os.Getenv("REFSVC_CLIENT_SECRET"),
-		RedirectURI:           os.Getenv("REFSVC_REDIRECT_URI"),
-		TsaURL:                os.Getenv("REFSVC_TSA_URL"),
+		RedirectURI:           os.Getenv(envRedirectURI),
+		TsaURL:                os.Getenv(envTsaURL),
 		TsaAuth:               os.Getenv("REFSVC_TSA_AUTH"),
 		TsaPolicy:             os.Getenv("REFSVC_TSA_POLICY"),
-		UpstreamBaseURL:       os.Getenv("REFSVC_BASE_URL"),
-		PublicUpstreamBaseURL: os.Getenv("REFSVC_PUBLIC_BASE_URL"),
+		UpstreamBaseURL:       os.Getenv(envBaseURL),
+		PublicUpstreamBaseURL: os.Getenv(envPublicBaseURL),
 		APIKey:                os.Getenv("REFSVC_API_KEY"),
 		DefaultConformance:    env("REFSVC_DEFAULT_CONFORMANCE", ConformanceBB),
 		Listen:                env("REFSVC_LISTEN", ":8080"),
@@ -115,7 +125,39 @@ func Load() (*Profile, error) {
 		return nil, fmt.Errorf("invalid REFSVC_MODE %q (%s|%s)", p.Mode, ModeFixtures, ModeLive)
 	}
 
+	// Validate URL-shaped vars once, after mode defaults are applied: a non-empty value that does not
+	// parse as an absolute URL with a scheme and host would pass Load() and then break at runtime (e.g.
+	// upstream.Rewrite silently falls back, the SDK emits unreachable hosts). Fail fast here instead.
+	if err := p.validateURLs(); err != nil {
+		return nil, err
+	}
+
 	return p, nil
+}
+
+// validateURLs fails fast on any non-empty URL-shaped var that is not an absolute URL with a scheme
+// and host. Each var is optional/defaulted upstream, so an empty value is left to its own required
+// check (e.g. fixtures REFSVC_BASE_URL) and is not re-validated here.
+func (p *Profile) validateURLs() error {
+	urls := []struct{ name, value string }{
+		{envBaseURL, p.UpstreamBaseURL},
+		{envPublicBaseURL, p.PublicUpstreamBaseURL},
+		{envRedirectURI, p.RedirectURI},
+		{envTsaURL, p.TsaURL},
+	}
+	for _, u := range urls {
+		if u.value == "" {
+			continue
+		}
+		parsed, err := url.Parse(u.value)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", u.name, u.value, err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("invalid %s %q: must be an absolute URL with a scheme and host", u.name, u.value)
+		}
+	}
+	return nil
 }
 
 // resolveAuth applies the auth policy: a key turns auth on; auth is on by default and may only be
@@ -142,7 +184,7 @@ func (p *Profile) resolveAuth() error {
 // redirect rewrites at the mock upstream.
 func (p *Profile) applyFixturesDefaults() error {
 	if p.UpstreamBaseURL == "" {
-		return errors.New("fixtures mode requires REFSVC_BASE_URL (the mock upstream URL)")
+		return fmt.Errorf("fixtures mode requires %s (the mock upstream URL)", envBaseURL)
 	}
 	if p.ClientID == "" {
 		p.ClientID = fixturesClientID
@@ -174,13 +216,13 @@ func (p *Profile) validateLive() error {
 		missing = append(missing, "REFSVC_CLIENT_SECRET")
 	}
 	if p.RedirectURI == "" {
-		missing = append(missing, "REFSVC_REDIRECT_URI")
+		missing = append(missing, envRedirectURI)
 	}
 	// Conformance is per-request overridable, so a live profile that defaults to B-B can still
 	// receive a B-T request and would otherwise fail late (mid-flow) for want of a TSA. Require the
 	// TSA up front regardless of the default: a live deployment must always be able to serve B-T.
 	if p.TsaURL == "" {
-		missing = append(missing, "REFSVC_TSA_URL")
+		missing = append(missing, envTsaURL)
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("live mode requires: %s", strings.Join(missing, ", "))

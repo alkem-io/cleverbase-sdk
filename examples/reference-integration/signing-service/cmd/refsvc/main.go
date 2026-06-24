@@ -24,6 +24,14 @@ import (
 //go:embed sample.pdf
 var samplePDF []byte
 
+// requestBudget bounds the worst-case duration of a single in-flight request. /v1/sign/complete
+// synchronously drives up to ~3 sequential upstream calls (each capped at 30s by the upstream
+// client) plus a TSA round-trip for B-T, so it must comfortably exceed that aggregate. It is the
+// single source of truth for both the server WriteTimeout (which aborts a stuck write) and the
+// graceful-shutdown deadline (which must be at least as long, or a SIGTERM would cut off a
+// legitimate in-flight signing request the WriteTimeout would have allowed to finish).
+const requestBudget = 150 * time.Second
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -55,13 +63,12 @@ func main() {
 		// Bound every phase of a connection so a slow/stalled client cannot tie up a goroutine
 		// indefinitely. ReadHeaderTimeout guards the request line+headers; ReadTimeout bounds the
 		// full request body (the base64 PDF on /start); IdleTimeout reaps idle keep-alive connections.
-		// WriteTimeout bounds the whole handler+response: /v1/sign/complete synchronously drives up to
-		// ~3 sequential upstream calls (each capped at 30s by the upstream client) plus a TSA round-trip
-		// for B-T, so it must comfortably exceed that aggregate or it would abort a legitimate in-flight
-		// signing flow. 150s covers the realistic worst case while still bounding a genuinely stuck write.
+		// WriteTimeout bounds the whole handler+response: a /v1/sign/complete drives the multi-call
+		// signing round-trip, so it is set to requestBudget (see its doc) — comfortably exceeding that
+		// aggregate while still bounding a genuinely stuck write.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      150 * time.Second,
+		WriteTimeout:      requestBudget,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -77,7 +84,11 @@ func main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Give graceful shutdown the same budget as a single request (requestBudget) so a SIGTERM
+	// during a legitimate in-flight signing round-trip lets it finish, rather than cutting it off
+	// short of what WriteTimeout would have allowed. The deadline still bounds the wait so a wedged
+	// connection cannot block shutdown forever.
+	ctx, cancel := context.WithTimeout(context.Background(), requestBudget)
 	err = srv.Shutdown(ctx)
 	cancel()
 	// A failed/timed-out Shutdown means in-flight requests were dropped; surface it (error level +
