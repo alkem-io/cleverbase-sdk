@@ -51,10 +51,15 @@ Mapping from SDK `Step`/`SigningOutcome` → `SessionStatus`:
 | outcome `CredentialUnavailable` | `failed` + `reason: credential_unavailable` |
 | outcome `AppearancePlacementError` | `failed` + `reason: appearance_placement_error` |
 
-Each `failed` session MUST carry a distinct `reason` code (the snake_case SDK outcome name above), so
-all **nine** terminal outcomes (`completed`, `declined`, and the **seven** `failed` reasons) remain
-distinguishable to the frontend; the `status` endpoint and the API contract enumerate exactly these
-reason values, mirroring the SDK's `SigningOutcome` set (single source).
+Each `failed` session carries a `reason` code (the snake_case SDK outcome name above), so all **nine**
+SDK terminal outcomes (`completed`, `declined`, and the **seven** `failed` reasons) remain
+distinguishable to the frontend, mirroring the SDK's `SigningOutcome` set (single source). `reason` is
+emitted **only** for `failed` (never for `declined`/`completed`/in-progress statuses).
+
+Beyond the SDK outcomes, the service maps its own operational failures to three additional `failed`
+reason codes — `upstream_error` (an upstream call failed), `resume_error` (the SDK could not advance),
+and `session_expired` (the TTL elapsed before completion). The `status`/`complete` endpoints and the
+API contract enumerate exactly this set (seven SDK + three operational).
 
 ### RunProfile (configuration)
 

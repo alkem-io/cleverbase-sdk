@@ -185,6 +185,10 @@ func TestCompleteErrorDeclinedHTTP(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"declined"`) {
 		t.Fatalf("decline: %d %s", rec.Code, rec.Body)
 	}
+	// Per the contract, a non-failed status (declined) carries no `reason`.
+	if strings.Contains(rec.Body.String(), `"reason"`) {
+		t.Fatalf("declined response must not include a reason: %s", rec.Body)
+	}
 	// A complete with neither code nor error is a 400.
 	if rec := do(t, h, "POST", "/v1/sign/complete", `{"state":"s1"}`, ""); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty complete should 400, got %d", rec.Code)

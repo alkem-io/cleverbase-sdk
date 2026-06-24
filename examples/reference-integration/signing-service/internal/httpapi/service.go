@@ -40,7 +40,8 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("content-type", "application/json")
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false) // emit raw '&' in redirect URLs rather than &
+	// Keep ampersands literal in redirect URLs (the default JSON HTML-escaping would mangle them).
+	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
 }
 
@@ -143,7 +144,8 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 	if redirectURL != "" {
 		resp["redirectUrl"] = redirectURL
 	}
-	if reason != "" {
+	// Per the API contract, `reason` is present only for a failed status.
+	if status == session.StatusFailed && reason != "" {
 		resp["reason"] = reason
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -157,7 +159,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := map[string]any{"status": string(v.Status)}
-	if v.Reason != "" {
+	// Per the API contract, `reason` is present only for a failed status.
+	if v.Status == session.StatusFailed && v.Reason != "" {
 		resp["reason"] = v.Reason
 	}
 	writeJSON(w, http.StatusOK, resp)

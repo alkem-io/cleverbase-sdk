@@ -55,16 +55,23 @@ Advance the flow after a browser redirect returns to the registered `redirect_ur
 - **Behavior**: resolves the pending session by `state`, calls `resume` with the redirect result,
   performs the resulting HTTP effects against the upstream, and returns the next `status`
   (+ `redirectUrl` if another redirect is needed).
-- **Errors**: `400` unknown/expired `state` or malformed; `401` auth; `409` session already terminal.
+- **Errors**: `400` unknown/expired/already-consumed `state` or malformed body; `401` auth; `500`
+  internal resume failure. (The pending `state` is one-shot: it is de-indexed when the session
+  becomes terminal, so a replay of a consumed `state` resolves as `400` unknown — there is no
+  separate `409`.)
 
 ## `GET /v1/sign/status?correlationId=…`
 
 - **Response 200**: `{ "status": "pending" | "authorizing" | "completed" | "declined" | "failed", "reason": "<code>" }`
-- `reason` is present (and required) when `status == "failed"`, and is exactly one of the seven
-  enumerated codes — `authorization_expired` · `credential_unavailable` · `identity_mismatch` ·
-  `invalid_document` · `timestamp_failed` · `appearance_placement_error` · `signature_invalid` (the
-  SDK's `SigningOutcome` failure set) — so all nine terminal outcomes stay distinguishable
-  (`completed`/`declined` are their own statuses). Absent for non-failed statuses.
+- `reason` is present (and required) **only** when `status == "failed"`, and is one of:
+  - the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `credential_unavailable`
+    · `identity_mismatch` · `invalid_document` · `timestamp_failed` · `appearance_placement_error` ·
+    `signature_invalid`; or
+  - a service-operational failure code — `upstream_error` (an upstream call failed),
+    `resume_error` (the SDK could not advance), or `session_expired` (the session TTL elapsed).
+
+  `completed` and `declined` are their own statuses and carry **no** `reason`; `reason` is absent for
+  every non-failed status. All nine SDK terminal outcomes thus stay distinguishable.
 - **Errors**: `404` unknown/expired correlation id; `401` auth.
 
 ## `GET /v1/sign/result?correlationId=…`
