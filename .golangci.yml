@@ -30,9 +30,11 @@ linters:
         text: "G204"
       # The mock upstream is a deliberate test double: it loads fixtures by configured path (G304),
       # mirrors the OAuth redirect_uri back to the caller (G710), and drives openssl for the RFC 3161
-      # TSA (G204). These patterns are inherent to standing in for Cleverbase, not production risks.
+      # TSA (G204). Scope the waiver to exactly those rules so a new gosec finding still surfaces (the
+      # mock is published to GHCR, so its security posture is load-bearing).
       - path: examples/reference-integration/mock-upstream/
         linters: [gosec]
+        text: "G304|G710|G204"
       # The result endpoint streams the SDK-produced signed PDF as application/pdf; gosec's XSS taint
       # check (G705) does not apply to a non-HTML binary response.
       - path: examples/reference-integration/signing-service/internal/httpapi/service\.go

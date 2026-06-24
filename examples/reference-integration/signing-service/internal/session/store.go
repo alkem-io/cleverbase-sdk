@@ -104,6 +104,36 @@ func (m *Memory) GetByState(state string) (*Session, error) {
 	return s, nil
 }
 
+// View is a race-free value snapshot of a session's client-facing fields, copied under the lock.
+// ResultPDF/Evidence share the underlying arrays, which are immutable once set on completion.
+type View struct {
+	Status    Status
+	Reason    string
+	ResultPDF []byte
+	Evidence  []byte
+}
+
+// ViewByID returns a snapshot by correlation id (expiring first), so handlers never read fields off
+// the live pointer while the flow engine writes them under the lock.
+func (m *Memory) ViewByID(corr string) (View, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.byID[corr]
+	if s == nil {
+		return View{}, ErrNotFound
+	}
+	m.expireLocked(s)
+	return View{Status: s.Status, Reason: s.Reason, ResultPDF: s.ResultPDF, Evidence: s.Evidence}, nil
+}
+
+// ResumeView returns, under the lock, whether the session is terminal and a copy of its current
+// handle — the inputs the flow engine needs before calling the SDK, read race-free.
+func (m *Memory) ResumeView(s *Session) (terminal bool, handle []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return s.Terminal(), s.Handle
+}
+
 // Update runs mutate (which closes over the session) under the store lock, serializing field writes
 // with concurrent reads.
 func (m *Memory) Update(_ *Session, mutate func()) {

@@ -15,14 +15,15 @@
 
 name: Images
 
+# Triggers are limited to MANUAL dispatch until the placeholder action SHAs below are replaced with
+# real pinned commits (an all-zero SHA fails to resolve, so an automatic push trigger would turn every
+# default-branch build red). Once pinned, uncomment the push/tag triggers so images publish on
+# default-branch pushes and version tags.
 on:
-  push:
-    branches:
-      - develop
-      - main
-    tags:
-      - "v*"
   workflow_dispatch:
+  # push:
+  #   branches: [develop, main]
+  #   tags: ["v*"]
 
 env:
   REGISTRY: ghcr.io

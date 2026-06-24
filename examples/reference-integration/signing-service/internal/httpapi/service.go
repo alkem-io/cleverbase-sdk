@@ -151,36 +151,36 @@ func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	corr := r.URL.Query().Get("correlationId")
-	sess, err := s.Store.Get(corr)
+	v, err := s.Store.ViewByID(corr) // race-free snapshot (the flow engine may be writing concurrently)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "not_found", "unknown correlation id")
 		return
 	}
-	resp := map[string]any{"status": string(sess.Status)}
-	if sess.Reason != "" {
-		resp["reason"] = sess.Reason
+	resp := map[string]any{"status": string(v.Status)}
+	if v.Reason != "" {
+		resp["reason"] = v.Reason
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Service) handleResult(w http.ResponseWriter, r *http.Request) {
 	corr := r.URL.Query().Get("correlationId")
-	sess, err := s.Store.Get(corr)
+	v, err := s.Store.ViewByID(corr)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "not_found", "unknown correlation id")
 		return
 	}
-	if sess.Status != session.StatusCompleted {
+	if v.Status != session.StatusCompleted {
 		writeErr(w, http.StatusConflict, "not_completed", "session is not completed")
 		return
 	}
-	if len(sess.Evidence) > 0 {
-		w.Header().Set("X-Signature-Evidence", base64.StdEncoding.EncodeToString(sess.Evidence))
+	if len(v.Evidence) > 0 {
+		w.Header().Set("X-Signature-Evidence", base64.StdEncoding.EncodeToString(v.Evidence))
 	}
 	w.Header().Set("content-type", "application/pdf")
 	w.WriteHeader(http.StatusOK)
 	// The body is the SDK-produced signed PDF served as application/pdf (not HTML); no XSS surface.
-	_, _ = w.Write(sess.ResultPDF)
+	_, _ = w.Write(v.ResultPDF)
 }
 
 func (s *Service) handleHealth(w http.ResponseWriter, _ *http.Request) {

@@ -84,6 +84,8 @@ func (e *Engine) drive(s *session.Session, res Result) (session.Status, string, 
 			e.Log.Info("effect.http_result", "status", status)
 			next, err := e.SDK.ResumeHTTP(handle, status, respBody)
 			if err != nil {
+				// Scrub + de-index now rather than letting the handle linger until the TTL.
+				e.fail(s, session.StatusFailed, "resume_error", nil)
 				return "", "", "", fmt.Errorf("resume http: %w", err)
 			}
 			res = next
@@ -109,6 +111,7 @@ func (e *Engine) drive(s *session.Session, res Result) (session.Status, string, 
 			e.Log.Info("transition.failed", "reason", reason)
 			return status, "", reason, nil
 		default:
+			e.fail(s, session.StatusFailed, "resume_error", nil)
 			return "", "", "", fmt.Errorf("unexpected step kind %q", kind)
 		}
 	}
@@ -148,11 +151,13 @@ func (e *Engine) Begin(corr string, document []byte, conformance string, opts *O
 
 // Complete advances a session after a redirect return with code+state.
 func (e *Engine) Complete(s *session.Session, code, state string) (session.Status, string, string, error) {
-	if s.Terminal() {
-		return s.Status, "", s.Reason, ErrTerminal
+	terminal, handle := e.Store.ResumeView(s) // read terminal + handle under the store lock
+	if terminal {
+		return "", "", "", ErrTerminal
 	}
-	res, err := e.SDK.ResumeRedirect(s.Handle, code, state)
+	res, err := e.SDK.ResumeRedirect(handle, code, state)
 	if err != nil {
+		e.fail(s, session.StatusFailed, "resume_error", nil)
 		return "", "", "", err
 	}
 	return e.drive(s, res)
@@ -160,11 +165,13 @@ func (e *Engine) Complete(s *session.Session, code, state string) (session.Statu
 
 // CompleteError advances a session after a redirect return carrying an OAuth error.
 func (e *Engine) CompleteError(s *session.Session, oauthError, state string) (session.Status, string, string, error) {
-	if s.Terminal() {
-		return s.Status, "", s.Reason, ErrTerminal
+	terminal, handle := e.Store.ResumeView(s)
+	if terminal {
+		return "", "", "", ErrTerminal
 	}
-	res, err := e.SDK.ResumeRedirectError(s.Handle, oauthError, state)
+	res, err := e.SDK.ResumeRedirectError(handle, oauthError, state)
 	if err != nil {
+		e.fail(s, session.StatusFailed, "resume_error", nil)
 		return "", "", "", err
 	}
 	return e.drive(s, res)

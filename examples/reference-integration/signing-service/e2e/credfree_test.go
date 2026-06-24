@@ -338,12 +338,35 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 	if len(bodies) == 0 {
 		t.Fatal("no upstream requests were recorded")
 	}
+
+	rawDoc := samplePDF(t)
+	docB64 := base64.StdEncoding.EncodeToString(rawDoc)
+	docB64URL := base64.RawURLEncoding.EncodeToString(rawDoc)
+	sawSignHash := false
 	for i, b := range bodies {
-		for _, marker := range []string{"%PDF", "MediaBox", "/ByteRange"} {
-			if strings.Contains(b, marker) {
-				t.Fatalf("upstream request %d leaked document bytes (marker %q): %.100s", i, marker, b)
+		// Negative: no upstream request may carry the document — verbatim, base64, or base64url
+		// encoded (the common ways a regression could smuggle it past a plaintext-marker scan).
+		if bytes.Contains([]byte(b), rawDoc) || strings.Contains(b, docB64) || strings.Contains(b, docB64URL) {
+			t.Fatalf("upstream request %d carried the document (hash-only violated): %.120s", i, b)
+		}
+		// Positive: the only document-derived payload is the signHash request, and its hash must be
+		// exactly a 32-byte SHA-256 digest — not the document.
+		if strings.Contains(b, `"hash"`) {
+			sawSignHash = true
+			var sh struct {
+				Hash []string `json:"hash"`
+			}
+			if err := json.Unmarshal([]byte(b), &sh); err != nil || len(sh.Hash) != 1 {
+				t.Fatalf("signHash request %d malformed: %.120s", i, b)
+			}
+			digest, err := base64.StdEncoding.DecodeString(sh.Hash[0])
+			if err != nil || len(digest) != 32 {
+				t.Fatalf("signHash request %d hash is not a 32-byte digest (len=%d, err=%v)", i, len(digest), err)
 			}
 		}
+	}
+	if !sawSignHash {
+		t.Fatal("expected a signHash request carrying the document digest")
 	}
 }
 

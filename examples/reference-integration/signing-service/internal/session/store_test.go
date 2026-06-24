@@ -58,6 +58,28 @@ func TestFinalizeScrubs(t *testing.T) {
 	}
 }
 
+func TestConcurrentViewAndUpdateRaceFree(t *testing.T) {
+	// Run under `go test -race`: a reader taking snapshots while the flow engine mutates the same
+	// session must not race (handlers read via ViewByID/ResumeView, never the live pointer off-lock).
+	m := NewMemory()
+	s := m.New("c", "st", "B-B", time.Minute)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 2000; i++ {
+			m.Update(s, func() { s.Status = StatusCompleted; s.ResultPDF = []byte("pdf") })
+			m.ResumeView(s)
+		}
+		close(done)
+	}()
+	for i := 0; i < 2000; i++ {
+		_, _ = m.ViewByID("c")
+	}
+	<-done
+	if v, err := m.ViewByID("c"); err != nil || v.Status != StatusCompleted || string(v.ResultPDF) != "pdf" {
+		t.Fatalf("final view: %v status=%s pdf=%q", err, v.Status, v.ResultPDF)
+	}
+}
+
 func TestExpiryYieldsTerminalNotHang(t *testing.T) {
 	m := NewMemory()
 	base := time.Now()

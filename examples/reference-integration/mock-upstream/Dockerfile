@@ -16,7 +16,9 @@ RUN apt-get update \
   && useradd -u 65532 -r -s /usr/sbin/nologin nonroot
 COPY --from=build /mockupstream /usr/local/bin/mockupstream
 # The mock only needs the committed DER/PKCS#8 PKI + the upstream JSON shapes. Make them readable by
-# the non-root runtime user (the committed private keys are 0600; these are synthetic test keys).
+# the non-root runtime user. The keys under tests/fixtures/pki are SYNTHETIC TEST keys ONLY; this
+# image is published to GHCR, so a real key must NEVER be placed under that path — it would be baked
+# in world-readable.
 COPY tests/fixtures/upstream /fixtures/upstream
 COPY tests/fixtures/pki /fixtures/pki
 RUN chmod -R a+rX /fixtures
