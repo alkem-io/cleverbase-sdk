@@ -44,7 +44,8 @@ jobs:
       - name: Create virtualenv
         run: python -m venv .venv
       - name: Install build + test deps
-        run: .venv/bin/pip install maturin pytest cbor2
+        # Pinned for reproducible builds/tests (same versions the lint job's mypy uses).
+        run: .venv/bin/pip install maturin==1.14.1 pytest==9.1.1 cbor2==6.1.2
       - name: Build the extension (into the venv)
         run: ../../.venv/bin/maturin develop
         working-directory: bindings/python
