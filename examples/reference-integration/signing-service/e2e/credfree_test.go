@@ -6,6 +6,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -120,37 +121,40 @@ func postJSON(t *testing.T, rawURL, body string) map[string]any {
 	return m
 }
 
-// followRedirect GETs the (mock) authorization URL without following, returning code+state.
-func followRedirect(t *testing.T, authURL string) (code, state string) {
-	t.Helper()
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize GET: %v", err)
+// stateFromURL extracts the OIDC `state` (CSRF nonce) the flow embedded in an authorize URL, so the
+// Authorizer can be told the state the service expects echoed back. Empty string if absent/unparseable.
+func stateFromURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
 	}
-	defer func() { _ = resp.Body.Close() }()
-	loc := resp.Header.Get("Location")
-	u, err := url.Parse(loc)
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		t.Fatalf("parse redirect %q: %v", loc, err)
+		return ""
 	}
-	return u.Query().Get("code"), u.Query().Get("state")
+	return u.Query().Get("state")
 }
 
 // runFlow performs start → complete ×2 and returns the result PDF + evidence header (or the terminal
-// status/reason if it ends early).
-func runFlow(t *testing.T, svc *httptest.Server, startBody string) (pdf []byte, evidence string, status, reason string) {
+// status/reason if it ends early). It drives each Cleverbase redirect through the pluggable Authorizer
+// (mockAutoApprove for credential-free runs, Interactive/Headless for live), calling Authorize exactly
+// once per redirect; the loop itself is authorizer-agnostic (contracts/authorizer.md, FR-013).
+func runFlow(t *testing.T, auth Authorizer, svc *httptest.Server, startBody string) (pdf []byte, evidence string, status, reason string) {
 	t.Helper()
 	start := postJSON(t, svc.URL+"/v1/sign/start", startBody)
 	corr, _ := start["correlationId"].(string)
 	redirect, _ := start["redirectUrl"].(string)
+	expectState := stateFromURL(redirect)
 
 	for i := 0; i < 2 && redirect != ""; i++ {
-		code, state := followRedirect(t, redirect)
+		code, state, err := auth.Authorize(context.Background(), redirect, expectState)
+		if err != nil {
+			t.Fatalf("authorize redirect %d: %v", i, err)
+		}
 		res := postJSON(t, svc.URL+"/v1/sign/complete", `{"code":"`+code+`","state":"`+state+`"}`)
 		status, _ = res["status"].(string)
 		reason, _ = res["reason"].(string)
 		redirect, _ = res["redirectUrl"].(string)
+		expectState = stateFromURL(redirect)
 		if status == "completed" {
 			break
 		}
@@ -189,9 +193,25 @@ func validateCMS(t *testing.T, pdf []byte) {
 }
 
 // verifyCMS runs `openssl cms -verify` over the PDF's ByteRange content against the given CMS DER
-// and returns the error (nil on accept). Splitting the CMS bytes out lets a caller verify a tampered
-// CMS and assert rejection (F1 / no-false-accept).
+// and returns the error (nil on accept), trusting the synthetic credential-free CA. Splitting the CMS
+// bytes out lets a caller verify a tampered CMS and assert rejection (F1 / no-false-accept).
 func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
+	t.Helper()
+	work := t.TempDir()
+	caPEM := filepath.Join(work, "ca.pem")
+	if out, err := exec.Command("openssl", "x509", "-inform", "DER",
+		"-in", filepath.Join(repoFixtures(t), "pki", "ca.cert.der"), "-out", caPEM).CombinedOutput(); err != nil {
+		t.Fatalf("materialize CA: %v %s", err, out)
+	}
+	return verifyCMSWithCA(t, pdf, cmsDER, caPEM)
+}
+
+// verifyCMSWithCA runs `openssl cms -verify` over the PDF's ByteRange content against the given CMS
+// DER, trusting the PEM trust anchor at caPEMPath. Algorithm-agnostic (RSA + ECDSA) and trust-anchor
+// agnostic: the credential-free arm passes the synthetic CA; the live arm passes the real Cleverbase
+// issuer chain (REFSVC_LIVE_CA_BUNDLE); the N3 negative test passes a deliberately-wrong CA. Returns
+// the error (nil on accept) so a caller can assert a loud failure on an untrusted issuer.
+func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 	t.Helper()
 	m := byteRangeRE.FindSubmatch(pdf)
 	if m == nil {
@@ -205,11 +225,6 @@ func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
 	signed := append(append([]byte{}, pdf[a:a+b]...), pdf[c:c+d]...)
 
 	work := t.TempDir()
-	caPEM := filepath.Join(work, "ca.pem")
-	if out, err := exec.Command("openssl", "x509", "-inform", "DER",
-		"-in", filepath.Join(repoFixtures(t), "pki", "ca.cert.der"), "-out", caPEM).CombinedOutput(); err != nil {
-		t.Fatalf("materialize CA: %v %s", err, out)
-	}
 	sigDER := filepath.Join(work, "sig.der")
 	dataBin := filepath.Join(work, "data.bin")
 	if err := os.WriteFile(sigDER, cmsDER, 0o600); err != nil {
@@ -219,7 +234,7 @@ func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
 		t.Fatal(err)
 	}
 	out, err := exec.Command("openssl", "cms", "-verify", "-binary", "-inform", "DER",
-		"-in", sigDER, "-content", dataBin, "-CAfile", caPEM, "-purpose", "any", "-no_check_time").CombinedOutput()
+		"-in", sigDER, "-content", dataBin, "-CAfile", caPEMPath, "-purpose", "any", "-no_check_time").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
 	}
@@ -317,7 +332,7 @@ func TestCredentialFreeBB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := stack(t, "B-B", tc.api)
 			doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-			pdf, evidence, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
+			pdf, evidence, status, _ := runFlow(t, mockAutoApprove{}, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
 			if status != "completed" || len(pdf) == 0 {
 				t.Fatalf("expected completed with a PDF, got status=%s len=%d", status, len(pdf))
 			}
@@ -340,7 +355,7 @@ func TestCredentialFreeBT(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := stack(t, "B-T", tc.api)
 			doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-			pdf, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
+			pdf, _, status, _ := runFlow(t, mockAutoApprove{}, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
 			if status != "completed" || len(pdf) == 0 {
 				t.Fatalf("expected completed B-T PDF, got status=%s len=%d", status, len(pdf))
 			}
@@ -360,7 +375,7 @@ func TestCredentialFreeECDSATamperRejected(t *testing.T) {
 	}
 	svc := stack(t, "B-B", "v2_ecdsa")
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-	pdf, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
+	pdf, _, status, _ := runFlow(t, mockAutoApprove{}, svc, `{"document":"`+doc+`","conformanceLevel":"B-B"}`)
 	if status != "completed" || len(pdf) == 0 {
 		t.Fatalf("expected completed ECDSA PDF, got status=%s len=%d", status, len(pdf))
 	}
@@ -482,7 +497,7 @@ func TestUpstreamReceivesHashOnly(t *testing.T) {
 
 	svc := buildService(t, "B-T", "v1_rsa", rec.URL) // B-T exercises the TSA request too
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
-	_, _, status, _ := runFlow(t, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
+	_, _, status, _ := runFlow(t, mockAutoApprove{}, svc, `{"document":"`+doc+`","conformanceLevel":"B-T"}`)
 	if status != "completed" {
 		t.Fatalf("expected completed, got %s", status)
 	}
@@ -542,7 +557,7 @@ func TestExpectedSignerMismatch(t *testing.T) {
 	svc := stack(t, "B-B", "v1_rsa")
 	doc := base64.StdEncoding.EncodeToString(samplePDF(t))
 	body := `{"document":"` + doc + `","expectedSigner":{"matchOn":"certificate_serial_number","value":"DOES-NOT-MATCH"}}`
-	_, _, status, reason := runFlow(t, svc, body)
+	_, _, status, reason := runFlow(t, mockAutoApprove{}, svc, body)
 	if status != "failed" || reason != "identity_mismatch" {
 		t.Fatalf("expected failed/identity_mismatch, got %s/%s", status, reason)
 	}

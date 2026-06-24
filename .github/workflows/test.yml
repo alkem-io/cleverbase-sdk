@@ -153,8 +153,10 @@ jobs:
         working-directory: examples/reference-integration/web
         run: go build -o /dev/null ./server
       # The credential-free E2E spins up the mock + service in-process (no Cleverbase credentials) and
-      # OpenSSL-validates the produced B-B and B-T signatures; auth stays enabled (FR-021/SC-002).
-      - name: Credential-free E2E (OpenSSL-validated B-B + B-T)
+      # OpenSSL-validates the produced B-B and B-T signatures for BOTH RSA (v1) and ECDSA P-256 (v2) — the
+      # `go test ./e2e/...` table runs every {v1_rsa, v2_ecdsa} x {B-B, B-T} arm; auth stays enabled
+      # (FR-021/SC-002; ECDSA parity per spec 003 FR-002/SC-001).
+      - name: Credential-free E2E (OpenSSL-validated B-B + B-T, RSA + ECDSA)
         working-directory: examples/reference-integration/signing-service
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
