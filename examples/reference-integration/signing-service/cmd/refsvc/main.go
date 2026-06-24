@@ -54,11 +54,14 @@ func main() {
 		Handler: svc.Handler(),
 		// Bound every phase of a connection so a slow/stalled client cannot tie up a goroutine
 		// indefinitely. ReadHeaderTimeout guards the request line+headers; ReadTimeout bounds the
-		// full request body (the base64 PDF on /start); WriteTimeout bounds a blocked response write;
-		// IdleTimeout reaps idle keep-alive connections.
+		// full request body (the base64 PDF on /start); IdleTimeout reaps idle keep-alive connections.
+		// WriteTimeout bounds the whole handler+response: /v1/sign/complete synchronously drives up to
+		// ~3 sequential upstream calls (each capped at 30s by the upstream client) plus a TSA round-trip
+		// for B-T, so it must comfortably exceed that aggregate or it would abort a legitimate in-flight
+		// signing flow. 150s covers the realistic worst case while still bounding a genuinely stuck write.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      150 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 

@@ -32,6 +32,9 @@ const (
 	// base64-encoded (~4/3 expansion) inside JSON, so the body cap is maxPDFBytes*4/3 plus a small
 	// slack for the surrounding JSON fields.
 	maxStartBodyBytes = maxPDFBytes*4/3 + (1 << 16) // base64 expansion + 64 KiB JSON slack
+	// maxCompleteBodyBytes caps /v1/sign/complete bodies, which carry only short OAuth code/state/error
+	// fields — no document — so a small cap suffices and bounds the decode allocation.
+	maxCompleteBodyBytes = 1 << 16 // 64 KiB
 )
 
 // Service holds the engine + store + profile and serves the REST API.
@@ -119,17 +122,16 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	doc := s.Sample
 	if req.Document != "" {
-		// Reject an over-large document by its base64 length BEFORE decoding, so we never allocate the
-		// oversized decoded buffer. DecodedLen(n) is the upper bound on the decoded size for an n-byte
-		// encoding, so a payload whose decoded bytes would exceed maxPDFBytes is rejected here; the
-		// actual decoded length can only be ≤ this bound.
-		if base64.StdEncoding.DecodedLen(len(req.Document)) > maxPDFBytes {
-			writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", "document exceeds the size limit")
-			return
-		}
+		// The request body is already bounded by MaxBytesReader (maxStartBodyBytes) above, so decoding
+		// allocates at most that many bytes — bounded. Decode, then enforce the EXACT decoded-PDF cap
+		// (a pre-decode base64 DecodedLen check over-rejects by up to 2 bytes at the boundary).
 		b, err := base64.StdEncoding.DecodeString(req.Document)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_request", "document is not valid base64")
+			return
+		}
+		if len(b) > maxPDFBytes {
+			writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", "document exceeds the size limit")
 			return
 		}
 		doc = b
@@ -173,8 +175,15 @@ type completeRequest struct {
 }
 
 func (s *Service) handleComplete(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCompleteBodyBytes)
 	var req completeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.State == "" {
+	err := json.NewDecoder(r.Body).Decode(&req)
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeErr(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body too large")
+		return
+	}
+	if err != nil || req.State == "" {
 		writeErr(w, http.StatusBadRequest, "bad_request", "invalid body or missing state")
 		return
 	}

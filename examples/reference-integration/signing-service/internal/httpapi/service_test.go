@@ -189,6 +189,14 @@ func TestStartRejectsOversizeBody(t *testing.T) {
 	}
 }
 
+func TestCompleteRejectsOversizeBody(t *testing.T) {
+	h := newService(happySteps(), false).Handler()
+	bigBody := `{"state":"` + strings.Repeat("A", maxCompleteBodyBytes+1) + `"}`
+	if rec := do(t, h, "POST", "/v1/sign/complete", bigBody, ""); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize complete body should 413, got %d", rec.Code)
+	}
+}
+
 func TestStartDefaultsAndExpectedSigner(t *testing.T) {
 	h := newService(happySteps(), false).Handler()
 	// Omitted conformanceLevel → profile default; explicit document (base64 of "%PDF").
