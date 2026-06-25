@@ -49,3 +49,34 @@ pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
     ciborium::into_writer(&req, &mut buf).expect("CBOR encode of the test VerifyRequest");
     buf
 }
+
+/// Build a CBOR-encoded issuance request envelope that **skips** (a `None` issuer backend) — the
+/// gated default. Driving it through the C-ABI (`cleverbase_attestation_issuance`) yields a
+/// `WireObtainStep::Skipped` (a clear skipped outcome, never a failure — FR-008), exercising the
+/// additive issuance surface end-to-end without requiring a live issuer.
+#[must_use]
+pub fn skipped_issuance_request_cbor() -> Vec<u8> {
+    use crate::issuance::obtain::{CredentialOffer, IssuerBackend};
+    use crate::issuance::signer::HolderContext;
+    use crate::issuance::wire::{IssuanceOp, IssuanceRequest, ISSUANCE_SCHEMA_VERSION};
+    use crate::sdjwtvc::test_issuer::HOLDER_JWK_JSON;
+
+    let jwk: serde_json::Value =
+        serde_json::from_slice(HOLDER_JWK_JSON).expect("holder JWK fixture parses");
+    let req = IssuanceRequest {
+        schema_version: ISSUANCE_SCHEMA_VERSION,
+        op: IssuanceOp::BeginObtain {
+            offer: CredentialOffer {
+                pre_authorized_code: "pre-auth".to_owned(),
+                credential_configuration_id: "eu.europa.ec.eudi.pid_vc_sd_jwt".to_owned(),
+                format: Format::SdJwtVc,
+            },
+            backend: IssuerBackend::none(),
+            holder: HolderContext::new(jwk, "holder-handle"),
+            now_unix: NOW,
+        },
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&req, &mut buf).expect("CBOR encode of the test IssuanceRequest");
+    buf
+}

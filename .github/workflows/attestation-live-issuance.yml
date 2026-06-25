@@ -1,0 +1,82 @@
+name: Attestation live issuance (opt-in)
+
+# Opt-in only (US2, task T027): brings up the EU `eudi-srv-pid-issuer` reference issuer via
+# docker-compose and runs the gated Rust live-issuance test against it. It is NEVER part of the default
+# pipeline — it is triggered manually (workflow_dispatch). The Rust live test self-skips cleanly when
+# `ATT_ISSUER` is unset (so this job is the only place it runs for real). No Cleverbase secrets are
+# needed: the reference issuer is a self-contained docker-compose stack (issuer + Keycloak), so the
+# OAuth/issuance surface is local to the runner.
+#
+# The default offline suite (`cargo test -p cleverbase-attestation`) already exercises the full
+# obtain/present round-trip against an IN-TEST issuer double (deterministic, no network) and is what
+# gates merges; this job adds the standards-conformance signal against the real EU reference issuer.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: attestation-live-issuance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-issuance:
+    name: Live issuance (eudi-srv-pid-issuer)
+    runs-on: ubuntu-latest
+    env:
+      # The reference issuer base URL the Rust live test drives its host effects against. Bringing the
+      # stack up exports this; it gates the `live_obtain_against_the_reference_issuer_or_skip` test
+      # (unset → the test self-skips; set → it runs for real).
+      ATT_ISSUER: http://localhost:8080
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      # Bring up the EU reference issuer (Kotlin, Apache-2.0; docker-compose with Keycloak — the OAuth
+      # gate is self-contained). Pinned to a tagged release ref so the conformance target is stable.
+      - name: Check out the reference issuer (eudi-srv-pid-issuer)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: eu-digital-identity-wallet/eudi-srv-pid-issuer
+          ref: v0.5.0
+          path: eudi-srv-pid-issuer
+          persist-credentials: false
+
+      - name: Bring up the reference issuer (docker-compose)
+        working-directory: eudi-srv-pid-issuer
+        run: |
+          # The reference repo ships a docker-compose stack under docker-compose/; bring it up
+          # detached. If the path/compose file moves upstream, this step fails loudly (the pinned ref
+          # keeps it stable). Non-fatal `|| true` is deliberately NOT used — a failure here must fail
+          # the opt-in job so a broken issuer is visible.
+          docker compose -f docker-compose/docker-compose.yaml up -d
+
+      - name: Wait for the issuer to become reachable
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "$ATT_ISSUER/.well-known/openid-credential-issuer" >/dev/null 2>&1; then
+              echo "issuer reachable after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::reference issuer did not become reachable at $ATT_ISSUER within 60s"
+          exit 1
+
+      - name: Run the gated live-issuance test
+        run: |
+          # --include-ignored: this test is NOT marked #[ignore] (it self-skips on a missing
+          # ATT_ISSUER instead), so a plain run executes it; ATT_ISSUER is set above so it runs for
+          # real. --nocapture surfaces the SKIP/PASS note without printing secrets.
+          cargo test -p cleverbase-attestation --test live_issuance -- --nocapture
+
+      - name: Tear down the reference issuer
+        if: always()
+        working-directory: eudi-srv-pid-issuer
+        run: docker compose -f docker-compose/docker-compose.yaml down -v || true

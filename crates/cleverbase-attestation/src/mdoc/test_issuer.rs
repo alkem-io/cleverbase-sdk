@@ -81,6 +81,9 @@ pub(crate) struct MdocBuilder {
     tdate_tagged: bool,
     /// When set, make the MSO `docType` differ from the document `docType` (tamper).
     mso_doc_type_mismatch: bool,
+    /// When `Some`, splice this externally-built `deviceSignature` COSE_Sign1 (CBOR) in place of one
+    /// signed in-process — the US2 signer-hook round-trip (the SDK built + spliced it via the hook).
+    device_signature_override: Option<Vec<u8>>,
 }
 
 /// The hash to compute `valueDigests` with, plus its MSO `digestAlgorithm` name.
@@ -179,7 +182,17 @@ impl MdocBuilder {
             omit_x5chain: false,
             tdate_tagged: false,
             mso_doc_type_mismatch: false,
+            device_signature_override: None,
         }
+    }
+
+    /// Splice an externally-built `deviceSignature` COSE_Sign1 (CBOR) — the US2 signer-hook
+    /// round-trip, where the SDK built the `DeviceAuthentication` signing input, the host signed it,
+    /// and the SDK spliced the detached COSE_Sign1. The builder embeds it verbatim instead of signing
+    /// in-process.
+    pub(crate) fn with_device_signature_cbor(mut self, device_signature_cbor: Vec<u8>) -> Self {
+        self.device_signature_override = Some(device_signature_cbor);
+        self
     }
 
     /// Sign the IssuerAuth with a non-ES256 algorithm header (alg-gate reject → Tamper).
@@ -471,14 +484,21 @@ impl MdocBuilder {
             coset::iana::Algorithm::ES256
         };
         let device_protected = HeaderBuilder::new().algorithm(device_alg).build();
-        let device_signature = CoseSign1Builder::new()
-            .protected(device_protected)
-            .create_detached_signature(&device_auth_payload, &[], |tbs| {
-                es256_sign(&device_signing_key, tbs)
-            })
-            .build();
-        let device_signature_bytes = device_signature.to_vec().expect("encode DeviceSignature");
-        let device_signature_value = decode(&device_signature_bytes);
+        let device_signature_value = self.device_signature_override.as_ref().map_or_else(
+            || {
+                let device_signature = CoseSign1Builder::new()
+                    .protected(device_protected)
+                    .create_detached_signature(&device_auth_payload, &[], |tbs| {
+                        es256_sign(&device_signing_key, tbs)
+                    })
+                    .build();
+                let device_signature_bytes =
+                    device_signature.to_vec().expect("encode DeviceSignature");
+                decode(&device_signature_bytes)
+            },
+            // The US2 signer-hook round-trip: embed the externally-built (SDK-spliced) COSE_Sign1.
+            |override_cbor| decode(override_cbor),
+        );
 
         // --- Assemble the document + DeviceResponse. ------------------------------------------------
         let issuer_signed = CborValue::Map(vec![

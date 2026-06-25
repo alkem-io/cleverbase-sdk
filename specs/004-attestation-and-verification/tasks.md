@@ -90,17 +90,17 @@ and verify under US1; with no issuer configured, the issuance test **skips** and
 
 ### Tests for US2 (write first — MUST fail / gated)
 
-- [ ] T021 [P] [US2] Signer-hook tests in `src/issuance/` — the SDK builds the exact PoP-JWT / KB-JWT / DeviceAuth **signingInput**, a stub HSM signs it, the SDK **never accesses a private key**, and `aud`/`nonce` are exposed for host inspection (FR-009).
-- [ ] T022 [P] [US2] Issuance gating tests in `src/issuance/` — `IssuerBackend.kind=None` → **skip** (reported skipped, never failed); `kind=Reference` → `obtain` yields a conformant attestation that verifies under US1 **and is cross-checked against the independent reference verifier** (T017 harness, C1/FR-013) (gated on the reference issuer).
-- [ ] T023 [P] [US2] Holder presentation tests in `src/issuance/` — `present` with a disclosed subset produces a `vp_token` that the US1 verifier accepts (round-trip), bound to the verifier's request, **and that the independent reference verifier (T017) also accepts** (C1/FR-013).
+- [X] T021 [P] [US2] Signer-hook tests in `src/issuance/` — the SDK builds the exact PoP-JWT / KB-JWT / DeviceAuth **signingInput**, a stub HSM signs it, the SDK **never accesses a private key**, and `aud`/`nonce` are exposed for host inspection (FR-009).
+- [X] T022 [P] [US2] Issuance gating tests in `src/issuance/` — `IssuerBackend.kind=None` → **skip** (reported skipped, never failed); `kind=Reference` → `obtain` yields a conformant attestation that verifies under US1 **and is cross-checked against the independent reference verifier** (T017 harness, C1/FR-013) (gated on the reference issuer).
+- [X] T023 [P] [US2] Holder presentation tests in `src/issuance/` — `present` with a disclosed subset produces a `vp_token` that the US1 verifier accepts (round-trip), bound to the verifier's request, **and that the independent reference verifier (T017) also accepts** (C1/FR-013).
 
 ### Implementation for US2
 
-- [ ] T024 [US2] Signer-hook + `HolderContext` in `src/issuance/` (integrator-supplied public key + async `sign(handle,alg,signingInput)`; build PoP-JWT/KB-JWT/DeviceSignature inputs deterministically) — reuse the spec-001 pattern (DRY). Makes T021 pass.
-- [ ] T025 [US2] OpenID4VCI `obtain` with a configurable `IssuerBackend` (None/Reference/Cleverbase) + the **skip-when-None** gating in `src/issuance/`. Makes T022 pass.
-- [ ] T026 [US2] Holder OpenID4VP `present` (selective disclosure, bound to the request) in `src/issuance/`. Makes T023 pass.
-- [ ] T027 [US2] Wire the EU `eudi-srv-pid-issuer` **reference-issuer double** (docker-compose) + an **opt-in** `.github/workflows/attestation-live-issuance.yml` job, gated on the reference issuer being available.
-- [ ] T028 [US2] Surface `issue`/`present` through the C-ABI + bindings.
+- [X] T024 [US2] Signer-hook + `HolderContext` in `src/issuance/` (integrator-supplied public key + async `sign(handle,alg,signingInput)`; build PoP-JWT/KB-JWT/DeviceSignature inputs deterministically) — reuse the spec-001 pattern (DRY). Makes T021 pass.
+- [X] T025 [US2] OpenID4VCI `obtain` with a configurable `IssuerBackend` (None/Reference/Cleverbase) + the **skip-when-None** gating in `src/issuance/`. Makes T022 pass.
+- [X] T026 [US2] Holder OpenID4VP `present` (selective disclosure, bound to the request) in `src/issuance/`. Makes T023 pass.
+- [X] T027 [US2] Wire the EU `eudi-srv-pid-issuer` **reference-issuer double** (docker-compose) + an **opt-in** `.github/workflows/attestation-live-issuance.yml` job, gated on the reference issuer being available.
+- [X] T028 [US2] Surface `issue`/`present` through the C-ABI + bindings.
 
 **Checkpoint**: US2 round-trips against the reference issuer; skips cleanly without one; a future Cleverbase
 issuer drops in by configuration (SC-005).

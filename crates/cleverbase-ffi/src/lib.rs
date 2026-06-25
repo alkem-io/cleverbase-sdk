@@ -158,12 +158,68 @@ pub unsafe extern "C" fn cleverbase_attestation_verify(
     }
 }
 
-/// Free a buffer previously returned by [`cleverbase_process`] or [`cleverbase_attestation_verify`]
-/// (both hand back an identically shaped boxed slice).
+/// Drive one issuance operation (the gated OpenID4VCI `obtain` / OpenID4VP holder `present` flow —
+/// contracts/holder-signer-hook.md, US2).
+///
+/// CBOR-in / CBOR-out, identical envelope discipline to [`cleverbase_attestation_verify`]: on success
+/// writes a heap buffer to `*out_ptr`/`*out_len` (free it with [`cleverbase_free`]) and returns `0`;
+/// returns non-zero only for null arguments (`1`) or a contained panic (`2`). The issuance *outcome*
+/// (the next sans-IO host effect — an HTTP request or a holder **sign** — the opaque session/prepared
+/// handle, or a decode error) is carried *inside* the CBOR response (a
+/// `cleverbase_attestation::issuance::wire::IssuanceOutcome`), never via the status code.
+///
+/// The holder private key never crosses this boundary: a `Sign` effect surfaces the SDK-built signing
+/// input for the host's HSM/KMS to sign out-of-process (FR-009); the host feeds the signature back via
+/// a resume operation. When no issuer API is configured (`kind = None`) the flow is **skipped** (a
+/// clear skipped outcome, never a failure — FR-008). This is an **additive** surface (its own schema
+/// version); the verifier surface above is unchanged.
 ///
 /// # Safety
-/// `ptr`/`len` must be exactly what a prior `cleverbase_process` / `cleverbase_attestation_verify`
-/// call wrote, freed at most once.
+/// `in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
+#[no_mangle]
+pub unsafe extern "C" fn cleverbase_attestation_issuance(
+    in_ptr: *const u8,
+    in_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    unsafe {
+        if out_ptr.is_null() || out_len.is_null() {
+            return 1;
+        }
+        // Initialize the outputs FIRST so every non-zero return below (null input or the panic path)
+        // leaves a null/empty buffer for a consumer that inspects them, never uninitialized memory.
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        if in_ptr.is_null() {
+            return 1;
+        }
+        let input = std::slice::from_raw_parts(in_ptr, in_len);
+        // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
+        let bytes = match std::panic::catch_unwind(|| {
+            cleverbase_attestation::issuance::wire::process_issuance_bytes(input)
+        }) {
+            Ok(bytes) => bytes,
+            Err(_) => return 2,
+        };
+
+        // Hand ownership to the caller as an exact-capacity boxed slice (cap == len), freed by
+        // [`cleverbase_free`] exactly like a `cleverbase_process` buffer.
+        let boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed).cast::<u8>();
+        *out_ptr = ptr;
+        *out_len = len;
+        0
+    }
+}
+
+/// Free a buffer previously returned by [`cleverbase_process`], [`cleverbase_attestation_verify`], or
+/// [`cleverbase_attestation_issuance`] (all hand back an identically shaped boxed slice).
+///
+/// # Safety
+/// `ptr`/`len` must be exactly what a prior `cleverbase_process` / `cleverbase_attestation_verify` /
+/// `cleverbase_attestation_issuance` call wrote, freed at most once.
 #[no_mangle]
 pub unsafe extern "C" fn cleverbase_free(ptr: *mut u8, len: usize) {
     unsafe {
@@ -401,5 +457,63 @@ mod tests {
         let out = drive_attestation_verify(&[0xffu8, 0x00, 0x13, 0x37]);
         let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
         assert!(matches!(resp.outcome, VerifyOutcome::Err { .. }));
+    }
+
+    /// Drive the given CBOR issuance request through the C-ABI and return the response bytes.
+    fn drive_attestation_issuance(input: &[u8]) -> Vec<u8> {
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        // SAFETY: valid input slice and out pointers.
+        let rc = unsafe {
+            cleverbase_attestation_issuance(
+                input.as_ptr(),
+                input.len(),
+                &raw mut out_ptr,
+                &raw mut out_len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(!out_ptr.is_null());
+        assert!(out_len > 0);
+        let out = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
+        unsafe { cleverbase_free(out_ptr, out_len) };
+        out
+    }
+
+    #[test]
+    fn attestation_issuance_none_backend_skips_end_to_end() {
+        // The gated default through the real C-ABI: a `None` issuer backend → a clean Skipped outcome
+        // (never a failure — FR-008), exercising the additive issuance surface.
+        use cleverbase_attestation::issuance::wire::{
+            IssuanceOutcome, IssuanceResponse, WireObtainStep,
+        };
+        let input = cleverbase_attestation::test_vectors::skipped_issuance_request_cbor();
+        let out = drive_attestation_issuance(&input);
+        let resp: IssuanceResponse = ciborium::from_reader(&out[..]).unwrap();
+        match resp.outcome {
+            IssuanceOutcome::Obtain { step, session } => {
+                assert_eq!(step, WireObtainStep::Skipped);
+                assert!(session.is_none());
+            }
+            other => panic!("expected a Skipped obtain outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attestation_issuance_null_args_return_nonzero() {
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe {
+            cleverbase_attestation_issuance(std::ptr::null(), 0, &raw mut out_ptr, &raw mut out_len)
+        };
+        assert_ne!(rc, 0);
+    }
+
+    #[test]
+    fn attestation_issuance_garbage_input_returns_err_outcome() {
+        use cleverbase_attestation::issuance::wire::{IssuanceOutcome, IssuanceResponse};
+        let out = drive_attestation_issuance(&[0xffu8, 0x00, 0x13, 0x37]);
+        let resp: IssuanceResponse = ciborium::from_reader(&out[..]).unwrap();
+        assert!(matches!(resp.outcome, IssuanceOutcome::Err { .. }));
     }
 }
