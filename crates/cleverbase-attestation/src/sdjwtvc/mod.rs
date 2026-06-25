@@ -113,6 +113,23 @@ pub fn kb_jwt_aud_nonce(presentation: &str) -> Option<(String, String)> {
     Some((claims.aud.clone(), claims.nonce.clone()))
 }
 
+/// Extract the issuer signing certificate (DER) a presented SD-JWT VC claims in its JWS `x5c` header,
+/// without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf against the
+/// national Trusted List's `EAA/Q` service entries).
+///
+/// Returns `None` when the presentation does not parse or carries no `x5c` leaf. The value is
+/// *claimed* (its trust + signature are decided by the always-on bar in [`verify_sd_jwt_vc`]); this
+/// read is only the gate's cert-matching input, never an acceptance.
+#[must_use]
+pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+    let jws = sd_jwt.presentation();
+    let header_b64 = jws.split('~').next()?.split('.').next()?;
+    let header_json = Base64UrlUnpadded::decode_vec(header_b64).ok()?;
+    let header: Value = serde_json::from_slice(&header_json).ok()?;
+    issuer_cert_from_header(&header).ok()
+}
+
 /// The verified, accepted view of a presentation, assembled once every always-on check has passed.
 fn accept(disclosed: BTreeMap<String, AttributeValue>) -> VerificationResult {
     VerificationResult {

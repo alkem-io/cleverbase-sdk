@@ -74,9 +74,9 @@ OpenID4VP binding, cross-checked against an independent verifier.
 **Goal**: opt-in eIDAS qualified-status determination over the always-on bar; off by default, experimental,
 version-pinned.
 
-- [ ] T018 [P] Qualified-gate tests in `src/qualified/` — qualified issuer (granted at the relevant time) → `Qualified`; trusted-but-non-qualified → VALID-but-`NotQualified` (no false "qualified"); missing TL data → `Indeterminate`; **gate disabled → the always-on verdict is unchanged** (SC-007). Self-skips if TL fixtures absent.
-- [ ] T019 Qualified-status determination (TS 119 615 v1.4.1 **cl. 4.12**) in `src/qualified/`, reusing the T013 trust primitives (service type `…/EAA/Q`, status-at-relevant-time); **opt-in**, version-pinned. **(A1)** Outcome conditions, pinned: `Qualified` = the issuer's `EAA/Q` service entry is `granted` at the relevant time; `NotQualified` = the entry is found but not granted (or withdrawn/suspended) at that time; `Indeterminate` = the trust-list data is absent / ambiguous / unreachable (never assume qualified). Makes T018 pass. (contracts/qualified-status-gate.md)
-- [ ] T020 Surface the opt-in gate via `VerificationPolicy.qualifiedGate` + the C-ABI + bindings.
+- [X] T018 [P] Qualified-gate tests in `src/qualified/` — qualified issuer (granted at the relevant time) → `Qualified`; trusted-but-non-qualified → VALID-but-`NotQualified` (no false "qualified"); missing TL data → `Indeterminate`; **gate disabled → the always-on verdict is unchanged** (SC-007). Self-skips if TL fixtures absent.
+- [X] T019 Qualified-status determination (TS 119 615 v1.4.1 **cl. 4.12**) in `src/qualified/`, reusing the T013 trust primitives (service type `…/EAA/Q`, status-at-relevant-time); **opt-in**, version-pinned. **(A1)** Outcome conditions, pinned: `Qualified` = the issuer's `EAA/Q` service entry is `granted` at the relevant time; `NotQualified` = the entry is found but not granted (or withdrawn/suspended) at that time; `Indeterminate` = the trust-list data is absent / ambiguous / unreachable (never assume qualified). Makes T018 pass. (contracts/qualified-status-gate.md)
+- [X] T020 Surface the opt-in gate via `VerificationPolicy.qualifiedGate` + the C-ABI + bindings.
 
 **Checkpoint**: enabling/disabling the gate never changes the always-on bar; no false "qualified".
 

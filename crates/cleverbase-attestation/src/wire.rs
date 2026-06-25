@@ -14,12 +14,15 @@
 //! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
 //! seam), and the optional OpenID4VP **request** the presentation must be bound to.
 //!
-//! ## Schema version 2
+//! ## Schema version 3
 //!
-//! Version 2 (this) replaced the version-1 foundation seam (which carried only `presentation` +
-//! `policy` and returned `NotImplemented`). The CBOR shape changed — additive fields plus the real
-//! verifier wiring — so the schema version was bumped (Principle VII); a binding speaking v1 is
-//! refused with a clear message rather than mis-parsed.
+//! Version 2 replaced the version-1 foundation seam (which carried only `presentation` + `policy` and
+//! returned `NotImplemented`) with the full always-on verifier wiring. Version 3 (this) additively
+//! carries the opt-in qualified-status gate's national Trusted List
+//! ([`WireContext::qualified_trust_list`]) alongside the existing `qualified_gate` flag (T020), so
+//! the C-ABI gate has data. The CBOR shape changed (an additive field), so the schema version was
+//! bumped (Principle VII); a binding speaking an older version is refused with a clear message rather
+//! than mis-parsed.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +35,7 @@ use crate::verify::{verify, Presentation, VerifyContext};
 /// Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
 /// SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
 /// verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
-pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 3;
 
 /// A single configured trust anchor passed across the wire: a trusted issuer/anchor certificate for
 /// a `(role, format)` (the host resolved these from the EU LOTL / national TLs / IACA roots in its
@@ -83,9 +86,18 @@ pub struct WireContext {
     /// The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
     #[serde(default, with = "serde_bytes")]
     pub session_transcript: Option<Vec<u8>>,
-    /// The off-by-default opt-in qualified-status gate seam (T019, not built yet).
+    /// The off-by-default opt-in qualified-status gate flag (T019/T020). When `true`, the gate runs
+    /// over [`Self::qualified_trust_list`] and populates `VerificationResult.qualified_status`; when
+    /// `false` (the default) the always-on verdict is byte-identical and `qualified_status` is absent
+    /// (SC-007).
     #[serde(default)]
     pub qualified_gate: bool,
+    /// The raw national Trusted List JSON the opt-in gate reads (the offline
+    /// `qualified-trust-list.json` form / a host-supplied national TL), carried additively on the
+    /// wire so the C-ABI gate has data. `None` (the default) with the gate enabled yields an honest
+    /// `Indeterminate` (unreachable data — never a false "qualified").
+    #[serde(default, with = "serde_bytes")]
+    pub qualified_trust_list: Option<Vec<u8>>,
 }
 
 /// A `verify` request: the presented credential, the policy, the configured anchors, the
@@ -184,12 +196,21 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
     let outcome = match decode_verify_request(input) {
         Ok(req) => {
             let anchors = anchors_from_wire(&req.anchors);
+            // Parse the optional national Trusted List the opt-in gate reads. A malformed list (or
+            // none) is treated as absent data → the gate yields `Indeterminate` (fail-closed, never a
+            // false "qualified"); it never fails the always-on verdict.
+            let qualified_trust_list = req
+                .context
+                .qualified_trust_list
+                .as_deref()
+                .and_then(|bytes| crate::qualified::QualifiedTrustList::parse(bytes).ok());
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,
                 status: req.context.status,
                 session_transcript: req.context.session_transcript.as_deref(),
                 qualified_gate: req.context.qualified_gate,
+                qualified_trust_list: qualified_trust_list.as_ref(),
             };
             let presentation = match &req.presentation {
                 WirePresentation::SdJwtVc { presentation } => Presentation::SdJwtVc(presentation),

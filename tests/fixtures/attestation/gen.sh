@@ -183,6 +183,58 @@ cat > trust-list.json <<JSON
 }
 JSON
 
+# --- Minimal test qualified-status Trusted List (JSON, for the opt-in gate T018/T019) --------------
+# The opt-in eIDAS qualified-status determination (TS 119 615 v1.4.1 cl. 4.12) needs a national
+# Trusted List whose EAA/Q services carry a per-service status HISTORY so the gate can read the
+# granted/withdrawn status AT the relevant time (the credential's issuance time, not "now"). This is
+# the JSON counterpart of a signed TS 119 612 national TL; the SDK's qualified module parses it. It
+# is SYNTHETIC and OFFLINE: the list is "signed" by the IACA root (signerCertDerB64), and it lists:
+#   * sdjwt-issuer  as an EAA/Q service, GRANTED from 2020-01-01 (qualified at the test instants);
+#   * mdoc-ds       as an EAA/Q service, GRANTED then WITHDRAWN on 2025-09-01 (status-at-time matters);
+#   * ca-iaca       as a plain EAA (NON-qualified) service — a trusted-but-not-qualified issuer.
+# A signing cert absent from every service yields the honest Indeterminate (no false "qualified").
+B64_SDJWT="$(openssl base64 -A -in sdjwt-issuer.cert.der)"
+B64_MDOC_DS="$(openssl base64 -A -in mdoc-ds.cert.der)"
+SVCTYPE_EAA_Q="http://uri.etsi.org/TrstSvc/Svctype/EAA/Q"
+SVCTYPE_EAA="http://uri.etsi.org/TrstSvc/Svctype/EAA"
+SVCSTATUS_GRANTED="http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted"
+SVCSTATUS_WITHDRAWN="http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn"
+cat > qualified-trust-list.json <<JSON
+{
+  "schema": "cleverbase-sdk/test-qualified-trust-list/v1",
+  "comment": "SYNTHETIC offline test qualified-status (TS 119 615 v1.4.1 cl. 4.12 / TS 119 612) national Trusted List for feature 004 (T018/T019). NOT a real EU national TL.",
+  "nextUpdate": "${NEXT_UPDATE}",
+  "signerCertDerB64": "${B64_IACA}",
+  "services": [
+    {
+      "serviceName": "Cleverbase SDK Test QEAA Issuer (EAA/Q, granted)",
+      "serviceTypeIdentifier": "${SVCTYPE_EAA_Q}",
+      "signingCertDerB64": "${B64_SDJWT}",
+      "statusHistory": [
+        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2020-01-01T00:00:00Z" }
+      ]
+    },
+    {
+      "serviceName": "Cleverbase SDK Test QEAA Issuer (EAA/Q, granted then withdrawn)",
+      "serviceTypeIdentifier": "${SVCTYPE_EAA_Q}",
+      "signingCertDerB64": "${B64_MDOC_DS}",
+      "statusHistory": [
+        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2020-01-01T00:00:00Z" },
+        { "status": "${SVCSTATUS_WITHDRAWN}", "startingTime": "2025-09-01T00:00:00Z" }
+      ]
+    },
+    {
+      "serviceName": "Cleverbase SDK Test Non-Qualified EAA Issuer (EAA, no /Q)",
+      "serviceTypeIdentifier": "${SVCTYPE_EAA}",
+      "signingCertDerB64": "${B64_IACA}",
+      "statusHistory": [
+        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2020-01-01T00:00:00Z" }
+      ]
+    }
+  ]
+}
+JSON
+
 # --- NOTICE ----------------------------------------------------------------------------------------
 cat > NOTICE <<'NOTICE'
 Cleverbase SDK — EUDI attestation test fixtures (feature 004)
@@ -199,6 +251,9 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
   wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
   trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
+  qualified-trust-list.json
+                   minimal national Trusted List with EAA/Q services + per-service status history
+                   for the opt-in qualified-status gate (TS 119 615 cl.4.12 — T018/T019)
 
 Tier A — vendored upstream conformance vectors (vectors/, see vectors/README.md)
 --------------------------------------------------------------------------------
@@ -235,6 +290,6 @@ echo "wrong-issuer.cert.der: correctly REJECTED against ca-iaca.cert.der (expect
 rm -f -- *.csr ca-iaca.cert.srl
 
 echo
-echo "OK: minted ca-iaca / sdjwt-issuer / mdoc-ds / holder / wrong-issuer + trust-list.json."
-echo "Committed forms: *.cert.der + *.key.pk8 (+ trust-list.json, holder.jwk.json, NOTICE)."
+echo "OK: minted ca-iaca / sdjwt-issuer / mdoc-ds / holder / wrong-issuer + trust-list.json + qualified-trust-list.json."
+echo "Committed forms: *.cert.der + *.key.pk8 (+ trust-list.json, qualified-trust-list.json, holder.jwk.json, NOTICE)."
 echo "Transient (gitignored / removed) working files: *.pem, *.key, *.csr, *.srl — not tracked."

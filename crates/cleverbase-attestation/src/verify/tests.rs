@@ -339,9 +339,11 @@ fn policy_that_excludes_a_format_rejects_it_as_unsupported() {
 }
 
 #[test]
-fn qualified_gate_seam_is_off_by_default_and_a_no_op_when_enabled() {
-    // The always-on bar must work without the gate, and enabling the seam (pending T019) must not
-    // change the verdict nor fabricate a qualified status.
+fn qualified_gate_off_by_default_leaves_qualified_status_none_and_bar_unchanged() {
+    // T019 landed: the gate is OFF by default. With it off, the always-on bar runs unchanged and
+    // qualified_status stays None; enabling it with NO trust list never fabricates a qualified
+    // status — it is the honest Indeterminate (SC-007), and the always-on `valid`/reasons are
+    // identical to the gate-off run (the gate is additive, never altering the bar).
     let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
     let presentation = sd_jwt.presentation();
     let anchors = sd_jwt_anchors();
@@ -351,9 +353,9 @@ fn qualified_gate_seam_is_off_by_default_and_a_no_op_when_enabled() {
         qualified_gate: false,
         ..VerifyContext::default()
     };
-    let on = VerifyContext {
+    let on_no_list = VerifyContext {
         now_unix: NOW,
-        qualified_gate: true,
+        qualified_gate: true, // enabled, but no qualified_trust_list supplied
         ..VerifyContext::default()
     };
     let r_off = verify(
@@ -367,9 +369,23 @@ fn qualified_gate_seam_is_off_by_default_and_a_no_op_when_enabled() {
         &Presentation::SdJwtVc(&presentation),
         &VerificationPolicy::default(),
         &anchors,
-        &on,
+        &on_no_list,
         None,
     );
-    assert_eq!(r_off, r_on, "the gate seam is a no-op pending T019");
-    assert!(r_on.qualified_status.is_none(), "never a false qualified");
+    // Gate off → qualified_status absent.
+    assert!(
+        r_off.qualified_status.is_none(),
+        "gate off → qualified_status absent (never assumed)"
+    );
+    // Enabling the gate is ADDITIVE: only qualified_status differs; the always-on verdict
+    // (valid + reasons + disclosures + trust) is byte-identical (SC-007).
+    assert_eq!(r_off.valid, r_on.valid);
+    assert_eq!(r_off.reasons, r_on.reasons);
+    assert_eq!(r_off.disclosed_attributes, r_on.disclosed_attributes);
+    assert_eq!(r_off.trust_status, r_on.trust_status);
+    assert_eq!(
+        r_on.qualified_status,
+        Some(crate::types::QualifiedStatus::Indeterminate),
+        "gate on with no trust list → Indeterminate, never a false qualified"
+    );
 }

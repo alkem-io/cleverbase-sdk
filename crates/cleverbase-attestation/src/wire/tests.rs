@@ -39,6 +39,7 @@ fn valid_sd_jwt_request() -> VerifyRequest {
             status: StatusOutcome::NoStatus,
             session_transcript: None,
             qualified_gate: false,
+            qualified_trust_list: None,
         },
         request: None,
     }
@@ -98,6 +99,7 @@ fn well_formed_mdoc_request_verifies_valid() {
             status: StatusOutcome::NoStatus,
             session_transcript: None,
             qualified_gate: false,
+            qualified_trust_list: None,
         },
         request: None,
     };
@@ -131,4 +133,66 @@ fn response_round_trips_through_cbor() {
     });
     let resp: VerifyResponse = ciborium::from_reader(&bytes[..]).unwrap();
     assert!(matches!(resp.outcome, VerifyOutcome::Err { .. }));
+}
+
+/// The optional national-TL fixture the opt-in C-ABI gate reads (qualified EAA/Q services).
+const QUALIFIED_TRUST_LIST_JSON: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/qualified-trust-list.json");
+
+#[test]
+fn opt_in_gate_over_the_c_abi_populates_qualified_status_and_is_additive() {
+    // T020: the wire envelope additively carries the gate flag + the national TL bytes. Driving the
+    // SAME credential with the gate OFF vs ON yields an identical always-on verdict; only ON carries
+    // the qualified_status (sdjwt-issuer is a granted EAA/Q issuer at NOW → Qualified).
+    let base = valid_sd_jwt_request();
+
+    let gate_on = {
+        let mut req = base.clone();
+        req.context.qualified_gate = true;
+        req.context.qualified_trust_list = Some(QUALIFIED_TRUST_LIST_JSON.to_vec());
+        req
+    };
+
+    let decode = |bytes: &[u8]| -> crate::types::VerificationResult {
+        let resp: VerifyResponse = ciborium::from_reader(bytes).unwrap();
+        match resp.outcome {
+            VerifyOutcome::Ok { result } => result,
+            VerifyOutcome::Err { message } => panic!("unexpected error: {message}"),
+        }
+    };
+
+    let off = decode(&process_verify_bytes(&encode(&base)));
+    let on = decode(&process_verify_bytes(&encode(&gate_on)));
+
+    // Always-on verdict identical; gate is purely additive (SC-007).
+    assert!(off.valid && on.valid);
+    assert_eq!(off.reasons, on.reasons);
+    assert_eq!(off.disclosed_attributes, on.disclosed_attributes);
+    assert!(off.qualified_status.is_none(), "gate off → absent");
+    assert_eq!(
+        on.qualified_status,
+        Some(crate::types::QualifiedStatus::Qualified),
+        "gate on over the C-ABI → Qualified for a granted EAA/Q issuer"
+    );
+}
+
+#[test]
+fn opt_in_gate_over_the_c_abi_with_malformed_trust_list_is_indeterminate_not_an_error() {
+    // A malformed national-TL blob fails CLOSED inside the gate (Indeterminate), never failing the
+    // always-on verdict nor erroring the whole verify — no false "qualified".
+    let mut req = valid_sd_jwt_request();
+    req.context.qualified_gate = true;
+    req.context.qualified_trust_list = Some(b"{ not a trust list".to_vec());
+    let resp: VerifyResponse =
+        ciborium::from_reader(&process_verify_bytes(&encode(&req))[..]).expect("response decodes");
+    match resp.outcome {
+        VerifyOutcome::Ok { result } => {
+            assert!(result.valid, "always-on bar unaffected by a bad TL");
+            assert_eq!(
+                result.qualified_status,
+                Some(crate::types::QualifiedStatus::Indeterminate)
+            );
+        }
+        VerifyOutcome::Err { message } => panic!("a bad TL must not error the verify: {message}"),
+    }
 }

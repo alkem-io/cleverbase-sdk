@@ -318,6 +318,23 @@ fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
     CoseSign1::from_slice(&buf).map_err(|_| VerifyFailure::malformed())
 }
 
+/// Extract the Document Signer signing certificate (DER) a presented mdoc claims in its `IssuerAuth`
+/// `x5chain`, without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf
+/// against the national Trusted List's `EAA/Q` service entries).
+///
+/// Returns `None` when the `DeviceResponse` does not parse or carries no `x5chain` leaf. The value is
+/// *claimed* (its trust + signature are decided by the always-on bar in [`verify`]); this read is
+/// only the gate's cert-matching input, never an acceptance.
+#[must_use]
+pub fn issuer_signing_cert_der(device_response: &[u8]) -> Option<Vec<u8>> {
+    let root: CborValue = ciborium::from_reader(device_response).ok()?;
+    let document = first_document(&root).ok()?;
+    let issuer_signed = get_map_entry(document, "issuerSigned")?;
+    let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
+    let issuer_auth = parse_cose_sign1(issuer_auth_value).ok()?;
+    ds_cert_from_x5chain(&issuer_auth).ok()
+}
+
 /// Resolve the Document Signer certificate (DER) from a COSE_Sign1's `x5chain` header. The leaf is
 /// the first certificate (RFC 9360); a single-cert chain may be carried as a bare `bstr` rather than
 /// an array of `bstr`.

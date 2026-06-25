@@ -14,13 +14,14 @@
 //! revocation/**status** outcome is resolved by the host through [`crate::status`] and passed in as
 //! a [`StatusOutcome`]. The format verifiers ([`crate::sdjwtvc`], [`crate::mdoc`]) own the crypto.
 //!
-//! ## Qualified-status gate (T019 — not built yet)
+//! ## Qualified-status gate (T019)
 //!
 //! The opt-in eIDAS qualified-status determination ([`crate::qualified`]) is a separate, off-by-
-//! default gate (T019). [`VerifyContext::qualified_gate`] is the seam: it is **off by default**, the
-//! always-on bar runs and returns a complete verdict without it, and `qualified_status` stays `None`
-//! until the gate lands. Enabling it today is a no-op (clearly marked below), never a false
-//! "qualified" (SC-007).
+//! default gate. [`VerifyContext::qualified_gate`] is the seam: it is **off by default**, in which
+//! case the always-on bar runs and returns a complete verdict and `qualified_status` stays `None`.
+//! When enabled (and a [`VerifyContext::qualified_trust_list`] is supplied), the gate populates
+//! `VerificationResult.qualified_status` via [`crate::qualified::qualified_status`]; disabling it
+//! leaves the always-on verdict **byte-identical** to a gate-off run (no false "qualified" — SC-007).
 
 use crate::mdoc::{self, MdocVerifyParams};
 use crate::openid4vp::{self, MdocVpToken, PresentationRequest, VpToken};
@@ -81,15 +82,22 @@ pub struct VerifyContext<'a> {
     /// The mdoc `SessionTranscript` the `DeviceAuth` is bound to, for a presentation **without** an
     /// OpenID4VP request (with a request, the handover is reconstructed from the request instead).
     pub session_transcript: Option<&'a [u8]>,
-    /// **Off by default** seam for the opt-in eIDAS qualified-status gate (T019, not built yet).
-    /// When `false` (the default) the always-on bar runs unchanged and `qualified_status` stays
-    /// `None`. The gate is wired in T019; enabling it today is a no-op (the always-on bar must work
-    /// without it — SC-007).
+    /// **Off by default** seam for the opt-in eIDAS qualified-status gate (T019). When `false` (the
+    /// default) the always-on bar runs unchanged and `qualified_status` stays `None`. When `true`
+    /// **and** a [`Self::qualified_trust_list`] is supplied, the gate populates
+    /// `qualified_status`; the always-on verdict is byte-identical either way (SC-007).
     pub qualified_gate: bool,
+    /// The national Trusted List the opt-in qualified gate reads (off-path unless `qualified_gate` is
+    /// set). `None` with the gate enabled yields an honest [`QualifiedStatus::Indeterminate`]
+    /// (unreachable data — never a false "qualified"). Host-supplied (the core stays sans-IO).
+    ///
+    /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
+    pub qualified_trust_list: Option<&'a crate::qualified::QualifiedTrustList>,
 }
 
 impl Default for VerifyContext<'_> {
-    /// The offline-suite default: epoch instant, PID role, no status, no transcript, gate off.
+    /// The offline-suite default: epoch instant, PID role, no status, no transcript, gate off, no
+    /// qualified trust list.
     fn default() -> Self {
         Self {
             now_unix: 0,
@@ -97,6 +105,7 @@ impl Default for VerifyContext<'_> {
             status: StatusOutcome::NoStatus,
             session_transcript: None,
             qualified_gate: false,
+            qualified_trust_list: None,
         }
     }
 }
@@ -160,7 +169,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
         return VerificationResult::invalid(ReasonCode::UnsupportedFormat);
     }
 
-    let result = match (presentation, request) {
+    let mut result = match (presentation, request) {
         // --- With an OpenID4VP request: run the binding verifier (bar + nonce/audience). ----------
         (Presentation::SdJwtVc(p), Some(req)) => openid4vp::verify_response(
             &VpToken::SdJwtVc(p),
@@ -227,16 +236,49 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
         }
     };
 
-    // Qualified-status gate (T019) — OFF by default and not built yet. The seam is here so the
-    // always-on verdict above is complete on its own; when `qualified_gate` is enabled (T019), the
-    // gate would populate `result.qualified_status`. Until then it is a no-op that never asserts
-    // "qualified" (SC-007).
-    if ctx.qualified_gate {
-        // Intentionally a no-op pending T019: the always-on bar already produced the verdict, and we
-        // must never fabricate a qualified status. T019 wires `crate::qualified` here.
+    // Qualified-status gate (T019) — OFF by default. The seam is here so the always-on verdict above
+    // is complete on its own; when the opt-in gate is enabled — via the verifier
+    // [`VerificationPolicy::qualified_gate`] OR the per-call [`VerifyContext::qualified_gate`] flag —
+    // it ADDITIVELY populates `result.qualified_status` (never changing the always-on
+    // `valid`/reasons — SC-007). It runs independently of the always-on verdict (even an INVALID
+    // credential can report its issuer's qualified status), and never fabricates "qualified": absent
+    // data → `Indeterminate`.
+    if policy.qualified_gate || ctx.qualified_gate {
+        result.qualified_status = Some(qualified_status_for(presentation, ctx));
     }
 
     result
+}
+
+/// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer at the relevant
+/// time (`ctx.now_unix`), reading the host-supplied national Trusted List ([`VerifyContext::
+/// qualified_trust_list`]).
+///
+/// Resolves the credential's claimed signing certificate (the SD-JWT VC JWS `x5c` leaf / the mdoc
+/// `IssuerAuth` x5chain leaf) and delegates to [`crate::qualified::qualified_status`]. When the cert
+/// cannot be read, or no trust list was supplied, it returns [`QualifiedStatus::Indeterminate`] —
+/// the data needed to decide is absent (never a false "qualified", SC-007).
+///
+/// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
+fn qualified_status_for(
+    presentation: &Presentation<'_>,
+    ctx: &VerifyContext<'_>,
+) -> crate::types::QualifiedStatus {
+    use crate::types::QualifiedStatus;
+    let Some(trust_list) = ctx.qualified_trust_list else {
+        // The gate is enabled but the host supplied no national TL → the data is unreachable.
+        return QualifiedStatus::Indeterminate;
+    };
+    let issuer_cert_der = match presentation {
+        Presentation::SdJwtVc(p) => sdjwtvc::issuer_signing_cert_der(p),
+        Presentation::Mdoc {
+            device_response, ..
+        } => mdoc::issuer_signing_cert_der(device_response),
+    };
+    // The signing cert cannot be read from the presentation → the data needed is absent.
+    issuer_cert_der.map_or(QualifiedStatus::Indeterminate, |cert_der| {
+        crate::qualified::qualified_status(&cert_der, ctx.now_unix, trust_list)
+    })
 }
 
 /// For a request-less SD-JWT VC, do not impose a holder-binding challenge: a presentation that omits

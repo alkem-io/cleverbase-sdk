@@ -138,9 +138,10 @@ impl TrustListManifest {
     }
 }
 
-/// Crate-internal re-export of [`parse_rfc3339_utc`] for the sibling XML parser ([`super::xml`]),
-/// keeping the timestamp grammar defined once (DRY).
-pub(super) fn parse_rfc3339_utc_pub(s: &str) -> Option<i64> {
+/// Crate-internal re-export of [`parse_rfc3339_utc`] for the sibling XML parser ([`super::xml`]) and
+/// the qualified-status gate ([`crate::qualified`]), keeping the RFC 3339 UTC timestamp grammar
+/// defined once (DRY — the same `…Z` form TS 119 612 `NextUpdate` / status `startingTime` use).
+pub(crate) fn parse_rfc3339_utc_pub(s: &str) -> Option<i64> {
     parse_rfc3339_utc(s)
 }
 
