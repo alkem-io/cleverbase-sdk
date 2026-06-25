@@ -274,22 +274,37 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     // surface as Replay (the verifier rebuilt `DeviceAuthentication` over a different transcript than
     // the holder signed — the audience already matched in cleartext above), OR a genuine
     // DeviceKey/DeviceSignature fault (a corrupt/garbled signature, non-ES256 alg, unparseable
-    // DeviceKey, DeviceMac-only DeviceAuth, or a multi-document doc[1] binding failure). Blindly
-    // re-attributing every `HolderBinding` to `Replay` would MASK those real faults.
+    // DeviceKey, DeviceMac-only DeviceAuth, or a WRONG-KEY DeviceSignature). Blindly re-attributing
+    // every `HolderBinding` to `Replay` would MASK those real faults.
     //
-    // Distinguish them by the transcript-INDEPENDENT binding machinery: a fresh-nonce mismatch fails
+    // The Replay re-attribution is only SOUND for a SINGLE-document response. There the only
+    // transcript-dependent variable is the request nonce (the audience already matched in cleartext),
+    // and the binding machinery is the cheap structural discriminator: a fresh-nonce mismatch fails
     // ONLY the signature-over-transcript check while leaving the machinery intact (ES256
-    // DeviceSignature + parseable DeviceKey + well-formed signature bytes), whereas a genuine fault
-    // breaks the machinery itself (it would fail for ANY transcript). Only re-attribute to `Replay`
-    // when the machinery is sound; a structural fault keeps `HolderBinding`.
+    // DeviceSignature + parseable DeviceKey + well-formed signature bytes), whereas a corrupt/garbled
+    // signature, a non-ES256 alg, or an unparseable DeviceKey breaks the machinery itself.
+    //
+    // RESIDUAL (documented): the machinery classifier verifies NO payload, so a WRONG-KEY but
+    // well-formed ES256 DeviceSignature classifies as `Sound` — structurally indistinguishable from a
+    // stale-nonce one. In a single-document response that residual is acceptable: a wrong-key signature
+    // and a fresh-nonce mismatch are both "this presentation is not the one we requested", and Replay is
+    // a reasonable single-document attribution. But in a MULTI-document response a real wrong-key fault
+    // on `documents[1]` must NOT be laundered into `Replay` (it would mis-report a genuine holder-
+    // binding fault as a freshness replay). So restrict the Replay re-attribution to `documents.len()
+    // == 1`; for more than one document (or when the count cannot be read) KEEP `HolderBinding`.
     if !result.valid && result.reasons == [ReasonCode::HolderBinding] {
-        return match mdoc::device_binding_machinery(&token.device_response) {
-            // Sound machinery + a binding failure ⇒ the rebuilt transcript (fresh nonce) is the only
-            // thing that can differ ⇒ a replay.
-            mdoc::DeviceBindingMachinery::Sound => VerificationResult::invalid(ReasonCode::Replay),
-            // A structurally-broken binding is a genuine holder-binding fault, never a replay.
-            mdoc::DeviceBindingMachinery::Faulty => result,
-        };
+        let single_document = mdoc::document_count(&token.device_response) == Some(1);
+        if single_document
+            && mdoc::device_binding_machinery(&token.device_response)
+                == mdoc::DeviceBindingMachinery::Sound
+        {
+            // Single document + sound machinery + a binding failure ⇒ the rebuilt transcript (fresh
+            // nonce) is the only thing that can differ ⇒ a replay.
+            return VerificationResult::invalid(ReasonCode::Replay);
+        }
+        // Multi-document, an unreadable count, or a structurally-broken binding ⇒ a genuine
+        // holder-binding fault, never laundered into `Replay`.
+        return result;
     }
     result
 }

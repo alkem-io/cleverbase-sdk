@@ -11,6 +11,10 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   mdoc-ds.*        mdoc Document Signer leaf (COSE ES256, EKU id-mso-mdl-DS), issued by ca-iaca
   holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
   wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
+  expired-ca.*     EXPIRED issuing CA (CA:TRUE, keyCertSign; past validity window) for the chain
+  expired-ca-leaf.*  leaf issued by expired-ca whose OWN window is current (anchor-validity reject path)
+  non-ca.*         NON-CA issuer (CA:FALSE, no keyCertSign) for the "any cert is a CA" reject path
+  non-ca-leaf.*    leaf issued by non-ca (CA-constraint reject path)
   trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
 
 Tier A — vendored upstream conformance vectors (vectors/, see vectors/README.md)

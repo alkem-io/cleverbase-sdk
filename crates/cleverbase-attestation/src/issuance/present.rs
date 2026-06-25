@@ -247,7 +247,7 @@ pub fn prepare_present(
 pub fn present<S: Signer>(
     held: &HeldAttestation,
     request: &PresentationRequest,
-    _holder: &HolderContext,
+    holder: &HolderContext,
     disclose: &BTreeSet<String>,
     signer: &S,
     iat: i64,
@@ -256,8 +256,14 @@ where
     S::Error: core::fmt::Display,
 {
     let prepared = prepare_present(held, request, disclose, iat)?;
+    // Pass the holder's key handle so the signer selects the correct holder key in its HSM/KMS — the
+    // handle is the host's opaque selector ([`HolderContext::key_handle`], threaded verbatim to
+    // [`Signer::sign`]). Signing with an empty handle would let an in-process wrapper sign with the
+    // wrong/default key (a holder-binding fault). The two-call C-ABI seam threads the handle on the
+    // host side instead (the host owns the key + calls `finish`); this one-shot wrapper owns the in-
+    // process `Signer`, so it must supply the handle here.
     let signature = signer
-        .sign("", prepared.signing_input())
+        .sign(&holder.key_handle, prepared.signing_input())
         .map_err(|e| PresentError::Signer(e.to_string()))?;
     prepared.finish(&signature)
 }

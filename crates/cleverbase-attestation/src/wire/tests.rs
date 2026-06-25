@@ -8,7 +8,7 @@ use super::{
     VerifyRequest, VerifyResponse, WireContext, WirePresentation, WireSchemeAnchor,
     WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
 };
-use crate::mdoc::test_issuer::MdocBuilder;
+use crate::mdoc::test_issuer::{default_session_transcript, MdocBuilder};
 use crate::sdjwtvc::test_issuer::{mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8};
 use crate::status::StatusOutcome;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
@@ -174,7 +174,10 @@ fn well_formed_mdoc_request_verifies_valid() {
             now_unix: IN_WINDOW_NOW,
             role: IssuerRole::Pid,
             status: StatusOutcome::NoStatus,
-            session_transcript: None,
+            // The mdoc `DeviceSignature` is signed over the builder's default transcript; a request-less
+            // verify must be handed that same transcript (§9.1.5 — the verifier no longer fabricates
+            // one) for the holder binding to verify.
+            session_transcript: Some(default_session_transcript()),
             qualified_gate: false,
             qualified_trust_list: None,
             qualified_scheme_anchors: Vec::new(),

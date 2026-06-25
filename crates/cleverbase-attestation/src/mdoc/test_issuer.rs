@@ -71,7 +71,9 @@ pub(crate) struct MdocBuilder {
     /// When `Some`, override the MSO `deviceKey` COSE_Key with this CBOR value (malformed-key cases).
     device_key_override: Option<CborValue>,
     /// When `Some`, the SessionTranscript bytes the DeviceSignature is computed over (and that the
-    /// verifier must be passed); otherwise the 3-null transcript is used.
+    /// verifier must be passed); otherwise [`default_session_transcript`] is used. The verifier no
+    /// longer fabricates a transcript (ISO/IEC 18013-5 §9.1.5), so a test MUST pass the SAME transcript
+    /// bytes to the verifier's `session_transcript` for the holder binding to verify.
     session_transcript: Option<Vec<u8>>,
     /// When set, sign the DeviceSignature with a non-ES256 (ES384) algorithm header so the verifier's
     /// algorithm gate rejects it.
@@ -110,6 +112,13 @@ pub(crate) struct MdocBuilder {
     /// disclosed element collides with a first-document identifier but carries this DIFFERENT value —
     /// the cross-document attribute-shadowing probe (a 2nd authentic doc must not overwrite a claim).
     append_colliding_document: Option<(&'static str, CborValue)>,
+    /// When `Some`, append a SECOND fully-VALID document (same trusted DS) disclosing one DISTINCT
+    /// (non-colliding) element, signed over the SAME `session_transcript` as the primary document, but
+    /// whose `DeviceSignature` is made by a NON-holder (wrong) key. The result is a multi-document
+    /// response whose `documents[0]` holder binding verifies (genuine holder signature over the request
+    /// transcript) but whose `documents[1]` fails on a WRONG KEY — a transcript-INDEPENDENT
+    /// holder-binding fault the OID4VP layer must keep as `HolderBinding`, NEVER launder into `Replay`.
+    append_wrong_key_document: Option<(&'static str, CborValue)>,
     /// When `Some`, append a SECOND fully-VALID document signed by the SAME trusted DS, disclosing one
     /// distinct (non-colliding) element, but with its OWN MSO `(signed, validUntil)` issuance window —
     /// the multi-document qualified-status fold probe: a VALID response whose documents[0] is issued in
@@ -203,6 +212,24 @@ pub(crate) fn mdoc_ds_cert_der() -> &'static [u8] {
     MDOC_DS_CERT
 }
 
+/// The canonical default `SessionTranscript` the [`MdocBuilder`] signs the `DeviceSignature` over when
+/// no explicit transcript is set — a conformant 3-element ISO/IEC 18013-5 §9.1.5 transcript
+/// `["DeviceEngagement", EReaderKey, Handover]`. A request-less verify CANNOT fabricate a transcript
+/// (it would silently no-op holder binding), so a test that mints a default-transcript mdoc MUST pass
+/// these exact bytes to the verifier's `session_transcript` so the holder binding is genuinely
+/// confirmed (the issuer signs over, and the verifier reconstructs, the SAME transcript).
+pub(crate) fn default_session_transcript() -> Vec<u8> {
+    // A concrete, explicit device-retrieval-style transcript (NOT the old fabricated `[null,null,null]`
+    // the verifier silently invented): three placeholder elements that stand in for
+    // DeviceEngagementBytes / EReaderKeyBytes / Handover. The exact contents are immaterial to the test
+    // bar — what matters is that issuer and verifier agree on the SAME bytes.
+    encode(&CborValue::Array(vec![
+        CborValue::Text("DeviceEngagement".to_owned()),
+        CborValue::Text("EReaderKey".to_owned()),
+        CborValue::Text("Handover".to_owned()),
+    ]))
+}
+
 /// The wrong/untrusted issuer certificate DER.
 pub(super) fn wrong_issuer_cert_der() -> &'static [u8] {
     WRONG_ISSUER_CERT
@@ -254,6 +281,7 @@ impl MdocBuilder {
             device_signature_override: None,
             append_forged_document: false,
             append_colliding_document: None,
+            append_wrong_key_document: None,
             append_valid_document_issued_at: None,
             status_override: None,
             omit_status: false,
@@ -322,6 +350,22 @@ impl MdocBuilder {
         value: CborValue,
     ) -> Self {
         self.append_colliding_document = Some((identifier, value));
+        self
+    }
+
+    /// Append a SECOND fully-VALID document (same trusted DS) disclosing one DISTINCT element, signed
+    /// over the SAME `session_transcript` as the primary document, but whose `DeviceSignature` is made
+    /// by a NON-holder (wrong) key. Produces a multi-document response whose `documents[0]` holder
+    /// binding verifies (over the request transcript) while `documents[1]` fails on a WRONG KEY — the
+    /// probe that the OID4VP Replay re-attribution must NOT launder a genuine multi-document
+    /// holder-binding fault into `Replay`. Requires a `session_transcript` to have been set (so both
+    /// documents are bound to the same request handover).
+    pub(crate) fn append_wrong_key_document(
+        mut self,
+        identifier: &'static str,
+        value: CborValue,
+    ) -> Self {
+        self.append_wrong_key_document = Some((identifier, value));
         self
     }
 
@@ -506,6 +550,20 @@ impl MdocBuilder {
                 .clone()
                 .map(|(signed_at, valid_until)| {
                     build_single_valid_document_issued_at(&signed_at, &valid_until)
+                });
+        // A second VALID document signed over the SAME transcript as the primary document but with a
+        // WRONG-KEY `DeviceSignature` — the multi-document holder-binding-fault probe. Use the parent's
+        // transcript (the one the primary document is bound to) so the only fault on `documents[1]` is
+        // the wrong key, never a transcript mismatch.
+        let wrong_key_document =
+            self.append_wrong_key_document
+                .clone()
+                .map(|(identifier, value)| {
+                    let transcript = self
+                        .session_transcript
+                        .clone()
+                        .unwrap_or_else(default_session_transcript);
+                    build_single_wrong_key_document(identifier, value, transcript)
                 });
 
         // --- IssuerSignedItems (#6.24(bstr .cbor IssuerSignedItem)) + their digests. ----------------
@@ -698,12 +756,16 @@ impl MdocBuilder {
         ));
         let device_ns_value = decode(&device_name_spaces_bytes);
 
-        // SessionTranscript: the supplied transcript, else the 3-null transcript the verifier
-        // defaults to (no transport).
-        let session_transcript = self.session_transcript.as_ref().map_or_else(
-            || CborValue::Array(vec![CborValue::Null, CborValue::Null, CborValue::Null]),
-            |bytes| decode(bytes),
-        );
+        // SessionTranscript: the supplied transcript, else the canonical default transcript. The
+        // verifier no longer fabricates a transcript (ISO/IEC 18013-5 §9.1.5: it is always supplied),
+        // so a default-transcript mdoc is verifiable ONLY when the test passes
+        // `default_session_transcript()` to the verifier's `session_transcript` (issuer + verifier sign
+        // over / reconstruct the SAME bytes).
+        let session_transcript = self
+            .session_transcript
+            .clone()
+            .unwrap_or_else(default_session_transcript);
+        let session_transcript = decode(&session_transcript);
         let device_auth_inner = encode(&CborValue::Array(vec![
             CborValue::Text("DeviceAuthentication".to_owned()),
             session_transcript,
@@ -805,6 +867,9 @@ impl MdocBuilder {
         if let Some(second_valid_document) = second_valid_issued_at {
             documents.push(second_valid_document);
         }
+        if let Some(wrong_key_doc) = wrong_key_document {
+            documents.push(wrong_key_doc);
+        }
 
         let mut response_entries = vec![
             (
@@ -848,6 +913,27 @@ fn build_single_valid_document(identifier: &'static str, value: CborValue) -> Cb
             identifier,
             value,
         }])
+        .build();
+    first_document_of_response(&response)
+}
+
+/// Mint a fresh, issuer-VALID single document (same trusted DS) disclosing one DISTINCT element,
+/// signed over `transcript` but with a WRONG-KEY `DeviceSignature` (a non-holder key) — so its issuer
+/// bar passes but its holder binding fails on the WRONG KEY (a transcript-INDEPENDENT fault), for the
+/// multi-document `HolderBinding`-not-`Replay` probe. Lifts out `documents[0]`.
+fn build_single_wrong_key_document(
+    identifier: &'static str,
+    value: CborValue,
+    transcript: Vec<u8>,
+) -> CborValue {
+    let response = MdocBuilder::new()
+        .elements(vec![Element {
+            digest_id: 0,
+            identifier,
+            value,
+        }])
+        .session_transcript(transcript)
+        .corrupt_device_signature()
         .build();
     first_document_of_response(&response)
 }

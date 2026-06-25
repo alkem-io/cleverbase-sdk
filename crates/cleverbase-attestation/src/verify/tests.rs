@@ -5,7 +5,7 @@
 //! `verify` (bound VALID, replay/wrong-audience INVALID, both formats); and the policy format gate.
 
 use super::{detect_format, fold_qualified, verify, Presentation, VerifyContext};
-use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
+use crate::mdoc::test_issuer::{default_session_transcript, mdoc_ds_cert_der, MdocBuilder};
 use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
 use crate::qualified::QualifiedTrustList;
 use crate::sdjwtvc::test_issuer::{
@@ -191,9 +191,14 @@ fn sd_jwt_vc_revoked_status_through_verify() {
 fn mdoc_valid_through_verify() {
     let response = MdocBuilder::new().build();
     let anchors = mdoc_anchors();
+    // A request-less mdoc verify with a `DeviceSignature` requires the explicit `SessionTranscript` the
+    // holder signed over (§9.1.5 — the verifier no longer fabricates one); supply the default
+    // transcript the builder used.
+    let transcript = default_session_transcript();
     let ctx = VerifyContext {
         now_unix: MDOC_NOW,
         role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
         ..VerifyContext::default()
     };
     let result = verify(
@@ -208,6 +213,36 @@ fn mdoc_valid_through_verify() {
     );
     assert!(result.valid, "reasons {:?}", result.reasons);
     assert!(result.disclosed_attributes.contains_key("family_name"));
+}
+
+#[test]
+fn mdoc_request_less_without_a_session_transcript_is_missing_request_binding() {
+    // A request-less mdoc verify with a `DeviceSignature` but NO `SessionTranscript` cannot confirm
+    // holder binding; the verifier MUST reject it (§9.1.5 — never fabricate a transcript and silently
+    // no-op the binding) rather than return VALID. This is the `verify`-entry-point view of the mdoc
+    // fail-closed fix (the `ctx.session_transcript` default of `None`).
+    let response = MdocBuilder::new().build();
+    let anchors = mdoc_anchors();
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        ..VerifyContext::default() // session_transcript: None
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "a request-less mdoc with no SessionTranscript must NOT silently pass holder binding"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MissingRequestBinding]);
 }
 
 #[test]
@@ -459,9 +494,12 @@ fn single_document_mdoc_qualified_issuer_reports_qualified() {
         .build();
     let anchors = mdoc_anchors();
     let scheme = [CA_IACA.to_vec()];
+    // Request-less verify of a `DeviceSignature`-bearing mdoc needs the explicit transcript (§9.1.5).
+    let transcript = default_session_transcript();
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
@@ -514,9 +552,13 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
         .build();
     let anchors = mdoc_anchors();
     let scheme = [CA_IACA.to_vec()];
+    // Both documents are signed over the builder's default transcript; supply it so the request-less
+    // verify confirms each holder binding (§9.1.5 — the verifier no longer fabricates one).
+    let transcript = default_session_transcript();
     let ctx = VerifyContext {
         now_unix: RELEVANT_AFTER_WITHDRAWN,
         role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,

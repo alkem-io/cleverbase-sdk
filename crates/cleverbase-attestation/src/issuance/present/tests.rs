@@ -40,10 +40,14 @@ fn hsm() -> StubHsm {
     }
 }
 
+/// The opaque holder key handle the test [`HolderContext`] carries — the value `present` MUST thread
+/// through to [`Signer::sign`] (so the HSM selects the right holder key, never the default).
+const HOLDER_HANDLE: &str = "holder-handle";
+
 fn holder_ctx() -> HolderContext {
     use crate::sdjwtvc::test_issuer::HOLDER_JWK_JSON;
     let jwk: Value = serde_json::from_slice(HOLDER_JWK_JSON).expect("holder JWK");
-    HolderContext::new(jwk, "holder-handle")
+    HolderContext::new(jwk, HOLDER_HANDLE)
 }
 
 fn request(nonce: &[u8]) -> PresentationRequest {
@@ -588,6 +592,128 @@ impl Signer for FailingSigner {
     fn sign(&self, _handle: &str, _input: &SigningInput) -> Result<Vec<u8>, String> {
         Err("HSM refused".to_owned())
     }
+}
+
+/// A signer that signs with the holder key ONLY when handed the expected key handle, recording the
+/// handle it actually received. It proves `present` threads `HolderContext::key_handle` through to
+/// `Signer::sign` (the handle selects the holder key in the HSM) rather than the old empty handle.
+struct HandleAssertingHsm {
+    key: SigningKey,
+    expected_handle: String,
+    seen_handle: std::cell::RefCell<Option<String>>,
+}
+impl Signer for HandleAssertingHsm {
+    type Error = String;
+    fn sign(&self, handle: &str, input: &SigningInput) -> Result<Vec<u8>, String> {
+        *self.seen_handle.borrow_mut() = Some(handle.to_owned());
+        // A real HSM selects the private key by handle; here we refuse a wrong/empty handle outright so
+        // a regression to `sign("", …)` is a hard failure, not a silently-wrong-key signature.
+        if handle != self.expected_handle {
+            return Err(format!(
+                "wrong key handle: expected {:?}, got {handle:?}",
+                self.expected_handle
+            ));
+        }
+        let sig: Signature = self.key.sign(input.to_be_signed());
+        Ok(sig.to_bytes().to_vec())
+    }
+}
+
+#[test]
+fn present_threads_the_holder_key_handle_to_the_signer() {
+    // The holder key handle (HolderContext::key_handle) MUST reach Signer::sign so the HSM selects the
+    // correct holder key. Before the fix `present` passed an EMPTY handle (`sign("", …)`), which an
+    // in-process wrapper would map to the wrong/default key. This signer refuses any handle other than
+    // the holder's, so a VALID round-trip proves the handle is threaded; it also records the exact
+    // handle seen.
+    use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8};
+
+    let held = HeldAttestation::SdJwtVc {
+        issued: mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER).presentation(),
+    };
+    let request = request(b"handle-thread-nonce");
+    let hsm = HandleAssertingHsm {
+        key: {
+            use crate::sdjwtvc::test_issuer::HOLDER_KEY_PK8;
+            SigningKey::from_pkcs8_der(HOLDER_KEY_PK8).expect("holder key")
+        },
+        expected_handle: HOLDER_HANDLE.to_owned(),
+        seen_handle: std::cell::RefCell::new(None),
+    };
+
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["given_name"]),
+        &hsm,
+        NOW,
+    )
+    .expect("present must succeed when handed the holder's key handle");
+
+    // The signer saw exactly the holder's key handle (not the empty string).
+    assert_eq!(
+        hsm.seen_handle.into_inner().as_deref(),
+        Some(HOLDER_HANDLE),
+        "present must thread HolderContext::key_handle to Signer::sign, not an empty handle"
+    );
+
+    // And the resulting presentation still verifies under US1 (the handle selected the right key).
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER);
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        crate::sdjwtvc::test_issuer::NOW,
+        IssuerRole::Pid,
+        crate::status::StatusOutcome::NoStatus,
+    );
+    assert!(result.valid, "reasons {:?}", result.reasons);
+}
+
+#[test]
+fn present_with_an_empty_handle_signer_fails_proving_the_handle_is_load_bearing() {
+    // Defence in depth: a signer that REQUIRES the holder handle rejects an empty one. If `present`
+    // regressed to `sign("", …)`, this would surface as a Signer error — so the test pins that the
+    // handle `present` passes is non-empty and exactly the holder's.
+    use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8};
+
+    let held = HeldAttestation::SdJwtVc {
+        issued: mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER).presentation(),
+    };
+    // A HolderContext whose handle differs from what the signer demands → the signer refuses, proving
+    // the handle `present` forwards is the HolderContext's, not a hard-coded/empty one.
+    use crate::sdjwtvc::test_issuer::HOLDER_JWK_JSON;
+    let jwk: Value = serde_json::from_slice(HOLDER_JWK_JSON).expect("holder JWK");
+    let mismatched_ctx = HolderContext::new(jwk, "some-other-handle");
+    let hsm = HandleAssertingHsm {
+        key: {
+            use crate::sdjwtvc::test_issuer::HOLDER_KEY_PK8;
+            SigningKey::from_pkcs8_der(HOLDER_KEY_PK8).expect("holder key")
+        },
+        expected_handle: HOLDER_HANDLE.to_owned(), // demands "holder-handle"
+        seen_handle: std::cell::RefCell::new(None),
+    };
+    let err = present(
+        &held,
+        &request(b"n"),
+        &mismatched_ctx,
+        &subset(&["given_name"]),
+        &hsm,
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, PresentError::Signer(m) if m.contains("wrong key handle")),
+        "present must forward the HolderContext's handle (here 'some-other-handle'), so the signer \
+         demanding 'holder-handle' refuses: {err:?}"
+    );
+    // It forwarded the mismatched context's handle, not the empty string.
+    assert_eq!(
+        hsm.seen_handle.into_inner().as_deref(),
+        Some("some-other-handle")
+    );
 }
 
 #[test]

@@ -393,6 +393,49 @@ fn mdoc_bound_presentation_with_a_corrupt_device_signature_is_holder_binding_not
 }
 
 #[test]
+fn multi_document_wrong_key_device_signature_is_holder_binding_not_replay() {
+    // MULTI-DOCUMENT WRONG-KEY PROBE: a presentation BOUND to the request (handover nonce == request
+    // nonce, so NOT a replay) carrying TWO documents — `documents[0]` correctly holder-bound (genuine
+    // holder signature over the request handover transcript) and `documents[1]` whose `DeviceSignature`
+    // is made by a WRONG (non-holder) key over the SAME transcript. The wrong-key signature is
+    // structurally well-formed (ES256 + parseable DeviceKey), so the binding-machinery classifier reads
+    // it as `Sound` — yet it is a GENUINE holder-binding fault, not a freshness replay. The OID4VP layer
+    // MUST keep `HolderBinding`: it only re-attributes to `Replay` in the SINGLE-document case (where the
+    // nonce is the only transcript-dependent variable); a multi-document binding fault is never laundered
+    // into `Replay`.
+    use ciborium::value::Value as CborValue;
+
+    let request = request_with(AUDIENCE, &[0x55u8; 16]);
+    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce, RESPONSE_URI);
+    let device_response = MdocBuilder::new()
+        .session_transcript(transcript)
+        // documents[1]: same trusted DS, distinct disclosed element, signed over the SAME transcript
+        // but with a WRONG (non-holder) key → a genuine wrong-key holder-binding fault.
+        .append_wrong_key_document("nationality", CborValue::Text("NL".to_owned()))
+        .build();
+    let token = MdocVpToken {
+        audience: AUDIENCE.to_owned(),
+        device_response,
+    };
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::HolderBinding],
+        "a wrong-key DeviceSignature on documents[1] of a multi-document response must stay \
+         HolderBinding, NEVER be laundered into Replay"
+    );
+}
+
+#[test]
 fn handover_transcript_is_deterministic_and_binds_all_inputs() {
     // The same (audience, nonce, response_uri) yields identical bytes; varying any one changes them
     // (so a stale nonce, wrong audience, or tampered response_uri necessarily breaks the

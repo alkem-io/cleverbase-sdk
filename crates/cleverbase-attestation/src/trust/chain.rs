@@ -15,6 +15,15 @@
 //! itself the listed entry), which covers a trusted-list entry that pins the leaf directly — but
 //! even that direct-pin path still enforces the leaf's validity window, so an expired pinned leaf
 //! is rejected rather than trusted.
+//!
+//! On the **issued-by** path the check enforces the RFC 5280 §6.1 path requirements a one-hop chain
+//! still owes: the issuing anchor must be a CA (`basicConstraints cA=TRUE`, and `keyUsage`'s
+//! `keyCertSign` bit when `keyUsage` is present — §6.1.4 (k)/(n), §4.2.1.9, §4.2.1.3), and **every**
+//! certificate in the path — the issuing CA *and* the leaf — must be within its own validity window
+//! at the relevant time (§6.1.3 (a)(2)). So a non-CA anchor cannot "issue" trusted leaves and an
+//! expired/not-yet-valid issuing CA cannot vouch for an otherwise-in-window leaf. The **direct-pin**
+//! path is deliberately exempt from the CA constraint: pinning a specific end-entity certificate as
+//! trusted is an intentional, distinct trust model.
 
 use der::{Decode as _, Encode as _};
 use x509_cert::Certificate;
@@ -36,6 +45,18 @@ pub enum ChainError {
     UnsupportedAlgorithm(String),
     /// The leaf is outside its own validity window at the relevant time.
     LeafExpired,
+    /// The issuing anchor (CA) is itself outside its own validity window at the relevant time. Per
+    /// RFC 5280 §6.1.3 (a)(2) **every** certificate in the path — the issuing CA included — must be
+    /// valid at the validation time, so an expired (or not-yet-valid) anchor cannot issue trusted
+    /// leaves even when the leaf's own window is current.
+    AnchorExpired,
+    /// The issuing anchor does not assert the CA constraints required to issue certificates: per RFC
+    /// 5280 §6.1.4 (k)/(n) and §4.2.1.9 an issuer MUST carry `basicConstraints` with `cA=TRUE` and
+    /// (when `keyUsage` is present) the `keyCertSign` bit. This closes the "any cert is a CA" gap —
+    /// a non-CA (end-entity) certificate listed as an anchor cannot issue trusted leaves on the
+    /// issued-by path. (The direct-pin path, where the anchor *is* the pinned leaf, is exempt:
+    /// pinning a specific end-entity certificate as trusted is an intentional, distinct model.)
+    NotACa,
 }
 
 impl core::fmt::Display for ChainError {
@@ -52,6 +73,13 @@ impl core::fmt::Display for ChainError {
                 write!(f, "unsupported certificate signature algorithm: {oid}")
             }
             Self::LeafExpired => write!(f, "leaf certificate is outside its validity window"),
+            Self::AnchorExpired => {
+                write!(f, "issuing anchor is outside its own validity window")
+            }
+            Self::NotACa => write!(
+                f,
+                "issuing anchor is not a CA (basicConstraints cA=TRUE / keyUsage keyCertSign required)"
+            ),
         }
     }
 }
@@ -95,14 +123,18 @@ impl SigAlg {
 /// This is the trust-anchoring primitive: a leaf is trusted iff some anchor either (a) is DER-equal
 /// to the leaf (the anchor pins the leaf directly), or (b) issued the leaf — the leaf's `issuer`
 /// name equals the anchor's `subject` name **and** the leaf's signature verifies under the anchor's
-/// public key. In **both** cases the leaf must be within its own validity window at `now_unix` (an
-/// expired directly-pinned leaf is rejected as [`ChainError::LeafExpired`], never trusted). Returns
-/// the first specific [`ChainError`] when no anchor matches.
+/// public key. On the issued-by path (b) the issuing anchor must additionally be a CA
+/// ([`ChainError::NotACa`] otherwise — RFC 5280 §6.1.4) and itself be within its validity window at
+/// `now_unix` ([`ChainError::AnchorExpired`] otherwise — §6.1.3 (a)(2)). In **both** paths the leaf
+/// must be within its own validity window at `now_unix` (an expired directly-pinned leaf is rejected
+/// as [`ChainError::LeafExpired`], never trusted). Returns the first specific [`ChainError`] when no
+/// anchor matches.
 ///
 /// # Errors
 ///
 /// Returns [`ChainError`] when the leaf is malformed, no anchor's subject matches the leaf's issuer,
-/// the signature does not verify, the algorithm is unsupported, or the leaf is expired.
+/// the signature does not verify, the algorithm is unsupported, the issuing anchor is not a CA or is
+/// itself outside its validity window, or the leaf is outside its validity window.
 pub fn verify_chain(
     leaf_cert_der: &[u8],
     anchor_certs_der: &[Vec<u8>],
@@ -116,12 +148,13 @@ pub fn verify_chain(
     // still be within its own validity window at `now_unix`. Otherwise an EXPIRED directly-pinned
     // leaf (e.g. the qualified-gate's TL-signer cert, which the fixtures pin as both signer and
     // scheme anchor) would authenticate, contradicting the documented "within its validity window
-    // at the relevant time" contract.
+    // at the relevant time" contract. This path is intentionally exempt from the issued-by CA
+    // constraint: pinning a specific end-entity certificate as trusted is a deliberate trust model.
     if anchor_certs_der
         .iter()
         .any(|a| a.as_slice() == leaf_cert_der)
     {
-        if leaf_is_valid_at(&leaf, now_unix) {
+        if cert_is_valid_at(&leaf, now_unix) {
             return Ok(());
         }
         return Err(ChainError::LeafExpired);
@@ -148,11 +181,28 @@ pub fn verify_chain(
         saw_name_match = true;
         match verify_leaf_under_anchor(&leaf, &anchor) {
             Ok(()) => {
-                // Signature is good; the leaf must also be within its own validity window.
-                if leaf_is_valid_at(&leaf, now_unix) {
+                // The anchor's signature over the leaf verifies — it really issued this leaf. Now
+                // enforce the remaining RFC 5280 §6.1 path requirements on the *issued-by* relation:
+                //
+                //   1. The issuing anchor must be a CA — §6.1.4 (k)/(n) + §4.2.1.9: basicConstraints
+                //      cA=TRUE AND (if keyUsage is present) the keyCertSign bit. This closes the
+                //      "any cert is a CA" gap; a non-CA anchor cannot issue trusted leaves.
+                //   2. The issuing anchor must itself be within its validity window at `now_unix` —
+                //      §6.1.3 (a)(2): EVERY certificate in the path (the CA included) must be valid
+                //      at the validation time, so an expired/not-yet-valid anchor is rejected.
+                //   3. The leaf must be within its own validity window at `now_unix` (as before).
+                //
+                // These apply ONLY to this issued-by path; the direct-pin path above pins a specific
+                // certificate intentionally and is exempt from the CA constraint.
+                if !anchor_asserts_ca(&anchor) {
+                    last_err = ChainError::NotACa;
+                } else if !cert_is_valid_at(&anchor, now_unix) {
+                    last_err = ChainError::AnchorExpired;
+                } else if cert_is_valid_at(&leaf, now_unix) {
                     return Ok(());
+                } else {
+                    last_err = ChainError::LeafExpired;
                 }
-                last_err = ChainError::LeafExpired;
             }
             Err(e) => last_err = e,
         }
@@ -221,22 +271,71 @@ where
         .map_err(|_| ChainError::SignatureInvalid)
 }
 
-/// Whether the leaf is within its `notBefore..=notAfter` validity window at `now_unix`.
-fn leaf_is_valid_at(leaf: &Certificate, now_unix: i64) -> bool {
-    let validity = &leaf.tbs_certificate.validity;
-    let not_before = unix_secs(validity.not_before);
-    let not_after = unix_secs(validity.not_after);
+/// Whether `cert` (leaf **or** issuing anchor) is within its `notBefore..=notAfter` validity window
+/// at `now_unix`. Per RFC 5280 §6.1.3 (a)(2) every certificate in the path must satisfy this at the
+/// validation time, so the same check applies to the leaf and to the issuing CA.
+fn cert_is_valid_at(cert: &Certificate, now_unix: i64) -> bool {
+    let validity = &cert.tbs_certificate.validity;
+    let not_before = unix_secs_not_before(validity.not_before);
+    let not_after = unix_secs_not_after(validity.not_after);
     now_unix >= not_before && now_unix <= not_after
 }
 
-/// X.509 `Time` → Unix seconds (saturating to `i64`).
-fn unix_secs(time: x509_cert::time::Time) -> i64 {
-    i64::try_from(time.to_unix_duration().as_secs()).unwrap_or(i64::MAX)
+/// Whether `anchor` asserts the CA constraints RFC 5280 requires of a certificate that issues other
+/// certificates, parsed via `x509-cert`'s typed extension decoders (no hand-rolled ASN.1):
+///
+/// - **§6.1.4 (k) / §4.2.1.9** — `basicConstraints` MUST be present with `cA=TRUE`. A certificate
+///   without `basicConstraints`, or with `cA=FALSE`, is an end entity and may not issue certificates.
+/// - **§6.1.4 (n) / §4.2.1.3** — *if* a `keyUsage` extension is present, the `keyCertSign` bit MUST
+///   be set. (When `keyUsage` is absent the spec leaves all usages permitted, so the bit is not
+///   required.)
+///
+/// A malformed or duplicate `basicConstraints` / `keyUsage` extension fails closed (treated as not a
+/// CA): a certificate whose constraints cannot be parsed must not be trusted to issue.
+fn anchor_asserts_ca(anchor: &Certificate) -> bool {
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
+
+    // basicConstraints present AND cA=TRUE (a parse error, duplicate, or absence ⇒ not a CA).
+    match anchor.tbs_certificate.get::<BasicConstraints>() {
+        Ok(Some((_critical, bc))) if bc.ca => {}
+        _ => return false,
+    }
+
+    // keyUsage, if present, MUST assert keyCertSign (parse error ⇒ fail closed; absence ⇒ allowed).
+    match anchor.tbs_certificate.get::<KeyUsage>() {
+        Ok(Some((_critical, ku))) => ku.key_cert_sign(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// Clamp an unsigned-seconds X.509 time to `i64`, saturating an unrepresentable value to a supplied
+/// **fail-closed** sentinel rather than fail-open.
+///
+/// A `notAfter` whose seconds overflow `i64` previously saturated to `i64::MAX` — "never expires" —
+/// which is fail-OPEN on a validity boundary. The secure default is fail-CLOSED: the caller passes
+/// `i64::MAX` for a `notBefore` (an unrepresentable lower bound reads "not yet valid") and `i64::MIN`
+/// for a `notAfter` (an unrepresentable upper bound reads "already expired"), so neither boundary can
+/// widen validity. Within standard X.509 (`UTCTime`/`GeneralizedTime`, year ≤ 9999) the seconds
+/// always fit, so this never fires in practice; it is the boundary's secure default, mirroring the
+/// fail-closed datetime parser ([`crate::datetime`]).
+fn clamp_secs(secs: u64, on_overflow: i64) -> i64 {
+    i64::try_from(secs).unwrap_or(on_overflow)
+}
+
+/// X.509 `notBefore` → Unix seconds, failing closed (unrepresentable ⇒ `i64::MAX` = not yet valid).
+fn unix_secs_not_before(time: x509_cert::time::Time) -> i64 {
+    clamp_secs(time.to_unix_duration().as_secs(), i64::MAX)
+}
+
+/// X.509 `notAfter` → Unix seconds, failing closed (unrepresentable ⇒ `i64::MIN` = already expired).
+fn unix_secs_not_after(time: x509_cert::time::Time) -> i64 {
+    clamp_secs(time.to_unix_duration().as_secs(), i64::MIN)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{verify_chain, ChainError, SigAlg};
+    use super::{clamp_secs, verify_chain, ChainError, SigAlg};
     use der::{Decode as _, Encode as _};
     use x509_cert::Certificate;
 
@@ -248,6 +347,18 @@ mod tests {
         include_bytes!("../../../../tests/fixtures/attestation/mdoc-ds.cert.der");
     const WRONG_ISSUER: &[u8] =
         include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
+    // Chain-validation negative anchors (RFC 5280 §6.1.3 / §6.1.4): an EXPIRED issuing CA whose leaf
+    // is itself in-window (only the anchor is out of its validity window), and a NON-CA "issuer"
+    // (basicConstraints CA:FALSE, no keyCertSign) that nonetheless signs a leaf carrying its subject
+    // as issuer. The genuine `ca-iaca` set cannot exercise these gates because it is a valid,
+    // in-window CA. See tests/fixtures/attestation/gen.sh.
+    const EXPIRED_CA: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/expired-ca.cert.der");
+    const EXPIRED_CA_LEAF: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/expired-ca-leaf.cert.der");
+    const NON_CA: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/non-ca.cert.der");
+    const NON_CA_LEAF: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/non-ca-leaf.cert.der");
     // The signing-core RSA PKI (`sha256WithRSAEncryption`): an RSA CA that signs an RSA leaf —
     // exercises the RSA-PKCS#1v1.5 certificate-signature path, which the EC-only attestation
     // fixtures cannot. Reused (DRY) rather than minting a parallel RSA fixture set.
@@ -256,7 +367,9 @@ mod tests {
 
     // The fixtures are minted 2026-06-25 and the leaves are valid ~15 months (notBefore
     // 2026-06-25, notAfter 2027-09-23); pick a `now` inside every fixture's window (research D9 /
-    // gen.sh DAYS_LEAF=455). The RSA leaf's window (2026-06-22..2028-09-24) also covers this.
+    // gen.sh DAYS_LEAF=455). The RSA leaf's window (2026-06-22..2028-09-24) also covers this. The
+    // negative anchors' in-window leaves use a fixed 2026-01-01..2027-01-01 window that also covers
+    // this instant, and the expired CA's window is 2018-01-01..2019-01-01 (long past).
     const NOW: i64 = 1_788_220_800; // 2026-09-01, comfortably inside the fixtures' validity.
 
     #[test]
@@ -288,6 +401,47 @@ mod tests {
     }
 
     #[test]
+    fn leaf_chaining_to_an_expired_ca_anchor_is_rejected_not_trusted() {
+        // RFC 5280 §6.1.3 (a)(2): EVERY certificate in the path (the issuing CA included) must be
+        // valid at the time of interest. `expired-ca-leaf` is itself in-window at NOW, and its
+        // signature verifies under `expired-ca` whose subject matches the leaf's issuer — but the
+        // ANCHOR (expired-ca) is past its own notAfter (2018..2019). The leaf must be REJECTED as
+        // `AnchorExpired`, never trusted (the anchor-validity-not-enforced fix).
+        let anchors = vec![EXPIRED_CA.to_vec()];
+        assert_eq!(
+            verify_chain(EXPIRED_CA_LEAF, &anchors, NOW),
+            Err(ChainError::AnchorExpired)
+        );
+    }
+
+    #[test]
+    fn leaf_chaining_to_a_non_ca_anchor_is_rejected_not_trusted() {
+        // RFC 5280 §6.1.4 (k)/(n) + §4.2.1.9: an issuing certificate MUST assert basicConstraints
+        // cA=TRUE and (if keyUsage is present) keyCertSign. `non-ca` is CA:FALSE with keyUsage
+        // digitalSignature only, yet it signs `non-ca-leaf` (whose issuer is the non-ca subject and
+        // whose signature verifies under it). The leaf must be REJECTED as `NotACa` — the classic
+        // "any cert is a CA" gap — never trusted on the issued-by path.
+        let anchors = vec![NON_CA.to_vec()];
+        assert_eq!(
+            verify_chain(NON_CA_LEAF, &anchors, NOW),
+            Err(ChainError::NotACa)
+        );
+    }
+
+    #[test]
+    fn direct_pinned_end_entity_leaf_is_trusted_without_a_ca_constraint() {
+        // The DIRECT-PIN model (anchor byte-equals the leaf) is a legitimate, distinct trust model:
+        // pinning a specific END-ENTITY certificate as trusted is intentional and MUST NOT require
+        // cA=TRUE. `sdjwt-issuer` is a CA:FALSE leaf; pinned directly and within its validity window
+        // it is trusted as-is (no issued-by CA-constraint applies to the direct pin).
+        let anchors = vec![SDJWT_ISSUER.to_vec()];
+        assert!(verify_chain(SDJWT_ISSUER, &anchors, NOW).is_ok());
+        // The non-CA fixture, pinned directly, is likewise trusted (CA constraint is issued-by only).
+        let anchors = vec![NON_CA.to_vec()];
+        assert!(verify_chain(NON_CA, &anchors, NOW).is_ok());
+    }
+
+    #[test]
     fn untrusted_leaf_not_chained_is_rejected_with_issuer_mismatch() {
         // wrong-issuer is self-signed under a different name → no anchor subject matches its issuer.
         let anchors = vec![CA_IACA.to_vec()];
@@ -307,12 +461,13 @@ mod tests {
 
     #[test]
     fn leaf_outside_its_validity_window_is_rejected_as_expired() {
-        // A time far in the future, past the ~15-month leaf validity (but the root still matches by
-        // name + signature) → the leaf-validity gate fires.
+        // A time past the ~15-month leaf validity (notAfter 2027-09-23) but still WITHIN the IACA
+        // root's window (notAfter 2036-06-22) → only the LEAF is expired, so the leaf-validity gate
+        // fires (not the anchor-validity gate). The root still matches by name + signature.
         let anchors = vec![CA_IACA.to_vec()];
-        let far_future = 4_000_000_000; // year ~2096
+        let leaf_expired_root_valid = 1_893_456_000; // 2030-01-01: past the leaf, inside the root.
         assert_eq!(
-            verify_chain(SDJWT_ISSUER, &anchors, far_future),
+            verify_chain(SDJWT_ISSUER, &anchors, leaf_expired_root_valid),
             Err(ChainError::LeafExpired)
         );
     }
@@ -345,12 +500,50 @@ mod tests {
         assert!(ChainError::IssuerMismatch.to_string().contains("issuer"));
         assert!(ChainError::SignatureInvalid.to_string().contains("verify"));
         assert!(ChainError::LeafExpired.to_string().contains("validity"));
+        assert!(ChainError::AnchorExpired.to_string().contains("validity"));
+        assert!(ChainError::AnchorExpired.to_string().contains("anchor"));
+        assert!(ChainError::NotACa.to_string().contains("CA"));
         assert!(ChainError::UnsupportedAlgorithm("1.2.3".into())
             .to_string()
             .contains("1.2.3"));
         assert!(ChainError::Malformed("x".into())
             .to_string()
             .contains("DER"));
+    }
+
+    #[test]
+    fn unrepresentable_validity_bounds_fail_closed() {
+        // RFC 5280 §6.1.3 (a)(2) at the i64 boundary: a bound whose seconds overflow i64 must fail
+        // CLOSED, never fail OPEN. `clamp_secs` saturates an unrepresentable bound to the supplied
+        // rejecting sentinel: notBefore → i64::MAX (reads "not yet valid", since `now >= MAX` is
+        // false for every real `now`), notAfter → i64::MIN (reads "already expired", since
+        // `now <= MIN` is false). This is the boundary the prior `unwrap_or(i64::MAX)` got WRONG for
+        // notAfter (an unrepresentable notAfter saturated to MAX = "never expires" = fail-open).
+        // Representable seconds pass through unchanged (the common path).
+        assert_eq!(clamp_secs(0, i64::MAX), 0);
+        assert_eq!(clamp_secs(1_788_220_800, i64::MIN), 1_788_220_800);
+        assert_eq!(
+            clamp_secs(i64::MAX as u64, i64::MAX),
+            i64::MAX,
+            "the largest representable i64 second value round-trips"
+        );
+        // Unrepresentable seconds (> i64::MAX) saturate to the rejecting sentinel — fail closed.
+        let overflow = (i64::MAX as u64) + 1;
+        assert_eq!(
+            clamp_secs(overflow, i64::MAX),
+            i64::MAX,
+            "notBefore that overflows i64 → i64::MAX (not-yet-valid) → reject"
+        );
+        assert_eq!(
+            clamp_secs(overflow, i64::MIN),
+            i64::MIN,
+            "notAfter that overflows i64 → i64::MIN (already-expired) → reject"
+        );
+        assert_eq!(clamp_secs(u64::MAX, i64::MIN), i64::MIN);
+        // End-to-end polarity (documented, not asserted to avoid a constant-assertion lint): a
+        // notBefore sentinel of i64::MAX and a notAfter sentinel of i64::MIN both reject every real
+        // `now` — `now >= i64::MAX` and `now <= i64::MIN` are both false for any finite instant such
+        // as `NOW` — so the window collapses to empty and an unrepresentable bound never widens it.
     }
 
     #[test]
@@ -442,6 +635,26 @@ mod tests {
     }
 
     #[test]
+    fn anchor_asserts_ca_classifies_ca_and_non_ca_certs() {
+        use super::anchor_asserts_ca;
+        // The genuine IACA root asserts basicConstraints cA=TRUE + keyUsage keyCertSign → a CA.
+        let ca = Certificate::from_der(CA_IACA).expect("parse ca-iaca");
+        assert!(
+            anchor_asserts_ca(&ca),
+            "ca-iaca asserts cA=TRUE + keyCertSign"
+        );
+        // The RSA signing CA likewise asserts the CA constraints.
+        let rsa_ca = Certificate::from_der(RSA_CA).expect("parse rsa ca");
+        assert!(anchor_asserts_ca(&rsa_ca), "the RSA test CA is a CA");
+        // The non-CA fixture (CA:FALSE, keyUsage digitalSignature only) is NOT a CA.
+        let non_ca = Certificate::from_der(NON_CA).expect("parse non-ca");
+        assert!(!anchor_asserts_ca(&non_ca), "CA:FALSE is not a CA");
+        // The end-entity leaves (CA:FALSE) are not CAs either.
+        let leaf = Certificate::from_der(SDJWT_ISSUER).expect("parse sdjwt-issuer");
+        assert!(!anchor_asserts_ca(&leaf), "an end-entity leaf is not a CA");
+    }
+
+    #[test]
     fn sig_alg_classifies_the_baseline_oids() {
         use const_oid::db::rfc5912;
         assert_eq!(
@@ -465,5 +678,31 @@ mod tests {
             SigAlg::from_oid(rfc5912::ECDSA_WITH_SHA_384),
             Err(ChainError::UnsupportedAlgorithm(_))
         ));
+    }
+
+    #[test]
+    fn anchor_with_an_unparseable_key_usage_fails_closed_as_not_a_ca() {
+        use super::anchor_asserts_ca;
+        use const_oid::db::rfc5280::ID_CE_KEY_USAGE;
+        // A CA whose basicConstraints say cA=TRUE but whose keyUsage extension cannot be decoded must
+        // fail CLOSED (treated as not-a-CA), never trusted to issue. `x509-cert`'s typed
+        // `get::<KeyUsage>()` returns Err when two keyUsage extensions are present, so duplicate the
+        // extension on the genuine IACA root to drive the `Err(_) => false` fail-closed arm.
+        let mut ca = Certificate::from_der(CA_IACA).expect("parse ca-iaca");
+        let exts = ca
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .expect("ca-iaca carries extensions");
+        let ku = exts
+            .iter()
+            .find(|e| e.extn_id == ID_CE_KEY_USAGE)
+            .expect("ca-iaca carries keyUsage")
+            .clone();
+        exts.push(ku); // a second keyUsage ⇒ get::<KeyUsage>() is Err ⇒ fail closed.
+        assert!(
+            !anchor_asserts_ca(&ca),
+            "a cert with an unparseable (duplicate) keyUsage must fail closed as not-a-CA"
+        );
     }
 }

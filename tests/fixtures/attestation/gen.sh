@@ -146,6 +146,69 @@ openssl req -x509 -new -key wrong-issuer.key.pem -sha256 -days "${DAYS_LEAF}" \
   -out wrong-issuer.cert.pem
 der_and_pk8 wrong-issuer
 
+# --- Chain-validation negative anchors (RFC 5280 §6.1.3 / §6.1.4 / §4.2.1.9) -----------------------
+# Two extra anchor PKIs that exercise the issued-by (CA-issues-leaf) path's RFC 5280 gates the genuine
+# `ca-iaca` set cannot, because `ca-iaca` is correctly a valid, in-window CA:
+#
+#   expired-ca / expired-ca-leaf  — an EXPIRED issuing CA (CA:TRUE, keyCertSign) with a fixed PAST
+#       validity window, whose leaf's OWN window still covers the test instants. So only the ANCHOR
+#       is out of its validity window: per RFC 5280 §6.1.3 (a)(2) EVERY certificate in the path
+#       (the CA included) must be valid at the time of interest, so the leaf must be REJECTED even
+#       though its own window is fine. Guards the "anchor validity not enforced" fix (ChainError::AnchorExpired).
+#
+#   non-ca / non-ca-leaf          — a NON-CA issuer (basicConstraints CA:FALSE, keyUsage WITHOUT
+#       keyCertSign) that nevertheless signs a leaf carrying its subject as issuer. Per RFC 5280
+#       §6.1.4 (k)/(n) and §4.2.1.9, only a cert asserting cA=TRUE (and, if keyUsage is present,
+#       keyCertSign) may act as an issuing CA, so the leaf must be REJECTED (the classic "any cert is
+#       a CA" gap). Guards the CA-constraint fix (ChainError::NotACa).
+#
+# Fixed (deterministic, reproducible) validity windows via -not_before / -not_after so the EXPIRED
+# anchor is reproducible regardless of when gen.sh runs (no "-days from now" drift).
+EXPIRED_NB="20180101000000Z" # notBefore 2018-01-01
+EXPIRED_NA="20190101000000Z" # notAfter  2019-01-01 — long past every test instant
+LEAF_NB="20260101000000Z"    # notBefore 2026-01-01 — covers the fixtures' NOW (2026-09-01)
+LEAF_NA="20270101000000Z"    # notAfter  2027-01-01
+
+# Expired issuing CA (CA:TRUE, keyCertSign) with a PAST validity window.
+genec expired-ca.key.pem
+openssl req -x509 -new -key expired-ca.key.pem -sha256 \
+  -not_before "${EXPIRED_NB}" -not_after "${EXPIRED_NA}" \
+  -subj "/CN=Cleverbase SDK Test EXPIRED CA/O=Alkemio Test/C=NL" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out expired-ca.cert.pem
+der_and_pk8 expired-ca
+
+# Leaf issued by the expired CA, with its OWN window covering the test instants (only the CA expired).
+genec expired-ca-leaf.key.pem
+openssl req -new -key expired-ca-leaf.key.pem \
+  -subj "/CN=Cleverbase SDK Test Leaf Of Expired CA/O=Alkemio Test/C=NL" -out expired-ca-leaf.csr
+openssl x509 -req -in expired-ca-leaf.csr -CA expired-ca.cert.pem -CAkey expired-ca.key.pem \
+  -CAcreateserial -sha256 -not_before "${LEAF_NB}" -not_after "${LEAF_NA}" \
+  -extfile <(printf '%b' 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n') \
+  -out expired-ca-leaf.cert.pem
+der_and_pk8 expired-ca-leaf
+
+# Non-CA "issuer" (CA:FALSE, keyUsage withOUT keyCertSign), in-window, that nonetheless signs a leaf.
+genec non-ca.key.pem
+openssl req -x509 -new -key non-ca.key.pem -sha256 \
+  -not_before "${LEAF_NB}" -not_after "${LEAF_NA}" \
+  -subj "/CN=Cleverbase SDK Test Non-CA Issuer/O=Alkemio Test/C=NL" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -out non-ca.cert.pem
+der_and_pk8 non-ca
+
+# Leaf "issued by" the non-CA cert (its subject is the leaf's issuer); in-window.
+genec non-ca-leaf.key.pem
+openssl req -new -key non-ca-leaf.key.pem \
+  -subj "/CN=Cleverbase SDK Test Leaf Of Non-CA/O=Alkemio Test/C=NL" -out non-ca-leaf.csr
+openssl x509 -req -in non-ca-leaf.csr -CA non-ca.cert.pem -CAkey non-ca.key.pem \
+  -CAcreateserial -sha256 -not_before "${LEAF_NB}" -not_after "${LEAF_NA}" \
+  -extfile <(printf '%b' 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n') \
+  -out non-ca-leaf.cert.pem
+der_and_pk8 non-ca-leaf
+
 # --- Minimal test trust-list anchor (JSON manifest for T009/T013) ----------------------------------
 # The native EU trust-list engine (T013) fetches/authenticates signed TS 119 612 XML in production;
 # for the OFFLINE suite the configured test anchor (StaticTestAnchors) is seeded from this manifest:
@@ -254,6 +317,10 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   mdoc-ds.*        mdoc Document Signer leaf (COSE ES256, EKU id-mso-mdl-DS), issued by ca-iaca
   holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
   wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
+  expired-ca.*     EXPIRED issuing CA (CA:TRUE, keyCertSign; past validity window) for the chain
+  expired-ca-leaf.*  leaf issued by expired-ca whose OWN window is current (anchor-validity reject path)
+  non-ca.*         NON-CA issuer (CA:FALSE, no keyCertSign) for the "any cert is a CA" reject path
+  non-ca-leaf.*    leaf issued by non-ca (CA-constraint reject path)
   trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
   qualified-trust-list.json
                    minimal national Trusted List with EAA/Q services + per-service status history
@@ -286,6 +353,14 @@ if openssl verify -CAfile ca-iaca.cert.der wrong-issuer.cert.der >/dev/null 2>&1
   exit 1
 fi
 echo "wrong-issuer.cert.der: correctly REJECTED against ca-iaca.cert.der (expected)"
+
+# The negative anchors are valid OpenSSL signatures (the SDK's RFC 5280 §6.1.3/§6.1.4 gates, not the
+# signature math, are what reject them), so confirm the signatures themselves are sound: expired-ca-leaf
+# is signed by expired-ca, and non-ca-leaf by non-ca. `openssl verify` rejects expired-ca (expired) and
+# non-ca (CA:FALSE) as issuers — exactly the conditions the SDK gates — so verify only the leaf/issuer
+# signature linkage with `-no_check_time -partial_chain` to assert the chain is otherwise structurally sound.
+openssl verify -no_check_time -partial_chain -CAfile expired-ca.cert.der expired-ca-leaf.cert.der
+echo "non-ca / non-ca-leaf: signature linkage minted (rejected by the SDK's CA-constraint gate, by design)"
 
 # --- drop transient working files ------------------------------------------------------------------
 # The tests load only the DER certs + PKCS#8 keys (+ the JSON/JWK/YAML/Kotlin material); the CSRs and

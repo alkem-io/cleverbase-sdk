@@ -7,7 +7,8 @@
 use ciborium::value::Value as CborValue;
 
 use super::test_issuer::{
-    mdoc_ds_cert_der, wrong_issuer_cert_der, DigestAlg, Element, MdocBuilder,
+    default_session_transcript, mdoc_ds_cert_der, wrong_issuer_cert_der, DigestAlg, Element,
+    MdocBuilder,
 };
 use super::{verify, MdocVerifyParams};
 use crate::status::StatusOutcome;
@@ -28,10 +29,23 @@ fn anchors_without_ds() -> StaticTestAnchors {
     StaticTestAnchors::new()
 }
 
+/// The canonical default `SessionTranscript` with a `'static` lifetime, so [`params`] (which the bulk
+/// of the suite shares) can hand the verifier the SAME transcript the test issuer signs the default
+/// `DeviceSignature` over. The verifier no longer fabricates a transcript (§9.1.5), so a
+/// default-transcript mdoc verifies ONLY when these exact bytes are supplied.
+fn static_default_transcript() -> &'static [u8] {
+    use std::sync::OnceLock;
+    static TRANSCRIPT: OnceLock<Vec<u8>> = OnceLock::new();
+    TRANSCRIPT.get_or_init(default_session_transcript)
+}
+
+/// The shared params for the bulk of the suite: the canonical default `SessionTranscript` (so the
+/// default-transcript `DeviceSignature` the builder mints is genuinely confirmed — never a fabricated
+/// no-op binding), PID role, no status, at [`NOW`].
 fn params() -> MdocVerifyParams<'static> {
     MdocVerifyParams {
         now_unix: NOW,
-        session_transcript: None,
+        session_transcript: Some(static_default_transcript()),
         role: IssuerRole::Pid,
         status: StatusOutcome::NoStatus,
     }
@@ -236,6 +250,44 @@ fn explicit_session_transcript_binds_the_device_signature() {
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(result.valid, "matching session transcript must verify");
+}
+
+#[test]
+fn device_signature_without_a_session_transcript_is_missing_request_binding() {
+    // FAIL-CLOSED (ISO/IEC 18013-5 §9.1.5): a `DeviceSignature` is always computed over a real
+    // `SessionTranscript`. When a document asserts holder binding (carries a `DeviceSignature`) and NO
+    // transcript is supplied, the verifier CANNOT confirm the binding — it MUST NOT fabricate a
+    // `[null, null, null]` transcript and silently "pass" (a zero-freshness no-op false-accept). It
+    // rejects with `MissingRequestBinding`: an explicit transcript (or the OpenID4VP handover) is
+    // required. The mdoc here is otherwise fully valid (trusted DS, valid MSO, matching digests, valid
+    // DeviceKey, genuine holder `DeviceSignature`) — the SOLE reason for the reject is the absent
+    // transcript.
+    let response = MdocBuilder::new().build();
+    let p = MdocVerifyParams {
+        now_unix: NOW,
+        session_transcript: None,
+        role: IssuerRole::Pid,
+        status: StatusOutcome::NoStatus,
+    };
+    let result = verify(&response, &trusted_anchors(), &p);
+    assert!(
+        !result.valid,
+        "a DeviceSignature with no SessionTranscript must NOT silently pass holder binding"
+    );
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::MissingRequestBinding],
+        "an absent SessionTranscript for a DeviceSignature is a missing request/transport binding"
+    );
+    assert!(result.disclosed_attributes.is_empty());
+
+    // Control: the SAME credential verifies once the default transcript it was signed over is supplied
+    // — proving the only thing the reject above turned on is the missing transcript, not any other bar
+    // check.
+    assert!(
+        verify(&response, &trusted_anchors(), &params()).valid,
+        "supplying the explicit transcript the DeviceSignature was signed over verifies"
+    );
 }
 
 #[test]
@@ -446,9 +498,10 @@ fn unavailable_status_is_rejected_as_status_unavailable() {
 fn good_status_still_verifies() {
     // A reachable status that reports the credential current does not disturb a VALID verdict.
     let response = MdocBuilder::new().build();
+    let transcript = default_session_transcript();
     let p = MdocVerifyParams {
         now_unix: NOW,
-        session_transcript: None,
+        session_transcript: Some(&transcript),
         role: IssuerRole::Pid,
         status: StatusOutcome::Good,
     };

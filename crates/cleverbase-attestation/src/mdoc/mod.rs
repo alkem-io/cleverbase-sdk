@@ -128,9 +128,14 @@ impl VerifyFailure {
 /// `now_unix` is the time (Unix seconds) at which the MSO `validityInfo` window is enforced — passed
 /// in (sans-IO) rather than read from the system clock so verification is deterministic and testable.
 /// `session_transcript` is the CBOR-encoded `SessionTranscript` the holder's `DeviceSignature` is
-/// computed over; it is supplied by the transport/OpenID4VP layer. When `None`, the verifier treats
-/// the holder binding as bound to an empty transcript (the value the test issuer and a transport-less
-/// presentation agree on).
+/// computed over; it is supplied by the transport/OpenID4VP layer. ISO/IEC 18013-5 §9.1.5
+/// `DeviceAuthentication` is **always** computed over a real `SessionTranscript` (the device-retrieval
+/// transcript, or the OpenID4VP handover), so when a document asserts holder binding (carries a
+/// `DeviceSignature`) and `session_transcript` is `None`, the verifier CANNOT confirm that binding and
+/// MUST NOT fabricate a transcript to "pass" it. The verifier therefore rejects such a document with
+/// [`ReasonCode::MissingRequestBinding`] rather than silently no-op the binding — the caller must
+/// supply the explicit `SessionTranscript` (or, for OpenID4VP, the reconstructed handover via
+/// [`crate::openid4vp`]).
 #[derive(Debug, Clone)]
 pub struct MdocVerifyParams<'a> {
     /// The verification instant, in Unix seconds, at which `validityInfo` is enforced.
@@ -149,6 +154,9 @@ pub struct MdocVerifyParams<'a> {
 impl Default for MdocVerifyParams<'_> {
     /// A default suitable for the offline suite: no session transcript, the PID role (the role under
     /// which the test IACA anchor is configured), and a zero instant the caller is expected to set.
+    /// Note: a `DeviceSignature`-bearing document verified with `session_transcript: None` is rejected
+    /// as [`ReasonCode::MissingRequestBinding`] (§9.1.5 — the transcript is required); the caller must
+    /// set an explicit transcript to verify the holder binding.
     fn default() -> Self {
         Self {
             now_unix: 0,
@@ -182,6 +190,23 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
         Ok(result) => result,
         Err(failure) => VerificationResult::invalid(failure.reason),
     }
+}
+
+/// The number of `Document`s a `DeviceResponse` carries (its `documents` array length), or `None` when
+/// the bytes do not parse as a `DeviceResponse` with a `documents` array.
+///
+/// [`crate::openid4vp`] uses this to bound the `Replay` re-attribution to the SINGLE-document case: the
+/// fresh-nonce-mismatch→`Replay` heuristic only holds when there is exactly one document whose ONLY
+/// transcript-dependent variable is the request nonce (the audience already matched in cleartext). With
+/// more than one document a `HolderBinding` failure cannot be safely attributed to a replay (e.g. a
+/// wrong-key `DeviceSignature` on `documents[1]` is structurally sound yet a genuine fault), so the
+/// binding fault is kept as `HolderBinding`.
+#[must_use]
+pub fn document_count(device_response: &[u8]) -> Option<usize> {
+    let root: CborValue = ciborium::from_reader(device_response).ok()?;
+    get_map_entry(&root, "documents")
+        .and_then(CborValue::as_array)
+        .map(Vec::len)
 }
 
 /// Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
@@ -1431,6 +1456,16 @@ fn verify_device_binding(
         // A DeviceMac-only DeviceAuth is the ECDH variant — a documented follow-on, not the
         // signature path; treat its absence here as a holder-binding failure (no false-accept).
         .ok_or_else(|| VerifyFailure::reason(ReasonCode::HolderBinding))?;
+
+    // FAIL-CLOSED (ISO/IEC 18013-5 §9.1.5): a `DeviceSignature` is ALWAYS computed over a real
+    // `SessionTranscript`. A request-less verify with no transcript cannot confirm holder binding, so
+    // the verifier MUST NOT fabricate a `[null, null, null]` transcript and "pass" the binding with
+    // zero freshness/transport binding (a silent no-op false-accept). Reject up front: an explicit
+    // `SessionTranscript` (or, for OpenID4VP, the reconstructed handover via `crate::openid4vp`) is
+    // required to verify the `DeviceAuth`.
+    let Some(session_transcript_bytes) = params.session_transcript else {
+        return Err(VerifyFailure::reason(ReasonCode::MissingRequestBinding));
+    };
     let device_signature = parse_cose_sign1(device_signature_value)?;
 
     // `deviceSigned.nameSpaces` is a `#6.24(bstr .cbor DeviceNameSpaces)`; carry its exact bytes.
@@ -1438,7 +1473,7 @@ fn verify_device_binding(
         get_map_entry(device_signed, "nameSpaces").ok_or_else(VerifyFailure::malformed)?;
     let device_name_spaces_bytes = reencode_tagged(device_name_spaces_value)?;
 
-    let session_transcript = build_session_transcript_value(params.session_transcript)?;
+    let session_transcript = decode_session_transcript_value(session_transcript_bytes)?;
     let device_auth_payload =
         build_device_authentication(&session_transcript, doc_type, &device_name_spaces_bytes)?;
 
@@ -1452,22 +1487,12 @@ fn reencode_tagged(value: &CborValue) -> Result<Vec<u8>, VerifyFailure> {
     encode_tagged_cbor(&inner)
 }
 
-/// Decode the supplied `SessionTranscript` bytes to a CBOR value, defaulting to a 3-element null
-/// transcript `[null, null, null]` (DeviceEngagementBytes, EReaderKeyBytes, Handover) when none is
-/// supplied — the value a transport-less presentation and the test issuer agree on.
-fn build_session_transcript_value(
-    session_transcript: Option<&[u8]>,
-) -> Result<CborValue, VerifyFailure> {
-    session_transcript.map_or_else(
-        || {
-            Ok(CborValue::Array(vec![
-                CborValue::Null,
-                CborValue::Null,
-                CborValue::Null,
-            ]))
-        },
-        |bytes| ciborium::from_reader(bytes).map_err(|_| VerifyFailure::malformed()),
-    )
+/// Decode the supplied `SessionTranscript` bytes to a CBOR value. The transcript is REQUIRED to verify
+/// a `DeviceSignature` (ISO/IEC 18013-5 §9.1.5); [`verify_device_binding`] rejects an absent transcript
+/// up front ([`ReasonCode::MissingRequestBinding`]) before calling this, so this helper never has to
+/// fabricate one — it only re-hydrates the explicit, caller-supplied bytes.
+fn decode_session_transcript_value(session_transcript: &[u8]) -> Result<CborValue, VerifyFailure> {
+    ciborium::from_reader(session_transcript).map_err(|_| VerifyFailure::malformed())
 }
 
 /// Build the `DeviceAuthentication` detached payload bytes: the `#6.24(bstr .cbor [...])` wrapping of
