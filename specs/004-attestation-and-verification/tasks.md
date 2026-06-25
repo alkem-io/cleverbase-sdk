@@ -28,8 +28,8 @@ different-language** reference verifier.
 ## Phase 1: Setup
 
 - [X] T001 Scaffold the `crates/cleverbase-attestation` crate in the workspace (Cargo.toml with **pinned** `coset`, `sd-jwt-payload`, `quick-xml` + reuse of the workspace crypto/X.509 deps; `src/lib.rs` + module dirs `sdjwtvc/ mdoc/ openid4vp/ trust/ qualified/ issuance/`); register it in the root workspace and as a dependency of `crates/cleverbase-ffi`.
-- [ ] T002 [P] Vendor **Tier A** conformance fixtures into `tests/fixtures/attestation/vectors/` — the IETF arf-pid SD-JWT VC example, the OWF multipaz ISO 18013-5 **Annex-D** mdoc vector, and the `isomdl`/EUDI test IACA PKI (incl. a deliberate wrong-signer cert) — with a `NOTICE` attribution file (research D9).
-- [ ] T003 [P] Add the **Tier B** generator + test PKI under `tests/fixtures/attestation/gen/` — a self-signed test IACA root/intermediate/DS + an SD-JWT VC issuer EC key + a recipe that mints SD-JWT VCs (with KB-JWTs) and mdocs and the negative variants (expired/revoked/tampered/wrong-issuer/wrong-audience). Offline, reproducible.
+- [X] T002 [P] Vendor **Tier A** conformance fixtures into `tests/fixtures/attestation/vectors/` — the IETF arf-pid SD-JWT VC example, the OWF multipaz ISO 18013-5 **Annex-D** mdoc vector, and the `isomdl`/EUDI test IACA PKI (incl. a deliberate wrong-signer cert) — with a `NOTICE` attribution file (research D9).
+- [X] T003 [P] Add the **Tier B** generator + test PKI under `tests/fixtures/attestation/gen/` — a self-signed test IACA root/intermediate/DS + an SD-JWT VC issuer EC key + a recipe that mints SD-JWT VCs (with KB-JWTs) and mdocs and the negative variants (expired/revoked/tampered/wrong-issuer/wrong-audience). Offline, reproducible.
 
 **Checkpoint**: crate builds; offline fixtures + generator present.
 
