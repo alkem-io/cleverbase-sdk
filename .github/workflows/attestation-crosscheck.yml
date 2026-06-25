@@ -1,0 +1,98 @@
+name: Attestation cross-check + qualified gate (opt-in)
+
+# Opt-in only (feature 004, task T030). Two off-by-default jobs that are NEVER part of the merge
+# pipeline (the always-on offline verify suite + the ≥95% coverage gate live in test.yml and gate
+# merges); these add standards-conformance signals that need either an external different-language
+# reference toolchain (the cross-check) or an experimental, pre-operational standard surface (the
+# qualified gate). They are triggered manually (workflow_dispatch) and SELF-SKIP cleanly when the
+# thing they need is absent, so they never fail an environment that did not opt in (FR-008/FR-013).
+#
+#   crosscheck       — exports the SDK-produced VALID artifacts (SD-JWT VC + mdoc) from the same
+#                      test-issuer minters the in-crate suite verifies, then runs
+#                      scripts/crosscheck-attestation.sh to assert an INDEPENDENT, different-language
+#                      EU reference verifier (Kotlin eudi-lib-jvm-sdjwt-kt / TS mdoc-ts) agrees with
+#                      the SDK's VALID verdict (Principle VI / FR-013, covering BOTH the US1 vectors
+#                      and the US2-produced artifacts — C1). The reference verifiers are NOT installed
+#                      here (no standard packaged binary with the pinned name exists today), so the
+#                      harness self-skips with a SKIP note — wiring the pinned reference build via the
+#                      *_REF_CMD env vars (printed by `--print-pins`) turns it into a real assertion.
+#   qualified-gate   — runs the opt-in eIDAS qualified-status gate suite (TS 119 615 v1.4.1 cl. 4.12,
+#                      EXPERIMENTAL / version-pinned). cl. 4.12 is pre-operational, so this is opt-in;
+#                      the suite self-skips when the qualified trust-list fixture is absent.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: attestation-crosscheck-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crosscheck:
+    name: Independent reference cross-check (US1 vectors + US2 artifacts)
+    runs-on: ubuntu-latest
+    env:
+      # Where the exporter test writes the rendered SD-JWT VC + mdoc artifacts (off-by-default: the
+      # test self-skips when this is unset; setting it here opts this job in).
+      ATT_EXPORT_DIR: ${{ github.workspace }}/cross-check-artifacts
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      # Read the SINGLE SOURCE OF TRUTH for the pinned reference verifiers from the harness itself
+      # (so the workflow and the script can never drift — Constitution Principle III). This prints the
+      # pinned versions/commands; a self-hosted/pinned reference build is wired by exporting the
+      # *_REF_CMD env vars to point at it before the cross-check step below.
+      - name: Show pinned reference verifiers (single source of truth)
+        run: bash scripts/crosscheck-attestation.sh --print-pins
+
+      # Export the SDK-produced VALID artifacts (SD-JWT VC + mdoc DeviceResponse) from the same
+      # test-issuer minters the in-crate suite verifies (DRY) — these are the produced/obtained
+      # artifacts FR-013 requires checking against an independent verifier (C1: spans US1 + US2).
+      - name: Export the SDK-produced cross-check artifacts
+        run: |
+          cargo test -p cleverbase-attestation --features test-vectors \
+            --test export_artifacts -- --nocapture
+          ls -l "$ATT_EXPORT_DIR"
+
+      # Cross-check both formats against the independent, different-language EU reference verifier and
+      # assert it AGREES with the SDK's VALID verdict. The harness self-skips (exit 0 + a SKIP note)
+      # when the reference verifier for a format is not on PATH — the common case here, since no
+      # packaged binary with the pinned name ships by default; this never fails the opt-in job.
+      - name: Cross-check the SD-JWT VC artifact (independent verifier)
+        run: |
+          bash scripts/crosscheck-attestation.sh --expect valid --format sd-jwt-vc \
+            "$ATT_EXPORT_DIR/valid-sd-jwt-vc.txt"
+
+      - name: Cross-check the mdoc artifact (independent verifier)
+        run: |
+          bash scripts/crosscheck-attestation.sh --expect valid --format mdoc \
+            "$ATT_EXPORT_DIR/valid-mdoc.cbor"
+
+  qualified-gate:
+    name: Opt-in eIDAS qualified-status gate (TS 119 615 cl. 4.12, experimental)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      # The qualified-status gate is EXPERIMENTAL and version-pinned (TS 119 615 v1.4.1 cl. 4.12 is
+      # pre-operational), so it is opt-in here rather than in the merge pipeline. The suite self-skips
+      # when the qualified trust-list fixture is absent (cl. 4.12 data is not always available); when
+      # the fixture is present it asserts granted→Qualified, found-but-not-granted→NotQualified, and
+      # absent/unreachable→Indeterminate, and that disabling the gate leaves the always-on verdict
+      # byte-identical (SC-007).
+      - name: Run the opt-in qualified-status gate suite
+        run: |
+          cargo test -p cleverbase-attestation qualified:: -- --nocapture

@@ -20,7 +20,7 @@
 //!
 //! ## Status
 //!
-//! User Story 1 (feature 004 — the MVP) is implemented: the global [`verify`] entry point assembles
+//! User Story 1 (feature 004 — the MVP) is implemented: the global [`verify()`] entry point assembles
 //! the always-on bar over both format verifiers ([`sdjwtvc`], [`mdoc`]), the native EU trust-list
 //! engine ([`trust`]), the revocation/[`status`] check (fail-closed by default), and the
 //! [`openid4vp`] request binding (nonce + audience), surfaced over the `cleverbase-ffi` C-ABI via

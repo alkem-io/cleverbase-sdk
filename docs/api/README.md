@@ -6,7 +6,7 @@ comments and committed to the repo so it is browseable directly on GitHub. Regen
 
 | Surface                    | Source                                               | Section |
 | -------------------------- | ---------------------------------------------------- | ------- |
-| Rust core + C ABI          | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | [`rust/`](rust/README.md) |
+| Rust core + C ABI          | `crates/cleverbase-core` + `crates/cleverbase-attestation` + `crates/cleverbase-ffi` | [`rust/`](rust/README.md) |
 | Go binding (backend)       | `bindings/go` (the public binding package)           | [`go.md`](go.md) |
 | Python binding (backend)   | `bindings/python/cleverbase.pyi` (the public stub)   | [`python.md`](python.md) |
 | Node binding (backend)     | `bindings/node/index.d.ts` (the napi binding)        | [`node/`](node/README.md) |

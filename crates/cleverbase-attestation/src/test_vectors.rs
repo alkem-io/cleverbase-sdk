@@ -80,3 +80,28 @@ pub fn skipped_issuance_request_cbor() -> Vec<u8> {
     ciborium::into_writer(&req, &mut buf).expect("CBOR encode of the test IssuanceRequest");
     buf
 }
+
+/// The **rendered** SD-JWT VC presentation string of a VALID, trusted-issuer credential — the raw
+/// artifact an *independent* EU reference verifier consumes (the `scripts/crosscheck-attestation.sh`
+/// `--format sd-jwt-vc` input, FR-013 / Principle VI).
+///
+/// This is the compact `<issuer-JWS>~<D.1>~…~<D.N>` produced by the same test issuer the in-crate
+/// suite uses (DRY), so the SDK-produced artifact the cross-check feeds the reference verifier is the
+/// exact credential the always-on bar accepts — no parallel minting.
+#[must_use]
+pub fn valid_sd_jwt_vc_artifact() -> String {
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    sd_jwt.presentation()
+}
+
+/// The **rendered** mdoc `DeviceResponse` (CBOR) of a VALID, conformant credential — the raw artifact
+/// an *independent* EU reference verifier consumes (the `scripts/crosscheck-attestation.sh`
+/// `--format mdoc` input, FR-013 / Principle VI).
+///
+/// Produced by the same ISO/IEC 18013-5 test issuer the in-crate suite verifies (DRY): together with
+/// the SD-JWT VC artifact this lets the cross-check span both mandated formats against a
+/// different-language reference verifier, not just the SDK's own Rust verifier.
+#[must_use]
+pub fn valid_mdoc_artifact() -> Vec<u8> {
+    crate::mdoc::test_issuer::MdocBuilder::new().build()
+}

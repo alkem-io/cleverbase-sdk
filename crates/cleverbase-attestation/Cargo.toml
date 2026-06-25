@@ -50,5 +50,14 @@ test-vectors = ["dep:pkcs8", "dep:async-trait"]
 pkcs8.workspace = true
 async-trait.workspace = true
 
+# The cross-check artifact exporter (T030) builds only with the shared test-issuer minters, which
+# live behind `test-vectors`; require that feature so a default `cargo test` neither builds nor runs
+# it (it self-skips on a missing ATT_EXPORT_DIR anyway). The opt-in cross-check workflow runs it with
+# `--features test-vectors`.
+[[test]]
+name = "export_artifacts"
+path = "tests/export_artifacts.rs"
+required-features = ["test-vectors"]
+
 [lints]
 workspace = true

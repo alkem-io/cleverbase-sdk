@@ -21,10 +21,10 @@
 //! ## Status seam (T014)
 //!
 //! The revocation/status check is owned by [`crate::status`]; this module takes its canonical
-//! [`StatusOutcome`] (re-exported here as [`StatusInput`]) so the always-on bar is honoured without
-//! re-implementing the status fetch here — the single authoritative status type (DRY). The
-//! always-on [`crate::verify`] entry point resolves the credential's status reference through the
-//! host [`crate::status::StatusSource`] seam and passes the outcome in.
+//! [`crate::status::StatusOutcome`] (re-exported here as [`StatusInput`]) so the always-on bar is
+//! honoured without re-implementing the status fetch here — the single authoritative status type
+//! (DRY). The always-on [`verify()`](crate::verify()) entry point resolves the credential's status
+//! reference through the host [`crate::status::StatusSource`] seam and passes the outcome in.
 
 use std::collections::BTreeMap;
 
@@ -47,7 +47,7 @@ const ES256: &str = "ES256";
 const SHA_256: &str = "sha-256";
 
 /// The revocation/status input to the verifier — the canonical [`crate::status::StatusOutcome`]
-/// (one authoritative status type, DRY). The [`crate::verify`] entry point resolves the credential's
+/// (one authoritative status type, DRY). The [`verify()`](crate::verify()) entry point resolves the credential's
 /// status reference through the host status seam and passes the outcome in; this module maps it onto
 /// the always-on bar (revoked → `Revoked`, unreachable-under-fail-closed → `StatusUnavailable`).
 pub use crate::status::StatusOutcome as StatusInput;

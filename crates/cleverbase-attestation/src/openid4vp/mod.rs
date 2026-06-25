@@ -137,7 +137,7 @@ pub struct MdocVpToken {
 /// OpenID4VP carries either a compact SD-JWT VC presentation string or an mdoc `DeviceResponse`
 /// (wrapped here with its addressed audience — see [`MdocVpToken`]). Detected by the caller; the
 /// verifier never guesses (an unrecognized shape would be [`ReasonCode::UnsupportedFormat`] at the
-/// [`crate::verify`] entry point).
+/// [`verify()`](crate::verify()) entry point).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VpToken<'a> {
     /// A compact SD-JWT VC presentation (`<issuer-JWS>~<D>…~<KB-JWT>`).
@@ -156,7 +156,7 @@ pub enum VpToken<'a> {
 ///   handover transcript reconstructed from the request nonce/audience (a fresh-nonce mismatch
 ///   surfaces as a failed holder binding, attributed to `Replay`).
 ///
-/// `now_unix`/`role`/`status` are the remaining per-format-bar inputs the [`crate::verify`] entry
+/// `now_unix`/`role`/`status` are the remaining per-format-bar inputs the [`verify()`](crate::verify()) entry
 /// point supplies (the validity instant, the trust-anchor role, and the resolved status outcome).
 pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     vp_token: &VpToken<'_>,

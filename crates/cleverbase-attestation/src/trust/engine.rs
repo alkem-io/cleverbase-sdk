@@ -1,14 +1,16 @@
 //! The native EU trust-list engine (research D5 — the biggest single build).
 //!
-//! [`NativeTrustEngine`] is the production [`TrustAnchorSource`]: a host-driven [`Self::refresh`]
+//! [`NativeTrustEngine`] is the production [`TrustAnchorSource`]: a host-driven
+//! [`NativeTrustEngine::refresh`]
 //! **fetches → parses → authenticates → caches** the signed trust lists (the offline JSON manifest
 //! now; a TS 119 612 XML LOTL / national TL via [`super::xml`]), and a pure, sans-IO
-//! [`Self::resolve`] answers issuer-trust questions against the **cached** anchors by chain-
+//! [`NativeTrustEngine::resolve`] answers issuer-trust questions against the **cached** anchors by
+//! chain-
 //! validating the issuer's signing certificate ([`super::chain`]).
 //!
 //! ## Reachability / stale policy (U1, fail-closed by default)
 //!
-//! [`refresh`](Self::refresh) is where the [`Reachability`] policy applies. Three outcomes are kept
+//! [`refresh`](NativeTrustEngine::refresh) is where the [`Reachability`] policy applies. Three outcomes are kept
 //! distinct (the contract's U1 requirement):
 //!
 //! - **Unreachable** — the [`TrustListFetcher`] could not return bytes ([`TrustError::Unreachable`]).

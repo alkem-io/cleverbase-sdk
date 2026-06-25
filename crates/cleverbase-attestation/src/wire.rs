@@ -1,14 +1,14 @@
 //! Versioned CBOR wire envelope for the attestation C-ABI (and WASM) boundary.
 //!
 //! Mirrors `cleverbase-core::wire`: the C-ABI and non-native bindings exchange these CBOR-encoded
-//! envelopes; native bindings can call the typed Rust API ([`crate::verify`]) directly. The envelope
+//! envelopes; native bindings can call the typed Rust API ([`verify()`](crate::verify())) directly. The envelope
 //! carries an [`ATTESTATION_SCHEMA_VERSION`] so a binding can refuse a payload it cannot read
 //! (Principle VII).
 //!
 //! Protocol logic lives **here, in the core** — the `cleverbase-ffi` C-ABI only wraps
 //! [`process_verify_bytes`] in the pointer/length/free dance (Principle III: no protocol logic in
 //! bindings). The `verify` operation is the always-on bar (contracts/verifier.md); this envelope
-//! carries everything the sans-IO [`crate::verify`] entry point needs: the presented credential, the
+//! carries everything the sans-IO [`verify()`](crate::verify()) entry point needs: the presented credential, the
 //! verifier policy, the configured **trust anchors** (resolved by the host-driven trust step and
 //! passed in as `(role, format, cert)` entries — data-model.md `TrustAnchorSource`), the verification
 //! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate

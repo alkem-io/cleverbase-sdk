@@ -13,14 +13,23 @@
 //! workspace `restriction` lints (no `unwrap`/`expect`/`panic`/casts in library code) are relaxed
 //! here — a panic IS the intended failure signal when the fixed test fixtures are wrong.
 //! A few items are deliberately `pub(crate)` for cross-module reuse by the OpenID4VP / verify / wire
-//! test suites, so `redundant_pub_crate` is allowed here.
+//! test suites (and the `test-vectors` feature), so `redundant_pub_crate` is allowed here. The
+//! negative-variant builder methods are only exercised by the in-crate `cfg(test)` suite, so when the
+//! module is compiled under the `test-vectors` feature (without `cfg(test)`) they are unused —
+//! `dead_code` is therefore permitted here.
 #![allow(
+    dead_code,
     clippy::redundant_pub_crate,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::missing_panics_doc,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    // Test-builder ergonomics that the in-crate `cfg(test)` suite gets relaxed via lib.rs's
+    // `cfg_attr(test, allow(...))`; under the `test-vectors` feature this module is compiled WITHOUT
+    // `cfg(test)`, so re-allow them here (the same constructs are intended as test assertions).
+    clippy::assigning_clones,
+    clippy::indexing_slicing
 )]
 
 use ciborium::value::Value as CborValue;

@@ -68,7 +68,7 @@ mkdir -p "$OUT/rust" "$OUT/ts"
 #    stable toolchain (1.94.x -> format_version 57; see rust-toolchain.toml).
 # ---------------------------------------------------------------------------
 echo "==> [1/5] Rust: cargo rustdoc --output-format json -> Markdown"
-for crate in cleverbase-core cleverbase-ffi; do
+for crate in cleverbase-core cleverbase-attestation cleverbase-ffi; do
   json="${crate//-/_}.json"
   RUSTDOCFLAGS="-D warnings" RUSTC_BOOTSTRAP=1 \
     cargo rustdoc -p "$crate" -- -Z unstable-options --output-format json
@@ -82,6 +82,9 @@ Generated from the in-source rustdoc comments of the Rust workspace (rustdoc JSO
 
 - [`cleverbase_core`](cleverbase_core.md) — the sans-IO protocol/crypto core (the state machine,
   PAdES/CMS assembly, RFC 3161 timestamping, the session handle).
+- [`cleverbase_attestation`](cleverbase_attestation.md) — the sans-IO EUDI attestation core (SD-JWT VC
+  + ISO 18013-5 mdoc verification, the native EU trust-list engine, OpenID4VP binding, and the gated
+  OpenID4VCI/OpenID4VP issuance/presentation path).
 - [`cleverbase_ffi`](cleverbase_ffi.md) — the stable C ABI over the core.
 MD
 
@@ -168,7 +171,7 @@ comments and committed to the repo so it is browseable directly on GitHub. Regen
 
 | Surface                    | Source                                               | Section |
 | -------------------------- | ---------------------------------------------------- | ------- |
-| Rust core + C ABI          | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | [`rust/`](rust/README.md) |
+| Rust core + C ABI          | `crates/cleverbase-core` + `crates/cleverbase-attestation` + `crates/cleverbase-ffi` | [`rust/`](rust/README.md) |
 | Go binding (backend)       | `bindings/go` (the public binding package)           | [`go.md`](go.md) |
 | Python binding (backend)   | `bindings/python/cleverbase.pyi` (the public stub)   | [`python.md`](python.md) |
 | Node binding (backend)     | `bindings/node/index.d.ts` (the napi binding)        | [`node/`](node/README.md) |

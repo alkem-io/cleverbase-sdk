@@ -139,7 +139,7 @@ pub struct MdocVerifyParams<'a> {
     /// root; the role selects the per-role/format anchor set).
     pub role: IssuerRole,
     /// The revocation/status outcome (the T014 seam) — the canonical [`StatusOutcome`] the
-    /// [`crate::verify`] entry point resolves through the host status source. Mirrors the SD-JWT VC
+    /// [`verify()`](crate::verify()) entry point resolves through the host status source. Mirrors the SD-JWT VC
     /// status seam so the always-on bar's revocation check covers both formats.
     pub status: StatusOutcome,
 }
@@ -802,7 +802,7 @@ fn verify_cose_sign1_detached_es256(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-vectors"))]
 pub(crate) mod test_issuer;
 #[cfg(test)]
 mod tests;
