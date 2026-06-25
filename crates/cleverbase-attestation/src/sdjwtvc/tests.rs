@@ -683,6 +683,68 @@ fn request_less_presentation_with_a_tampered_kb_sd_hash_is_rejected_as_holder_bi
     assert_invalid(&result, ReasonCode::HolderBinding);
 }
 
+#[test]
+fn kb_jwt_with_lying_es384_alg_header_is_rejected_with_request() {
+    // JOSE ALG-CONFUSION PROBE (with-request path): a PRESENT KB-JWT whose protected header lies as
+    // `alg: ES384` — while the holder still ES256-signs with its P-256 key and the `sd_hash`/`aud`/
+    // `nonce` all match — must be REJECTED. The alg-blind raw-P-256 verify would otherwise accept it
+    // (signature valid over `header.payload`, `sd_hash` correct), violating this module's invariant
+    // (ES256 for issuer AND KB-JWT signatures; HAIP 1.0 §7). The reject is `UnsupportedFormat`,
+    // symmetric with the issuer JWS non-ES256 alg path — NOT a false-accept.
+    let presentation = happy_presentation();
+    let lying = resign_kb_with_alg(&presentation, "ES384");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&lying, &anchors));
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn kb_jwt_with_lying_es384_alg_header_is_rejected_request_less() {
+    // JOSE ALG-CONFUSION PROBE (request-less path): the same `alg: ES384` lie must be rejected even
+    // with no challenge — a present KB-JWT is always cryptographically verified (sig + `sd_hash`), and
+    // the alg header is part of that check. The old alg-blind path would wave this through on the
+    // request-less path too (valid = true); now it is `UnsupportedFormat`.
+    let presentation = happy_presentation();
+    let lying = resign_kb_with_alg(&presentation, "ES384");
+    let anchors = trusted_anchors();
+    let mut inp = input(&lying, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn kb_jwt_with_lying_rs256_alg_header_is_rejected() {
+    // A KB-JWT header lying as `alg: RS256` (any non-ES256, non-`none` value) is likewise rejected:
+    // the verifier accepts ONLY ES256 for the holder binding, regardless of the raw P-256 signature
+    // being valid. (`sd_jwt_payload`'s parse rejects only `alg=="none"`, not a specific alg.)
+    let presentation = happy_presentation();
+    let lying = resign_kb_with_alg(&presentation, "RS256");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&lying, &anchors));
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn kb_jwt_resigned_with_honest_es256_alg_header_still_verifies() {
+    // NO-FALSE-REJECT GUARD: re-signing the KB-JWT with an HONEST `alg: ES256` header (the same rewrite
+    // path the lying-alg probe uses, only with the correct alg) must still VERIFY — the new alg check
+    // fires ONLY on a non-ES256 alg, never on the legitimate ES256 holder binding.
+    let presentation = happy_presentation();
+    let honest = resign_kb_with_alg(&presentation, "ES256");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&honest, &anchors));
+    assert!(
+        result.valid,
+        "an honest ES256 KB-JWT must still verify; reasons {:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
+}
+
 // --- presentation-mutation helpers --------------------------------------------------------------
 
 /// Flip a byte in the middle of the KB-JWT signature (the final `~`-segment), invalidating the
@@ -720,6 +782,36 @@ fn resign_kb_with_wrong_sd_hash(presentation: &str) -> String {
     let header_b64 = parts[0].to_string();
     let payload_b64 =
         Base64UrlUnpadded::encode_string(serde_json::to_vec(&payload).unwrap().as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = p256::ecdsa::SigningKey::from_pkcs8_der(HOLDER_KEY_PK8).unwrap();
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    let new_kb = format!("{signing_input}.{sig_b64}");
+    segments[kb_idx] = &new_kb;
+    segments.join("~")
+}
+
+/// Re-sign the KB-JWT (the final `~`-segment) with the holder key over a **lying `alg` header**: the
+/// protected JOSE header declares `new_alg` (e.g. `ES384`/`RS256`) while the holder still ES256-signs
+/// with its P-256 key, leaving the `sd_hash` and `aud`/`nonce` claims untouched. The resulting KB-JWT
+/// therefore carries a VALID raw P-256 signature over its own `header.payload` AND a matching
+/// `sd_hash` — so it would pass an alg-blind signature check; only an explicit `alg=ES256` header
+/// check can reject it (the JOSE alg-confusion probe for [`super::require_kb_jwt_es256_alg`]).
+fn resign_kb_with_alg(presentation: &str, new_alg: &str) -> String {
+    use p256::ecdsa::signature::Signer as _;
+    use pkcs8::DecodePrivateKey as _;
+
+    let mut segments: Vec<&str> = presentation.split('~').collect();
+    let kb_idx = segments.len() - 1;
+    let parts: Vec<&str> = segments[kb_idx].split('.').collect();
+    // Rewrite the KB-JWT protected header `alg` to the lying value, keep the payload (sd_hash/aud/
+    // nonce) verbatim, then re-sign with the holder key so the signature verifies over the new header.
+    let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
+    let mut header: Value = serde_json::from_slice(&header_json).unwrap();
+    header["alg"] = Value::String(new_alg.to_string());
+    let header_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    let payload_b64 = parts[1].to_string();
     let signing_input = format!("{header_b64}.{payload_b64}");
     let key = p256::ecdsa::SigningKey::from_pkcs8_der(HOLDER_KEY_PK8).unwrap();
     let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());

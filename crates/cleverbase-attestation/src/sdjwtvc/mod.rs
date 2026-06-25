@@ -390,10 +390,45 @@ fn check_holder_binding(
         return Err(ReasonCode::HolderBinding);
     }
 
+    // The KB-JWT's OWN protected JOSE header MUST declare `alg=ES256` — the verifier accepts ES256 for
+    // BOTH the issuer JWS and the KB-JWT (this module's invariant; HAIP 1.0 §7). This is checked HERE,
+    // before the raw P-256 signature is verified, so a present KB-JWT that lies in its header (`alg`:
+    // ES384/RS256/any non-ES256 value) is rejected even though the holder still signs with P-256 and
+    // the `sd_hash` matches — a JOSE alg-confusion guard. A non-ES256 KB-JWT `alg` maps to
+    // [`ReasonCode::UnsupportedFormat`], SYMMETRIC with the issuer JWS path (which rejects a non-ES256
+    // `alg` with the same reason); a genuine signature/framing failure below stays `HolderBinding`.
+    require_kb_jwt_es256_alg(&kb_compact)?;
+
     // Verify the KB-JWT ES256 signature under the holder key bound by the issuer in `cnf`. Always
     // verified for a present KB-JWT (the holder-possession proof, independent of any challenge).
     let holder_key = holder_key_from_cnf(sd_jwt)?;
     verify_compact_es256(&kb_compact, &holder_key).map_err(|()| ReasonCode::HolderBinding)
+}
+
+/// Require the compact KB-JWT's protected JOSE header to declare `alg=ES256` (RFC 7515 §4.1.1), the
+/// only signature algorithm this verifier accepts for the holder Key-Binding JWT (HAIP 1.0 §7).
+///
+/// This is the holder-binding counterpart of the issuer JWS alg check in [`verify_issuer_signature`]
+/// and rejects a non-ES256 `alg` with the SAME [`ReasonCode::UnsupportedFormat`], so the two
+/// signature paths are symmetric. Without it, a present KB-JWT whose header lies (`alg`: ES384/RS256/
+/// any non-ES256 value) would be waved through as long as the holder still raw-signs with P-256 and
+/// the `sd_hash` matches — a JOSE alg-confusion false-accept that violates this module's own invariant
+/// (ES256 for issuer AND KB-JWT signatures; `sd_jwt_payload`'s parse only rejects `alg=="none"` and
+/// `typ`, NOT the specific alg). A KB-JWT header that does not decode as JSON with a string `alg` is a
+/// malformed holder binding ([`ReasonCode::HolderBinding`]).
+fn require_kb_jwt_es256_alg(kb_compact: &str) -> Result<(), ReasonCode> {
+    let header_b64 = kb_compact
+        .split('.')
+        .next()
+        .ok_or(ReasonCode::HolderBinding)?;
+    let header_json =
+        Base64UrlUnpadded::decode_vec(header_b64).map_err(|_| ReasonCode::HolderBinding)?;
+    let header: Value =
+        serde_json::from_slice(&header_json).map_err(|_| ReasonCode::HolderBinding)?;
+    if header.get("alg").and_then(Value::as_str) != Some(ES256) {
+        return Err(ReasonCode::UnsupportedFormat);
+    }
+    Ok(())
 }
 
 /// Extract the holder's P-256 verifying key from the issuer-signed `cnf` confirmation (RFC 7800):
