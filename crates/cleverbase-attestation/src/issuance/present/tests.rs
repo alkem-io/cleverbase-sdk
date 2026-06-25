@@ -371,7 +371,15 @@ fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
         result.reasons
     );
     // The issued elements are revealed (family_name/given_name/age_over_18 from the issuer double).
-    assert!(result.disclosed_attributes.contains_key("family_name"));
+    // mdoc disclosed attributes are GROUPED BY NAMESPACE (`{ ns: Map({ id: value }) }`); the default
+    // namespace is `org.iso.18013.5.1`.
+    assert!(
+        matches!(
+            result.disclosed_attributes.get("org.iso.18013.5.1"),
+            Some(crate::types::AttributeValue::Map(ns)) if ns.contains_key("family_name")
+        ),
+        "family_name is disclosed under the org.iso.18013.5.1 namespace"
+    );
 }
 
 #[test]

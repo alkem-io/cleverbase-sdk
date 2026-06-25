@@ -109,23 +109,31 @@ fn iso_18013_5_annex_d_issuer_auth_verifies_under_the_sdk_verifier() {
 
     // The Annex-D mDL discloses these org.iso.18013.5.1 elements (family_name, issue_date,
     // expiry_date, document_number, portrait, driving_privileges) plus the US-namespace elements; the
-    // valueDigests recompute proved each one's integrity against the MSO. Assert the canonical ones.
+    // valueDigests recompute proved each one's integrity against the MSO. The disclosed attributes are
+    // GROUPED BY NAMESPACE (`{ ns: Map({ id: value }) }` — `elementIdentifier`s are unique only within a
+    // namespace), so read the canonical ones from the `org.iso.18013.5.1` namespace's sub-map.
+    let iso = match disclosed.get("org.iso.18013.5.1") {
+        Some(AttributeValue::Map(ns_map)) => ns_map,
+        _ => {
+            panic!("the org.iso.18013.5.1 namespace is present in the namespace-grouped disclosure")
+        }
+    };
     assert_eq!(
-        disclosed.get("family_name"),
+        iso.get("family_name"),
         Some(&AttributeValue::Text("Doe".to_owned())),
         "the Annex-D family_name disclosed item verified against its MSO digest"
     );
     assert_eq!(
-        disclosed.get("document_number"),
+        iso.get("document_number"),
         Some(&AttributeValue::Text("123456789".to_owned())),
         "the Annex-D document_number disclosed item verified against its MSO digest"
     );
     assert!(
-        disclosed.contains_key("portrait"),
+        iso.contains_key("portrait"),
         "the Annex-D portrait (a large bstr) verified against its MSO digest"
     );
     assert!(
-        disclosed.contains_key("driving_privileges"),
+        iso.contains_key("driving_privileges"),
         "the Annex-D driving_privileges (a CBOR array) verified against its MSO digest"
     );
 }

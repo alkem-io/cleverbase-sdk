@@ -18,6 +18,31 @@ use crate::types::{AttributeValue, Format, IssuerRole, ReasonCode, TrustStatus};
 /// The verification instant (2024-06-01T00:00:00Z) — inside the default issued window.
 const NOW: i64 = 1_717_200_000;
 
+/// The default ISO/IEC 18013-5 namespace the test issuer mints elements under (`MdocBuilder::new`).
+const DEFAULT_NS: &str = "org.iso.18013.5.1";
+
+/// Read a disclosed attribute out of the namespace-grouped result map (`{ ns: Map({ id: value }) }`,
+/// the mdoc disclosed-attributes shape) under the DEFAULT namespace. `None` when the namespace or id is
+/// absent (or the namespace value is not a map).
+fn disclosed_attr<'a>(
+    result: &'a crate::types::VerificationResult,
+    id: &str,
+) -> Option<&'a AttributeValue> {
+    disclosed_in(result, DEFAULT_NS, id)
+}
+
+/// Read a disclosed attribute under an EXPLICIT namespace from the namespace-grouped result map.
+fn disclosed_in<'a>(
+    result: &'a crate::types::VerificationResult,
+    namespace: &str,
+    id: &str,
+) -> Option<&'a AttributeValue> {
+    match result.disclosed_attributes.get(namespace) {
+        Some(AttributeValue::Map(ns_map)) => ns_map.get(id),
+        _ => None,
+    }
+}
+
 /// Anchors trusting the test DS cert as a PID/mdoc issuer (the role the params use).
 fn trusted_anchors() -> StaticTestAnchors {
     StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der())
@@ -67,18 +92,24 @@ fn valid_mdoc_verifies_and_returns_disclosed_attributes() {
     assert_eq!(result.trust_status, TrustStatus::Trusted);
     assert!(result.qualified_status.is_none());
 
-    // The three disclosed elements are returned, decoded to AttributeValue.
+    // The three disclosed elements are returned, decoded to AttributeValue, GROUPED under their
+    // namespace (the namespace-grouped mdoc shape — `{ ns: Map({ id: value }) }`).
     assert_eq!(
-        result.disclosed_attributes.get("family_name"),
+        disclosed_attr(&result, "family_name"),
         Some(&AttributeValue::Text("Doe".to_owned()))
     );
     assert_eq!(
-        result.disclosed_attributes.get("given_name"),
+        disclosed_attr(&result, "given_name"),
         Some(&AttributeValue::Text("Ada".to_owned()))
     );
     assert_eq!(
-        result.disclosed_attributes.get("age_over_18"),
+        disclosed_attr(&result, "age_over_18"),
         Some(&AttributeValue::Boolean(true))
+    );
+    // The top-level result key is the NAMESPACE; the elements live in its sub-map.
+    assert!(
+        result.disclosed_attributes.contains_key(DEFAULT_NS),
+        "disclosed attributes are grouped under the ISO namespace, not flat by id"
     );
 }
 
@@ -217,7 +248,7 @@ fn sha384_digest_algorithm_verifies() {
         .build();
     let result = verify(&response, &trusted_anchors(), &params());
     assert!(result.valid, "a SHA-384 MSO must verify");
-    assert!(result.disclosed_attributes.contains_key("given_name"));
+    assert!(disclosed_attr(&result, "given_name").is_some());
 }
 
 #[test]
@@ -367,14 +398,16 @@ fn heterogeneous_element_values_decode_to_attribute_values() {
     let result = verify(&response, &trusted_anchors(), &params());
     assert!(result.valid, "heterogeneous values must verify");
 
-    let attrs = &result.disclosed_attributes;
-    assert_eq!(attrs.get("age"), Some(&AttributeValue::Integer(42)));
     assert_eq!(
-        attrs.get("portrait"),
+        disclosed_attr(&result, "age"),
+        Some(&AttributeValue::Integer(42))
+    );
+    assert_eq!(
+        disclosed_attr(&result, "portrait"),
         Some(&AttributeValue::Bytes(vec![0xDE, 0xAD]))
     );
     assert_eq!(
-        attrs.get("tags"),
+        disclosed_attr(&result, "tags"),
         Some(&AttributeValue::Array(vec![
             AttributeValue::Text("a".to_owned()),
             AttributeValue::Null,
@@ -382,8 +415,14 @@ fn heterogeneous_element_values_decode_to_attribute_values() {
     );
     let mut want = std::collections::BTreeMap::new();
     want.insert("city".to_owned(), AttributeValue::Text("London".to_owned()));
-    assert_eq!(attrs.get("address"), Some(&AttributeValue::Map(want)));
-    assert_eq!(attrs.get("absent"), Some(&AttributeValue::Null));
+    assert_eq!(
+        disclosed_attr(&result, "address"),
+        Some(&AttributeValue::Map(want))
+    );
+    assert_eq!(
+        disclosed_attr(&result, "absent"),
+        Some(&AttributeValue::Null)
+    );
 }
 
 #[test]
@@ -543,6 +582,34 @@ fn issuer_auth_non_es256_alg_is_rejected_as_tamper() {
 }
 
 #[test]
+fn cose_der_encoded_issuer_auth_signature_is_rejected_raw_accepted() {
+    // RFC 9053 §2.1 (ECDSA, the COSE algorithm) mandates the signature be the fixed-width raw `r‖s`
+    // concatenation (`I2OSP(R, n) | I2OSP(S, n)`), NEVER an ASN.1/DER `SEQUENCE`. A DER-encoded
+    // COSE_Sign1 signature is a valid ECDSA signature but a non-conformant ENCODING — a reference COSE
+    // validator rejects what a DER-tolerant verifier would accept. The SDK's COSE path must therefore
+    // reject the DER form (`Tamper`): the `from_der` fallback was dropped from `verify_p256_es256_sig`.
+    let der = MdocBuilder::new().issuer_auth_der_signature().build();
+    let result = verify(&der, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a DER-encoded COSE_Sign1 ES256 signature must NOT verify (RFC 9053 §2.1 mandates raw r‖s)"
+    );
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::Tamper],
+        "a non-conformant DER signature encoding is a Tamper-class reject"
+    );
+
+    // Positive control: the SAME credential WITHOUT the DER re-encode (the default builder mints raw
+    // `r‖s`) verifies — so the rejection above is the encoding, not any other bar check.
+    let raw = MdocBuilder::new().build();
+    assert!(
+        verify(&raw, &trusted_anchors(), &params()).valid,
+        "the raw fixed-width r‖s COSE signature is the accepted form"
+    );
+}
+
+#[test]
 fn tagged_issuer_auth_cose_sign1_verifies() {
     // The `#6.18`-tagged COSE_Sign1 form is accepted (defensive parse path).
     let response = MdocBuilder::new().tag_issuer_auth().build();
@@ -634,11 +701,11 @@ fn forged_item_reusing_a_genuine_digest_id_is_rejected_no_disclosure() {
             "an INVALID verdict discloses nothing — the forged claim never surfaces"
         );
         assert!(
-            !result.disclosed_attributes.contains_key("forged_claim"),
+            disclosed_attr(&result, "forged_claim").is_none(),
             "the attacker-chosen claim the issuer never signed must NEVER be disclosed"
         );
         assert_ne!(
-            result.disclosed_attributes.get("family_name"),
+            disclosed_attr(&result, "family_name"),
             Some(&AttributeValue::Text("EVIL".to_owned())),
             "the forged value must never be served under any identifier"
         );
@@ -694,9 +761,10 @@ fn cross_document_attribute_collision_is_rejected_no_silent_shadow() {
         "an INVALID verdict discloses nothing — the shadowing value never surfaces"
     );
     // Prove the shadow specifically did NOT win (defence in depth against a future regression that
-    // returns attributes on this path).
+    // returns attributes on this path). Both documents disclose under the SAME default namespace, so
+    // this is a genuine same-(namespace, id) conflict.
     assert_ne!(
-        result.disclosed_attributes.get("given_name"),
+        disclosed_attr(&result, "given_name"),
         Some(&AttributeValue::Text("EVIL".to_owned())),
         "the second document's value must never shadow the first"
     );
@@ -716,12 +784,12 @@ fn cross_document_distinct_identifiers_merge_cleanly() {
         result.reasons
     );
     assert_eq!(
-        result.disclosed_attributes.get("given_name"),
+        disclosed_attr(&result, "given_name"),
         Some(&AttributeValue::Text("Ada".to_owned())),
         "the first document's claim is preserved"
     );
     assert_eq!(
-        result.disclosed_attributes.get("nationality"),
+        disclosed_attr(&result, "nationality"),
         Some(&AttributeValue::Text("NL".to_owned())),
         "the second document's distinct claim is surfaced too"
     );
@@ -741,9 +809,44 @@ fn cross_document_identical_redisclosure_is_accepted() {
         result.reasons
     );
     assert_eq!(
-        result.disclosed_attributes.get("given_name"),
+        disclosed_attr(&result, "given_name"),
         Some(&AttributeValue::Text("Ada".to_owned()))
     );
+}
+
+#[test]
+fn multi_namespace_same_id_different_values_is_valid_and_namespace_distinguished() {
+    // MULTI-NAMESPACE PROBE (fix #1): `documents[0]` discloses given_name="Ada" under the default ISO
+    // namespace; a SECOND fully-VALID document (same trusted DS) discloses given_name="Grace" under a
+    // DIFFERENT namespace. ISO/IEC 18013-5 `elementIdentifier`s are unique only WITHIN a namespace, so
+    // the same id in two namespaces is a DISTINCT attribute — a flat bare-id merge would FALSE-REJECT
+    // this legitimate presentation as `DisclosureIntegrity`. With namespace-grouped disclosure the
+    // response is VALID and BOTH values are surfaced, each under its own namespace (never collided,
+    // provenance preserved).
+    const OTHER_NS: &str = "org.example.secondary";
+    let response = MdocBuilder::new()
+        .append_document_in_namespace(OTHER_NS, "given_name", CborValue::Text("Grace".to_owned()))
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        result.valid,
+        "the same id in two DIFFERENT namespaces is not a collision — must be VALID: {:?}",
+        result.reasons
+    );
+    // Both `given_name`s are present, namespace-distinguished.
+    assert_eq!(
+        disclosed_in(&result, DEFAULT_NS, "given_name"),
+        Some(&AttributeValue::Text("Ada".to_owned())),
+        "the default-namespace given_name is preserved"
+    );
+    assert_eq!(
+        disclosed_in(&result, OTHER_NS, "given_name"),
+        Some(&AttributeValue::Text("Grace".to_owned())),
+        "the second namespace's same-id given_name is a DISTINCT attribute, surfaced too"
+    );
+    // The two namespaces are distinct top-level keys (provenance preserved, never merged into one id).
+    assert!(result.disclosed_attributes.contains_key(DEFAULT_NS));
+    assert!(result.disclosed_attributes.contains_key(OTHER_NS));
 }
 
 #[test]

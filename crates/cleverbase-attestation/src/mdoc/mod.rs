@@ -37,6 +37,15 @@ use crate::types::{
     AttributeValue, IssuerRole, ReasonCode, TrustStatus, Validity, VerificationResult,
 };
 
+/// The disclosed attributes of an mdoc, GROUPED BY NAMESPACE: `{ namespace → { elementIdentifier →
+/// elementValue } }`. ISO/IEC 18013-5 `elementIdentifier`s are unique only WITHIN a namespace, so the
+/// disclosure is a nested map keyed first by namespace (so the same `id` in two namespaces is a
+/// distinct attribute, never a collision) and then by identifier. The verifier carries this strongly-
+/// typed nested shape internally — it cannot be anything but a map by construction — and projects it to
+/// the public [`VerificationResult::disclosed_attributes`] shape (`{ namespace → AttributeValue::Map }`)
+/// once, at the end of [`verify_inner`], via [`namespace_grouped_attributes`].
+type DisclosedByNamespace = BTreeMap<String, BTreeMap<String, AttributeValue>>;
+
 /// The CBOR tag for an "encoded CBOR data item" (`#6.24`) — re-exported from the crate-level
 /// [`crate::TAG_ENCODED_CBOR`] (the one authoritative definition; DRY — Principle III) so this
 /// module's match arms and the test helper read it under the local name.
@@ -177,6 +186,18 @@ impl Default for MdocVerifyParams<'_> {
 /// is essential: a verdict that covered only `documents[0]` would let a forged second document ride
 /// inside a VALID result unverified.
 ///
+/// ## Disclosed-attributes shape (mdoc: namespace-grouped)
+///
+/// [`VerificationResult::disclosed_attributes`] for an mdoc is GROUPED BY NAMESPACE: each top-level key
+/// is an ISO/IEC 18013-5 namespace, and its value is an [`AttributeValue::Map`] of that namespace's
+/// `{ elementIdentifier: elementValue }` — i.e. `{ "org.iso.18013.5.1": Map({ "given_name": … }), … }`.
+/// `elementIdentifier`s are unique only WITHIN a namespace, so a presentation MAY legitimately carry the
+/// SAME id (e.g. `given_name`) in two namespaces with different values; grouping by namespace keeps
+/// those distinct (never a false `DisclosureIntegrity` reject) and preserves the namespace provenance a
+/// consumer needs. Across multiple documents the namespaces merge, with a same-`(namespace, id)`
+/// conflicting value rejected as `DisclosureIntegrity` (an identical re-disclosure merges cleanly).
+/// (This shape is mdoc-specific; SD-JWT VC keeps its own claim layout. See contracts/verifier.md.)
+///
 /// `anchors` is the configured trust-anchor source (the IACA root for mdoc); `params` carries the
 /// verification instant, the session transcript for the holder binding, and the issuer role.
 #[must_use]
@@ -270,7 +291,12 @@ fn classify_device_binding(device_response: &[u8]) -> Option<bool> {
 /// Whether a single `Document`'s `DeviceAuth` holder-binding machinery is structurally sound: the
 /// `DeviceAuth` carries a `DeviceSignature` (not `DeviceMac`-only), its protected alg is ES256, the
 /// MSO `DeviceKey` parses to a P-256 key, and the `DeviceSignature` bytes form a well-formed ES256
-/// (`r‖s` or DER) signature. No payload is checked (transcript-independent).
+/// fixed-width raw `r‖s` signature. No payload is checked (transcript-independent).
+///
+/// The well-formed test matches the verifier's accepted-signature set exactly (raw `r‖s` only — RFC
+/// 9053 §2.1; see [`verify_p256_es256_sig`]): a DER-encoded COSE signature is NOT well-formed here, so
+/// it is classified `Faulty` — a genuine, transcript-INDEPENDENT binding fault that the verifier now
+/// rejects for any transcript, never a freshness/replay signal.
 fn device_binding_machinery_sound(document: &CborValue) -> bool {
     let check = || -> Option<bool> {
         // The MSO DeviceKey must parse (a malformed key is a binding fault, not a freshness issue).
@@ -299,8 +325,9 @@ fn device_binding_machinery_sound(document: &CborValue) -> bool {
             return Some(false);
         }
         let sig = &device_signature.signature;
-        let well_formed = p256::ecdsa::Signature::from_slice(sig).is_ok()
-            || p256::ecdsa::Signature::from_der(sig).is_ok();
+        // Raw fixed-width `r‖s` ONLY (RFC 9053 §2.1) — the same accepted set the verifier enforces.
+        // A DER-encoded signature is a structural fault (fails for any transcript), not a freshness mismatch.
+        let well_formed = p256::ecdsa::Signature::from_slice(sig).is_ok();
         Some(well_formed)
     };
     // A document too malformed to inspect is conservatively NOT sound (fault, never a silent replay).
@@ -308,7 +335,10 @@ fn device_binding_machinery_sound(document: &CborValue) -> bool {
 }
 
 /// The disclosed attributes recovered by the **issuer-side** conformance verification of an mdoc
-/// `DeviceResponse`'s first document, keyed by `elementIdentifier`.
+/// `DeviceResponse`'s first document, GROUPED BY NAMESPACE: keyed by namespace, each value an
+/// [`AttributeValue::Map`] of that namespace's `{ elementIdentifier: elementValue }` (the same
+/// namespace-grouped shape [`verify`] returns — `elementIdentifier`s are unique only within a
+/// namespace, ISO/IEC 18013-5).
 ///
 /// Returned by [`verify_issuer_auth_against_vector`] — the external-vector entry that runs the
 /// issuer-side bar (IssuerAuth signature + DS trust + MSO validity + `valueDigests` recompute) without
@@ -353,7 +383,9 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
         let raw_items = scan_raw_issuer_items(device_response);
         let verified =
             verify_issuer_signed(issuer_signed, raw_items.first(), anchors, &doc_type, params)?;
-        Ok(verified.disclosed)
+        // Project the internal nested disclosure to the public namespace-grouped wire shape
+        // (`{ ns: AttributeValue::Map({ id: value }) }`) — the same shape `verify` returns.
+        Ok(namespace_grouped_attributes(verified.disclosed))
     };
     run().map_err(|failure| failure.reason)
 }
@@ -401,28 +433,49 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let raw_items = scan_raw_issuer_items(device_response);
 
     // Verify EVERY document; the verdict is VALID only if all pass. Disclosed attributes are merged
-    // across documents into the single result map WITHOUT silent shadowing: a second authentic
-    // document (same trusted DS, or a holder presenting two credentials) MUST NOT be able to overwrite
-    // a claim a consumer reads with a conflicting value. A same-identifier clash with a different value
+    // across documents into the single namespace-grouped result map (`{ ns: Map({ id: value }) }`)
+    // WITHOUT silent shadowing: a second authentic document (same trusted DS, or a holder presenting two
+    // credentials) MUST NOT be able to overwrite a claim a consumer reads with a conflicting value. The
+    // conflict rule is keyed on the FULL `(namespace, id)` — the SAME `id` in two different namespaces
+    // is a DISTINCT attribute and never collides. A same-`(namespace, id)` clash with a different value
     // is rejected (`DisclosureIntegrity`); an identical re-disclosure is harmless and merges cleanly.
-    let mut disclosed = BTreeMap::new();
+    let mut disclosed: DisclosedByNamespace = BTreeMap::new();
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
         let doc_raw_items = raw_items.get(index);
         let doc_disclosed = verify_one_document(document, doc_raw_items, anchors, params)?;
-        for (identifier, value) in doc_disclosed {
-            insert_no_shadow(&mut disclosed, identifier, value)?;
+        // `doc_disclosed` is namespace-grouped (`{ ns: { id: value } }`); merge each `(namespace, id,
+        // value)` triple so the cross-document no-shadow rule is keyed per `(namespace, id)`.
+        for (namespace, ns_map) in doc_disclosed {
+            for (identifier, value) in ns_map {
+                insert_no_shadow(&mut disclosed, &namespace, identifier, value)?;
+            }
         }
     }
 
     Ok(VerificationResult {
         valid: true,
-        disclosed_attributes: disclosed,
+        // Project the strongly-typed nested disclosure to the public wire shape (`{ ns:
+        // AttributeValue::Map({ id: value }) }`) exactly once, at the boundary.
+        disclosed_attributes: namespace_grouped_attributes(disclosed),
         trust_status: TrustStatus::Trusted,
         qualified_status: None,
         reasons: Vec::new(),
     })
+}
+
+/// Project the strongly-typed namespace-grouped disclosure (`{ ns → { id → value } }`) to the public
+/// [`VerificationResult::disclosed_attributes`] shape: `{ ns → AttributeValue::Map({ id → value }) }`.
+/// The single place the internal nested map becomes the wire `AttributeValue` shape (so the merge logic
+/// never has to re-unwrap an `AttributeValue::Map`).
+fn namespace_grouped_attributes(
+    disclosed: DisclosedByNamespace,
+) -> BTreeMap<String, AttributeValue> {
+    disclosed
+        .into_iter()
+        .map(|(namespace, ns_map)| (namespace, AttributeValue::Map(ns_map)))
+        .collect()
 }
 
 /// Enforce the top-level `DeviceResponse.status` (ISO/IEC 18013-5 §8.3.2.1.2.2): the field is an
@@ -440,7 +493,8 @@ fn enforce_device_response_status(root: &CborValue) -> Result<(), VerifyFailure>
     }
 }
 
-/// Run the full always-on bar over a single `Document`, returning its disclosed attributes on success.
+/// Run the full always-on bar over a single `Document`, returning its disclosed attributes (GROUPED BY
+/// NAMESPACE — `{ ns: { id: value } }`; see [`verify_value_digests`]) on success.
 ///
 /// `raw_items` is the on-wire `IssuerSignedItemBytes` captured for THIS document (keyed by
 /// `(namespace, digestID)`), the digest input ISO/IEC 18013-5 §9.2.2.5 hashes; `None` when the raw
@@ -450,7 +504,7 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
     params: &MdocVerifyParams<'_>,
-) -> Result<BTreeMap<String, AttributeValue>, VerifyFailure> {
+) -> Result<DisclosedByNamespace, VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
@@ -469,8 +523,9 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
 /// (after the `valueDigests` integrity recompute) and the MSO `DeviceKey` the holder binding is
 /// checked against.
 struct IssuerVerified {
-    /// The disclosed attributes, after each `IssuerSignedItem` digest was recomputed and matched.
-    disclosed: BTreeMap<String, AttributeValue>,
+    /// The disclosed attributes (GROUPED BY NAMESPACE — `{ ns: { id: value } }`), after each
+    /// `IssuerSignedItem` digest was recomputed and matched. See [`verify_value_digests`].
+    disclosed: DisclosedByNamespace,
     /// The holder's `DeviceKey` extracted from the MSO (the input to the `DeviceAuth` binding check).
     device_key: DeviceKey,
 }
@@ -1115,22 +1170,27 @@ fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), Ver
     outcome.map_err(|()| VerifyFailure::reason(ReasonCode::Tamper))
 }
 
-/// Verify a raw P-256 ES256 signature `sig_bytes` over `tbs` under `vk`, accepting the COSE/JOSE raw
-/// `r‖s` fixed-width form with a DER (`SEQUENCE`) fallback. The **one** ES256-signature-bytes check
-/// shared by both the attached (`IssuerAuth`) and detached (`DeviceSignature`) COSE_Sign1 verifiers
-/// (DRY — Principle III): both previously transcribed the identical
-/// `from_slice(sig).or_else(from_der)? → vk.verify(tbs, &sig)` body; the byte-level
-/// accepted-signature set is identical at both sites. Returns `Err(())` on a malformed signature
-/// encoding or a failed verification (no hand-rolled crypto — the SDK's `p256`/`ecdsa`).
+/// Verify a P-256 ES256 signature `sig_bytes` over `tbs` under `vk`, accepting ONLY the COSE
+/// fixed-width raw `r‖s` form. The **one** ES256-signature-bytes check shared by both the attached
+/// (`IssuerAuth`) and detached (`DeviceSignature`) COSE_Sign1 verifiers (DRY — Principle III): both
+/// transcribe the identical `from_slice(sig)? → vk.verify(tbs, &sig)` body; the byte-level
+/// accepted-signature set is identical at both sites.
+///
+/// RFC 9053 §2.1 (ECDSA, the COSE algorithm definition) mandates the signature be the concatenation
+/// of `R` and `S` as fixed-width octet strings — `Signature = I2OSP(R, n) | I2OSP(S, n)`,
+/// `n = ceil(key_length / 8)` — i.e. the raw 64-byte `r‖s` for P-256, NEVER an ASN.1/DER `SEQUENCE`.
+/// A DER-encoded COSE_Sign1 signature is non-conformant (a reference COSE validator rejects what a
+/// DER-tolerant verifier would accept), so the DER fallback is dropped here: only `from_slice`
+/// (fixed-width raw) is accepted. (The JOSE/SD-JWT VC path `verify_compact_es256` is likewise
+/// raw-only, per RFC 7515/7518.) Returns `Err(())` on a non-raw/malformed signature encoding or a
+/// failed verification (no hand-rolled crypto — the SDK's `p256`/`ecdsa`).
 fn verify_p256_es256_sig(
     vk: &p256::ecdsa::VerifyingKey,
     sig_bytes: &[u8],
     tbs: &[u8],
 ) -> Result<(), ()> {
     use p256::ecdsa::signature::Verifier as _;
-    let signature = p256::ecdsa::Signature::from_slice(sig_bytes)
-        .map_err(|_| ())
-        .or_else(|()| p256::ecdsa::Signature::from_der(sig_bytes).map_err(|_| ()))?;
+    let signature = p256::ecdsa::Signature::from_slice(sig_bytes).map_err(|_| ())?;
     vk.verify(tbs, &signature).map_err(|_| ())
 }
 
@@ -1223,7 +1283,17 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
 // =================================================================================================
 
 /// Recompute every on-wire `IssuerSignedItem` digest and match it against the MSO `valueDigests`,
-/// returning the disclosed attributes only for items whose digest matches.
+/// returning the disclosed attributes (GROUPED BY NAMESPACE) only for items whose digest matches.
+///
+/// ## Result shape (namespace-grouped)
+///
+/// ISO/IEC 18013-5 `elementIdentifier`s are unique only WITHIN a namespace — a valid presentation MAY
+/// carry the SAME identifier (e.g. `given_name`) in two different namespaces with different values. The
+/// returned map ([`DisclosedByNamespace`]) is therefore keyed by **namespace**, each value the nested
+/// `{ elementIdentifier: elementValue }` map for that namespace: `{ ns: { id: value } }`. This (i) never
+/// false-rejects two distinct `(namespace, id)` pairs that merely share an `id`, and (ii) preserves the
+/// namespace provenance a consumer needs to tell the two apart. (It is projected to the public
+/// `{ ns: AttributeValue::Map }` shape once in [`verify_inner`] — see [`verify`] / contracts/verifier.md.)
 ///
 /// The disclosure works from the [`scan_raw_issuer_items`] **records** (`raw_items`): each record
 /// carries the item's exact `IssuerSignedItemBytes` span (`#6.24(bstr .cbor IssuerSignedItem)`)
@@ -1231,9 +1301,9 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
 /// For each record the digest is computed over its OWN `raw_bytes` — the bytes as received (ISO/IEC
 /// 18013-5 §9.2.2.5: "the input for the digest function is the binary data of the IssuerSignedItem"),
 /// never a re-encode — and matched against `valueDigests[ns][digestID]`; ONLY on a match is that
-/// record's OWN identifier/value disclosed. Because the hashed bytes and the disclosed value are one
-/// inseparable record, a forged item cannot hash a genuine item's bytes while disclosing an
-/// attacker-chosen claim (SC-002 — the selective-disclosure-integrity false-accept).
+/// record's OWN identifier/value disclosed under its namespace. Because the hashed bytes and the
+/// disclosed value are one inseparable record, a forged item cannot hash a genuine item's bytes while
+/// disclosing an attacker-chosen claim (SC-002 — the selective-disclosure-integrity false-accept).
 ///
 /// Integrity rules (all → `DisclosureIntegrity`):
 /// * `digestID` uniqueness within a namespace — a `digestID` appearing on two on-wire items is
@@ -1253,7 +1323,7 @@ fn verify_value_digests(
     raw_items: Option<&RawDocumentItems<'_>>,
     mso: &CborValue,
     digest_alg: DigestAlgorithm,
-) -> Result<BTreeMap<String, AttributeValue>, VerifyFailure> {
+) -> Result<DisclosedByNamespace, VerifyFailure> {
     let name_spaces = get_map_entry(issuer_signed, "nameSpaces")
         .and_then(CborValue::as_map)
         .ok_or_else(VerifyFailure::malformed)?;
@@ -1265,7 +1335,7 @@ fn verify_value_digests(
     let raw_items =
         raw_items.ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
 
-    let mut disclosed = BTreeMap::new();
+    let mut disclosed: DisclosedByNamespace = BTreeMap::new();
     for (ns_key, items_value) in name_spaces {
         let ns = ns_key.as_text().ok_or_else(VerifyFailure::malformed)?;
         let decoded_items = items_value
@@ -1312,13 +1382,15 @@ fn verify_value_digests(
                 return Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity));
             }
 
-            // The disclosed map is keyed by `elementIdentifier` alone (the format's flat claim view),
-            // but a credential MAY carry the same identifier in more than one namespace. Merging
-            // last-writer-wins would let one namespace silently SHADOW another's value, so insert
-            // without overwriting a conflicting value — a clash is a structurally untrustworthy
-            // disclosure set (a consumer cannot know which value is authoritative).
+            // Disclose this record's `(identifier → value)` UNDER its namespace (the namespace-grouped
+            // shape — `elementIdentifier`s are unique only within a namespace, ISO/IEC 18013-5). Insert
+            // without ever silently shadowing a CONFLICTING value for the SAME `(namespace, id)` — a
+            // same-key clash with a different value is a structurally untrustworthy disclosure set (a
+            // consumer cannot know which value is authoritative); an identical re-disclosure is harmless.
+            // Two namespaces carrying the same `id` land in distinct sub-maps and never collide.
             insert_no_shadow(
                 &mut disclosed,
+                ns,
                 record.identifier.clone(),
                 record.element_value.clone(),
             )?;
@@ -1327,28 +1399,34 @@ fn verify_value_digests(
     Ok(disclosed)
 }
 
-/// Insert a disclosed attribute into `map` without ever silently shadowing an existing entry.
+/// Insert a disclosed `(namespace, identifier) → value` into the namespace-grouped `map` without ever
+/// silently shadowing an existing entry.
 ///
-/// The disclosed map is keyed by `elementIdentifier` alone (the flat claim view consumers read). If
-/// the same identifier is disclosed more than once — across namespaces within a document, or across
-/// documents in a multi-credential response — a *conflicting* value MUST NOT silently overwrite an
-/// earlier one (a consumer reading `given_name` could otherwise be served a second, attacker-chosen
-/// document's value). An identical re-disclosure is harmless (no shadowing of a different value) and
-/// is accepted; a conflicting one is rejected as a structurally untrustworthy disclosure set.
+/// `map` ([`DisclosedByNamespace`]) is keyed by namespace, each value the nested `{ identifier: value }`
+/// map for that namespace. ISO/IEC 18013-5 `elementIdentifier`s are unique only WITHIN a namespace, so
+/// the conflict rule is keyed on the FULL `(namespace, identifier)`: two namespaces carrying the same
+/// `id` land in distinct sub-maps and NEVER collide (they are different attributes). A clash on the
+/// SAME `(namespace, id)` with a DIFFERENT value MUST NOT silently overwrite an earlier one — across
+/// documents in a multi-credential response, a consumer reading that attribute could otherwise be
+/// served a second, attacker-chosen document's value — so it is rejected as a structurally
+/// untrustworthy disclosure set. An identical re-disclosure (same value) is harmless and accepted.
 fn insert_no_shadow(
-    map: &mut BTreeMap<String, AttributeValue>,
+    map: &mut DisclosedByNamespace,
+    namespace: &str,
     identifier: String,
     value: AttributeValue,
 ) -> Result<(), VerifyFailure> {
-    match map.get(&identifier) {
-        // A genuine collision with a DIFFERENT value: one disclosure would shadow the other — reject.
+    // Reach (or create) this namespace's `{ id: value }` sub-map.
+    let ns_map = map.entry(namespace.to_owned()).or_default();
+    match ns_map.get(&identifier) {
+        // A genuine same-(namespace,id) collision with a DIFFERENT value: one would shadow the other.
         Some(existing) if *existing != value => {
             Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity))
         }
-        // Same identifier, same value (or first sighting): no shadowing risk.
+        // Same `(namespace, id)`, same value (or first sighting): no shadowing risk.
         Some(_) => Ok(()),
         None => {
-            map.insert(identifier, value);
+            ns_map.insert(identifier, value);
             Ok(())
         }
     }
@@ -1576,7 +1654,7 @@ fn verify_cose_sign1_detached_es256(
     let verifying_key =
         p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| ())?;
     // The detached coset call (`verify_detached_signature`) stays distinct from the attached path's
-    // `verify_signature`; only the inner raw-`r‖s`-with-DER-fallback ES256 check is shared (DRY).
+    // `verify_signature`; only the inner raw-`r‖s` ES256 check is shared (DRY).
     sign1.verify_detached_signature(payload, &[], |sig, tbs| {
         verify_p256_es256_sig(&verifying_key, sig, tbs)
     })
@@ -1633,52 +1711,89 @@ mod unit {
         );
     }
 
+    /// Read a disclosed `(namespace, id)` out of the namespace-grouped nested map (`{ ns: { id: value }
+    /// }`, [`super::DisclosedByNamespace`]) — the shape `insert_no_shadow` / `verify_value_digests` build.
+    fn ns_attr<'a>(
+        map: &'a super::DisclosedByNamespace,
+        namespace: &str,
+        id: &str,
+    ) -> Option<&'a AttributeValue> {
+        map.get(namespace).and_then(|ns_map| ns_map.get(id))
+    }
+
     #[test]
     fn insert_no_shadow_inserts_accepts_idempotent_rejects_conflict() {
+        const NS: &str = "org.iso.18013.5.1";
         let mut map = BTreeMap::new();
-        // First sighting inserts.
+        // First sighting inserts under the namespace.
         assert!(insert_no_shadow(
             &mut map,
+            NS,
             "given_name".to_owned(),
             AttributeValue::Text("Ada".to_owned())
         )
         .is_ok());
         assert_eq!(
-            map.get("given_name"),
+            ns_attr(&map, NS, "given_name"),
             Some(&AttributeValue::Text("Ada".to_owned()))
         );
         // Identical re-disclosure is accepted (no shadowing of a different value) and does not change
         // the stored value.
         assert!(insert_no_shadow(
             &mut map,
+            NS,
             "given_name".to_owned(),
             AttributeValue::Text("Ada".to_owned())
         )
         .is_ok());
         assert_eq!(
-            map.get("given_name"),
+            ns_attr(&map, NS, "given_name"),
             Some(&AttributeValue::Text("Ada".to_owned()))
         );
-        // A conflicting value is rejected (DisclosureIntegrity) and the original is preserved.
+        // A conflicting value for the SAME (namespace, id) is rejected (DisclosureIntegrity) and the
+        // original is preserved.
         let err = insert_no_shadow(
             &mut map,
+            NS,
             "given_name".to_owned(),
             AttributeValue::Text("EVIL".to_owned()),
         )
         .unwrap_err();
         assert_eq!(err.reason, crate::types::ReasonCode::DisclosureIntegrity);
         assert_eq!(
-            map.get("given_name"),
+            ns_attr(&map, NS, "given_name"),
             Some(&AttributeValue::Text("Ada".to_owned())),
             "a rejected conflict never overwrites the existing value"
         );
-        // A distinct identifier still inserts cleanly.
+        // A distinct identifier in the same namespace still inserts cleanly.
         assert!(insert_no_shadow(
             &mut map,
+            NS,
             "nationality".to_owned(),
             AttributeValue::Text("NL".to_owned())
         )
         .is_ok());
+        // The SAME id in a DIFFERENT namespace is a DISTINCT attribute: it never collides with the
+        // first namespace's `given_name`, and BOTH values are kept under their own namespaces.
+        const OTHER_NS: &str = "org.example.other";
+        assert!(insert_no_shadow(
+            &mut map,
+            OTHER_NS,
+            "given_name".to_owned(),
+            AttributeValue::Text("Grace".to_owned())
+        )
+        .is_ok());
+        assert_eq!(
+            ns_attr(&map, NS, "given_name"),
+            Some(&AttributeValue::Text("Ada".to_owned())),
+            "the first namespace's given_name is untouched by a same-id different-namespace insert"
+        );
+        assert_eq!(
+            ns_attr(&map, OTHER_NS, "given_name"),
+            Some(&AttributeValue::Text("Grace".to_owned())),
+            "the same id in another namespace is a distinct attribute, kept under that namespace"
+        );
+        // Two namespaces present: `org.iso.18013.5.1` (given_name + nationality) and `org.example.other`.
         assert_eq!(map.len(), 2);
     }
 

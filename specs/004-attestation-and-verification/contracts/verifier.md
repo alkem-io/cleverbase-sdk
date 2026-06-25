@@ -36,7 +36,22 @@ verify(presentation: bytes, policy: VerificationPolicy, anchors: TrustAnchors, r
 ## Result
 
 `VerificationResult { valid, disclosedAttributes, trustStatus, qualifiedStatus?, reasons[] }`. INVALID
-always carries a **specific machine-readable reason** (FR-005/SC-002). `qualifiedStatus` is populated only
+always carries a **specific machine-readable reason** (FR-005/SC-002).
+
+**`disclosedAttributes` shape (per format).** SD-JWT VC returns the disclosed claims at their position in
+the credential structure (RFC 9901 §7.1 nesting). **mdoc returns disclosed attributes GROUPED BY
+NAMESPACE**: each top-level key is an ISO/IEC 18013-5 namespace, its value a map of that namespace's
+`{ elementIdentifier: elementValue }` — e.g. `{ "org.iso.18013.5.1": { "given_name": …, … }, … }`. mdoc
+`elementIdentifier`s are unique only **within** a namespace, so a valid presentation MAY carry the same
+identifier (e.g. `given_name`) in two namespaces (or two documents) with different values; namespace
+grouping keeps those distinct (never a false `disclosure_integrity` reject) and preserves namespace
+provenance. A genuine conflict — the **same `(namespace, elementIdentifier)`** disclosed twice with
+**different** values (across namespaces within a document, or across documents) — is rejected as
+`disclosure_integrity`; an identical re-disclosure merges cleanly. The CBOR/C-ABI wire shape is unchanged
+(`disclosedAttributes` is still `{ string → AttributeValue }`, the namespace map carried as an
+`AttributeValue::Map`), so no schema bump.
+
+`qualifiedStatus` is populated only
 when the opt-in gate (`qualified-status-gate.md`) ran **and the credential is VALID** — it is only
 meaningful for a VALID credential (the gate matches the credential's *claimed* signing cert, which only a
 VALID verdict has signature-verified + trust-anchored), so on an INVALID credential `qualifiedStatus` is

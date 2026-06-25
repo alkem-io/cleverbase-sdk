@@ -219,7 +219,15 @@ fn mdoc_bound_to_the_issued_request_is_valid() {
         "bound mdoc must be VALID: {:?}",
         result.reasons
     );
-    assert!(result.disclosed_attributes.contains_key("given_name"));
+    // mdoc disclosed attributes are GROUPED BY NAMESPACE (`{ ns: Map({ id: value }) }`); the builder's
+    // default namespace is `org.iso.18013.5.1`, with `given_name` in its sub-map.
+    assert!(
+        matches!(
+            result.disclosed_attributes.get("org.iso.18013.5.1"),
+            Some(crate::types::AttributeValue::Map(ns)) if ns.contains_key("given_name")
+        ),
+        "given_name is disclosed under the org.iso.18013.5.1 namespace"
+    );
 }
 
 #[test]

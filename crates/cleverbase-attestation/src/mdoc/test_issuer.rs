@@ -91,6 +91,11 @@ pub(crate) struct MdocBuilder {
     device_signature_attached_payload: bool,
     /// When set, sign the IssuerAuth with a non-ES256 (ES384) algorithm header (alg-gate reject).
     issuer_auth_wrong_alg: bool,
+    /// When set, re-encode the (genuine, ES256) IssuerAuth signature as an ASN.1/DER `SEQUENCE` instead
+    /// of the COSE-mandated raw fixed-width `r‖s` (RFC 9053 §2.1). The signature still verifies as a
+    /// VALID ECDSA signature over the MSO, but its ENCODING is non-conformant — a reference COSE
+    /// validator rejects it, so the SDK's COSE path MUST reject it too (`Tamper`), never accept DER.
+    issuer_auth_der_signature: bool,
     /// When set, emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1 (the tagged form the verifier
     /// also accepts).
     tag_issuer_auth: bool,
@@ -112,6 +117,12 @@ pub(crate) struct MdocBuilder {
     /// disclosed element collides with a first-document identifier but carries this DIFFERENT value —
     /// the cross-document attribute-shadowing probe (a 2nd authentic doc must not overwrite a claim).
     append_colliding_document: Option<(&'static str, CborValue)>,
+    /// When `Some`, append a SECOND fully-VALID document (signed by the SAME trusted DS) disclosing one
+    /// element `(identifier → value)` under a DIFFERENT `namespace` than the primary document — the
+    /// multi-namespace probe: the SAME `elementIdentifier` in two namespaces is a DISTINCT attribute, so
+    /// the response stays VALID and BOTH values are surfaced, namespace-distinguished (never a false
+    /// `DisclosureIntegrity` collision). Tuple: `(namespace, identifier, value)`.
+    append_document_in_namespace: Option<(&'static str, &'static str, CborValue)>,
     /// When `Some`, append a SECOND fully-VALID document (same trusted DS) disclosing one DISTINCT
     /// (non-colliding) element, signed over the SAME `session_transcript` as the primary document, but
     /// whose `DeviceSignature` is made by a NON-holder (wrong) key. The result is a multi-document
@@ -282,6 +293,7 @@ impl MdocBuilder {
             mangle_device_signature: false,
             device_signature_attached_payload: false,
             issuer_auth_wrong_alg: false,
+            issuer_auth_der_signature: false,
             tag_issuer_auth: false,
             x5chain_as_array: false,
             omit_x5chain: false,
@@ -290,6 +302,7 @@ impl MdocBuilder {
             device_signature_override: None,
             append_forged_document: false,
             append_colliding_document: None,
+            append_document_in_namespace: None,
             append_wrong_key_document: None,
             append_valid_document_issued_at: None,
             append_wrong_issuer_document_issued_at: None,
@@ -360,6 +373,20 @@ impl MdocBuilder {
         value: CborValue,
     ) -> Self {
         self.append_colliding_document = Some((identifier, value));
+        self
+    }
+
+    /// Append a SECOND fully-VALID document (same trusted DS) disclosing one element `identifier →
+    /// value` under a DIFFERENT `namespace` than the primary document — the multi-namespace probe. The
+    /// SAME `elementIdentifier` in two namespaces is a DISTINCT attribute, so the response stays VALID
+    /// and BOTH values are surfaced, grouped under their own namespaces (never a false collision).
+    pub(crate) fn append_document_in_namespace(
+        mut self,
+        namespace: &'static str,
+        identifier: &'static str,
+        value: CborValue,
+    ) -> Self {
+        self.append_document_in_namespace = Some((namespace, identifier, value));
         self
     }
 
@@ -437,6 +464,13 @@ impl MdocBuilder {
         self
     }
 
+    /// Re-encode the (genuine, ES256) IssuerAuth signature as ASN.1/DER instead of the COSE-mandated
+    /// raw `r‖s` (RFC 9053 §2.1) — the non-conformant-encoding reject probe (must be `Tamper`).
+    pub(super) fn issuer_auth_der_signature(mut self) -> Self {
+        self.issuer_auth_der_signature = true;
+        self
+    }
+
     /// Emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1.
     pub(super) fn tag_issuer_auth(mut self) -> Self {
         self.tag_issuer_auth = true;
@@ -471,6 +505,14 @@ impl MdocBuilder {
     /// conversions for integer/bytes/array/map/null values).
     pub(super) fn elements(mut self, elements: Vec<Element>) -> Self {
         self.elements = elements;
+        self
+    }
+
+    /// Set the ISO/IEC 18013-5 namespace the disclosed elements are minted under (the `nameSpaces` /
+    /// `valueDigests` key). Used by the multi-namespace probe: the SAME `elementIdentifier` in two
+    /// different namespaces is a DISTINCT attribute and must not collide.
+    pub(crate) fn namespace(mut self, namespace: &str) -> Self {
+        self.namespace = namespace.to_owned();
         self
     }
 
@@ -570,6 +612,14 @@ impl MdocBuilder {
         let colliding = self
             .append_colliding_document
             .map(|(identifier, value)| build_single_valid_document(identifier, value));
+        // A second VALID document disclosing one element under a DIFFERENT namespace — the
+        // multi-namespace probe (same id in two namespaces is a distinct attribute, never a collision).
+        let other_namespace_document =
+            self.append_document_in_namespace
+                .clone()
+                .map(|(namespace, identifier, value)| {
+                    build_single_valid_document_in_namespace(namespace, identifier, value)
+                });
         // A second VALID document (same trusted DS) issued in its OWN window — the multi-document
         // qualified-status fold probe (documents[0] qualified-at-issuance, this one not-qualified).
         let second_valid_issued_at =
@@ -775,6 +825,13 @@ impl MdocBuilder {
                 *byte ^= 0xff;
             }
         }
+        if self.issuer_auth_der_signature {
+            // Re-encode the raw `r‖s` signature as ASN.1/DER (a valid ECDSA signature, non-conformant
+            // COSE encoding). RFC 9053 §2.1 mandates the raw fixed-width form; the COSE path must reject
+            // this DER signature (`Tamper`), never accept it via a DER fallback.
+            let raw = Signature::from_slice(&issuer_auth.signature).expect("raw r‖s signature");
+            issuer_auth.signature = raw.to_der().as_bytes().to_vec();
+        }
         let issuer_auth_bytes = if self.tag_issuer_auth {
             issuer_auth
                 .to_tagged_vec()
@@ -900,6 +957,9 @@ impl MdocBuilder {
         if let Some(colliding_document) = colliding {
             documents.push(colliding_document);
         }
+        if let Some(other_ns_document) = other_namespace_document {
+            documents.push(other_ns_document);
+        }
         if let Some(second_valid_document) = second_valid_issued_at {
             documents.push(second_valid_document);
         }
@@ -947,6 +1007,27 @@ impl MdocBuilder {
 fn build_single_valid_document(identifier: &'static str, value: CborValue) -> CborValue {
     // Re-use the full minting path for a one-element document, then lift out `documents[0]`.
     let response = MdocBuilder::new()
+        .elements(vec![Element {
+            digest_id: 0,
+            identifier,
+            value,
+        }])
+        .build();
+    first_document_of_response(&response)
+}
+
+/// Mint a fresh, fully-VALID single document (same trusted DS + holder) disclosing one element
+/// `identifier → value` under `namespace` (a DIFFERENT namespace than the primary document). Used by
+/// the multi-namespace probe: the same `elementIdentifier` in two namespaces is a DISTINCT attribute,
+/// so the merged response stays VALID and both values are surfaced under their own namespaces. Lifts
+/// out `documents[0]`.
+fn build_single_valid_document_in_namespace(
+    namespace: &'static str,
+    identifier: &'static str,
+    value: CborValue,
+) -> CborValue {
+    let response = MdocBuilder::new()
+        .namespace(namespace)
         .elements(vec![Element {
             digest_id: 0,
             identifier,

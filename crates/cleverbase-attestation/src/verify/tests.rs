@@ -224,7 +224,15 @@ fn mdoc_valid_through_verify() {
         None,
     );
     assert!(result.valid, "reasons {:?}", result.reasons);
-    assert!(result.disclosed_attributes.contains_key("family_name"));
+    // mdoc disclosed attributes are GROUPED BY NAMESPACE (`{ ns: Map({ id: value }) }`); the builder's
+    // default namespace is `org.iso.18013.5.1`, with `family_name` in its sub-map.
+    assert!(
+        matches!(
+            result.disclosed_attributes.get("org.iso.18013.5.1"),
+            Some(crate::types::AttributeValue::Map(ns)) if ns.contains_key("family_name")
+        ),
+        "family_name is disclosed under the org.iso.18013.5.1 namespace"
+    );
 }
 
 #[test]
