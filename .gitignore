@@ -71,6 +71,12 @@ target/doc/
 /tests/fixtures/pki/*.srl
 /tests/fixtures/pki/*serial*
 
+# EUDI attestation test fixtures (feature 004). Same convention as tests/fixtures/pki: the durable
+# tracked material is the DER certs (*.cert.der) + PKCS#8 keys (*.key.pk8) + the JSON/YAML/Kotlin
+# vectors + trust-list.json + NOTICE + gen.sh; the *.srl serial byproduct of `openssl x509 -CA` is
+# transient and must never be tracked (the *.pem/*.key working files are already dropped above).
+/tests/fixtures/attestation/*.srl
+
 # Editor / OS
 .DS_Store
 Thumbs.db

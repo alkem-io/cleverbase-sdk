@@ -7,10 +7,11 @@
 //! pattern (the always-on verifier bar). Each CBOR envelope is versioned (`schema_version`), so the
 //! ABI stays stable within a SemVer major.
 //!
-//! `cleverbase_attestation_verify` is the **attestation seam**: it is wired and links now, but the
-//! verifier logic lands in task T016, so a well-formed request currently returns a structured
-//! `VerifyOutcome::NotImplemented` inside the CBOR response (status `0`). All protocol logic lives in
-//! the core crates; this layer only does the pointer/length/free dance (Principle III).
+//! `cleverbase_attestation_verify` is the **attestation verifier seam**: it runs the always-on bar
+//! (contracts/verifier.md) over the CBOR `VerifyRequest` envelope and returns the
+//! `cleverbase_attestation::wire::VerifyOutcome` (the verdict, or a decode error) inside the CBOR
+//! response (status `0`). All protocol logic lives in the core crates; this layer only does the
+//! pointer/length/free dance (Principle III).
 
 // The workspace pins a strict `restriction` lint set (unwrap/expect/panic/indexing/…) for library
 // code. The `#[cfg(test)]` module below uses those constructs as test assertions, where a panic IS
@@ -111,12 +112,11 @@ pub unsafe extern "C" fn cleverbase_process(
 /// CBOR-in / CBOR-out, identical envelope discipline to [`cleverbase_process`]: on success writes a
 /// heap buffer to `*out_ptr`/`*out_len` (free it with [`cleverbase_free`]) and returns `0`; returns
 /// non-zero only for null arguments (`1`) or a contained panic (`2`). The verification *outcome*
-/// (including the not-yet-implemented signal and any decode error) is carried *inside* the CBOR
-/// response (a `cleverbase_attestation::wire::VerifyOutcome`), never via the status code.
+/// (the verdict, or any decode error) is carried *inside* the CBOR response (a
+/// `cleverbase_attestation::wire::VerifyOutcome`), never via the status code.
 ///
-/// The verifier itself lands in task T016; until then a well-formed request returns
-/// `VerifyOutcome::NotImplemented` and a malformed one returns `VerifyOutcome::Err` — both with
-/// status `0`. The function is fully wired so bindings can link and exercise the CBOR seam now.
+/// A well-formed request runs the always-on verifier bar and returns `VerifyOutcome::Ok { result }`;
+/// a malformed/unsupported-version one returns `VerifyOutcome::Err` — both with status `0`.
 ///
 /// # Safety
 /// `in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
@@ -347,23 +347,8 @@ mod tests {
         unsafe { cleverbase_free(std::ptr::null_mut(), 0) };
     }
 
-    fn verify_envelope() -> Vec<u8> {
-        use cleverbase_attestation::types::VerificationPolicy;
-        use cleverbase_attestation::wire::{VerifyRequest, ATTESTATION_SCHEMA_VERSION};
-        let req = VerifyRequest {
-            schema_version: ATTESTATION_SCHEMA_VERSION,
-            presentation: b"eyJ...~WyJ...~".to_vec(),
-            policy: VerificationPolicy::default(),
-        };
-        let mut buf = Vec::new();
-        ciborium::into_writer(&req, &mut buf).unwrap();
-        buf
-    }
-
-    #[test]
-    fn attestation_verify_roundtrip_returns_not_implemented() {
-        use cleverbase_attestation::wire::{VerifyOutcome, VerifyResponse};
-        let input = verify_envelope();
+    /// Drive the given CBOR `verify` request through the C-ABI and return the response bytes.
+    fn drive_attestation_verify(input: &[u8]) -> Vec<u8> {
         let mut out_ptr: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         // SAFETY: valid input slice and out pointers.
@@ -380,9 +365,24 @@ mod tests {
         assert!(out_len > 0);
         let out = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
         unsafe { cleverbase_free(out_ptr, out_len) };
+        out
+    }
 
+    #[test]
+    fn attestation_verify_smoke_test_valid_end_to_end() {
+        // The end-to-end VALID path through the real C-ABI: a conformant, trusted-issuer SD-JWT VC
+        // (built by the shared test vectors) verifies to `VerifyOutcome::Ok { valid: true }`.
+        use cleverbase_attestation::wire::{VerifyOutcome, VerifyResponse};
+        let input = cleverbase_attestation::test_vectors::valid_sd_jwt_verify_request_cbor();
+        let out = drive_attestation_verify(&input);
         let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
-        assert_eq!(resp.outcome, VerifyOutcome::NotImplemented);
+        match resp.outcome {
+            VerifyOutcome::Ok { result } => {
+                assert!(result.valid, "expected VALID, reasons {:?}", result.reasons);
+                assert!(result.disclosed_attributes.contains_key("given_name"));
+            }
+            VerifyOutcome::Err { message } => panic!("unexpected verify error: {message}"),
+        }
     }
 
     #[test]
@@ -398,21 +398,7 @@ mod tests {
     #[test]
     fn attestation_verify_garbage_input_returns_err_outcome() {
         use cleverbase_attestation::wire::{VerifyOutcome, VerifyResponse};
-        let input = [0xffu8, 0x00, 0x13, 0x37];
-        let mut out_ptr: *mut u8 = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        // SAFETY: valid input slice and out pointers.
-        let rc = unsafe {
-            cleverbase_attestation_verify(
-                input.as_ptr(),
-                input.len(),
-                &raw mut out_ptr,
-                &raw mut out_len,
-            )
-        };
-        assert_eq!(rc, 0);
-        let out = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
-        unsafe { cleverbase_free(out_ptr, out_len) };
+        let out = drive_attestation_verify(&[0xffu8, 0x00, 0x13, 0x37]);
         let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
         assert!(matches!(resp.outcome, VerifyOutcome::Err { .. }));
     }

@@ -1,0 +1,565 @@
+//! Test-only ISO/IEC 18013-5 mdoc issuer helper.
+//!
+//! Mints a `DeviceResponse` the way a conformant mdoc issuer + holder would, so the verifier (T012)
+//! can be driven against well-formed material and the negative paths (T008) constructed by mutating
+//! one field at a time. It builds the MSO (with `valueDigests` over the `IssuerSignedItem`s), signs
+//! the `IssuerAuth` `COSE_Sign1` with the test Document Signer key (`mdoc-ds.key.pk8`, x5chain =
+//! `mdoc-ds` cert), and signs the `DeviceSignature` `COSE_Sign1` with the test holder key
+//! (`holder.key.pk8`) over the `DeviceAuthentication` structure.
+//!
+//! Synthetic test material only — no production use (mirrors `tests/fixtures/attestation/gen.sh`).
+//!
+//! Test-support code (compiled under `cfg(test)` or the `test-vectors` feature); the strict
+//! workspace `restriction` lints (no `unwrap`/`expect`/`panic`/casts in library code) are relaxed
+//! here — a panic IS the intended failure signal when the fixed test fixtures are wrong.
+//! A few items are deliberately `pub(crate)` for cross-module reuse by the OpenID4VP / verify / wire
+//! test suites, so `redundant_pub_crate` is allowed here.
+#![allow(
+    clippy::redundant_pub_crate,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation
+)]
+
+use ciborium::value::Value as CborValue;
+use coset::{CborSerializable, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable};
+use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+use pkcs8::DecodePrivateKey as _;
+use sha2::{Digest as _, Sha256, Sha384, Sha512};
+
+use super::{COSE_HEADER_X5CHAIN, TAG_ENCODED_CBOR};
+
+/// A single attribute to embed as an `IssuerSignedItem`.
+pub(super) struct Element {
+    /// The `digestID` assigned to this element.
+    pub digest_id: i64,
+    /// The `elementIdentifier` (claim name).
+    pub identifier: &'static str,
+    /// The `elementValue` (claim value).
+    pub value: CborValue,
+}
+
+/// A builder for a test mdoc `DeviceResponse`, with knobs the negative tests flip.
+pub(crate) struct MdocBuilder {
+    doc_type: String,
+    namespace: String,
+    elements: Vec<Element>,
+    signed: String,
+    valid_from: String,
+    valid_until: String,
+    /// The MSO `digestAlgorithm` name; the digests are always computed with the matching hash.
+    digest_algorithm: DigestAlg,
+    /// When set, corrupt the IssuerAuth signature after signing (tamper case).
+    corrupt_issuer_auth: bool,
+    /// When set, corrupt the recorded digest of the first element so it mismatches the disclosed
+    /// item (valueDigests-mismatch case).
+    corrupt_value_digest: bool,
+    /// When set, sign the IssuerAuth with the wrong-issuer key + cert (untrusted-DS case).
+    use_wrong_issuer: bool,
+    /// When set, sign the DeviceSignature with a different (non-holder) key (holder-binding case).
+    corrupt_device_signature: bool,
+    /// When `Some`, override the MSO `deviceKey` COSE_Key with this CBOR value (malformed-key cases).
+    device_key_override: Option<CborValue>,
+    /// When `Some`, the SessionTranscript bytes the DeviceSignature is computed over (and that the
+    /// verifier must be passed); otherwise the 3-null transcript is used.
+    session_transcript: Option<Vec<u8>>,
+    /// When set, sign the DeviceSignature with a non-ES256 (ES384) algorithm header so the verifier's
+    /// algorithm gate rejects it.
+    device_sig_wrong_alg: bool,
+    /// When set, sign the IssuerAuth with a non-ES256 (ES384) algorithm header (alg-gate reject).
+    issuer_auth_wrong_alg: bool,
+    /// When set, emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1 (the tagged form the verifier
+    /// also accepts).
+    tag_issuer_auth: bool,
+    /// When set, carry the x5chain as an array of one cert rather than a bare bstr.
+    x5chain_as_array: bool,
+    /// When set, omit the x5chain header entirely (no DS cert → malformed).
+    omit_x5chain: bool,
+    /// When set, wrap the `validityInfo` date strings as `#6.0` (tdate) tagged text.
+    tdate_tagged: bool,
+    /// When set, make the MSO `docType` differ from the document `docType` (tamper).
+    mso_doc_type_mismatch: bool,
+}
+
+/// The hash to compute `valueDigests` with, plus its MSO `digestAlgorithm` name.
+#[derive(Clone, Copy)]
+pub(super) enum DigestAlg {
+    /// SHA-256 (the baseline).
+    Sha256,
+    /// SHA-384.
+    Sha384,
+    /// SHA-512.
+    Sha512,
+    /// An unrecognized name (`"SHA-1"`) the verifier must reject.
+    Unsupported,
+}
+
+impl DigestAlg {
+    /// The MSO `digestAlgorithm` text for this choice.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sha256 => "SHA-256",
+            Self::Sha384 => "SHA-384",
+            Self::Sha512 => "SHA-512",
+            Self::Unsupported => "SHA-1",
+        }
+    }
+
+    /// Compute the digest of `data` (the unsupported name still hashes with SHA-256 so the bytes are
+    /// well-formed; the verifier rejects on the *name*, before any hashing).
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 | Self::Unsupported => Sha256::digest(data).to_vec(),
+            Self::Sha384 => Sha384::digest(data).to_vec(),
+            Self::Sha512 => Sha512::digest(data).to_vec(),
+        }
+    }
+}
+
+/// The test PKI material (DER cert + PKCS#8 key), loaded from the committed fixtures.
+const MDOC_DS_CERT: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/mdoc-ds.cert.der");
+const MDOC_DS_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/mdoc-ds.key.pk8");
+const HOLDER_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/holder.key.pk8");
+const WRONG_ISSUER_CERT: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
+const WRONG_ISSUER_KEY: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.key.pk8");
+
+/// The trusted DS certificate DER (for configuring the test anchors).
+pub(crate) fn mdoc_ds_cert_der() -> &'static [u8] {
+    MDOC_DS_CERT
+}
+
+/// The wrong/untrusted issuer certificate DER.
+pub(super) fn wrong_issuer_cert_der() -> &'static [u8] {
+    WRONG_ISSUER_CERT
+}
+
+impl MdocBuilder {
+    /// A conformant default: an mDL docType, one namespace with three disclosed elements, and a
+    /// validity window around the canonical 2023 instant the tests verify at.
+    pub(crate) fn new() -> Self {
+        Self {
+            doc_type: "org.iso.18013.5.1.mDL".to_owned(),
+            namespace: "org.iso.18013.5.1".to_owned(),
+            elements: vec![
+                Element {
+                    digest_id: 0,
+                    identifier: "family_name",
+                    value: CborValue::Text("Doe".to_owned()),
+                },
+                Element {
+                    digest_id: 1,
+                    identifier: "given_name",
+                    value: CborValue::Text("Ada".to_owned()),
+                },
+                Element {
+                    digest_id: 2,
+                    identifier: "age_over_18",
+                    value: CborValue::Bool(true),
+                },
+            ],
+            signed: "2023-01-01T00:00:00Z".to_owned(),
+            valid_from: "2023-01-01T00:00:00Z".to_owned(),
+            valid_until: "2030-01-01T00:00:00Z".to_owned(),
+            digest_algorithm: DigestAlg::Sha256,
+            corrupt_issuer_auth: false,
+            corrupt_value_digest: false,
+            use_wrong_issuer: false,
+            corrupt_device_signature: false,
+            device_key_override: None,
+            session_transcript: None,
+            device_sig_wrong_alg: false,
+            issuer_auth_wrong_alg: false,
+            tag_issuer_auth: false,
+            x5chain_as_array: false,
+            omit_x5chain: false,
+            tdate_tagged: false,
+            mso_doc_type_mismatch: false,
+        }
+    }
+
+    /// Sign the IssuerAuth with a non-ES256 algorithm header (alg-gate reject → Tamper).
+    pub(super) fn issuer_auth_wrong_alg(mut self) -> Self {
+        self.issuer_auth_wrong_alg = true;
+        self
+    }
+
+    /// Emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1.
+    pub(super) fn tag_issuer_auth(mut self) -> Self {
+        self.tag_issuer_auth = true;
+        self
+    }
+
+    /// Carry the x5chain as a one-element array of certs.
+    pub(super) fn x5chain_as_array(mut self) -> Self {
+        self.x5chain_as_array = true;
+        self
+    }
+
+    /// Omit the x5chain header entirely (no DS cert).
+    pub(super) fn omit_x5chain(mut self) -> Self {
+        self.omit_x5chain = true;
+        self
+    }
+
+    /// Wrap the validityInfo date strings as `#6.0` tdate-tagged text.
+    pub(super) fn tdate_tagged(mut self) -> Self {
+        self.tdate_tagged = true;
+        self
+    }
+
+    /// Make the MSO `docType` differ from the document `docType` (tamper).
+    pub(super) fn mso_doc_type_mismatch(mut self) -> Self {
+        self.mso_doc_type_mismatch = true;
+        self
+    }
+
+    /// Replace the disclosed elements (used to exercise the `elementValue` → `AttributeValue`
+    /// conversions for integer/bytes/array/map/null values).
+    pub(super) fn elements(mut self, elements: Vec<Element>) -> Self {
+        self.elements = elements;
+        self
+    }
+
+    /// Set the MSO `digestAlgorithm` (SHA-384, or an unsupported name to drive the reject path).
+    pub(super) fn digest_algorithm(mut self, alg: DigestAlg) -> Self {
+        self.digest_algorithm = alg;
+        self
+    }
+
+    /// Override the MSO `deviceKey` COSE_Key (malformed-key cases: non-EC2, wrong curve, short
+    /// coordinate).
+    pub(super) fn device_key_override(mut self, key: CborValue) -> Self {
+        self.device_key_override = Some(key);
+        self
+    }
+
+    /// Set an explicit SessionTranscript the DeviceSignature is bound to (and that the verifier must
+    /// be passed verbatim).
+    pub(crate) fn session_transcript(mut self, transcript_bytes: Vec<u8>) -> Self {
+        self.session_transcript = Some(transcript_bytes);
+        self
+    }
+
+    /// Sign the DeviceSignature with a non-ES256 algorithm header (drives the alg-gate reject).
+    pub(super) fn device_sig_wrong_alg(mut self) -> Self {
+        self.device_sig_wrong_alg = true;
+        self
+    }
+
+    /// Set the validity window (RFC 3339 `Z` strings).
+    pub(super) fn validity(mut self, valid_from: &str, valid_until: &str) -> Self {
+        self.valid_from = valid_from.to_owned();
+        self.valid_until = valid_until.to_owned();
+        self
+    }
+
+    /// Corrupt the IssuerAuth signature (tamper case).
+    pub(super) fn corrupt_issuer_auth(mut self) -> Self {
+        self.corrupt_issuer_auth = true;
+        self
+    }
+
+    /// Corrupt a recorded `valueDigests` entry (disclosure-integrity case).
+    pub(super) fn corrupt_value_digest(mut self) -> Self {
+        self.corrupt_value_digest = true;
+        self
+    }
+
+    /// Sign the IssuerAuth with the untrusted wrong-issuer key/cert (untrusted-DS case).
+    pub(crate) fn use_wrong_issuer(mut self) -> Self {
+        self.use_wrong_issuer = true;
+        self
+    }
+
+    /// Sign the DeviceSignature with a non-holder key (holder-binding case).
+    pub(super) fn corrupt_device_signature(mut self) -> Self {
+        self.corrupt_device_signature = true;
+        self
+    }
+
+    /// Build the CBOR-encoded `DeviceResponse` bytes.
+    pub(crate) fn build(self) -> Vec<u8> {
+        // --- IssuerSignedItems (#6.24(bstr .cbor IssuerSignedItem)) + their digests. ----------------
+        let mut issuer_items = Vec::new();
+        let mut value_digests = Vec::new();
+        for (idx, el) in self.elements.iter().enumerate() {
+            let item = CborValue::Map(vec![
+                (
+                    CborValue::Text("digestID".to_owned()),
+                    CborValue::Integer(el.digest_id.into()),
+                ),
+                (
+                    CborValue::Text("random".to_owned()),
+                    CborValue::Bytes(vec![idx as u8; 16]),
+                ),
+                (
+                    CborValue::Text("elementIdentifier".to_owned()),
+                    CborValue::Text(el.identifier.to_owned()),
+                ),
+                (CborValue::Text("elementValue".to_owned()), el.value.clone()),
+            ]);
+            let item_inner = encode(&item);
+            let tagged = CborValue::Tag(
+                TAG_ENCODED_CBOR,
+                Box::new(CborValue::Bytes(item_inner.clone())),
+            );
+            let tagged_bytes = encode(&tagged);
+            let mut digest = self.digest_algorithm.digest(&tagged_bytes);
+            if self.corrupt_value_digest && idx == 0 {
+                digest[0] ^= 0xff;
+            }
+            value_digests.push((
+                CborValue::Integer(el.digest_id.into()),
+                CborValue::Bytes(digest),
+            ));
+            issuer_items.push(tagged);
+        }
+
+        // --- holder DeviceKey (COSE_Key) from the holder private key's public point. ----------------
+        let holder_key = SigningKey::from_pkcs8_der(HOLDER_KEY).expect("holder key");
+        let holder_pub = holder_key.verifying_key().to_encoded_point(false);
+        let device_key = self.device_key_override.clone().unwrap_or_else(|| {
+            cose_ec2_key(holder_pub.x().expect("x"), holder_pub.y().expect("y"))
+        });
+
+        // A tdate value: plain text, or `#6.0`-tagged text when exercising that decode path.
+        let tdate = |s: &str| -> CborValue {
+            if self.tdate_tagged {
+                CborValue::Tag(0, Box::new(CborValue::Text(s.to_owned())))
+            } else {
+                CborValue::Text(s.to_owned())
+            }
+        };
+        let mso_doc_type = if self.mso_doc_type_mismatch {
+            format!("{}.other", self.doc_type)
+        } else {
+            self.doc_type.clone()
+        };
+
+        // --- MSO. ----------------------------------------------------------------------------------
+        let mso = CborValue::Map(vec![
+            (
+                CborValue::Text("version".to_owned()),
+                CborValue::Text("1.0".to_owned()),
+            ),
+            (
+                CborValue::Text("digestAlgorithm".to_owned()),
+                CborValue::Text(self.digest_algorithm.name().to_owned()),
+            ),
+            (
+                CborValue::Text("valueDigests".to_owned()),
+                CborValue::Map(vec![(
+                    CborValue::Text(self.namespace.clone()),
+                    CborValue::Map(value_digests),
+                )]),
+            ),
+            (
+                CborValue::Text("deviceKeyInfo".to_owned()),
+                CborValue::Map(vec![(CborValue::Text("deviceKey".to_owned()), device_key)]),
+            ),
+            (
+                CborValue::Text("docType".to_owned()),
+                CborValue::Text(mso_doc_type),
+            ),
+            (
+                CborValue::Text("validityInfo".to_owned()),
+                CborValue::Map(vec![
+                    (CborValue::Text("signed".to_owned()), tdate(&self.signed)),
+                    (
+                        CborValue::Text("validFrom".to_owned()),
+                        tdate(&self.valid_from),
+                    ),
+                    (
+                        CborValue::Text("validUntil".to_owned()),
+                        tdate(&self.valid_until),
+                    ),
+                ]),
+            ),
+        ]);
+        let mso_inner = encode(&mso);
+        let mso_payload = encode(&CborValue::Tag(
+            TAG_ENCODED_CBOR,
+            Box::new(CborValue::Bytes(mso_inner)),
+        ));
+
+        // --- IssuerAuth COSE_Sign1 (ES256) over the MSO payload. ------------------------------------
+        let (issuer_key_der, issuer_cert_der) = if self.use_wrong_issuer {
+            (WRONG_ISSUER_KEY, WRONG_ISSUER_CERT)
+        } else {
+            (MDOC_DS_KEY, MDOC_DS_CERT)
+        };
+        let issuer_key = SigningKey::from_pkcs8_der(issuer_key_der).expect("issuer key");
+        let issuer_alg = if self.issuer_auth_wrong_alg {
+            coset::iana::Algorithm::ES384
+        } else {
+            coset::iana::Algorithm::ES256
+        };
+        let protected = HeaderBuilder::new().algorithm(issuer_alg).build();
+        let mut unprotected = HeaderBuilder::new();
+        if !self.omit_x5chain {
+            let x5chain = if self.x5chain_as_array {
+                coset::cbor::value::Value::Array(vec![coset::cbor::value::Value::Bytes(
+                    issuer_cert_der.to_vec(),
+                )])
+            } else {
+                coset::cbor::value::Value::Bytes(issuer_cert_der.to_vec())
+            };
+            unprotected = unprotected.value(COSE_HEADER_X5CHAIN, x5chain);
+        }
+        let mut issuer_auth = CoseSign1Builder::new()
+            .protected(protected)
+            .unprotected(unprotected.build())
+            .payload(mso_payload)
+            .create_signature(&[], |tbs| es256_sign(&issuer_key, tbs))
+            .build();
+        if self.corrupt_issuer_auth {
+            // Flip a signature byte: the COSE_Sign1 stays structurally valid but the ES256 check
+            // must fail (Tamper).
+            if let Some(byte) = issuer_auth.signature.first_mut() {
+                *byte ^= 0xff;
+            }
+        }
+        let issuer_auth_bytes = if self.tag_issuer_auth {
+            issuer_auth
+                .to_tagged_vec()
+                .expect("encode tagged IssuerAuth")
+        } else {
+            issuer_auth.to_vec().expect("encode IssuerAuth")
+        };
+        let issuer_auth_value = decode(&issuer_auth_bytes);
+
+        // --- DeviceSigned: empty DeviceNameSpaces + DeviceSignature over DeviceAuthentication. -------
+        let device_name_spaces_inner = encode(&CborValue::Map(vec![]));
+        let device_name_spaces_bytes = encode(&CborValue::Tag(
+            TAG_ENCODED_CBOR,
+            Box::new(CborValue::Bytes(device_name_spaces_inner)),
+        ));
+        let device_ns_value = decode(&device_name_spaces_bytes);
+
+        // SessionTranscript: the supplied transcript, else the 3-null transcript the verifier
+        // defaults to (no transport).
+        let session_transcript = self.session_transcript.as_ref().map_or_else(
+            || CborValue::Array(vec![CborValue::Null, CborValue::Null, CborValue::Null]),
+            |bytes| decode(bytes),
+        );
+        let device_auth_inner = encode(&CborValue::Array(vec![
+            CborValue::Text("DeviceAuthentication".to_owned()),
+            session_transcript,
+            CborValue::Text(self.doc_type.clone()),
+            device_ns_value.clone(),
+        ]));
+        let device_auth_payload = encode(&CborValue::Tag(
+            TAG_ENCODED_CBOR,
+            Box::new(CborValue::Bytes(device_auth_inner)),
+        ));
+
+        let device_signing_key = if self.corrupt_device_signature {
+            // A fresh, deterministic non-holder key (the wrong-issuer key doubles as a non-holder
+            // P-256 key — its public point is not the MSO DeviceKey, so the binding must fail).
+            SigningKey::from_pkcs8_der(WRONG_ISSUER_KEY).expect("non-holder key")
+        } else {
+            SigningKey::from_pkcs8_der(HOLDER_KEY).expect("holder key")
+        };
+        let device_alg = if self.device_sig_wrong_alg {
+            coset::iana::Algorithm::ES384
+        } else {
+            coset::iana::Algorithm::ES256
+        };
+        let device_protected = HeaderBuilder::new().algorithm(device_alg).build();
+        let device_signature = CoseSign1Builder::new()
+            .protected(device_protected)
+            .create_detached_signature(&device_auth_payload, &[], |tbs| {
+                es256_sign(&device_signing_key, tbs)
+            })
+            .build();
+        let device_signature_bytes = device_signature.to_vec().expect("encode DeviceSignature");
+        let device_signature_value = decode(&device_signature_bytes);
+
+        // --- Assemble the document + DeviceResponse. ------------------------------------------------
+        let issuer_signed = CborValue::Map(vec![
+            (
+                CborValue::Text("nameSpaces".to_owned()),
+                CborValue::Map(vec![(
+                    CborValue::Text(self.namespace.clone()),
+                    CborValue::Array(issuer_items),
+                )]),
+            ),
+            (CborValue::Text("issuerAuth".to_owned()), issuer_auth_value),
+        ]);
+        let device_signed = CborValue::Map(vec![
+            (CborValue::Text("nameSpaces".to_owned()), device_ns_value),
+            (
+                CborValue::Text("deviceAuth".to_owned()),
+                CborValue::Map(vec![(
+                    CborValue::Text("deviceSignature".to_owned()),
+                    device_signature_value,
+                )]),
+            ),
+        ]);
+        let document = CborValue::Map(vec![
+            (
+                CborValue::Text("docType".to_owned()),
+                CborValue::Text(self.doc_type),
+            ),
+            (CborValue::Text("issuerSigned".to_owned()), issuer_signed),
+            (CborValue::Text("deviceSigned".to_owned()), device_signed),
+        ]);
+        let device_response = CborValue::Map(vec![
+            (
+                CborValue::Text("version".to_owned()),
+                CborValue::Text("1.0".to_owned()),
+            ),
+            (
+                CborValue::Text("documents".to_owned()),
+                CborValue::Array(vec![document]),
+            ),
+            (
+                CborValue::Text("status".to_owned()),
+                CborValue::Integer(0.into()),
+            ),
+        ]);
+        encode(&device_response)
+    }
+}
+
+/// Encode a `ciborium` value to CBOR bytes.
+fn encode(value: &CborValue) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).expect("encode CBOR");
+    buf
+}
+
+/// Decode CBOR bytes to a `ciborium` value.
+fn decode(bytes: &[u8]) -> CborValue {
+    ciborium::from_reader(bytes).expect("decode CBOR")
+}
+
+/// ES256-sign `tbs`, returning the raw fixed-width `r‖s` signature (the COSE form).
+fn es256_sign(key: &SigningKey, tbs: &[u8]) -> Vec<u8> {
+    let sig: Signature = key.sign(tbs);
+    sig.to_bytes().to_vec()
+}
+
+/// Build a COSE_Key (EC2 / P-256) CBOR map from raw 32-byte X and Y coordinates.
+fn cose_ec2_key(x: &[u8], y: &[u8]) -> CborValue {
+    CborValue::Map(vec![
+        (CborValue::Integer(1.into()), CborValue::Integer(2.into())), // kty = EC2
+        (
+            CborValue::Integer((-1).into()),
+            CborValue::Integer(1.into()),
+        ), // crv = P-256
+        (
+            CborValue::Integer((-2).into()),
+            CborValue::Bytes(x.to_vec()),
+        ), // x
+        (
+            CborValue::Integer((-3).into()),
+            CborValue::Bytes(y.to_vec()),
+        ), // y
+    ])
+}

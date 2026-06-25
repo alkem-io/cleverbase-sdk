@@ -1,0 +1,29 @@
+Cleverbase SDK — EUDI attestation test fixtures (feature 004)
+=============================================================
+
+ALL key material in this directory is SYNTHETIC and generated solely for tests by `gen.sh`.
+It contains NO real keys, NO real secrets, and is NOT for any production use.
+
+Tier B — self-generated test backbone (this directory, minted by gen.sh)
+------------------------------------------------------------------------
+  ca-iaca.*        self-signed test CA / ISO 18013-5 IACA root (EC P-256)
+  sdjwt-issuer.*   SD-JWT VC issuer leaf (JOSE ES256), issued by ca-iaca
+  mdoc-ds.*        mdoc Document Signer leaf (COSE ES256, EKU id-mso-mdl-DS), issued by ca-iaca
+  holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
+  wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
+  trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
+
+Tier A — vendored upstream conformance vectors (vectors/, see vectors/README.md)
+--------------------------------------------------------------------------------
+  vectors/sd-jwt-vc/arf-pid-specification.yml
+  vectors/sd-jwt-vc/ietf-examples-settings.yml
+      Source: IETF oauth-wg/oauth-sd-jwt-vc, examples/03-pid + examples/settings.yml.
+      The arf-pid SD-JWT VC conformance example INPUTS (the rendered SD-JWT is reproduced
+      deterministically from these with random_seed:0). IETF Trust Legal Provisions (BCP 78/79);
+      code components under the Simplified BSD License (TLP §4). Upstream commits only the YAML
+      inputs (rendered outputs are .gitignore'd upstream), so these inputs are the vendored form.
+
+  vectors/mdoc/multipaz-TestVectors.kt
+      Source: OpenWallet Foundation `multipaz` (org.multipaz.mdoc.TestVectors), originally
+      The Android Open Source Project. Licensed under the Apache License, Version 2.0.
+      The ISO/IEC 18013-5 Annex-D worked-example mdoc vectors (DeviceResponse, MSO, etc.).

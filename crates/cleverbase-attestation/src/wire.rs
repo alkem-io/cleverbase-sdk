@@ -1,45 +1,117 @@
 //! Versioned CBOR wire envelope for the attestation C-ABI (and WASM) boundary.
 //!
 //! Mirrors `cleverbase-core::wire`: the C-ABI and non-native bindings exchange these CBOR-encoded
-//! envelopes; native bindings can call the typed Rust API directly. The envelope carries an
-//! [`ATTESTATION_SCHEMA_VERSION`] so a binding can refuse a payload it cannot read (Principle VII).
+//! envelopes; native bindings can call the typed Rust API ([`crate::verify`]) directly. The envelope
+//! carries an [`ATTESTATION_SCHEMA_VERSION`] so a binding can refuse a payload it cannot read
+//! (Principle VII).
 //!
 //! Protocol logic lives **here, in the core** — the `cleverbase-ffi` C-ABI only wraps
 //! [`process_verify_bytes`] in the pointer/length/free dance (Principle III: no protocol logic in
-//! bindings). The `verify` operation is the always-on bar (contracts/verifier.md); its full
-//! implementation lands in task **T016**. Until then this returns a structured
-//! [`VerifyOutcome::NotImplemented`] so the bindings can link and exercise the CBOR seam now.
+//! bindings). The `verify` operation is the always-on bar (contracts/verifier.md); this envelope
+//! carries everything the sans-IO [`crate::verify`] entry point needs: the presented credential, the
+//! verifier policy, the configured **trust anchors** (resolved by the host-driven trust step and
+//! passed in as `(role, format, cert)` entries — data-model.md `TrustAnchorSource`), the verification
+//! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
+//! seam), and the optional OpenID4VP **request** the presentation must be bound to.
+//!
+//! ## Schema version 2
+//!
+//! Version 2 (this) replaced the version-1 foundation seam (which carried only `presentation` +
+//! `policy` and returned `NotImplemented`). The CBOR shape changed — additive fields plus the real
+//! verifier wiring — so the schema version was bumped (Principle VII); a binding speaking v1 is
+//! refused with a clear message rather than mis-parsed.
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{VerificationPolicy, VerificationResult};
+use crate::openid4vp::PresentationRequest;
+use crate::status::StatusOutcome;
+use crate::trust::StaticTestAnchors;
+use crate::types::{Format, IssuerRole, VerificationPolicy, VerificationResult};
+use crate::verify::{verify, Presentation, VerifyContext};
 
 /// Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
-/// SemVer major (independent of the signing core's `SCHEMA_VERSION`).
-pub const ATTESTATION_SCHEMA_VERSION: u32 = 1;
+/// SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
+/// verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 
-/// A `verify` request: the presented credential plus the verifier policy.
+/// A single configured trust anchor passed across the wire: a trusted issuer/anchor certificate for
+/// a `(role, format)` (the host resolved these from the EU LOTL / national TLs / IACA roots in its
+/// trust-refresh step and passes them in — the core stays sans-IO).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireTrustAnchor {
+    /// The issuer role this anchor covers.
+    pub role: IssuerRole,
+    /// The credential format this anchor covers.
+    pub format: Format,
+    /// The DER-encoded trusted issuer/anchor certificate.
+    #[serde(with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
+}
+
+/// The presented credential as carried on the wire (the CBOR mirror of [`Presentation`]).
 ///
-/// `presentation` is the encoded credential as received (compact SD-JWT(+KB) or CBOR
-/// `DeviceResponse`). The configured trust anchors and the OpenID4VP `request` binding are carried by
-/// the fuller envelope that lands with the verifier implementation (task T016); the foundation seam
-/// carries the policy so the shape is stable and the not-implemented path is exercisable.
+/// SD-JWT VC is the compact presentation string; mdoc is the `DeviceResponse` bytes plus the
+/// OpenID4VP addressed audience (present only when verifying against a request).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WirePresentation {
+    /// A compact SD-JWT VC presentation string.
+    SdJwtVc {
+        /// The compact `<issuer-JWS>~<D>…~<KB-JWT>` presentation.
+        presentation: String,
+    },
+    /// An mdoc `DeviceResponse` plus its OpenID4VP addressed audience (when bound to a request).
+    Mdoc {
+        /// The CBOR-encoded `DeviceResponse`.
+        #[serde(with = "serde_bytes")]
+        device_response: Vec<u8>,
+        /// The audience the response was addressed to (the verifier `client_id`), when applicable.
+        #[serde(default)]
+        audience: Option<String>,
+    },
+}
+
+/// The verification context carried on the wire (the CBOR mirror of [`VerifyContext`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireContext {
+    /// The verification instant (Unix seconds).
+    pub now_unix: i64,
+    /// The issuer role under which trust is anchored.
+    pub role: IssuerRole,
+    /// The host-resolved revocation/status outcome.
+    pub status: StatusOutcome,
+    /// The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
+    #[serde(default, with = "serde_bytes")]
+    pub session_transcript: Option<Vec<u8>>,
+    /// The off-by-default opt-in qualified-status gate seam (T019, not built yet).
+    #[serde(default)]
+    pub qualified_gate: bool,
+}
+
+/// A `verify` request: the presented credential, the policy, the configured anchors, the
+/// verification context, and (optionally) the OpenID4VP request the presentation must be bound to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyRequest {
     /// Wire schema version of this envelope.
     pub schema_version: u32,
-    /// The presented credential, encoded.
-    #[serde(with = "serde_bytes")]
-    pub presentation: Vec<u8>,
+    /// The presented credential.
+    pub presentation: WirePresentation,
     /// The verifier policy.
     pub policy: VerificationPolicy,
+    /// The configured trust anchors (resolved + passed in by the host's trust-refresh step).
+    pub anchors: Vec<WireTrustAnchor>,
+    /// The verification context (instant, role, status, transcript, gate seam).
+    pub context: WireContext,
+    /// The OpenID4VP request the presentation must be bound to, when present.
+    #[serde(default)]
+    pub request: Option<PresentationRequest>,
 }
 
 /// The outcome of a `verify` operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyOutcome {
-    /// The verdict (the always-on bar). Produced once task T016 lands the verifier.
+    /// The verdict (the always-on bar — contracts/verifier.md).
     Ok {
         /// The verification result.
         result: VerificationResult,
@@ -49,9 +121,6 @@ pub enum VerifyOutcome {
         /// Human-readable error message.
         message: String,
     },
-    /// The verifier is not yet implemented (the current foundation state). Distinct from `Err` so a
-    /// caller can tell "not built yet" from "your request was rejected".
-    NotImplemented,
 }
 
 /// A versioned `verify` response envelope.
@@ -97,67 +166,54 @@ pub fn encode_verify_response(outcome: VerifyOutcome) -> Vec<u8> {
     buf
 }
 
+/// Build a [`StaticTestAnchors`] trust source from the wire anchor entries (the host's resolved,
+/// passed-in anchor set — the core never fetches a trust list itself).
+fn anchors_from_wire(entries: &[WireTrustAnchor]) -> StaticTestAnchors {
+    let mut anchors = StaticTestAnchors::new();
+    for e in entries {
+        anchors = anchors.trust(e.role, e.format, &e.cert_der);
+    }
+    anchors
+}
+
 /// Decode → verify → encode. Pure; shared by the C-ABI, language bindings, and tests (single source
-/// of truth — Principle III). The verifier itself lands in task T016; until then a well-formed
-/// request yields [`VerifyOutcome::NotImplemented`] and a malformed one yields [`VerifyOutcome::Err`].
+/// of truth — Principle III). A well-formed request runs the always-on [`verify`] entry point and
+/// returns the [`VerificationResult`]; a malformed one yields [`VerifyOutcome::Err`].
 #[must_use]
 pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
     let outcome = match decode_verify_request(input) {
-        Ok(_req) => VerifyOutcome::NotImplemented,
+        Ok(req) => {
+            let anchors = anchors_from_wire(&req.anchors);
+            let ctx = VerifyContext {
+                now_unix: req.context.now_unix,
+                role: req.context.role,
+                status: req.context.status,
+                session_transcript: req.context.session_transcript.as_deref(),
+                qualified_gate: req.context.qualified_gate,
+            };
+            let presentation = match &req.presentation {
+                WirePresentation::SdJwtVc { presentation } => Presentation::SdJwtVc(presentation),
+                WirePresentation::Mdoc {
+                    device_response,
+                    audience,
+                } => Presentation::Mdoc {
+                    device_response,
+                    audience: audience.as_deref(),
+                },
+            };
+            let result = verify(
+                &presentation,
+                &req.policy,
+                &anchors,
+                &ctx,
+                req.request.as_ref(),
+            );
+            VerifyOutcome::Ok { result }
+        }
         Err(message) => VerifyOutcome::Err { message },
     };
     encode_verify_response(outcome)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        decode_verify_request, encode_verify_response, process_verify_bytes, VerifyOutcome,
-        VerifyRequest, VerifyResponse, ATTESTATION_SCHEMA_VERSION,
-    };
-    use crate::types::VerificationPolicy;
-
-    fn encode(req: &VerifyRequest) -> Vec<u8> {
-        let mut buf = Vec::new();
-        ciborium::into_writer(req, &mut buf).unwrap();
-        buf
-    }
-
-    fn well_formed_request() -> VerifyRequest {
-        VerifyRequest {
-            schema_version: ATTESTATION_SCHEMA_VERSION,
-            presentation: b"eyJ...~WyJ...~".to_vec(),
-            policy: VerificationPolicy::default(),
-        }
-    }
-
-    #[test]
-    fn well_formed_request_yields_not_implemented() {
-        let out = process_verify_bytes(&encode(&well_formed_request()));
-        let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
-        assert_eq!(resp.schema_version, ATTESTATION_SCHEMA_VERSION);
-        assert_eq!(resp.outcome, VerifyOutcome::NotImplemented);
-    }
-
-    #[test]
-    fn garbage_input_yields_err_outcome() {
-        let out = process_verify_bytes(&[0xff, 0x00, 0x13, 0x37]);
-        let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
-        assert!(matches!(resp.outcome, VerifyOutcome::Err { .. }));
-    }
-
-    #[test]
-    fn wrong_schema_version_is_rejected() {
-        let mut req = well_formed_request();
-        req.schema_version = ATTESTATION_SCHEMA_VERSION + 1;
-        let err = decode_verify_request(&encode(&req)).unwrap_err();
-        assert!(err.contains("unsupported attestation schema_version"));
-    }
-
-    #[test]
-    fn response_round_trips_through_cbor() {
-        let bytes = encode_verify_response(VerifyOutcome::NotImplemented);
-        let resp: VerifyResponse = ciborium::from_reader(&bytes[..]).unwrap();
-        assert_eq!(resp.outcome, VerifyOutcome::NotImplemented);
-    }
-}
+mod tests;

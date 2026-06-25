@@ -111,6 +111,9 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 ecdsa = { version = "0.16", features = ["der"] }
 signature = "2"
 pkcs8 = "0.10"
+# Constant-time Base64 (RustCrypto; already in-tree via pkcs8/spki). Used for the compact-JWS
+# base64url framing in the SD-JWT VC verifier — no general-purpose base64 dep, no hand-rolled codec.
+base64ct = { version = "1", features = ["alloc"] }
 lopdf = "0.36"
 # --- EUDI attestation (feature 004) — pinned per Principle VII (pre-1.0 / mid-rollout standards). ---
 # COSE codec for ISO 18013-5 mdoc (Google, Apache-2.0); pure-Rust, builds on the existing `ciborium`.
@@ -122,3 +125,6 @@ coset = "=0.4.2"
 sd-jwt-payload = { version = "=0.5.1", default-features = false }
 # Trust-list XML (TS 119 612) reader/writer; pure-Rust, no_std-capable.
 quick-xml = "=0.40.1"
+# `JwsSigner` is an `async_trait` (sd-jwt-payload); the test-only issuer helper that mints SD-JWT VCs
+# implements it. Already in-tree via `sd-jwt-payload`; declared here for the dev-dependency only.
+async-trait = "0.1"

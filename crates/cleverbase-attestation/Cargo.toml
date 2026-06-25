@@ -29,13 +29,26 @@ rsa.workspace = true
 p256.workspace = true
 ecdsa.workspace = true
 signature.workspace = true
+base64ct.workspace = true
 # EUDI format/trust-list layers (pinned in [workspace.dependencies]).
 coset.workspace = true
 sd-jwt-payload.workspace = true
 quick-xml.workspace = true
+# Optional, enabled only by the `test-vectors` feature (the shared test-issuer minters): a downstream
+# crate (e.g. `cleverbase-ffi`) enables them as a dev-dependency to drive a VALID end-to-end smoke
+# test through the C-ABI without re-implementing the issuer side (DRY). Otherwise dev-only.
+pkcs8 = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[features]
+# Exposes `crate::test_vectors` (and compiles the shared test-issuer minters outside `cfg(test)`) so a
+# downstream crate can build a conformant VALID request envelope for an end-to-end C-ABI smoke test.
+# Not part of the production verification surface.
+test-vectors = ["dep:pkcs8", "dep:async-trait"]
 
 [dev-dependencies]
 pkcs8.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

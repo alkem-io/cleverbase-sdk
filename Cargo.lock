@@ -198,6 +198,8 @@ dependencies = [
 name = "cleverbase-attestation"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64ct",
  "ciborium",
  "cms",
  "const-oid",

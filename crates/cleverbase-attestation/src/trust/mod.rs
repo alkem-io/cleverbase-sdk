@@ -22,6 +22,20 @@ use std::collections::BTreeSet;
 
 use crate::types::{Format, IssuerRole};
 
+// The native trust-list engine, split into focused modules (the X.509 [`chain`] primitive, the
+// offline JSON [`manifest`] path, the TS 119 612 [`xml`] path, and the [`engine`] that composes
+// them). They are public modules (matching the core crate's convention — a `pub fn` in a `pub mod`
+// is genuinely reachable, satisfying both `unreachable_pub` and clippy's `redundant_pub_crate`);
+// the curated names below are re-exported at `crate::trust` for ergonomics.
+pub mod chain;
+pub mod engine;
+pub mod manifest;
+pub mod xml;
+
+pub use engine::{NativeTrustEngine, TrustListFetcher};
+pub use manifest::{ManifestError, TrustListManifest};
+pub use xml::{XmlTrustList, XmlTrustListError};
+
 /// The reachability policy for fetching/refreshing a trust list (contracts/trust-anchor-source.md).
 ///
 /// The default is **fail-closed**: an unreachable or stale (past its `NextUpdate`) LOTL / national

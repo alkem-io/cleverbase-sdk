@@ -20,6 +20,9 @@ cleverbase-attestation = { path = "../cleverbase-attestation" }
 
 [dev-dependencies]
 ciborium.workspace = true
+# Enable the shared test vectors so the C-ABI smoke test can drive a VALID verification end-to-end
+# without re-implementing the issuer side (the minting logic lives once, in the attestation crate).
+cleverbase-attestation = { path = "../cleverbase-attestation", features = ["test-vectors"] }
 
 [lints]
 workspace = true

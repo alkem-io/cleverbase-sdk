@@ -1,0 +1,507 @@
+//! Tests for the SD-JWT VC verifier (task T007 — written test-first against T011).
+//!
+//! These mint real SD-JWT VC presentations with `sd-jwt-payload`'s issuer side, signed by the test
+//! issuer key, with selective disclosures + a holder KB-JWT, and assert the always-on bar: a
+//! well-formed in-validity credential is VALID with only the disclosed attributes returned, and each
+//! tampered/expired/untrusted/broken-KB/forged-disclosure/malformed case is INVALID with the
+//! specific [`ReasonCode`] — no false-accept (SC-002).
+
+use std::collections::BTreeMap;
+
+use base64ct::{Base64UrlUnpadded, Encoding as _};
+use sd_jwt_payload::{Hasher, KeyBindingJwt, RequiredKeyBinding, SdJwtBuilder};
+use serde_json::{json, Value};
+
+use super::test_issuer::{
+    attach_kb_jwt, block_on, mint_sd_jwt, Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8,
+    ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
+};
+use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
+use crate::trust::StaticTestAnchors;
+use crate::types::{AttributeValue, Format, IssuerRole, ReasonCode, TrustStatus};
+
+const AUDIENCE: &str = "https://verifier.example/cb";
+const NONCE: &str = "n-0S6_WzA2Mj";
+
+/// A trusted-anchor set that trusts the test issuer cert as a PID provider for SD-JWT VC.
+fn trusted_anchors() -> StaticTestAnchors {
+    StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER)
+}
+
+/// The default verifier input: trusted anchors, a holder-binding challenge, in-validity, no status.
+fn input<'a>(
+    presentation: &'a str,
+    anchors: &'a StaticTestAnchors,
+) -> SdJwtVcInput<'a, StaticTestAnchors> {
+    SdJwtVcInput {
+        presentation,
+        anchors,
+        role: IssuerRole::Pid,
+        key_binding: Some(KeyBindingChallenge {
+            audience: AUDIENCE,
+            nonce: NONCE,
+        }),
+        now_unix: NOW,
+        status: StatusInput::NoStatus,
+    }
+}
+
+/// Mint the happy-path presentation: trusted issuer, holder KB over the expected aud/nonce.
+fn happy_presentation() -> String {
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE)
+}
+
+// --- VALID ---------------------------------------------------------------------------------------
+
+#[test]
+fn valid_credential_from_trusted_issuer_is_accepted_with_disclosed_attributes() {
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(
+        result.valid,
+        "expected VALID, got reasons {:?}",
+        result.reasons
+    );
+    assert!(result.reasons.is_empty());
+    assert_eq!(result.trust_status, TrustStatus::Trusted);
+    assert!(result.qualified_status.is_none());
+
+    // All three concealable claims were disclosed (the builder discloses by default).
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("family_name"),
+        Some(&AttributeValue::Text("Lovelace".to_string()))
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("birthdate"),
+        Some(&AttributeValue::Text("1815-12-10".to_string()))
+    );
+}
+
+#[test]
+fn selective_disclosure_reveals_only_the_presented_subset() {
+    // Mint, then conceal `family_name` + `birthdate` for the presentation (disclose only given_name).
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let (mut presented, _withheld) = sd_jwt
+        .into_presentation(&Sha2Hasher)
+        .unwrap()
+        .conceal("/family_name")
+        .unwrap()
+        .conceal("/birthdate")
+        .unwrap()
+        .finish();
+    let holder = Es256Signer::from_pkcs8(HOLDER_KEY_PK8);
+    let kb = block_on(
+        KeyBindingJwt::builder()
+            .iat(NOW)
+            .aud(AUDIENCE)
+            .nonce(NONCE)
+            .finish(&presented, &Sha2Hasher, "ES256", &holder),
+    )
+    .unwrap();
+    presented.attach_key_binding_jwt(kb);
+    let presentation = presented.presentation();
+
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    // Only `given_name` is revealed; the concealed claims are neither revealed nor required.
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
+    assert!(!result.disclosed_attributes.contains_key("family_name"));
+    assert!(!result.disclosed_attributes.contains_key("birthdate"));
+}
+
+// --- INVALID: each with its specific reason, no false-accept ------------------------------------
+
+/// Assert an INVALID result carrying exactly the expected reason.
+fn assert_invalid(result: &crate::types::VerificationResult, expected: ReasonCode) {
+    assert!(!result.valid, "expected INVALID for {expected:?}");
+    assert!(
+        result.disclosed_attributes.is_empty(),
+        "an INVALID result must reveal no attributes"
+    );
+    assert_eq!(result.reasons, vec![expected]);
+}
+
+#[test]
+fn tampered_issuer_signature_is_rejected_as_tamper() {
+    // Flip the last base64url char of the issuer JWS signature segment.
+    let presentation = happy_presentation();
+    let tampered = flip_issuer_signature(&presentation);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&tampered, &anchors));
+    assert_invalid(&result, ReasonCode::Tamper);
+}
+
+#[test]
+fn expired_credential_is_rejected_as_expired() {
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    // Verify at a time past `exp` (NOW + 1_000_000).
+    let mut inp = input(&presentation, &anchors);
+    inp.now_unix = NOW + 2_000_000;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::Expired);
+}
+
+#[test]
+fn not_yet_valid_credential_is_rejected_as_expired() {
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    // Verify at a time before `nbf` (NOW - 1_000).
+    let mut inp = input(&presentation, &anchors);
+    inp.now_unix = NOW - 2_000;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::Expired);
+}
+
+#[test]
+fn untrusted_issuer_certificate_is_rejected_as_untrusted_issuer() {
+    // A credential validly self-signed by the wrong-issuer key+cert: its own signature verifies, but
+    // the cert is NOT on the configured anchor → UntrustedIssuer (no false-accept).
+    let sd_jwt = mint_sd_jwt(WRONG_ISSUER_KEY_PK8, WRONG_ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors(); // trusts only the real issuer cert.
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::UntrustedIssuer);
+}
+
+#[test]
+fn broken_holder_binding_wrong_nonce_is_rejected_as_holder_binding() {
+    // KB-JWT minted over a different nonce than the verifier's challenge.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, "a-different-nonce");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
+#[test]
+fn holder_binding_signed_by_wrong_key_is_rejected_as_holder_binding() {
+    // Correct aud/nonce/sd_hash, but the KB-JWT is signed by the wrong-issuer key, not the holder
+    // key bound in `cnf` → the signature does not verify under the `cnf` key.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, WRONG_ISSUER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
+#[test]
+fn missing_kb_jwt_when_required_is_rejected_as_holder_binding() {
+    // A presentation with no KB-JWT, but the verifier requires holder binding.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = sd_jwt.presentation(); // trailing `~`, no KB segment.
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
+#[test]
+fn forged_disclosure_with_unsigned_digest_is_rejected_as_disclosure_integrity() {
+    // Splice an extra, well-formed disclosure whose digest is NOT in any issuer-signed `_sd` array.
+    // Use an issuer-only presentation (no holder binding) so the integrity check is the failing one
+    // under test — splicing a disclosure into a KB-bound presentation would (correctly) also break
+    // the KB `sd_hash`; here we isolate the disclosure-integrity path.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = sd_jwt.presentation();
+    let forged = splice_forged_disclosure(&presentation);
+    let anchors = trusted_anchors();
+    let mut inp = input(&forged, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::DisclosureIntegrity);
+}
+
+#[test]
+fn malformed_presentation_is_rejected_as_malformed_credential() {
+    let anchors = trusted_anchors();
+    // A single segment with no `~` is not a valid SD-JWT (needs at least 2 segments).
+    let result = verify_sd_jwt_vc(&input("not-an-sd-jwt", &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn unsupported_alg_is_rejected_as_unsupported_format() {
+    // Rewrite the issuer JWS header `alg` to a non-ES256 value; the framing still parses, so this is
+    // an unsupported-format reject rather than malformed.
+    let presentation = happy_presentation();
+    let rewritten = rewrite_issuer_alg(&presentation, "RS256");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&rewritten, &anchors));
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn host_supplied_revoked_status_is_rejected_as_revoked() {
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.status = StatusInput::Revoked;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::Revoked);
+}
+
+#[test]
+fn unavailable_status_is_rejected_as_status_unavailable() {
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.status = StatusInput::Unavailable;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::StatusUnavailable);
+}
+
+#[test]
+fn presentation_without_holder_binding_is_accepted_when_not_required() {
+    // No KB-JWT and no challenge → holder binding is not required (issuer-only credential).
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = sd_jwt.presentation();
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
+}
+
+// --- presentation-mutation helpers --------------------------------------------------------------
+
+/// Flip a byte in the middle of the issuer JWS signature (invalidating it while keeping the
+/// base64url framing canonical, so the verifier reaches the signature check rather than a decode
+/// error).
+fn flip_issuer_signature(presentation: &str) -> String {
+    let (jws, rest) = split_first_segment(presentation);
+    let mut parts: Vec<&str> = jws.split('.').collect();
+    let mut sig_bytes = Base64UrlUnpadded::decode_vec(parts[2]).unwrap();
+    let mid = sig_bytes.len() / 2;
+    sig_bytes[mid] ^= 0xFF;
+    let new_sig = Base64UrlUnpadded::encode_string(&sig_bytes);
+    parts[2] = &new_sig;
+    format!("{}~{rest}", parts.join("."))
+}
+
+/// Rewrite the issuer JWS header `alg` claim to `new_alg`, re-encoding the header (signature now
+/// won't verify, but the framing is intact so the verifier reaches the alg check first).
+fn rewrite_issuer_alg(presentation: &str, new_alg: &str) -> String {
+    let (jws, rest) = split_first_segment(presentation);
+    let parts: Vec<&str> = jws.split('.').collect();
+    let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
+    let mut header: Value = serde_json::from_slice(&header_json).unwrap();
+    header["alg"] = Value::String(new_alg.to_string());
+    let new_header =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    format!("{new_header}.{}.{}~{rest}", parts[1], parts[2])
+}
+
+/// Splice a syntactically valid disclosure whose digest is NOT issuer-signed, inserted before the
+/// KB-JWT (so the framing and KB-JWT remain otherwise intact). The KB `sd_hash` no longer matches,
+/// but disclosure integrity is checked before holder binding's sd_hash — and a forged disclosure is
+/// the precise failure under test, so we assert the integrity reason is raised first.
+fn splice_forged_disclosure(presentation: &str) -> String {
+    // A fresh, well-formed object-property disclosure: ["<salt>", "rogue_claim", "value"].
+    let forged = Base64UrlUnpadded::encode_string(
+        json!(["AAAAAAAAAAAAAAAAAAAAAA", "rogue_claim", "value"])
+            .to_string()
+            .as_bytes(),
+    );
+    // presentation = jws~D1~...~Dn~KB ; insert the forged disclosure just before the KB segment.
+    let mut segments: Vec<&str> = presentation.split('~').collect();
+    let kb_idx = segments.len() - 1;
+    segments.insert(kb_idx, &forged);
+    segments.join("~")
+}
+
+/// Split off the first `~`-delimited segment (the issuer JWS) from the rest.
+fn split_first_segment(presentation: &str) -> (&str, &str) {
+    presentation
+        .split_once('~')
+        .expect("presentation has at least one ~")
+}
+
+// --- a focused unit test of the JSON→AttributeValue mapping (coverage of nested shapes) ----------
+
+#[test]
+fn json_value_maps_to_the_closed_attribute_value() {
+    use super::json_to_attribute;
+    assert_eq!(json_to_attribute(&json!(null)), AttributeValue::Null);
+    assert_eq!(
+        json_to_attribute(&json!(true)),
+        AttributeValue::Boolean(true)
+    );
+    assert_eq!(json_to_attribute(&json!(42)), AttributeValue::Integer(42));
+    // A non-integer number is preserved as text (no lossy float).
+    assert_eq!(
+        json_to_attribute(&json!(1.5)),
+        AttributeValue::Text("1.5".to_string())
+    );
+    assert_eq!(
+        json_to_attribute(&json!("hi")),
+        AttributeValue::Text("hi".to_string())
+    );
+    assert_eq!(
+        json_to_attribute(&json!(["a", 1])),
+        AttributeValue::Array(vec![
+            AttributeValue::Text("a".to_string()),
+            AttributeValue::Integer(1),
+        ])
+    );
+    let mut nested = BTreeMap::new();
+    nested.insert("k".to_string(), AttributeValue::Boolean(false));
+    assert_eq!(
+        json_to_attribute(&json!({ "k": false })),
+        AttributeValue::Map(nested)
+    );
+}
+
+// --- focused unit tests of the verifier's internal reject branches ------------------------------
+
+#[test]
+fn issuer_jws_with_more_than_three_segments_is_malformed() {
+    // A four-segment "JWS" (extra `.segment`) is not valid compact JWS framing.
+    let presentation = happy_presentation();
+    let (jws, rest) = presentation.split_once('~').unwrap();
+    let mangled = format!("{jws}.extra~{rest}");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&mangled, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn sd_hash_mismatch_is_rejected_as_holder_binding() {
+    // Splice a forged disclosure into a KB-bound presentation: `aud`/`nonce` still match, but the
+    // presentation prefix changed so the KB-JWT `sd_hash` no longer matches → HolderBinding (this
+    // exercises the `sd_hash` branch, which precedes the integrity check for a KB-bound credential).
+    let presentation = happy_presentation();
+    let spliced = splice_forged_disclosure(&presentation);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&spliced, &anchors));
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
+#[test]
+fn non_jwk_cnf_is_rejected_as_holder_binding() {
+    use super::holder_key_from_cnf;
+    // Mint with a `cnf` that is a `kid` (not a `jwk`); the holder-key extraction must reject it.
+    let cert_b64 = base64ct::Base64::encode_string(ISSUER_CERT_DER);
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    let sd_jwt = block_on(
+        SdJwtBuilder::new_with_hasher(json!({ "iss": "x", "given_name": "Ada" }), Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .make_concealable("/given_name")
+            .unwrap()
+            .require_key_binding(RequiredKeyBinding::Kid("key-1".to_string()))
+            .finish(&signer, "ES256"),
+    )
+    .unwrap();
+    assert_eq!(holder_key_from_cnf(&sd_jwt), Err(ReasonCode::HolderBinding));
+}
+
+#[test]
+fn malformed_p256_jwks_are_rejected() {
+    use super::verifying_key_from_p256_jwk;
+    // Wrong kty.
+    assert_eq!(
+        verifying_key_from_p256_jwk(&json!({ "kty": "RSA", "crv": "P-256", "x": "", "y": "" })),
+        Err(ReasonCode::HolderBinding)
+    );
+    // Wrong curve.
+    assert_eq!(
+        verifying_key_from_p256_jwk(&json!({ "kty": "EC", "crv": "P-384", "x": "", "y": "" })),
+        Err(ReasonCode::HolderBinding)
+    );
+    // Missing `x`.
+    assert_eq!(
+        verifying_key_from_p256_jwk(&json!({ "kty": "EC", "crv": "P-256", "y": "AAAA" })),
+        Err(ReasonCode::HolderBinding)
+    );
+    // Wrong-length coordinates (1 byte each, not 32).
+    let one = Base64UrlUnpadded::encode_string(&[0x01]);
+    assert_eq!(
+        verifying_key_from_p256_jwk(&json!({ "kty": "EC", "crv": "P-256", "x": one, "y": one })),
+        Err(ReasonCode::HolderBinding)
+    );
+    // The real holder JWK round-trips into a usable key.
+    let holder: Value = serde_json::from_slice(HOLDER_JWK_JSON).unwrap();
+    assert!(verifying_key_from_p256_jwk(&holder).is_ok());
+}
+
+#[test]
+fn compact_es256_rejects_bad_framing_and_signatures() {
+    use super::verify_compact_es256;
+    let holder: Value = serde_json::from_slice(HOLDER_JWK_JSON).unwrap();
+    let key = super::verifying_key_from_p256_jwk(&holder).unwrap();
+    // Four segments → framing error.
+    assert_eq!(verify_compact_es256("a.b.c.d", &key), Err(()));
+    // Two segments → missing signature.
+    assert_eq!(verify_compact_es256("a.b", &key), Err(()));
+    // Non-base64url signature segment.
+    assert_eq!(verify_compact_es256("aa.bb.!!", &key), Err(()));
+    // Right-length but wrong signature bytes.
+    let bogus = Base64UrlUnpadded::encode_string(&[0x01; 64]);
+    assert_eq!(
+        verify_compact_es256(&format!("aa.bb.{bogus}"), &key),
+        Err(())
+    );
+}
+
+#[test]
+fn unsupported_sd_alg_is_rejected_as_unsupported_format() {
+    use super::collect_disclosed_attributes;
+    // A hasher that names itself "sha-512" makes the builder write `_sd_alg: "sha-512"`, which the
+    // verifier rejects (only sha-256 is supported).
+    #[derive(Debug)]
+    struct Sha512NameHasher;
+    impl Hasher for Sha512NameHasher {
+        fn digest(&self, input: &[u8]) -> Vec<u8> {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(input).to_vec()
+        }
+        fn alg_name(&self) -> &'static str {
+            "sha-512"
+        }
+    }
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    let sd_jwt = block_on(
+        SdJwtBuilder::new_with_hasher(json!({ "iss": "x", "given_name": "Ada" }), Sha512NameHasher)
+            .unwrap()
+            .make_concealable("/given_name")
+            .unwrap()
+            .finish(&signer, "ES256"),
+    )
+    .unwrap();
+    assert_eq!(
+        collect_disclosed_attributes(&sd_jwt),
+        Err(ReasonCode::UnsupportedFormat)
+    );
+}
+
+#[test]
+fn collect_signed_digests_gathers_array_element_redactions() {
+    use std::collections::BTreeSet;
+    // An array-element redaction `{ "...": "<digest>" }` plus a nested object `_sd` array.
+    let value = json!({
+        "_sd": ["top-digest"],
+        "nested": { "_sd": ["nested-digest"] },
+        "nationalities": [ { "...": "array-digest" }, "DE" ],
+    });
+    let mut out = BTreeSet::new();
+    super::collect_signed_digests(&value, &mut out);
+    assert!(out.contains("top-digest"));
+    assert!(out.contains("nested-digest"));
+    assert!(out.contains("array-digest"));
+}
