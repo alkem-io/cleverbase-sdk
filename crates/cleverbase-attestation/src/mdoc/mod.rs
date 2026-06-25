@@ -30,8 +30,6 @@ use ciborium::value::Value;
 use ciborium::Value as CborValue;
 use coset::{CborSerializable, CoseKey, CoseSign1, Label, RegisteredLabelWithPrivate};
 use sha2::{Digest, Sha384, Sha512};
-use x509_cert::der::{Decode as _, Encode as _};
-use x509_cert::Certificate;
 
 use crate::status::StatusOutcome;
 use crate::trust::TrustAnchorSource;
@@ -939,8 +937,9 @@ pub fn issuer_signing_cert_der(device_response: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Extract the claimed Document Signer leaf certificate (DER) from a single `Document`'s `IssuerAuth`
-/// `x5chain` (read-only, no verification — the shared body of [`issuer_signing_cert_der`] and
-/// [`issuer_signing_certs_der`]). Returns `None` when the document carries no resolvable leaf.
+/// `x5chain` (read-only, no verification — the shared body of [`issuer_signing_cert_der`] and the
+/// per-document [`issuer_signing_certs_with_issuance_der`]). Returns `None` when the document carries
+/// no resolvable leaf.
 fn issuer_signing_cert_of_document(document: &CborValue) -> Option<Vec<u8>> {
     let issuer_signed = get_map_entry(document, "issuerSigned")?;
     let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
@@ -970,31 +969,6 @@ fn issuance_time_of_document(document: &CborValue) -> Option<i64> {
     tdate_field(info, "signed")
         .ok()
         .or_else(|| tdate_field(info, "validFrom").ok())
-}
-
-/// Extract the claimed Document Signer leaf certificate (DER) of **every** document in a
-/// `DeviceResponse`, in document order — the per-document input the opt-in [`crate::qualified`] gate
-/// needs so a multi-document response is decided over ALL its issuers, not just `documents[0]`.
-///
-/// The always-on bar verifies + merges attributes from every document (possibly different issuers), so
-/// a qualified-status determination that read only `documents[0]` could report `Qualified` over a
-/// result that also carries a non-qualified second document's attributes. This returns one entry per
-/// document (`None` for a document whose leaf cannot be read), so the gate can fold a status across
-/// all of them and never report a single `Qualified` that under-covers.
-///
-/// Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
-/// [`issuer_signing_cert_der`], the certs are *claimed* (trust + signature are decided by the
-/// always-on bar in [`verify`]); this read is only the gate's cert-matching input, never an acceptance.
-#[must_use]
-pub fn issuer_signing_certs_der(device_response: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
-    let root: CborValue = ciborium::from_reader(device_response).ok()?;
-    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
-    Some(
-        documents
-            .iter()
-            .map(issuer_signing_cert_of_document)
-            .collect(),
-    )
 }
 
 /// One document's *claimed* qualified-gate input: its Document Signer leaf certificate (DER) and its
@@ -1077,7 +1051,6 @@ fn cose_alg_is_es256(sign1: &CoseSign1) -> bool {
 /// rejected as a tamper (the EUDI baseline is ES256).
 fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), VerifyFailure> {
     use p256::ecdsa::signature::Verifier as _;
-    use x509_cert::spki::DecodePublicKey as _;
 
     // The protected header MUST name ES256 (the EUDI baseline). Anything else is rejected on the
     // algorithm alone, before any signature math.
@@ -1085,14 +1058,11 @@ fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), Ver
         return Err(VerifyFailure::reason(ReasonCode::Tamper));
     }
 
-    let cert = Certificate::from_der(cert_der).map_err(|_| VerifyFailure::malformed())?;
-    let spki_der = cert
-        .tbs_certificate
-        .subject_public_key_info
-        .to_der()
-        .map_err(|_| VerifyFailure::malformed())?;
-    let verifying_key = p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der)
-        .map_err(|_| VerifyFailure::reason(ReasonCode::Tamper))?;
+    // The crate's single cert-DER → P-256 key path (DRY — Principle III; the SD-JWT VC JWS verifier
+    // shares the same helper). An `x5chain` leaf that does not yield a usable P-256 key means the
+    // IssuerAuth signature cannot be verified — a `Tamper`-class reject.
+    let verifying_key = crate::crypto::p256_verifying_key_from_cert_der(cert_der)
+        .ok_or_else(|| VerifyFailure::reason(ReasonCode::Tamper))?;
 
     let outcome = sign1.verify_signature(&[], |sig, tbs| {
         let signature = p256::ecdsa::Signature::from_slice(sig)

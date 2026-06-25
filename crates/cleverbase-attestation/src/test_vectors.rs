@@ -8,7 +8,7 @@
 //!
 //! Test-support code: the strict `restriction` lints are relaxed here exactly as in the test-issuer
 //! modules (a panic on a broken fixed fixture is the intended signal).
-#![allow(clippy::expect_used, clippy::missing_panics_doc)]
+#![allow(clippy::expect_used)]
 
 use crate::sdjwtvc::test_issuer::{
     mint_sd_jwt, mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,

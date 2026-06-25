@@ -17,8 +17,7 @@
     clippy::redundant_pub_crate,
     clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
-    clippy::missing_panics_doc
+    clippy::panic
 )]
 
 use std::future::Future;
@@ -71,7 +70,9 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// A `sha-256` [`Hasher`] over the SDK's own `sha2` (the crate's `Sha256Hasher` is feature-gated off).
+/// A `sha-256` [`Hasher`] over the SDK's own `sha2` — the `sd-jwt-payload` [`Hasher`] adapter the test
+/// issuer/holder minters use (the crate ships no SHA-256 `Hasher` impl of its own, since production
+/// hashing goes through [`crate::crypto::sha256`], not this trait).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Sha2Hasher;
 

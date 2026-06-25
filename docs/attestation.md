@@ -45,9 +45,10 @@ Cleverbase issuer is a configuration change, not a rewrite.
   OpenID4VP nonce/audience binding. Returns a `VerificationResult { valid, disclosed_attributes,
   trust_status, qualified_status?, reasons[] }`; a failure carries a specific `ReasonCode` (a closed
   enum — never a false-accept).
-- **`openid4vp::build_request(nonce_source, dcql, audience)`** and
+- **`openid4vp::build_request(nonce_source, dcql, audience, response_uri)`** and
   **`openid4vp::verify_response(vp_token, request, …)`**: the full OpenID4VP verifier — build a DCQL
-  request with a fresh nonce + audience, and verify a returned `vp_token` is bound to it.
+  request with a fresh nonce + audience (`client_id`) + the verifier's `response_uri` (the 4th element
+  of the mdoc handover, OpenID4VP 1.0 §B.2.6), and verify a returned `vp_token` is bound to it.
 - **Trust** (`crate::trust`): the `TrustAnchorSource` trait (`resolve` / host-driven `refresh`) with
   the `NativeTrustEngine` production implementation (TS 119 612 LOTL / national TL parse +
   authenticate + cache; fail-closed on unreachable/stale lists by default) and a configured

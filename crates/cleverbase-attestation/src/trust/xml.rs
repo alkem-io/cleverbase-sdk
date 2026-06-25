@@ -26,7 +26,6 @@
 
 use std::collections::BTreeMap;
 
-use base64ct::{Base64, Encoding as _};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
@@ -249,10 +248,10 @@ fn local_name(qname: &[u8]) -> String {
 }
 
 /// Decode a `<X509Certificate>` base64 body (which may contain PEM-style line breaks / whitespace)
-/// into DER bytes.
+/// into DER bytes, via the crate's single whitespace-tolerant cert-body decode (DRY — Principle III).
 fn decode_b64_cert(body: &str) -> Result<Vec<u8>, XmlTrustListError> {
-    let compact: String = body.split_whitespace().collect();
-    Base64::decode_vec(&compact).map_err(|e| XmlTrustListError::Base64(e.to_string()))
+    crate::crypto::decode_base64_cert_lenient(body)
+        .map_err(|e| XmlTrustListError::Base64(e.to_string()))
 }
 
 #[cfg(test)]

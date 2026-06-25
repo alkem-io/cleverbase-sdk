@@ -223,9 +223,6 @@ impl HolderContext {
 /// An error building a signing input or splicing a signature back into an envelope.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SignerError {
-    /// The host returned a signature whose ceremony does not match the input it was built for.
-    #[error("signature spliced into the wrong ceremony envelope")]
-    CeremonyMismatch,
     /// The host returned a signature of the wrong length for the algorithm (ES256 raw `r‖s` is 64
     /// bytes).
     #[error("unexpected signature length for {0:?}: got {1} bytes")]

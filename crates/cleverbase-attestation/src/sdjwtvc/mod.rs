@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value;
-use x509_cert::spki::DecodePublicKey as _;
 
 use crate::trust::TrustAnchorSource;
 use crate::types::{
@@ -268,18 +267,12 @@ fn issuer_cert_from_header(header: &Value) -> Result<Vec<u8>, ReasonCode> {
     base64ct::Base64::decode_vec(leaf_b64).map_err(|_| ReasonCode::MalformedCredential)
 }
 
-/// Parse a DER certificate and extract its P-256 ECDSA verifying key (the SDK's vetted X.509 +
-/// `p256` stack — the same path `cleverbase-core` uses for CMS leaf verification).
+/// Parse a DER certificate and extract its P-256 ECDSA verifying key via the crate's single cert-DER →
+/// key path [`crate::crypto::p256_verifying_key_from_cert_der`] (DRY — Principle III; the mdoc
+/// `IssuerAuth` verifier shares the same helper). A leaf that base64-decoded from `x5c` but does not
+/// yield a usable P-256 key means the issuer signature cannot be verified — a `Tamper`-class reject.
 fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::VerifyingKey, ReasonCode> {
-    use der::{Decode as _, Encode as _};
-    let cert =
-        x509_cert::Certificate::from_der(cert_der).map_err(|_| ReasonCode::MalformedCredential)?;
-    let spki_der = cert
-        .tbs_certificate
-        .subject_public_key_info
-        .to_der()
-        .map_err(|_| ReasonCode::MalformedCredential)?;
-    p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der).map_err(|_| ReasonCode::Tamper)
+    crate::crypto::p256_verifying_key_from_cert_der(cert_der).ok_or(ReasonCode::Tamper)
 }
 
 /// Check the `nbf`/`exp` validity window against `now` (RFC 9901 carries the JWT `nbf`/`exp` claims).

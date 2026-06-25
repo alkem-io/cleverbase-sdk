@@ -49,7 +49,6 @@ mod tests;
 
 use std::collections::BTreeMap;
 
-use base64ct::{Base64, Encoding as _};
 use serde::Deserialize;
 
 use crate::trust::manifest::parse_rfc3339_utc_pub;
@@ -191,10 +190,11 @@ struct RawStatus {
     starting_time: String,
 }
 
-/// Decode a base64 DER certificate body (tolerating PEM-style whitespace) to DER bytes.
+/// Decode a base64 DER certificate body (tolerating PEM-style whitespace) to DER bytes, via the
+/// crate's single whitespace-tolerant cert-body decode (DRY — Principle III).
 fn decode_b64_cert(body: &str) -> Result<Vec<u8>, QualifiedTrustListError> {
-    let compact: String = body.split_whitespace().collect();
-    Base64::decode_vec(&compact).map_err(|e| QualifiedTrustListError::Base64(e.to_string()))
+    crate::crypto::decode_base64_cert_lenient(body)
+        .map_err(|e| QualifiedTrustListError::Base64(e.to_string()))
 }
 
 impl QualifiedTrustList {

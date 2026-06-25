@@ -84,41 +84,6 @@ pub struct Validity {
     pub not_after: Option<i64>,
 }
 
-/// The signing authority of an attestation, with its resolved trust posture (data-model.md).
-///
-/// `qualified_status` is `Some` only when the opt-in qualified gate ran; otherwise it is `None`
-/// (never assume qualified).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Issuer {
-    /// The issuer role, which selects the trust anchor.
-    pub role: IssuerRole,
-    /// Whether the issuer is on the configured trust anchor for its role/format.
-    pub trust_status: TrustStatus,
-    /// The eIDAS qualified status, present only when the opt-in gate ran.
-    pub qualified_status: Option<QualifiedStatus>,
-}
-
-/// An issuer-signed set of attributes about a subject, in one of two formats (data-model.md).
-///
-/// For a *presentation*, `attributes` holds only the **disclosed** subset; undisclosed attributes are
-/// neither revealed nor required. `raw` is the encoded credential as received (compact SD-JWT(+KB) or
-/// CBOR `DeviceResponse`) — the verifier works from `raw`, and the structured fields are the parsed,
-/// verified view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Attestation {
-    /// The credential format.
-    pub format: Format,
-    /// The signing authority and its resolved trust posture.
-    pub issuer: Issuer,
-    /// The disclosed claims (for a presentation, only the disclosed subset).
-    pub attributes: BTreeMap<String, AttributeValue>,
-    /// The credential validity window.
-    pub validity: Validity,
-    /// The encoded credential as received.
-    #[serde(with = "serde_bytes")]
-    pub raw: Vec<u8>,
-}
-
 /// A disclosed attribute value.
 ///
 /// Credential claims are heterogeneous (strings, numbers, booleans, nested maps, byte strings — e.g.
@@ -264,8 +229,8 @@ impl VerificationResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attestation, AttributeValue, Format, Issuer, IssuerRole, QualifiedStatus, ReasonCode,
-        StatusReachability, TrustStatus, Validity, VerificationPolicy, VerificationResult,
+        AttributeValue, Format, ReasonCode, StatusReachability, TrustStatus, VerificationPolicy,
+        VerificationResult,
     };
     use std::collections::BTreeMap;
 
@@ -285,45 +250,6 @@ mod tests {
         assert_eq!(policy.formats, vec![Format::SdJwtVc, Format::Mdoc]);
         assert!(!policy.qualified_gate);
         assert_eq!(policy.status_reachability, StatusReachability::FailClosed);
-    }
-
-    #[test]
-    fn attestation_round_trips_through_cbor() {
-        let mut attributes = BTreeMap::new();
-        attributes.insert("given_name".to_string(), AttributeValue::Text("Ada".into()));
-        attributes.insert("age_over_18".to_string(), AttributeValue::Boolean(true));
-        attributes.insert("birth_year".to_string(), AttributeValue::Integer(1815));
-        attributes.insert(
-            "portrait".to_string(),
-            AttributeValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-        );
-        let mut nested = BTreeMap::new();
-        nested.insert(
-            "locality".to_string(),
-            AttributeValue::Text("London".into()),
-        );
-        attributes.insert("address".to_string(), AttributeValue::Map(nested));
-        attributes.insert(
-            "tags".to_string(),
-            AttributeValue::Array(vec![AttributeValue::Text("a".into()), AttributeValue::Null]),
-        );
-
-        let attestation = Attestation {
-            format: Format::SdJwtVc,
-            issuer: Issuer {
-                role: IssuerRole::Qeaa,
-                trust_status: TrustStatus::Trusted,
-                qualified_status: Some(QualifiedStatus::Qualified),
-            },
-            attributes,
-            validity: Validity {
-                not_before: Some(1_700_000_000),
-                not_after: Some(1_800_000_000),
-            },
-            raw: b"eyJ...~WyJ...~".to_vec(),
-        };
-
-        assert_eq!(cbor_roundtrip(&attestation), attestation);
     }
 
     #[test]

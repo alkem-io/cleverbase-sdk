@@ -1,24 +1,46 @@
 //! Shared crate-internal crypto helpers (DRY — Constitution Principle III): the **one** SHA-256
-//! digest, the **one** P-256 JWK → SEC1 decode, and the IANA hash-algorithm name the verifier
-//! supports.
+//! digest, the **one** P-256 JWK → SEC1 decode, the **one** cert-DER → P-256 verifying-key path, and
+//! the IANA hash-algorithm name the verifier supports.
 //!
-//! These were previously copy-pasted across [`crate::sdjwtvc`] (the SD-JWT VC verifier),
-//! [`crate::issuance::signer`] (the holder context), and [`mod@crate::issuance::present`] (the
-//! `_sd_alg` name) — three independent transcriptions of the same `kty=EC`/`crv=P-256` guard,
-//! base64url `x`/`y` decode, 32-byte-length check, and `0x04 ‖ X ‖ Y` SEC1 assembly, plus two
-//! copies of `sha256(&[u8]) -> [u8; 32]` and a stray `"sha-256"` literal. They are consolidated
-//! here so there is one authoritative source.
+//! The JWK decode + digest were previously copy-pasted across [`crate::sdjwtvc`] (the SD-JWT VC
+//! verifier), [`crate::issuance::signer`] (the holder context), and [`mod@crate::issuance::present`]
+//! (the `_sd_alg` name) — three independent transcriptions of the same `kty=EC`/`crv=P-256` guard,
+//! base64url `x`/`y` decode, 32-byte-length check, and `0x04 ‖ X ‖ Y` SEC1 assembly, plus two copies
+//! of `sha256(&[u8]) -> [u8; 32]` and a stray `"sha-256"` literal. The cert-DER → verifying-key
+//! `Certificate::from_der → subject_public_key_info.to_der() → from_public_key_der` sequence was
+//! likewise transcribed in both issuer-signature verifiers ([`crate::sdjwtvc`]'s JWS `x5c` leaf and
+//! [`crate::mdoc`]'s COSE_Sign1 `IssuerAuth` `x5chain` leaf). All are consolidated here so there is
+//! one authoritative source.
 //!
-//! No hand-rolled crypto (Principle IV): the digest is the SDK's vetted `sha2`, and the public-point
-//! decode ends in `p256::ecdsa::VerifyingKey::from_sec1_bytes`, whose on-curve check is preserved.
+//! No hand-rolled crypto (Principle IV): the digest is the SDK's vetted `sha2`, the public-point
+//! decode ends in `p256::ecdsa::VerifyingKey::from_sec1_bytes`, and the cert path ends in
+//! `from_public_key_der` — each crate's own on-curve check is preserved.
 
-use base64ct::{Base64UrlUnpadded, Encoding as _};
+use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
 use serde_json::Value;
 
 /// The SD-JWT `_sd_alg` / IANA "Named Information Hash Algorithm" registry name for SHA-256. Per
 /// RFC 9901 the default when `_sd_alg` is absent is `sha-256`; it is also the only digest the
 /// verifier and the holder-presentation builder support.
 pub(crate) const SHA_256: &str = "sha-256";
+
+/// Decode a **standard** base64 certificate body to DER, tolerating PEM-style whitespace (internal
+/// line breaks / spaces are stripped before decoding). The **one** authoritative whitespace-tolerant
+/// `<X509Certificate>`-body decode (DRY — Principle III): the TS 119 612 trust-list XML
+/// ([`crate::trust::xml`]) and the qualified-status national TL JSON ([`crate::qualified`]) both carry
+/// PEM-wrapped base64 certificate bodies and previously transcribed the identical
+/// `split_whitespace().collect()` → `Base64::decode_vec` step. Returns the underlying
+/// [`base64ct::Error`] so each caller maps it into its own error variant (preserving its existing
+/// `Base64(e.to_string())` message).
+///
+/// Deliberately distinct from the two stricter cert decodes that are NOT folded in (they would change
+/// behaviour): the JSON manifest ([`crate::trust::manifest`]) trims only leading/trailing whitespace,
+/// and the SD-JWT VC JWS `x5c` leaf ([`crate::sdjwtvc`]) is a compact RFC 7515 array element decoded
+/// with no whitespace tolerance at all.
+pub(crate) fn decode_base64_cert_lenient(body: &str) -> Result<Vec<u8>, base64ct::Error> {
+    let compact: String = body.split_whitespace().collect();
+    Base64::decode_vec(&compact)
+}
 
 /// The byte length of a single P-256 affine coordinate (and of the raw `r`/`s` scalars).
 const P256_COORD_LEN: usize = 32;
@@ -77,4 +99,23 @@ pub(crate) fn p256_sec1_from_jwk(jwk: &Value) -> Option<Vec<u8>> {
 pub(crate) fn p256_verifying_key_from_jwk(jwk: &Value) -> Option<p256::ecdsa::VerifyingKey> {
     let sec1 = p256_sec1_from_jwk(jwk)?;
     p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).ok()
+}
+
+/// Extract the P-256 ECDSA verifying key from a DER certificate's `SubjectPublicKeyInfo`, returning
+/// `None` when the certificate does not parse, its SPKI cannot be re-encoded, or the key is not a
+/// valid P-256 public key. This is the **one** cert-DER → `VerifyingKey` path for the crate (DRY —
+/// Principle III): both issuer-signature verifiers — the SD-JWT VC JWS (`x5c` leaf) and the mdoc
+/// COSE_Sign1 `IssuerAuth` (`x5chain` leaf) — previously transcribed the identical
+/// `Certificate::from_der → tbs.subject_public_key_info.to_der() → from_public_key_der` sequence; they
+/// now share this. The terminal `from_public_key_der` performs the on-curve point validation (the SDK's
+/// vetted X.509 + `p256` stack — the same path `cleverbase-core` uses for CMS leaf verification; no
+/// hand-rolled crypto, Principle IV). Callers map the `None` to their own format-specific reason.
+pub(crate) fn p256_verifying_key_from_cert_der(
+    cert_der: &[u8],
+) -> Option<p256::ecdsa::VerifyingKey> {
+    use der::{Decode as _, Encode as _};
+    use x509_cert::spki::DecodePublicKey as _;
+    let cert = x509_cert::Certificate::from_der(cert_der).ok()?;
+    let spki_der = cert.tbs_certificate.subject_public_key_info.to_der().ok()?;
+    p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der).ok()
 }

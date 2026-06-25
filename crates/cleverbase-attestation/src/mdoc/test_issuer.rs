@@ -23,7 +23,6 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::missing_panics_doc,
     clippy::cast_possible_truncation,
     // Test-builder ergonomics that the in-crate `cfg(test)` suite gets relaxed via lib.rs's
     // `cfg_attr(test, allow(...))`; under the `test-vectors` feature this module is compiled WITHOUT
@@ -111,10 +110,6 @@ pub(crate) struct MdocBuilder {
     /// disclosed element collides with a first-document identifier but carries this DIFFERENT value —
     /// the cross-document attribute-shadowing probe (a 2nd authentic doc must not overwrite a claim).
     append_colliding_document: Option<(&'static str, CborValue)>,
-    /// When set, append a SECOND document whose `IssuerAuth` x5chain leaf is the WRONG-issuer cert (a
-    /// DIFFERENT claimed DS) — the multi-issuer probe for the qualified-status gate (the gate must
-    /// decide over every document's issuer, not just `documents[0]`).
-    append_second_issuer_document: bool,
     /// When `Some`, append a SECOND fully-VALID document signed by the SAME trusted DS, disclosing one
     /// distinct (non-colliding) element, but with its OWN MSO `(signed, validUntil)` issuance window —
     /// the multi-document qualified-status fold probe: a VALID response whose documents[0] is issued in
@@ -259,7 +254,6 @@ impl MdocBuilder {
             device_signature_override: None,
             append_forged_document: false,
             append_colliding_document: None,
-            append_second_issuer_document: false,
             append_valid_document_issued_at: None,
             status_override: None,
             omit_status: false,
@@ -328,14 +322,6 @@ impl MdocBuilder {
         value: CborValue,
     ) -> Self {
         self.append_colliding_document = Some((identifier, value));
-        self
-    }
-
-    /// Append a second document signed by the WRONG-issuer DS (a different claimed `IssuerAuth`
-    /// x5chain leaf), producing a multi-ISSUER response — the qualified-status gate must decide over
-    /// every document's issuer, not just `documents[0]`.
-    pub(crate) fn append_second_issuer_document(mut self) -> Self {
-        self.append_second_issuer_document = true;
         self
     }
 
@@ -513,11 +499,6 @@ impl MdocBuilder {
         let colliding = self
             .append_colliding_document
             .map(|(identifier, value)| build_single_valid_document(identifier, value));
-        // A second document signed by the WRONG-issuer DS (a different claimed signing cert) — the
-        // multi-issuer probe for the qualified-status gate.
-        let second_issuer = self
-            .append_second_issuer_document
-            .then(build_wrong_issuer_document);
         // A second VALID document (same trusted DS) issued in its OWN window — the multi-document
         // qualified-status fold probe (documents[0] qualified-at-issuance, this one not-qualified).
         let second_valid_issued_at =
@@ -821,9 +802,6 @@ impl MdocBuilder {
         if let Some(colliding_document) = colliding {
             documents.push(colliding_document);
         }
-        if let Some(second_issuer_document) = second_issuer {
-            documents.push(second_issuer_document);
-        }
         if let Some(second_valid_document) = second_valid_issued_at {
             documents.push(second_valid_document);
         }
@@ -871,14 +849,6 @@ fn build_single_valid_document(identifier: &'static str, value: CborValue) -> Cb
             value,
         }])
         .build();
-    first_document_of_response(&response)
-}
-
-/// Mint a single document whose `IssuerAuth` is signed by the WRONG-issuer DS (a different claimed
-/// x5chain leaf), and return its `Document` CBOR value. Used to append a SECOND document with a
-/// DIFFERENT issuer — the multi-issuer probe for the qualified-status gate.
-fn build_wrong_issuer_document() -> CborValue {
-    let response = MdocBuilder::new().use_wrong_issuer().build();
     first_document_of_response(&response)
 }
 

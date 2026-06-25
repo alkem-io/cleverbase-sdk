@@ -79,6 +79,12 @@ the configured anchors + the presented credential alone, offline-capable where t
 `qualifiedStatus=Qualified` requires the opt-in gate to have positively determined it (no false "qualified",
 SC-007).
 
+**Implemented surface**: this flat `VerificationResult` (the `cleverbase-attestation` `types::VerificationResult`
+struct) is the verifier's result type. The `Attestation` / `Issuer` entries above are **conceptual** model
+entities (this file is "conceptual … not a wire schema") and intentionally have no standalone Rust struct —
+their fields are folded into `VerificationResult` (`disclosedAttributes`, `trustStatus`, `qualifiedStatus`) so
+the result API has one authoritative shape rather than a parallel `Attestation` mirror.
+
 ## HolderContext + SignerHook (issuance/presentation — gated)
 
 | Member | Type | Notes |
