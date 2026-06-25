@@ -382,12 +382,21 @@ fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<()
         .map_err(|_| ())
 }
 
-/// Recompute the SD-JWT disclosure digests with `sha2` and match them against the issuer-signed
-/// `_sd` arrays, returning the disclosed attribute map.
+/// Recompute the SD-JWT disclosure digests with `sha2`, match them against the issuer-signed `_sd`
+/// arrays, and reconstruct the **disclosed** claims preserving their nesting (RFC 9901 §7.1).
 ///
 /// Selective-disclosure integrity (FR-003): the verifier accepts only disclosed claims whose
 /// disclosure digest appears in an issuer-signed `_sd` array (top-level or nested). A presented
 /// disclosure whose digest is *not* signed is a tampered/forged disclosure → `DisclosureIntegrity`.
+///
+/// The disclosed claims are returned at their **actual positions in the credential structure**, not
+/// flattened onto their leaf name: per RFC 9901 §7.1 a disclosed object property is inserted at the
+/// level of the `_sd` key that referenced it. So `address.locality` and `place_of_birth.locality` are
+/// two *distinct* nested values — `{"address": {"locality": …}, "place_of_birth": {"locality": …}}` —
+/// not a single collapsed `locality` (which both silently lost data *and*, when the leaf-keyed
+/// collision guard was added, false-rejected the legitimate EUDI PID shape as `DisclosureIntegrity`).
+/// Only the disclosed (selectively-disclosable) claims are surfaced; the always-visible registered
+/// claims (`iss`/`vct`/`nbf`/`exp`/…) are not "disclosed attributes" and are not returned here.
 fn collect_disclosed_attributes(
     sd_jwt: &sd_jwt_payload::SdJwt,
 ) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
@@ -398,92 +407,303 @@ fn collect_disclosed_attributes(
         }
     }
 
-    // Gather every issuer-signed digest from the JWS claims (top-level `_sd` + nested `_sd` arrays +
-    // array-element `{"...": digest}` entries). A disclosure whose digest is absent is unsigned.
-    let claims_value =
-        serde_json::to_value(sd_jwt.claims()).map_err(|_| ReasonCode::MalformedCredential)?;
-    let mut signed_digests = std::collections::BTreeSet::new();
-    collect_signed_digests(&claims_value, &mut signed_digests);
-
-    let mut disclosed = BTreeMap::new();
-    let mut seen_digests = std::collections::BTreeSet::new();
+    // Index every presented disclosure by its digest. Two presented disclosures hashing to the same
+    // digest are the same disclosure repeated — that digest is then "encountered more than once" and
+    // RFC 9901 §7.1 step 4 invalidates the SD-JWT, so a repeated presented digest is rejected here
+    // (the in-structure repeat — the same digest in two `_sd` arrays — is caught during the walk).
+    // A disclosure whose digest is not referenced by any issuer-signed `_sd`/array-element entry is
+    // never substituted below, so it is rejected as forged by the unused-disclosure check after the
+    // walk (membership / `DisclosureIntegrity`).
+    let mut disclosures_by_digest = BTreeMap::new();
     for disclosure in sd_jwt.disclosures() {
         let digest = Base64UrlUnpadded::encode_string(&sha256(disclosure.as_str().as_bytes()));
-        if !signed_digests.contains(&digest) {
+        if disclosures_by_digest.insert(digest, disclosure).is_some() {
             return Err(ReasonCode::DisclosureIntegrity);
         }
-        // RFC 9901 §7.3: if any digest is encountered more than once during processing the SD-JWT is
-        // invalid. A presentation that repeats the same disclosure (same digest) is rejected — a
-        // duplicate could otherwise pass the membership check and be silently accepted.
-        if !seen_digests.insert(digest) {
+    }
+
+    // Reconstruct the disclosed subtree by substituting digests at their position in the issuer-signed
+    // structure (RFC 9901 §7.1): per-object claim-name uniqueness and the global "digest seen more than
+    // once" rule are enforced as we walk. `used_digests` records every digest we substitute, so a
+    // presented-but-unreferenced (forged) disclosure can be detected after the walk.
+    let claims_value =
+        serde_json::to_value(sd_jwt.claims()).map_err(|_| ReasonCode::MalformedCredential)?;
+    // `SdJwtClaims` always serializes to a JSON object; a non-object is a serializer contract break.
+    let claims_object = claims_value
+        .as_object()
+        .ok_or(ReasonCode::MalformedCredential)?;
+    let mut used_digests = std::collections::BTreeSet::new();
+    let disclosed = disclosed_object(claims_object, &disclosures_by_digest, &mut used_digests)?;
+
+    // Membership (FR-003): every presented disclosure's digest MUST appear in the issuer-signed
+    // structure. Any digest we never substituted is a disclosure the issuer did not sign — forged.
+    if used_digests.len() != disclosures_by_digest.len() {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    Ok(disclosed)
+}
+
+/// Reconstruct the **disclosed** claims of one object level (RFC 9901 §7.1), preserving nesting.
+///
+/// For each digest in this object's `_sd` array that has a matching presented disclosure, insert the
+/// disclosed object property *at this level* (the level of the `_sd` key — the spec's nesting rule),
+/// recursing into the disclosed value so nested disclosures are reconstructed too. Clear (always-
+/// present) object/array properties are recursed into so a disclosed claim nested under a non-
+/// concealable parent (e.g. `address.locality`) is surfaced under that parent — a property is included
+/// only when it (recursively) yields at least one disclosed claim.
+///
+/// Two RFC 9901 §7.1 invariants are enforced here:
+/// - **Claim-name uniqueness at the level of the `_sd` key** (per-object, *not* a crate-wide leaf
+///   name): a claim name already populated at this level by another disclosure → reject. This is the
+///   real reorder attack — two issuer-signed disclosures for the same claim at the same level let a
+///   malicious holder pick which value the relying party sees by reordering the segments.
+/// - **A digest encountered more than once** (`used_digests`) anywhere in the structure → reject.
+///
+/// Both reject as [`ReasonCode::DisclosureIntegrity`].
+fn disclosed_object(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    // Disclosable object properties: substitute this object's `_sd` entries (DRY with the full-value
+    // reconstruction; this is the shared per-object `_sd`/uniqueness/repeated-digest logic).
+    let mut disclosed = substitute_sd_array(object, disclosures_by_digest, used_digests)?;
+
+    // Clear properties may nest disclosable claims (e.g. a non-concealable `address` carrying a
+    // concealable `locality`); recurse and keep the property only when it yields disclosed claims. A
+    // clear *scalar* holds no disclosure, so it is NOT surfaced here — only the credential's disclosed
+    // claims are returned at top level (the always-visible registered claims are not disclosures).
+    for (key, child) in object {
+        if is_sd_reserved_key(key) {
+            continue;
+        }
+        if let Some(nested) = disclosed_subtree(child, disclosures_by_digest, used_digests)? {
+            insert_unique_at_level(&mut disclosed, key, nested)?;
+        }
+    }
+
+    Ok(disclosed)
+}
+
+/// Substitute the `_sd` array of one object: each digest with a matching *presented* disclosure
+/// becomes that disclosed object property, inserted at this level (RFC 9901 §7.1). A withheld digest
+/// (no presented disclosure) is skipped; a repeated digest or a same-level claim-name collision is
+/// rejected. Shared by the disclosed-only top-level walk and the full disclosed-value reconstruction.
+fn substitute_sd_array(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    let mut out = BTreeMap::new();
+    let Some(Value::Array(sd)) = object.get("_sd") else {
+        return Ok(out);
+    };
+    for digest in sd.iter().filter_map(Value::as_str) {
+        let Some(disclosure) = disclosures_by_digest.get(digest) else {
+            // The digest is signed but not disclosed — a withheld claim; nothing to surface.
+            continue;
+        };
+        if !used_digests.insert(digest.to_string()) {
+            // RFC 9901 §7.1 step 4: a digest encountered more than once invalidates the SD-JWT.
             return Err(ReasonCode::DisclosureIntegrity);
         }
-        // Object-property disclosures carry a claim name; array-element disclosures do not — the
-        // latter are sub-values of a named claim and are surfaced via that claim's value, so only
-        // named top-level/object disclosures become returned attributes here.
-        if let Some(name) = disclosure.claim_name.as_deref() {
-            insert_no_shadow(
-                &mut disclosed,
-                name.to_string(),
-                json_to_attribute(&disclosure.claim_value),
-            )?;
+        // An `_sd` entry MUST resolve to an object-property disclosure (`[salt, name, value]`); an
+        // array-element disclosure (`[salt, value]`, no claim name) referenced from `_sd` is invalid.
+        let name = disclosure
+            .claim_name
+            .as_deref()
+            .ok_or(ReasonCode::DisclosureIntegrity)?;
+        let value =
+            reconstruct_value(&disclosure.claim_value, disclosures_by_digest, used_digests)?;
+        insert_unique_at_level(&mut out, name, value)?;
+    }
+    Ok(out)
+}
+
+/// The reserved SD-JWT keys that are never reconstructed as claim values: the `_sd` digest array, the
+/// `_sd_alg` selector, and the `cnf` holder-binding key (RFC 9901 / SD-JWT VC machinery, not claims).
+fn is_sd_reserved_key(key: &str) -> bool {
+    matches!(key, "_sd" | "_sd_alg" | "cnf")
+}
+
+/// Reconstruct a disclosed object value **in full** (RFC 9901 §7.1 recursive processing): keep every
+/// clear property the issuer signed (scalars included), substitute this object's disclosed `_sd`
+/// entries, and recurse into clear object/array properties for their own nested disclosures. This is
+/// the disclosed *value* of a revealed claim, distinct from the disclosed-only top-level walk.
+fn reconstruct_object(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    let mut out = substitute_sd_array(object, disclosures_by_digest, used_digests)?;
+    for (key, child) in object {
+        if is_sd_reserved_key(key) {
+            continue;
+        }
+        // A clear property of a disclosed value is part of that value: keep it, reconstructing any
+        // nested disclosures within it.
+        let value = reconstruct_value(child, disclosures_by_digest, used_digests)?;
+        insert_unique_at_level(&mut out, key, value)?;
+    }
+    Ok(out)
+}
+
+/// Reconstruct any disclosed claims nested under a clear property's value, returning `None` when the
+/// value contains no disclosed claim (so the property is omitted from the disclosed view) and
+/// `Some(value)` carrying only the disclosed nested claims otherwise.
+fn disclosed_subtree(
+    value: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<AttributeValue>, ReasonCode> {
+    match value {
+        Value::Object(object) => {
+            let nested = disclosed_object(object, disclosures_by_digest, used_digests)?;
+            Ok((!nested.is_empty()).then_some(AttributeValue::Map(nested)))
+        }
+        Value::Array(items) => {
+            let disclosed = disclosed_array(items, disclosures_by_digest, used_digests)?;
+            Ok((!disclosed.is_empty()).then_some(AttributeValue::Array(disclosed)))
+        }
+        // A scalar clear property holds no disclosable claim.
+        _ => Ok(None),
+    }
+}
+
+/// Reconstruct the disclosed elements of an array for the **top-level disclosed-only walk** (RFC 9901
+/// §7.1): an `{"...": "<digest>"}` redaction whose disclosure is presented becomes that disclosed
+/// element; an undisclosed redaction is dropped (the element was not revealed). A clear element is
+/// surfaced only when it nests a disclosed claim — a clear scalar carries no disclosure.
+fn disclosed_array(
+    items: &[Value],
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<AttributeValue>, ReasonCode> {
+    let mut disclosed = Vec::new();
+    for item in items {
+        if let Some(element) = disclosed_array_redaction(item, disclosures_by_digest, used_digests)?
+        {
+            // A revealed redacted element.
+            disclosed.push(element);
+        } else if !is_array_redaction(item) {
+            // A clear element: surface it only when it nests a disclosed claim (mirrors a clear
+            // property in the disclosed-only walk).
+            if let Some(nested) = disclosed_subtree(item, disclosures_by_digest, used_digests)? {
+                disclosed.push(nested);
+            }
         }
     }
     Ok(disclosed)
 }
 
-/// Insert a disclosed claim, rejecting a disclosure that would populate an **already-populated** claim
-/// name with a different value (RFC 9901 §9.3 — the verifier MUST reject an SD-JWT that would populate
-/// a claim name more than once; populating it twice would let a malicious holder pick which
-/// issuer-signed value the relying party sees by reordering the disclosure segments).
-///
-/// This mirrors the mdoc path's [`crate::mdoc`] `insert_no_shadow` (parity, DRY in spirit): an
-/// identical re-disclosure is harmless (no shadowing of a different value) and is accepted; a
-/// conflicting one is rejected as a structurally untrustworthy disclosure set
-/// ([`ReasonCode::DisclosureIntegrity`]).
-fn insert_no_shadow(
-    map: &mut BTreeMap<String, AttributeValue>,
-    name: String,
-    value: AttributeValue,
-) -> Result<(), ReasonCode> {
-    match map.get(&name) {
-        // A genuine collision with a DIFFERENT value: one disclosure would shadow the other — reject.
-        Some(existing) if *existing != value => Err(ReasonCode::DisclosureIntegrity),
-        // Same name, same value (or first sighting): no shadowing risk.
-        Some(_) => Ok(()),
-        None => {
-            map.insert(name, value);
-            Ok(())
+/// Reconstruct an array value **in full** (RFC 9901 §7.1 recursive processing of a disclosed array):
+/// a presented redaction becomes its disclosed element, an undisclosed redaction is dropped, and a
+/// clear element is kept in full (with any nested disclosures within it substituted).
+fn reconstruct_array(
+    items: &[Value],
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<AttributeValue>, ReasonCode> {
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(element) = disclosed_array_redaction(item, disclosures_by_digest, used_digests)?
+        {
+            out.push(element);
+        } else if !is_array_redaction(item) {
+            // A clear element of a disclosed array is part of that value: keep it in full.
+            out.push(reconstruct_value(
+                item,
+                disclosures_by_digest,
+                used_digests,
+            )?);
         }
+    }
+    Ok(out)
+}
+
+/// Whether an array element is a selective-disclosure redaction object `{"...": "<digest>"}`.
+fn is_array_redaction(item: &Value) -> bool {
+    item.as_object()
+        .and_then(|map| map.get("..."))
+        .is_some_and(Value::is_string)
+}
+
+/// Resolve an array-element redaction `{"...": "<digest>"}`: `Ok(Some(value))` when the disclosure is
+/// presented (the revealed element value), `Ok(None)` when the element is not a redaction or the
+/// redaction was not disclosed. Enforces the repeated-digest rule and that an array-element disclosure
+/// carries no claim name (`[salt, value]`); both violations reject as [`ReasonCode::DisclosureIntegrity`].
+fn disclosed_array_redaction(
+    item: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<AttributeValue>, ReasonCode> {
+    let Some(Value::String(digest)) = item.as_object().and_then(|map| map.get("...")) else {
+        return Ok(None);
+    };
+    let Some(disclosure) = disclosures_by_digest.get(digest.as_str()) else {
+        // Undisclosed array element — not revealed in this presentation.
+        return Ok(None);
+    };
+    if !used_digests.insert(digest.clone()) {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    // An array-element disclosure is `[salt, value]` — it MUST NOT carry a claim name.
+    if disclosure.claim_name.is_some() {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    Ok(Some(reconstruct_value(
+        &disclosure.claim_value,
+        disclosures_by_digest,
+        used_digests,
+    )?))
+}
+
+/// Reconstruct a disclosed claim's *value* in full (RFC 9901 §7.1 "recursively process the value").
+///
+/// Unlike the [`disclosed_object`] top-level walk — which surfaces *only* the disclosed claims of the
+/// credential — a disclosed value is revealed in full: when the holder discloses a whole object (e.g.
+/// the entire `address`), every clear sub-property the issuer signed (`country`, …) is part of that
+/// disclosed value and is kept, alongside any nested `_sd`/array-element disclosures substituted in
+/// place. A nested redaction the holder did *not* present is dropped (that sub-claim stays concealed).
+fn reconstruct_value(
+    value: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<AttributeValue, ReasonCode> {
+    match value {
+        Value::Object(object) => Ok(AttributeValue::Map(reconstruct_object(
+            object,
+            disclosures_by_digest,
+            used_digests,
+        )?)),
+        Value::Array(items) => Ok(AttributeValue::Array(reconstruct_array(
+            items,
+            disclosures_by_digest,
+            used_digests,
+        )?)),
+        scalar => Ok(json_to_attribute(scalar)),
     }
 }
 
-/// Walk a JSON value collecting every SD digest: object `_sd` arrays (strings) and array-element
-/// `{ "...": "<digest>" }` redactions, recursing into nested objects/arrays.
-fn collect_signed_digests(value: &Value, out: &mut std::collections::BTreeSet<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::Array(sd)) = map.get("_sd") {
-                for d in sd.iter().filter_map(Value::as_str) {
-                    out.insert(d.to_string());
-                }
-            }
-            for v in map.values() {
-                collect_signed_digests(v, out);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                if let Value::Object(map) = item {
-                    if let Some(Value::String(d)) = map.get("...") {
-                        out.insert(d.clone());
-                    }
-                }
-                collect_signed_digests(item, out);
-            }
-        }
-        _ => {}
+/// Insert a disclosed claim at the current object level, enforcing per-level claim-name uniqueness
+/// (RFC 9901 §7.1: "if the claim name already exists at the level of the `_sd` key, the SD-JWT MUST be
+/// rejected"). The check is scoped to **this** level (the `BTreeMap` being built), never a crate-wide
+/// leaf name — so two distinct nested claims sharing a leaf under different parents are both kept.
+///
+/// A genuine same-level collision is the reorder attack (two issuer-signed disclosures populating one
+/// claim name; the holder picks the value by reordering the segments): rejected as
+/// [`ReasonCode::DisclosureIntegrity`]. A clear property and a disclosure cannot both target the same
+/// name at one level under a well-formed issuer payload, so the check fires only on that attack.
+fn insert_unique_at_level(
+    map: &mut BTreeMap<String, AttributeValue>,
+    name: &str,
+    value: AttributeValue,
+) -> Result<(), ReasonCode> {
+    if map.contains_key(name) {
+        return Err(ReasonCode::DisclosureIntegrity);
     }
+    map.insert(name.to_string(), value);
+    Ok(())
 }
 
 /// Map a disclosed `serde_json::Value` claim into the SDK's closed [`AttributeValue`] (the CBOR wire

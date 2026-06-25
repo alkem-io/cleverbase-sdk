@@ -13,9 +13,11 @@ use sd_jwt_payload::{Hasher, KeyBindingJwt, RequiredKeyBinding, SdJwtBuilder};
 use serde_json::{json, Value};
 
 use super::test_issuer::{
-    attach_kb_jwt, block_on, mint_dual_value_same_name, mint_sd_jwt, mint_sd_jwt_with_validity,
-    Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
-    WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
+    array_disclosure, attach_kb_jwt, block_on, disclosure_digest, mint_array_element_disclosures,
+    mint_concealable_object_with_concealable_child, mint_dual_value_same_name,
+    mint_nested_shared_leaf, mint_sd_jwt, mint_sd_jwt_with_validity, object_disclosure,
+    sign_issuer_jws, Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER,
+    ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
 };
 use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
 use crate::trust::StaticTestAnchors;
@@ -407,6 +409,175 @@ fn single_disclosure_for_a_dual_minted_claim_still_verifies() {
 }
 
 #[test]
+fn distinct_nested_claims_sharing_a_leaf_name_are_both_disclosed() {
+    // FALSE-REJECT PROBE (the regression the inner-3 collision guard introduced): a legitimate,
+    // issuer-signed SD-JWT VC with two DISTINCT nested claims sharing a leaf name under different
+    // parents — `address.locality` = "London" and `place_of_birth.locality` = "Paris" — is the routine
+    // EUDI PID shape. RFC 9901 §7.1 scopes claim-name uniqueness to the level of the `_sd` key (per
+    // object), NOT the leaf name, so this is VALID and BOTH distinct values are exposed in their nested
+    // positions — never collapsed to a single bare `locality` (the old flat last-wins) nor rejected as
+    // `DisclosureIntegrity` (the leaf-keyed guard's false-reject).
+    let sd_jwt = mint_nested_shared_leaf(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(
+        result.valid,
+        "a nested SD-JWT VC with two distinct claims sharing a leaf name must be VALID; reasons {:?}",
+        result.reasons
+    );
+
+    // The disclosed view reflects the NESTING: `address` and `place_of_birth` are distinct top-level
+    // keys, each a nested map carrying its own `locality` — the two values are not collapsed.
+    let mut london = BTreeMap::new();
+    london.insert(
+        "locality".to_string(),
+        AttributeValue::Text("London".to_string()),
+    );
+    let mut paris = BTreeMap::new();
+    paris.insert(
+        "locality".to_string(),
+        AttributeValue::Text("Paris".to_string()),
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("address"),
+        Some(&AttributeValue::Map(london)),
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("place_of_birth"),
+        Some(&AttributeValue::Map(paris)),
+    );
+    // Only the disclosed claims are surfaced — the always-visible registered claims are not returned.
+    assert!(!result.disclosed_attributes.contains_key("iss"));
+    assert!(!result.disclosed_attributes.contains_key("vct"));
+}
+
+#[test]
+fn disclosed_concealable_object_reconstructs_its_nested_disclosed_child() {
+    // A whole `address` object is concealable AND its `locality` child is concealable; disclosing both
+    // means the `address` disclosure's VALUE is itself an object carrying an `_sd` for `locality`. The
+    // reconstruction must substitute the nested disclosure inside the disclosed value, yielding
+    // `address` = { locality, country } (country is a clear sub-property of the disclosed object).
+    let sd_jwt = mint_concealable_object_with_concealable_child(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    let mut address = BTreeMap::new();
+    address.insert(
+        "locality".to_string(),
+        AttributeValue::Text("London".to_string()),
+    );
+    address.insert(
+        "country".to_string(),
+        AttributeValue::Text("UK".to_string()),
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("address"),
+        Some(&AttributeValue::Map(address)),
+    );
+}
+
+#[test]
+fn disclosed_array_elements_are_reconstructed_in_place() {
+    // Array-element disclosures (RFC 9901 `{"...": "<digest>"}` redaction): disclosing all elements of
+    // `nationalities` surfaces them by value in the array, in their issuer-signed order — exercising
+    // the array-element reconstruction path.
+    let sd_jwt = mint_array_element_disclosures(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    assert_eq!(
+        result.disclosed_attributes.get("nationalities"),
+        Some(&AttributeValue::Array(vec![
+            AttributeValue::Text("DE".to_string()),
+            AttributeValue::Text("FR".to_string()),
+        ])),
+    );
+}
+
+#[test]
+fn undisclosed_array_element_is_dropped_from_the_disclosed_array() {
+    // Conceal one of the two disclosable `nationalities` elements: the disclosed array carries only the
+    // revealed element; the concealed redaction is dropped (not surfaced as a placeholder).
+    let sd_jwt = mint_array_element_disclosures(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let (mut presented, _withheld) = sd_jwt
+        .into_presentation(&Sha2Hasher)
+        .unwrap()
+        .conceal("/nationalities/1")
+        .unwrap()
+        .finish();
+    let holder = Es256Signer::from_pkcs8(HOLDER_KEY_PK8);
+    let kb = block_on(
+        KeyBindingJwt::builder()
+            .iat(NOW)
+            .aud(AUDIENCE)
+            .nonce(NONCE)
+            .finish(&presented, &Sha2Hasher, "ES256", &holder),
+    )
+    .unwrap();
+    presented.attach_key_binding_jwt(kb);
+    let presentation = presented.presentation();
+
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    assert_eq!(
+        result.disclosed_attributes.get("nationalities"),
+        Some(&AttributeValue::Array(vec![AttributeValue::Text(
+            "DE".to_string()
+        )])),
+    );
+}
+
+#[test]
+fn one_of_two_nested_shared_leaf_claims_disclosed_surfaces_only_that_branch() {
+    // Disclose ONLY `place_of_birth.locality`, concealing `address.locality`. The disclosed view must
+    // carry `place_of_birth.locality` = "Paris" at its nested position and must NOT carry `address` at
+    // all (its sole disclosable child was concealed) — the per-level reconstruction includes a parent
+    // only when it yields a disclosed child.
+    let sd_jwt = mint_nested_shared_leaf(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let (mut presented, _withheld) = sd_jwt
+        .into_presentation(&Sha2Hasher)
+        .unwrap()
+        .conceal("/address/locality")
+        .unwrap()
+        .finish();
+    let holder = Es256Signer::from_pkcs8(HOLDER_KEY_PK8);
+    let kb = block_on(
+        KeyBindingJwt::builder()
+            .iat(NOW)
+            .aud(AUDIENCE)
+            .nonce(NONCE)
+            .finish(&presented, &Sha2Hasher, "ES256", &holder),
+    )
+    .unwrap();
+    presented.attach_key_binding_jwt(kb);
+    let presentation = presented.presentation();
+
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    let mut paris = BTreeMap::new();
+    paris.insert(
+        "locality".to_string(),
+        AttributeValue::Text("Paris".to_string()),
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("place_of_birth"),
+        Some(&AttributeValue::Map(paris)),
+    );
+    // `address` carried only the concealed `locality`, so its parent is absent from the disclosed view.
+    assert!(!result.disclosed_attributes.contains_key("address"));
+}
+
+#[test]
 fn malformed_presentation_is_rejected_as_malformed_credential() {
     let anchors = trusted_anchors();
     // A single segment with no `~` is not a valid SD-JWT (needs at least 2 segments).
@@ -690,18 +861,139 @@ fn unsupported_sd_alg_is_rejected_as_unsupported_format() {
     );
 }
 
+/// Parse a hand-built `<jws>~<D1>~…~<Dn>~` presentation (issuer-only) into an [`SdJwt`] and run the
+/// disclosure-integrity reconstruction over it. The issuer signature is not checked by
+/// `collect_disclosed_attributes`, so a crafted payload is enough to exercise its reject branches.
+fn collect_over_crafted(payload: &Value, disclosures: &[&str]) -> Result<(), ReasonCode> {
+    use super::collect_disclosed_attributes;
+    let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, payload);
+    let presentation = format!("{jws}~{}~", disclosures.join("~"));
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    collect_disclosed_attributes(&sd_jwt).map(drop)
+}
+
 #[test]
-fn collect_signed_digests_gathers_array_element_redactions() {
-    use std::collections::BTreeSet;
-    // An array-element redaction `{ "...": "<digest>" }` plus a nested object `_sd` array.
-    let value = json!({
-        "_sd": ["top-digest"],
-        "nested": { "_sd": ["nested-digest"] },
-        "nationalities": [ { "...": "array-digest" }, "DE" ],
+fn the_same_digest_referenced_twice_in_the_structure_is_rejected() {
+    // RFC 9901 §7.1 step 4: a digest encountered more than once invalidates the SD-JWT. Here ONE
+    // disclosure's digest is listed twice in the top-level `_sd` array (a malformed/forged structure) —
+    // the second substitution sees an already-used digest and rejects (distinct from a repeated
+    // *presented* disclosure, which is caught while indexing).
+    let disclosure = object_disclosure("AAAAAAAAAAAAAAAAAAAAAA", "given_name", json!("Ada"));
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [digest, digest],
     });
-    let mut out = BTreeSet::new();
-    super::collect_signed_digests(&value, &mut out);
-    assert!(out.contains("top-digest"));
-    assert!(out.contains("nested-digest"));
-    assert!(out.contains("array-digest"));
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
+fn an_sd_entry_resolving_to_an_array_element_disclosure_is_rejected() {
+    // An object `_sd` entry MUST resolve to an object-property disclosure (`[salt, name, value]`). A
+    // `_sd` digest that resolves to an array-element disclosure (`[salt, value]`, no claim name) is a
+    // structurally invalid disclosure set → reject.
+    let disclosure = array_disclosure("AAAAAAAAAAAAAAAAAAAAAA", json!("orphan"));
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [digest],
+    });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
+fn an_array_element_redaction_resolving_to_a_named_disclosure_is_rejected() {
+    // An array-element redaction `{"...": digest}` MUST resolve to an array-element disclosure (no
+    // claim name). A digest that resolves to an object-property disclosure (`[salt, name, value]`) in
+    // an array position is structurally invalid → reject.
+    let disclosure = object_disclosure("AAAAAAAAAAAAAAAAAAAAAA", "given_name", json!("Ada"));
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256",
+        "nationalities": [ { "...": digest } ],
+    });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
+fn the_same_digest_referenced_twice_in_an_array_is_rejected() {
+    // The repeated-digest rule also covers array-element redactions: the same `{"...": digest}` listed
+    // twice in an array → the second occurrence is an already-used digest → reject.
+    let disclosure = array_disclosure("AAAAAAAAAAAAAAAAAAAAAA", json!("DE"));
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256",
+        "nationalities": [ { "...": digest }, { "...": digest } ],
+    });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
+fn a_disclosed_array_claim_value_is_reconstructed_in_full() {
+    use super::collect_disclosed_attributes;
+    // A WHOLE array claim `tags` is concealable; its disclosed value carries a clear scalar element AND
+    // a nested array-element redaction. Reconstructing the disclosed value keeps the clear element in
+    // full and substitutes the presented redaction — exercising `reconstruct_array` (a disclosed array
+    // *value*, distinct from disclosing individual elements of a clear array).
+    let inner = array_disclosure("BBBBBBBBBBBBBBBBBBBBBB", json!("hidden-tag"));
+    let inner_digest = disclosure_digest(&inner);
+    let outer = object_disclosure(
+        "AAAAAAAAAAAAAAAAAAAAAA",
+        "tags",
+        json!(["clear-tag", { "...": inner_digest }]),
+    );
+    let outer_digest = disclosure_digest(&outer);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [outer_digest],
+    });
+    let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, &payload);
+    let presentation = format!("{jws}~{outer}~{inner}~");
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    let disclosed = collect_disclosed_attributes(&sd_jwt).unwrap();
+
+    assert_eq!(
+        disclosed.get("tags"),
+        Some(&AttributeValue::Array(vec![
+            AttributeValue::Text("clear-tag".to_string()),
+            AttributeValue::Text("hidden-tag".to_string()),
+        ])),
+    );
+}
+
+#[test]
+fn a_clear_array_element_nesting_a_disclosed_claim_is_reconstructed() {
+    use super::collect_disclosed_attributes;
+    // A clear (non-redacted) array element that is itself an object nesting a disclosable claim must be
+    // recursed into: the disclosed nested claim is surfaced inside that array element, exercising the
+    // array's clear-element branch and the nested-object reconstruction within an array.
+    let inner = object_disclosure("AAAAAAAAAAAAAAAAAAAAAA", "locality", json!("London"));
+    let digest = disclosure_digest(&inner);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256",
+        "addresses": [ { "_sd": [digest] } ],
+    });
+    let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, &payload);
+    let presentation = format!("{jws}~{inner}~");
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    let disclosed = collect_disclosed_attributes(&sd_jwt).unwrap();
+
+    let mut locality = BTreeMap::new();
+    locality.insert(
+        "locality".to_string(),
+        AttributeValue::Text("London".to_string()),
+    );
+    assert_eq!(
+        disclosed.get("addresses"),
+        Some(&AttributeValue::Array(vec![AttributeValue::Map(locality)])),
+    );
 }

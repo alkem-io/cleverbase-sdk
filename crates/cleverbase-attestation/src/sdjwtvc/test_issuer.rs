@@ -228,6 +228,136 @@ pub(crate) fn mint_dual_value_same_name(
     (jws, disclosure_a, disclosure_b)
 }
 
+/// Mint an SD-JWT VC whose payload carries two **distinct nested claims that share a leaf name**:
+/// `address.locality` and `place_of_birth.locality`, with different values, each made concealable at
+/// its own JSON-pointer path. This is the legitimate EUDI PID shape (nested `address`/`place_of_birth`
+/// objects) that a crate-wide leaf-keyed collision guard false-rejects: the leaf `locality` appears
+/// under two different parents (RFC 9901 §7.1 scopes claim-name uniqueness to the level of the `_sd`
+/// key, not the leaf name). Both `locality` disclosures are issuer-signed and have distinct digests.
+pub(crate) fn mint_nested_shared_leaf(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "address": { "locality": "London" },
+        "place_of_birth": { "locality": "Paris" },
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .make_concealable("/address/locality")
+            .unwrap()
+            .make_concealable("/place_of_birth/locality")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
+/// Mint an SD-JWT VC where a whole object claim is concealable AND so is a claim nested inside it:
+/// `/address` and `/address/locality` are both made concealable. Disclosing both means the `address`
+/// disclosure's *value* is itself an object carrying its own `_sd` for `locality` — exercising the
+/// nested-value reconstruction (a disclosed claim whose value contains further disclosures).
+pub(crate) fn mint_concealable_object_with_concealable_child(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "address": { "locality": "London", "country": "UK" },
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            // Make the nested claim concealable first, then the whole object: disclosing both yields a
+            // disclosed `address` value that still carries an `_sd` for `locality`.
+            .make_concealable("/address/locality")
+            .unwrap()
+            .make_concealable("/address")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
+/// Sign an arbitrary issuer JWS payload with the test issuer key, returning the compact JWS string
+/// (`header.payload.signature`). The header is `alg=ES256` + the issuer `x5c`. Used to craft hand-built
+/// SD-JWT structures (repeated digests, mis-typed disclosures) for the verifier's reject-branch tests;
+/// the structure is what is under test, not the signature, so callers parse — not cryptographically
+/// verify — the result via `collect_disclosed_attributes`.
+pub(crate) fn sign_issuer_jws(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    payload: &Value,
+) -> String {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let header = json!({ "alg": "ES256", "x5c": [cert_b64] });
+    let header_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    let payload_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(payload).unwrap().as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = p256::ecdsa::SigningKey::from_pkcs8_der(issuer_pk8).expect("valid PKCS#8 P-256 key");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    format!("{signing_input}.{sig_b64}")
+}
+
+/// Base64url-encode an object-property disclosure `[salt, name, value]`.
+pub(crate) fn object_disclosure(salt: &str, name: &str, value: Value) -> String {
+    Base64UrlUnpadded::encode_string(json!([salt, name, value]).to_string().as_bytes())
+}
+
+/// Base64url-encode an array-element disclosure `[salt, value]`.
+pub(crate) fn array_disclosure(salt: &str, value: Value) -> String {
+    Base64UrlUnpadded::encode_string(json!([salt, value]).to_string().as_bytes())
+}
+
+/// The `sha-256` digest (base64url) of a disclosure string — its `_sd` / `{"...":}` reference.
+pub(crate) fn disclosure_digest(disclosure: &str) -> String {
+    Base64UrlUnpadded::encode_string(&Sha2Hasher.digest(disclosure.as_bytes()))
+}
+
+/// Mint an SD-JWT VC carrying a `nationalities` array whose **elements** are selectively disclosable
+/// (RFC 9901 array-element redaction `{"...": "<digest>"}`), plus a concealable scalar `given_name`.
+/// Exercises the array-element reconstruction path: a disclosed element is surfaced by value, an
+/// undisclosed element is dropped from the disclosed array.
+pub(crate) fn mint_array_element_disclosures(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "nationalities": ["DE", "FR"],
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .make_concealable("/nationalities/0")
+            .unwrap()
+            .make_concealable("/nationalities/1")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
 /// Attach a holder KB-JWT (signed by `holder_pk8`) over the given `aud`/`nonce` to a minted SD-JWT,
 /// returning the full compact presentation string.
 pub(crate) fn attach_kb_jwt(
