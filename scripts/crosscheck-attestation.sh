@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
 # Independent cross-check harness (feature 004, task T017, FR-013 / Constitution Principle VI).
 #
-# Verifies EUDI attestation artifacts with an INDEPENDENT, DIFFERENT-LANGUAGE EU reference verifier
-# and asserts the reference verdict AGREES with the expected/known verdict. This is the cross-check
-# that backs FR-013's "produced/obtained artifacts are checked against an independent reference
-# verifier" — it runs IN ADDITION TO, never instead of, the SDK's own always-on Rust verifier
-# (`cargo test -p cleverbase-attestation`).
+# ON-DEMAND MANUAL GATE — this harness REQUIRES the operator to provide an independent reference
+# verifier (via the SDJWT_REF_CMD / MDOC_REF_CMD env vars). When the needed reference verifier is NOT
+# on PATH (the default — no packaged binary with the pinned name ships, and the SDK keeps these as
+# oracles, never as deps — Principle V/VII), the harness SELF-SKIPS (exit 0 + a "SKIP:" note) and
+# asserts NOTHING. That self-skip is intentional and explicit, NOT a silent no-op masquerading as an
+# always-on gate.
+#
+# The ALWAYS-ON Principle VI / FR-013 external conformance does NOT come from this harness: it is the
+# in-crate `conformance::` tests (`cargo test -p cleverbase-attestation conformance::`) that verify a
+# REAL, externally-authored ISO/IEC 18013-5 Annex-D mdoc vector under the production verifier and run
+# on every push. THIS harness ADDS a cross-LANGUAGE agreement signal on top of that, for operators who
+# wire a reference verifier — and is the route for the SD-JWT VC arf-pid external vector (which is
+# `iss`/JWK-keyed, outside the SDK's `x5c` trust profile, so it cannot be an always-on in-crate
+# positive vector — see tests/fixtures/attestation/vectors/README.md).
+#
+# When a reference verifier IS provided, it verifies EUDI attestation artifacts with that INDEPENDENT,
+# DIFFERENT-LANGUAGE EU reference verifier and asserts the reference verdict AGREES with the
+# expected/known verdict — IN ADDITION TO, never instead of, the SDK's own Rust verifier.
 #
 # It accepts an ARBITRARY artifact path (C1), so it cross-checks BOTH:
 #   * the shared Tier-A conformance vectors and SDK-produced US1 material, AND
@@ -18,8 +31,9 @@
 #   * ISO mdoc   — mdoc-ts (TypeScript/Node, the OWF/EUDI mdoc reference). Again a different language
 #                  and implementation.
 # Neither is a build/runtime dependency of the SDK; both run locally so no artifact leaves the
-# operator's machine (Principle IV). The real run happens in the opt-in CI job
-# (.github/workflows, T030); locally it self-skips cleanly when the reference toolchain is absent.
+# operator's machine (Principle IV). The operator wires a pinned reference build via the *_REF_CMD env
+# vars (printed by `--print-pins`); absent that, the harness self-skips (it never fails an environment
+# that did not opt in, mirroring the openssl/DSS-absent skips in the other gates).
 #
 # Exit status:
 #   0  — every artifact's reference verdict matched the expected verdict (cross-check PASSED), OR

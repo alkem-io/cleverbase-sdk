@@ -8,17 +8,19 @@
 //!
 //! ## Operations
 //!
-//! - [`build_request`] — `(dcql, audience) -> PresentationRequest { dcql, nonce (fresh), audience }`.
-//!   The fresh `nonce` comes from the host RNG seam [`NonceSource`] (the core is sans-IO; entropy is
-//!   host-provided exactly as the signing core takes it via `HostContext.entropy`).
+//! - [`build_request`] — `(dcql, audience, response_uri) -> PresentationRequest { dcql, nonce
+//!   (fresh), audience, response_uri }`. The fresh `nonce` comes from the host RNG seam
+//!   [`NonceSource`] (the core is sans-IO; entropy is host-provided exactly as the signing core takes
+//!   it via `HostContext.entropy`). The `response_uri` is the verifier's response endpoint — a
+//!   first-class request parameter the mdoc handover binds (OpenID4VP 1.0 §B.2.6).
 //! - [`verify_response`] — `(vp_token, request, policy, anchors) -> VerificationResult`. Runs the
 //!   per-format always-on bar ([`crate::sdjwtvc`] / [`crate::mdoc`]) **plus** the binding checks.
 //!
 //! ## Binding checks (FR-015 / SC-008)
 //!
 //! - **Nonce**: the presentation echoes the request's fresh `nonce` — SD-JWT VC in the KB-JWT
-//!   (`nonce`); mdoc in the `SessionTranscript` / `OpenID4VPHandover` (OpenID4VP 1.0 Appendix
-//!   B.2.6.1) the `DeviceAuth` signs over. A missing/mismatched nonce ⇒ INVALID
+//!   (`nonce`); mdoc in the `SessionTranscript` / `OpenID4VPHandover` (OpenID4VP 1.0 §B.2.6)
+//!   the `DeviceAuth` signs over. A missing/mismatched nonce ⇒ INVALID
 //!   [`ReasonCode::Replay`] (a replayed presentation cannot satisfy a fresh nonce).
 //! - **Audience**: the presentation is addressed to this verifier's `client_id` — SD-JWT VC KB-JWT
 //!   `aud`; mdoc the handover/`client_id`. Wrong audience ⇒ INVALID [`ReasonCode::WrongAudience`].
@@ -87,6 +89,13 @@ pub struct PresentationRequest {
     pub nonce: Vec<u8>,
     /// The verifier's `client_id` the presentation MUST be addressed to (audience binding).
     pub audience: String,
+    /// The verifier's `response_uri` (or `redirect_uri`) request parameter — the endpoint the
+    /// presentation is returned to. This is the **4th element** of the mdoc `OpenID4VPHandoverInfo`
+    /// (OpenID4VP 1.0 §B.2.6), a distinct request parameter from the `client_id` (`audience`); the
+    /// holder folds it into the signed handover, so the verifier MUST reconstruct the handover with
+    /// the same value. A direct-`response_uri` deployment uses the absolute response endpoint; a
+    /// `redirect_uri` deployment its redirect target (the spec accepts either, by Response Mode).
+    pub response_uri: String,
 }
 
 impl PresentationRequest {
@@ -99,19 +108,24 @@ impl PresentationRequest {
 }
 
 /// Build an OpenID4VP presentation request: the DCQL query, a **fresh** nonce drawn from the host
-/// [`NonceSource`], and the verifier's audience (`client_id`).
+/// [`NonceSource`], the verifier's audience (`client_id`), and the verifier's `response_uri`.
 ///
 /// A fresh nonce per call is the replay-protection invariant (contracts/openid4vp-verifier.md): the
-/// SDK keeps the returned [`PresentationRequest`] and only accepts a `vp_token` bound to it.
+/// SDK keeps the returned [`PresentationRequest`] and only accepts a `vp_token` bound to it. The
+/// `response_uri` is the verifier's response endpoint (or `redirect_uri`); it is the 4th element of
+/// the mdoc handover (OpenID4VP 1.0 §B.2.6) and is therefore part of what the holder cryptographically
+/// binds — distinct from the `audience`/`client_id`.
 pub fn build_request<N: NonceSource + ?Sized>(
     nonce_source: &mut N,
     dcql: Dcql,
     audience: impl Into<String>,
+    response_uri: impl Into<String>,
 ) -> PresentationRequest {
     PresentationRequest {
         dcql,
         nonce: nonce_source.fresh_nonce(),
         audience: audience.into(),
+        response_uri: response_uri.into(),
     }
 }
 
@@ -231,9 +245,10 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     }
 
     // Reconstruct the conformant OpenID4VP-1.0 `OpenID4VPHandover` transcript the holder must have
-    // signed over (from the request nonce + audience). If the DeviceAuth does not verify against it,
-    // the presentation is not bound to this fresh request → a replay.
-    let transcript = oid4vp_handover_transcript(&request.audience, &request.nonce);
+    // signed over (from the request nonce + audience + response_uri). If the DeviceAuth does not
+    // verify against it, the presentation is not bound to this fresh request → a replay.
+    let transcript =
+        oid4vp_handover_transcript(&request.audience, &request.nonce, &request.response_uri);
     let params = MdocVerifyParams {
         now_unix,
         session_transcript: Some(&transcript),
@@ -250,10 +265,11 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
 }
 
 /// Build the conformant OpenID4VP-1.0 / ISO 18013-7 mdoc `SessionTranscript` bytes for a
-/// redirect-invoked presentation, from the verifier's `client_id` (`audience`) and request `nonce`.
+/// redirect-invoked presentation, from the verifier's `client_id` (`audience`), request `nonce`, and
+/// `response_uri`.
 ///
-/// This is the **`OpenID4VPHandover`** of OpenID4VP 1.0 Appendix B.2.6.1 ("Invocation via
-/// Redirects"), NOT a custom structure — a conformant EUDI wallet signs `DeviceAuth` over exactly
+/// This is the **`OpenID4VPHandover`** of OpenID4VP 1.0 §B.2.6 ("`Handover` and `SessionTranscript`
+/// Definitions"), NOT a custom structure — a conformant EUDI wallet signs `DeviceAuth` over exactly
 /// this `SessionTranscript`, so the verifier reconstructs it identically (CDDL reproduced verbatim):
 ///
 /// ```text
@@ -274,32 +290,32 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
 /// changes the single hash. The holder (here the test issuer) and the verifier MUST build the
 /// transcript identically, so this one function is the single authoritative source for both halves.
 ///
-/// **Modelling note (offline suite).** The verifier currently models only the `client_id`
-/// (`audience`) and `nonce`; the SDK does not yet carry a separate `response_uri` nor the
-/// response-encryption key. Per OpenID4VP B.2.6.1 those map to:
+/// Per OpenID4VP 1.0 §B.2.6 the four `OpenID4VPHandoverInfo` elements map to the SDK as:
+/// - `clientId` — the `client_id` request parameter (the verifier's `audience`).
 /// - `nonce` — the `nonce` request parameter is a text string; the SDK carries the nonce as bytes,
 ///   so the conformant text value is its base64url-unpadded form (identical to the value an SD-JWT VC
 ///   KB-JWT echoes), keeping the two formats' nonce-on-the-wire byte-identical.
-/// - `jwkThumbprint` — `null` (this SDK does not negotiate response encryption, so there is no
-///   verifier encryption key to thumbprint; the structure carries the conformant `null`).
-/// - `responseUri` — stubbed to the `client_id` (`audience`) until the SDK models a distinct
-///   `response_uri` request parameter. The external-conformance vector test (added separately) pins
-///   the exact wire bytes against a reference once the parameter is modelled.
+/// - `jwkThumbprint` — `null`: this SDK does not negotiate response encryption (no `direct_post.jwt`),
+///   so there is no verifier encryption key to thumbprint; the spec mandates `null` in that case.
+/// - `responseUri` — the **actual** `response_uri` (or `redirect_uri`) request parameter, a value
+///   distinct from `clientId`. The spec's §B.2.6 fourth element MUST be this real endpoint, NOT the
+///   `client_id`, so the SDK carries it as the first-class [`PresentationRequest::response_uri`].
 #[must_use]
-pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8]) -> Vec<u8> {
+pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &str) -> Vec<u8> {
     use base64ct::{Base64UrlUnpadded, Encoding as _};
     use sha2::{Digest as _, Sha256};
 
-    // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri].
+    // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri] (OpenID4VP 1.0 §B.2.6).
     // `nonce` is the text `nonce` request parameter; the SDK's bytes map to their base64url form.
     let nonce_text = Base64UrlUnpadded::encode_string(nonce);
     let handover_info = CborValue::Array(vec![
         CborValue::Text(audience.to_owned()),
         CborValue::Text(nonce_text),
-        // jwkThumbprint: null — no response encryption negotiated (see modelling note).
+        // jwkThumbprint: null — no response encryption negotiated (unencrypted flow, §B.2.6).
         CborValue::Null,
-        // responseUri: stubbed to the client_id until a distinct response_uri is modelled.
-        CborValue::Text(audience.to_owned()),
+        // responseUri: the actual `response_uri` request parameter — §B.2.6's 4th element, distinct
+        // from the client_id.
+        CborValue::Text(response_uri.to_owned()),
     ]);
     let handover_info_bytes = encode_cbor(&handover_info);
     let handover_info_hash = Sha256::digest(&handover_info_bytes).to_vec();

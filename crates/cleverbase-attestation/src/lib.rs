@@ -43,6 +43,8 @@
     )
 )]
 
+#[cfg(test)]
+mod conformance;
 pub mod datetime;
 pub mod issuance;
 pub mod mdoc;

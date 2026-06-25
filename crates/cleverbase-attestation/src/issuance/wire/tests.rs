@@ -23,6 +23,8 @@ use crate::trust::StaticTestAnchors;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
 
 const AUDIENCE: &str = "https://verifier.example/cb";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element).
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 const CREDENTIAL_ISSUER: &str = "https://issuer.example/cb";
 
 fn encode(req: &IssuanceRequest) -> Vec<u8> {
@@ -179,6 +181,7 @@ fn present_over_wire_and_verify(held: HeldAttestation) {
         dcql: Dcql::from_json("{}"),
         nonce: b"wire-vp-nonce".to_vec(),
         audience: AUDIENCE.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     };
     let out = drive(IssuanceOp::BeginPresent {
         held,
@@ -274,6 +277,7 @@ fn begin_present_with_a_malformed_credential_is_an_err() {
             dcql: Dcql::from_json("{}"),
             nonce: b"n".to_vec(),
             audience: AUDIENCE.to_owned(),
+            response_uri: RESPONSE_URI.to_owned(),
         },
         disclose: vec![],
         iat: NOW,

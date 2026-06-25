@@ -21,6 +21,10 @@ use crate::types::{Format, IssuerRole, ReasonCode, VerificationPolicy};
 
 const AUDIENCE: &str = "https://verifier.example/cb";
 const WRONG_AUDIENCE: &str = "https://attacker.example/evil";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element) —
+/// deliberately DISTINCT from the `client_id` (`audience`) so the handover-structure test can assert
+/// the 4th element is the response_uri, not the client_id.
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 
 /// A deterministic [`NonceSource`] for the tests: an incrementing counter, so each `build_request`
 /// gets a distinct nonce (the freshness invariant) without a real CSPRNG in the offline suite.
@@ -47,6 +51,7 @@ fn request_with(audience: &str, nonce: &[u8]) -> PresentationRequest {
         dcql: Dcql::from_json(r#"{"credentials":[]}"#),
         nonce: nonce.to_vec(),
         audience: audience.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     }
 }
 
@@ -72,10 +77,11 @@ const MDOC_NOW: i64 = 1_717_200_000; // inside the mdoc test issuer's default wi
 fn build_request_draws_a_fresh_nonce_each_call() {
     let mut nonces = CountingNonces::default();
     let dcql = Dcql::from_json(r#"{"credentials":[{"id":"pid"}]}"#);
-    let r1 = build_request(&mut nonces, dcql.clone(), AUDIENCE);
-    let r2 = build_request(&mut nonces, dcql.clone(), AUDIENCE);
+    let r1 = build_request(&mut nonces, dcql.clone(), AUDIENCE, RESPONSE_URI);
+    let r2 = build_request(&mut nonces, dcql.clone(), AUDIENCE, RESPONSE_URI);
     assert_ne!(r1.nonce, r2.nonce, "each request MUST carry a fresh nonce");
     assert_eq!(r1.audience, AUDIENCE);
+    assert_eq!(r1.response_uri, RESPONSE_URI);
     assert_eq!(r1.dcql, dcql);
 }
 
@@ -186,7 +192,7 @@ fn sd_jwt_without_a_kb_jwt_is_missing_request_binding() {
 /// Mint an mdoc `vp_token` whose `DeviceAuth` is bound to the OID4VP handover for `(aud, nonce)` and
 /// that declares it was addressed to `addressed_audience`.
 fn mdoc_vp_token(addressed_audience: &str, handover_aud: &str, nonce: &[u8]) -> MdocVpToken {
-    let transcript = oid4vp_handover_transcript(handover_aud, nonce);
+    let transcript = oid4vp_handover_transcript(handover_aud, nonce, RESPONSE_URI);
     let device_response = MdocBuilder::new().session_transcript(transcript).build();
     MdocVpToken {
         audience: addressed_audience.to_owned(),
@@ -259,7 +265,7 @@ fn mdoc_binding_failure_other_than_holder_binding_passes_through() {
     // An untrusted DS (right audience + nonce) must surface UntrustedIssuer, NOT be masked as Replay
     // — only a holder-binding failure (the fresh-nonce mismatch) is attributed to Replay.
     let request = request_with(AUDIENCE, &[8u8; 16]);
-    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce);
+    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce, RESPONSE_URI);
     let device_response = MdocBuilder::new()
         .use_wrong_issuer()
         .session_transcript(transcript)
@@ -283,22 +289,29 @@ fn mdoc_binding_failure_other_than_holder_binding_passes_through() {
 }
 
 #[test]
-fn handover_transcript_is_deterministic_and_binds_both_inputs() {
-    // The same (audience, nonce) yields identical bytes; varying either changes them (so a stale
-    // nonce or wrong audience necessarily breaks the device-bound transcript).
-    let a = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 3]);
-    let same = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 3]);
-    let diff_nonce = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 4]);
-    let diff_aud = oid4vp_handover_transcript(WRONG_AUDIENCE, &[1, 2, 3]);
+fn handover_transcript_is_deterministic_and_binds_all_inputs() {
+    // The same (audience, nonce, response_uri) yields identical bytes; varying any one changes them
+    // (so a stale nonce, wrong audience, or tampered response_uri necessarily breaks the
+    // device-bound transcript).
+    let a = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 3], RESPONSE_URI);
+    let same = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 3], RESPONSE_URI);
+    let diff_nonce = oid4vp_handover_transcript(AUDIENCE, &[1, 2, 4], RESPONSE_URI);
+    let diff_aud = oid4vp_handover_transcript(WRONG_AUDIENCE, &[1, 2, 3], RESPONSE_URI);
+    let diff_response_uri =
+        oid4vp_handover_transcript(AUDIENCE, &[1, 2, 3], "https://attacker.example/steal");
     assert_eq!(a, same);
     assert_ne!(a, diff_nonce);
     assert_ne!(a, diff_aud);
+    assert_ne!(
+        a, diff_response_uri,
+        "the response_uri is folded into the handover hash, so changing it changes the transcript"
+    );
 }
 
 #[test]
 fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
     // Pin the SessionTranscript to the OpenID4VP 1.0 / ISO 18013-7 `OpenID4VPHandover`
-    // (Appendix B.2.6.1) — NOT the old self-invented `["OID4VPHandover", clientIdHash, nonceHash]`.
+    // (§B.2.6) — NOT the old self-invented `["OID4VPHandover", clientIdHash, nonceHash]`.
     // SessionTranscript = [null, null, OpenID4VPHandover]
     // OpenID4VPHandover = ["OpenID4VPHandover", sha256(OpenID4VPHandoverInfoBytes)]
     // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint(null), responseUri]
@@ -307,7 +320,7 @@ fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
     use sha2::{Digest as _, Sha256};
 
     let nonce = [1u8, 2, 3];
-    let transcript_bytes = oid4vp_handover_transcript(AUDIENCE, &nonce);
+    let transcript_bytes = oid4vp_handover_transcript(AUDIENCE, &nonce, RESPONSE_URI);
     let transcript: CborValue = ciborium::from_reader(transcript_bytes.as_slice()).unwrap();
 
     // SessionTranscript = [null, null, OpenID4VPHandover].
@@ -331,11 +344,12 @@ fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
 
     // Recompute the expected single SHA-256 over the inner OpenID4VPHandoverInfo array and assert the
     // handover carries exactly that hash (so every request parameter is bound by one digest).
+    // OpenID4VP 1.0 §B.2.6: OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri].
     let expected_info = CborValue::Array(vec![
         CborValue::Text(AUDIENCE.to_owned()),
         CborValue::Text(Base64UrlUnpadded::encode_string(&nonce)),
         CborValue::Null,
-        CborValue::Text(AUDIENCE.to_owned()),
+        CborValue::Text(RESPONSE_URI.to_owned()),
     ]);
     let mut info_bytes = Vec::new();
     ciborium::into_writer(&expected_info, &mut info_bytes).unwrap();
@@ -352,5 +366,48 @@ fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
         handover.len(),
         3,
         "must not regress to the self-invented 3-element handover"
+    );
+
+    // Directly assert the 4th OpenID4VPHandoverInfo element is the REAL response_uri (OpenID4VP 1.0
+    // §B.2.6: "The fourth element MUST be either the redirect_uri or response_uri request
+    // parameter"), NOT the client_id — this is the conformance bug fixed (the old code stubbed the
+    // 4th element to the client_id/audience). Reconstruct the exact OpenID4VPHandoverInfoBytes the
+    // handover hashes (the canonical CBOR encoding of the array we just verified) and decode it.
+    let CborValue::Array(info) = &expected_info else {
+        panic!("OpenID4VPHandoverInfo is an array")
+    };
+    assert_eq!(
+        info.len(),
+        4,
+        "OpenID4VPHandoverInfo has exactly 4 elements"
+    );
+    assert_eq!(
+        info[0],
+        CborValue::Text(AUDIENCE.to_owned()),
+        "1st element is the client_id (audience)"
+    );
+    assert_eq!(
+        info[2],
+        CborValue::Null,
+        "3rd element (jwkThumbprint) is null (unencrypted flow)"
+    );
+    assert_eq!(
+        info[3],
+        CborValue::Text(RESPONSE_URI.to_owned()),
+        "4th element MUST be the response_uri request parameter (§B.2.6), not the client_id"
+    );
+    assert_ne!(
+        info[3], info[0],
+        "the 4th element (response_uri) MUST be distinct from the 1st (client_id) — guarding the \
+         fixed stub that previously set responseUri = client_id"
+    );
+
+    // And prove it end-to-end through the public function: a transcript whose 4th handover element
+    // wrongly equalled the client_id (the old stub) would be byte-identical to building with
+    // response_uri == AUDIENCE; assert the real transcript (response_uri = RESPONSE_URI) differs.
+    let stubbed = oid4vp_handover_transcript(AUDIENCE, &nonce, AUDIENCE);
+    assert_ne!(
+        transcript_bytes, stubbed,
+        "the real response_uri transcript MUST differ from the old responseUri = client_id stub"
     );
 }

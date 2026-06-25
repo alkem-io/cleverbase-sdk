@@ -21,6 +21,8 @@ use crate::sdjwtvc::test_issuer::{
 };
 
 const AUDIENCE: &str = "https://verifier.example/cb";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element).
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 const NONCE: &str = "n-0S6_WzA2Mj";
 const C_NONCE: &str = "issuer-c-nonce-xyz";
 const ISSUER_ID: &str = "https://issuer.example/cb";
@@ -283,8 +285,10 @@ fn device_signature_built_via_signer_hook_verifies_under_us1_openid4vp() {
         dcql: Dcql::from_json("{}"),
         nonce: b"fresh-nonce-1234".to_vec(),
         audience: AUDIENCE.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     };
-    let transcript = oid4vp_handover_transcript(&request.audience, &request.nonce);
+    let transcript =
+        oid4vp_handover_transcript(&request.audience, &request.nonce, &request.response_uri);
 
     // The SDK builds the DeviceSignature signing input over the DeviceAuthentication; the stub HSM
     // signs the COSE Sig_structure; the SDK splices → a detached COSE_Sign1.

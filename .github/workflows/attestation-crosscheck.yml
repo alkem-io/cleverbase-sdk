@@ -1,21 +1,37 @@
 name: Attestation cross-check + qualified gate (opt-in)
 
-# Opt-in only (feature 004, task T030). Two off-by-default jobs that are NEVER part of the merge
-# pipeline (the always-on offline verify suite + the ≥95% coverage gate live in test.yml and gate
-# merges); these add standards-conformance signals that need either an external different-language
-# reference toolchain (the cross-check) or an experimental, pre-operational standard surface (the
-# qualified gate). They are triggered manually (workflow_dispatch) and SELF-SKIP cleanly when the
-# thing they need is absent, so they never fail an environment that did not opt in (FR-008/FR-013).
+# ON-DEMAND MANUAL GATE (feature 004, task T030) — read this before assuming it gates anything.
 #
+# This workflow is `workflow_dispatch`-only and is NEVER part of the merge pipeline. The cross-check
+# job below is an ON-DEMAND gate that REQUIRES the operator to supply an independent reference
+# verifier (via the *_REF_CMD env vars); with none supplied — the default here, since no packaged
+# binary with the pinned name ships and the SDK keeps these as oracles, not deps (Principle V/VII) —
+# the harness self-skips (exit 0 + SKIP note) and asserts nothing. That self-skip is intentional and
+# explicit; this job is NOT a silent no-op presented as an always-on gate.
+#
+# The ALWAYS-ON Principle VI / FR-013 external conformance does NOT depend on this workflow: it runs
+# on every push as part of the default test suite (test.yml). In particular,
+# `cleverbase-attestation` `src/conformance.rs` verifies a REAL, externally-authored ISO/IEC 18013-5
+# Annex-D mdoc vector (issuer-auth: COSE_Sign1 signature + MSO valueDigests recompute + validityInfo)
+# under the production verifier — genuine external conformance, not Rust-mint-then-Rust-verify. This
+# workflow's `conformance-vectors` job re-runs exactly those tests so a manual dispatch surfaces the
+# always-on signal alongside the on-demand cross-check.
+#
+#   conformance-vectors — runs the ALWAYS-ON external-vector conformance tests (`conformance::`) that
+#                      also gate every push in test.yml; included here so a dispatch shows them
+#                      explicitly. This is the real, no-operator-setup-needed external signal.
 #   crosscheck       — exports the SDK-produced VALID artifacts (SD-JWT VC + mdoc) from the same
 #                      test-issuer minters the in-crate suite verifies, then runs
 #                      scripts/crosscheck-attestation.sh to assert an INDEPENDENT, different-language
 #                      EU reference verifier (Kotlin eudi-lib-jvm-sdjwt-kt / TS mdoc-ts) agrees with
 #                      the SDK's VALID verdict (Principle VI / FR-013, covering BOTH the US1 vectors
 #                      and the US2-produced artifacts — C1). The reference verifiers are NOT installed
-#                      here (no standard packaged binary with the pinned name exists today), so the
-#                      harness self-skips with a SKIP note — wiring the pinned reference build via the
-#                      *_REF_CMD env vars (printed by `--print-pins`) turns it into a real assertion.
+#                      here, so the harness self-skips with a SKIP note UNLESS the operator wires a
+#                      pinned reference build via the *_REF_CMD env vars (printed by `--print-pins`).
+#                      Wiring them turns this into a real cross-language assertion; the SD-JWT VC
+#                      arf-pid external vector (which is `iss`/JWK-keyed, outside the SDK's `x5c` trust
+#                      profile — see tests/fixtures/attestation/vectors/README.md) is covered here
+#                      rather than by an always-on in-crate test.
 #   qualified-gate   — runs the opt-in eIDAS qualified-status gate suite (TS 119 615 v1.4.1 cl. 4.12,
 #                      EXPERIMENTAL / version-pinned). cl. 4.12 is pre-operational, so this is opt-in;
 #                      the suite self-skips when the qualified trust-list fixture is absent.
@@ -31,6 +47,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  conformance-vectors:
+    name: Always-on external-vector conformance (real ISO 18013-5 Annex-D mdoc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      # The REAL external conformance: verify the vendored ISO/IEC 18013-5 Annex-D mdoc vector under
+      # the production verifier. These tests also run on every push (test.yml's default `cargo test`);
+      # they need NO operator setup and assert a concrete cross-implementation result, so THIS is the
+      # always-on Principle-VI external signal — distinct from the operator-gated cross-check below.
+      - name: Run the always-on external-vector conformance tests
+        run: |
+          cargo test -p cleverbase-attestation conformance:: -- --nocapture
+
   crosscheck:
     name: Independent reference cross-check (US1 vectors + US2 artifacts)
     runs-on: ubuntu-latest
@@ -65,7 +100,10 @@ jobs:
       # Cross-check both formats against the independent, different-language EU reference verifier and
       # assert it AGREES with the SDK's VALID verdict. The harness self-skips (exit 0 + a SKIP note)
       # when the reference verifier for a format is not on PATH — the common case here, since no
-      # packaged binary with the pinned name ships by default; this never fails the opt-in job.
+      # packaged binary with the pinned name ships by default. In that default case THIS STEP ASSERTS
+      # NOTHING (it self-skips); a real cross-language assertion requires the operator to export the
+      # *_REF_CMD env vars to point at a pinned reference build first. The always-on external signal is
+      # the `conformance-vectors` job above, which needs no such setup.
       - name: Cross-check the SD-JWT VC artifact (independent verifier)
         run: |
           bash scripts/crosscheck-attestation.sh --expect valid --format sd-jwt-vc \

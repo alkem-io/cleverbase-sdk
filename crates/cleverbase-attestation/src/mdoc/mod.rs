@@ -182,6 +182,53 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     }
 }
 
+/// The disclosed attributes recovered by the **issuer-side** conformance verification of an mdoc
+/// `DeviceResponse`'s first document, keyed by `elementIdentifier`.
+///
+/// Returned by [`verify_issuer_auth_against_vector`] — the external-vector entry that runs the
+/// issuer-side bar (IssuerAuth signature + DS trust + MSO validity + `valueDigests` recompute) without
+/// the holder `DeviceAuth` binding, for vectors whose `DeviceAuth` is the ISO device-retrieval
+/// `DeviceMac` (not the OID4VP `DeviceSignature`).
+#[cfg(any(test, feature = "test-vectors"))]
+pub type IssuerVerifiedAttributes = BTreeMap<String, AttributeValue>;
+
+/// Run the **issuer-side** always-on bar over a real ISO/IEC 18013-5 `DeviceResponse` vector's first
+/// document — the `IssuerAuth` `COSE_Sign1` signature, DS-certificate trust, MSO `digestAlgorithm` /
+/// `validityInfo` enforcement, and the in-house `valueDigests` recompute over every disclosed
+/// `IssuerSignedItem` — returning the disclosed attributes on success or the specific [`ReasonCode`]
+/// on the first failure.
+///
+/// This is the entry the **external-vector conformance** test drives (the ISO Annex-D worked example),
+/// exercising the exact production [`verify_issuer_signed`] path — NOT a parallel re-implementation
+/// (Principle III/VIII). It deliberately omits the holder `DeviceAuth` binding: the Annex-D vector's
+/// `DeviceAuth` is the device-retrieval `DeviceMac` (an ECDH-derived HMAC over the ISO
+/// `SessionTranscript`), which is a documented follow-on to this SDK's `DeviceSignature` path
+/// (research D8) and out of scope for an issuer-signature conformance check. The issuer-signed parts
+/// (signature + digests + validity) are what a real vector lets us prove byte-for-byte against an
+/// independent, externally-authored credential.
+///
+/// # Errors
+///
+/// Returns the specific [`ReasonCode`] of the first issuer-side check that fails.
+#[cfg(any(test, feature = "test-vectors"))]
+pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
+    device_response: &[u8],
+    anchors: &A,
+    params: &MdocVerifyParams<'_>,
+) -> Result<IssuerVerifiedAttributes, ReasonCode> {
+    let run = || -> Result<IssuerVerifiedAttributes, VerifyFailure> {
+        let root: CborValue =
+            ciborium::from_reader(device_response).map_err(|_| VerifyFailure::malformed())?;
+        let document = first_document(&root)?;
+        let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
+        let issuer_signed =
+            get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
+        let verified = verify_issuer_signed(issuer_signed, anchors, &doc_type, params)?;
+        Ok(verified.disclosed)
+    };
+    run().map_err(|failure| failure.reason)
+}
+
 /// The fallible verification body; `verify` maps its error to a specific-reason INVALID verdict.
 ///
 /// A `DeviceResponse` MAY carry more than one `Document`. The verdict is VALID only when **every**
@@ -266,6 +313,42 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
 
+    // --- Issuer-side bar: IssuerAuth signature + DS trust + MSO validity + valueDigests integrity. --
+    let issuer_verified = verify_issuer_signed(issuer_signed, anchors, &doc_type, params)?;
+
+    // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
+    verify_device_binding(document, &issuer_verified.device_key, &doc_type, params)?;
+
+    Ok(issuer_verified.disclosed)
+}
+
+/// The result of verifying the **issuer-signed** half of an mdoc document: the disclosed attributes
+/// (after the `valueDigests` integrity recompute) and the MSO `DeviceKey` the holder binding is
+/// checked against.
+struct IssuerVerified {
+    /// The disclosed attributes, after each `IssuerSignedItem` digest was recomputed and matched.
+    disclosed: BTreeMap<String, AttributeValue>,
+    /// The holder's `DeviceKey` extracted from the MSO (the input to the `DeviceAuth` binding check).
+    device_key: DeviceKey,
+}
+
+/// Verify the **issuer-signed** half of an mdoc `Document` (everything the issuer signs, independent
+/// of the holder's `DeviceAuth`): parse the `IssuerAuth` `COSE_Sign1` + the MSO it carries, verify the
+/// `IssuerAuth` ES256 signature with the DS certificate, resolve DS trust against the configured
+/// `anchors`, parse + enforce the MSO `digestAlgorithm` / `validityInfo` / status / `docType`
+/// consistency, and recompute every disclosed `IssuerSignedItem` digest against the MSO `valueDigests`.
+///
+/// This is the single authoritative issuer-side verification path: [`verify_one_document`] runs it and
+/// then adds the holder binding, while the external-vector conformance test
+/// ([`verify_issuer_auth_against_vector`]) runs exactly this against a real ISO/IEC 18013-5 Annex-D
+/// vector whose `DeviceAuth` uses the device-retrieval `DeviceMac` (not the OID4VP `DeviceSignature`),
+/// so the two callers share one implementation (no parallel re-verification — Principle III/VIII).
+fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
+    issuer_signed: &CborValue,
+    anchors: &A,
+    doc_type: &str,
+    params: &MdocVerifyParams<'_>,
+) -> Result<IssuerVerified, VerifyFailure> {
     // --- Parse the IssuerAuth COSE_Sign1 and the MSO it carries. -----------------------------------
     let issuer_auth_value =
         get_map_entry(issuer_signed, "issuerAuth").ok_or_else(VerifyFailure::malformed)?;
@@ -306,18 +389,20 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     }
 
     // The MSO docType MUST match the document's docType (a mismatch is a structural tamper).
-    if get_text(&mso, "docType").as_deref() != Some(doc_type.as_str()) {
+    if get_text(&mso, "docType").as_deref() != Some(doc_type) {
         return Err(VerifyFailure::reason(ReasonCode::Tamper));
     }
 
     // --- valueDigests integrity (in-house): recompute each disclosed item's digest. -----------------
     let disclosed = verify_value_digests(issuer_signed, &mso, digest_alg)?;
 
-    // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
+    // --- Extract the MSO DeviceKey (the input to the DeviceAuth holder binding the caller runs). -----
     let device_key = mso_device_key(&mso)?;
-    verify_device_binding(document, &device_key, &doc_type, params)?;
 
-    Ok(disclosed)
+    Ok(IssuerVerified {
+        disclosed,
+        device_key,
+    })
 }
 
 // =================================================================================================

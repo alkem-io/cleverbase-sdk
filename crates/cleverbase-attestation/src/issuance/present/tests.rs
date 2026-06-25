@@ -17,6 +17,8 @@ use crate::trust::StaticTestAnchors;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
 
 const AUDIENCE: &str = "https://verifier.example/cb";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element).
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 const NOW: i64 = 1_700_000_000;
 
 /// A stub holder HSM (the only holder of a private key) signing the SDK-built input.
@@ -49,6 +51,7 @@ fn request(nonce: &[u8]) -> PresentationRequest {
         dcql: Dcql::from_json("{}"),
         nonce: nonce.to_vec(),
         audience: AUDIENCE.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     }
 }
 
@@ -481,6 +484,7 @@ fn mdoc_present_wrong_audience_is_rejected_by_the_verifier() {
         dcql: Dcql::from_json("{}"),
         nonce: built_for.nonce,
         audience: "https://other-verifier.example".to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     };
     let result = verify_response(
         &vp.as_vp_token(),

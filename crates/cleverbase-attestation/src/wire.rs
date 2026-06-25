@@ -14,18 +14,22 @@
 //! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
 //! seam), and the optional OpenID4VP **request** the presentation must be bound to.
 //!
-//! ## Schema version 4
+//! ## Schema version 5
 //!
 //! Version 2 replaced the version-1 foundation seam (which carried only `presentation` + `policy` and
 //! returned `NotImplemented`) with the full always-on verifier wiring. Version 3 additively carried
 //! the opt-in qualified-status gate's national Trusted List ([`WireContext::qualified_trust_list`])
-//! alongside the existing `qualified_gate` flag (T020). Version 4 (this) additively carries the
+//! alongside the existing `qualified_gate` flag (T020). Version 4 additively carried the
 //! gate's **scheme-operator trust anchors** ([`WireContext::qualified_scheme_anchors`]) — the X.509
 //! anchor(s) the gate chain-authenticates the national TL's signer against before reading any status,
 //! so a forged / unsigned / unchained / stale TL can never report `Qualified` (fail-closed, SC-007);
-//! with the gate enabled but no scheme anchor the determination is `Indeterminate`. The CBOR shape
-//! changed (an additive field), so the schema version was bumped (Principle VII); a binding speaking
-//! an older version is refused with a clear message rather than mis-parsed.
+//! with the gate enabled but no scheme anchor the determination is `Indeterminate`. Version 5 (this)
+//! adds the OpenID4VP request's first-class **`response_uri`**
+//! ([`crate::openid4vp::PresentationRequest::response_uri`]) — the 4th element of the mdoc
+//! `OpenID4VPHandoverInfo` (OpenID4VP 1.0 §B.2.6), previously stubbed to the `client_id`. A
+//! `PresentationRequest` carried in [`VerifyRequest::request`] now requires this field, so the CBOR
+//! shape changed and the schema version was bumped (Principle VII); a binding speaking an older
+//! version is refused with a clear message rather than mis-parsed.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +42,7 @@ use crate::verify::{verify, Presentation, VerifyContext};
 /// Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
 /// SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
 /// verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
-pub const ATTESTATION_SCHEMA_VERSION: u32 = 4;
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 5;
 
 /// A single configured trust anchor passed across the wire: a trusted issuer/anchor certificate for
 /// a `(role, format)` (the host resolved these from the EU LOTL / national TLs / IACA roots in its

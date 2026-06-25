@@ -19,6 +19,9 @@ use crate::types::{
 
 const AUDIENCE: &str = "https://verifier.example/cb";
 const WRONG_AUDIENCE: &str = "https://attacker.example/evil";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element) —
+/// distinct from the `client_id` (`audience`).
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 const MDOC_NOW: i64 = 1_717_200_000;
 
 /// The scheme-operator anchor (the IACA root) the qualified-gate fixture's national TL is signed by.
@@ -45,6 +48,7 @@ fn request_with(audience: &str, nonce: &[u8]) -> PresentationRequest {
         dcql: Dcql::from_json(r#"{"credentials":[]}"#),
         nonce: nonce.to_vec(),
         audience: audience.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
     }
 }
 
@@ -256,7 +260,7 @@ fn sd_jwt_vc_replay_is_invalid_through_verify() {
 #[test]
 fn mdoc_bound_request_is_valid_through_verify() {
     let request = request_with(AUDIENCE, &[6u8; 16]);
-    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce);
+    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce, RESPONSE_URI);
     let response = MdocBuilder::new().session_transcript(transcript).build();
     let anchors = mdoc_anchors();
     let ctx = VerifyContext {
@@ -279,7 +283,7 @@ fn mdoc_bound_request_is_valid_through_verify() {
 #[test]
 fn mdoc_wrong_audience_is_invalid_through_verify() {
     let request = request_with(AUDIENCE, &[6u8; 16]);
-    let transcript = oid4vp_handover_transcript(WRONG_AUDIENCE, &request.nonce);
+    let transcript = oid4vp_handover_transcript(WRONG_AUDIENCE, &request.nonce, RESPONSE_URI);
     let response = MdocBuilder::new().session_transcript(transcript).build();
     let anchors = mdoc_anchors();
     let ctx = VerifyContext {

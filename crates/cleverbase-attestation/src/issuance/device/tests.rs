@@ -6,9 +6,11 @@ use crate::issuance::signer::{Ceremony, SignatureAlgorithm, SignerError};
 use crate::openid4vp::oid4vp_handover_transcript;
 
 const AUDIENCE: &str = "https://verifier.example/cb";
+/// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element).
+const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 
 fn a_build() -> crate::issuance::device::DeviceSignatureBuild {
-    let transcript = oid4vp_handover_transcript(AUDIENCE, b"nonce-bytes-here");
+    let transcript = oid4vp_handover_transcript(AUDIENCE, b"nonce-bytes-here", RESPONSE_URI);
     let device_ns = empty_device_name_spaces_bytes().expect("empty device namespaces");
     build_device_signature(
         "org.iso.18013.5.1.mDL",

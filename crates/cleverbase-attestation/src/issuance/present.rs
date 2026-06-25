@@ -445,7 +445,8 @@ fn prepare_mdoc(
     // the document discloses no device namespaces.
     let device_name_spaces_bytes = first_device_name_spaces_bytes(&response)?;
 
-    let transcript = oid4vp_handover_transcript(&request.audience, &request.nonce);
+    let transcript =
+        oid4vp_handover_transcript(&request.audience, &request.nonce, &request.response_uri);
     let build = build_device_signature(
         &doc_type,
         &transcript,
