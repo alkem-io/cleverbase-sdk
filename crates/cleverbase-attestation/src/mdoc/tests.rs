@@ -662,6 +662,46 @@ fn issuer_signing_cert_der_reads_the_claimed_ds_leaf() {
 }
 
 #[test]
+fn issuer_signing_certs_with_issuance_reads_the_claimed_cert_and_relevant_time() {
+    // The qualified-gate per-document input reads each document's claimed DS leaf PAIRED with that
+    // document's MSO `validityInfo.signed` (the issuance/relevant time) — read-only, no verification.
+    // The default builder mints `signed = 2023-01-01T00:00:00Z` (1672531200).
+    let response = MdocBuilder::new()
+        .signed("2026-08-01T00:00:00Z") // 1785542400
+        .validity("2026-08-01T00:00:00Z", "2027-02-01T00:00:00Z")
+        .build();
+    let per_doc =
+        super::issuer_signing_certs_with_issuance_der(&response).expect("documents present");
+    assert_eq!(per_doc.len(), 1);
+    let (cert, issued) = &per_doc[0];
+    assert_eq!(cert.as_deref(), Some(mdoc_ds_cert_der()));
+    assert_eq!(*issued, Some(1_785_542_400)); // the MSO `signed`, NOT "now"
+                                              // A second document with its OWN issuance window yields its OWN relevant time (per-document).
+    let multi = MdocBuilder::new()
+        .signed("2026-08-01T00:00:00Z")
+        .validity("2026-08-01T00:00:00Z", "2027-09-01T00:00:00Z")
+        .append_valid_document_issued_at("2027-04-01T00:00:00Z", "2027-09-01T00:00:00Z")
+        .build();
+    let per_doc = super::issuer_signing_certs_with_issuance_der(&multi).expect("documents present");
+    assert_eq!(per_doc.len(), 2);
+    assert_eq!(per_doc[0].1, Some(1_785_542_400)); // documents[0] signed 2026-08-01
+    assert_eq!(per_doc[1].1, Some(1_806_537_600)); // documents[1] signed 2027-04-01
+                                                   // When the MSO omits `signed`, the reader falls back to `validFrom` (the issuance-time fallback).
+    let no_signed = MdocBuilder::new()
+        .omit_mso_signed()
+        .validity("2026-08-01T00:00:00Z", "2027-02-01T00:00:00Z")
+        .build();
+    let per_doc =
+        super::issuer_signing_certs_with_issuance_der(&no_signed).expect("documents present");
+    assert_eq!(per_doc[0].1, Some(1_785_542_400)); // falls back to validFrom = 2026-08-01
+                                                   // Not CBOR / no `documents` → None (read-only and total).
+    assert!(super::issuer_signing_certs_with_issuance_der(&[0xff, 0x00]).is_none());
+    let mut empty = Vec::new();
+    ciborium::into_writer(&CborValue::Map(vec![]), &mut empty).unwrap();
+    assert!(super::issuer_signing_certs_with_issuance_der(&empty).is_none());
+}
+
+#[test]
 fn empty_documents_array_is_rejected_as_malformed() {
     // A DeviceResponse with an empty `documents` array carries no credential to verify; a VALID
     // verdict over zero documents is meaningless and must be rejected.

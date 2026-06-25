@@ -14,6 +14,18 @@
 //! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
 //! seam), and the optional OpenID4VP **request** the presentation must be bound to.
 //!
+//! ## Trust semantics over the C-ABI
+//!
+//! The wire anchors are treated as **trusted anchors/roots** and the credential's signing leaf is
+//! **chain-validated** against them (per role/format) via [`ChainValidatingAnchors`], reusing the
+//! production [`crate::trust::chain::verify_chain`] primitive (DRY). This is the EUDI chain-to-root
+//! model (contracts/verifier.md step 3): a host passing an issuing **CA / IACA root** trusts every
+//! credential whose leaf chains to it, and the leaf's **validity window** is enforced at the
+//! verification instant — an expired/withdrawn pinned issuer leaf is rejected
+//! ([`crate::trust::chain::ChainError::LeafExpired`]), never silently accepted. The core stays
+//! **sans-IO**: the host fetches/refreshes the trust list and passes the resolved anchors in; the
+//! core only chain-validates against them (it does not fetch).
+//!
 //! ## Schema version 5
 //!
 //! Version 2 replaced the version-1 foundation seam (which carried only `presentation` + `policy` and
@@ -35,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::openid4vp::PresentationRequest;
 use crate::status::StatusOutcome;
-use crate::trust::StaticTestAnchors;
+use crate::trust::ChainValidatingAnchors;
 use crate::types::{Format, IssuerRole, VerificationPolicy, VerificationResult};
 use crate::verify::{verify, Presentation, VerifyContext};
 
@@ -202,10 +214,17 @@ pub fn encode_verify_response(outcome: VerifyOutcome) -> Vec<u8> {
     buf
 }
 
-/// Build a [`StaticTestAnchors`] trust source from the wire anchor entries (the host's resolved,
+/// Build a [`ChainValidatingAnchors`] trust source from the wire anchor entries (the host's resolved,
 /// passed-in anchor set — the core never fetches a trust list itself).
-fn anchors_from_wire(entries: &[WireTrustAnchor]) -> StaticTestAnchors {
-    let mut anchors = StaticTestAnchors::new();
+///
+/// Each wire anchor is treated as a **trusted anchor/root**: at verify time the credential's signing
+/// leaf is **chain-validated** against the anchors for its role/format (reusing the production
+/// [`crate::trust::chain::verify_chain`] primitive — DRY), enforcing the leaf's validity window at
+/// `now_unix`. This is the production C-ABI trust semantics (chain-to-root + leaf-validity), NOT the
+/// exact-DER-equality test seam: a host passing an issuing CA / IACA root trusts every credential
+/// whose leaf chains to it, and an expired pinned issuer leaf is rejected rather than accepted.
+fn anchors_from_wire(entries: &[WireTrustAnchor], now_unix: i64) -> ChainValidatingAnchors {
+    let mut anchors = ChainValidatingAnchors::new(now_unix);
     for e in entries {
         anchors = anchors.trust(e.role, e.format, &e.cert_der);
     }
@@ -219,7 +238,9 @@ fn anchors_from_wire(entries: &[WireTrustAnchor]) -> StaticTestAnchors {
 pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
     let outcome = match decode_verify_request(input) {
         Ok(req) => {
-            let anchors = anchors_from_wire(&req.anchors);
+            // Chain-validate the credential's leaf against the host-supplied anchors at the
+            // verification instant (the leaf-validity window is enforced at `now_unix`).
+            let anchors = anchors_from_wire(&req.anchors, req.context.now_unix);
             // Parse the optional national Trusted List the opt-in gate reads. A malformed list (or
             // none) is treated as absent data → the gate yields `Indeterminate` (fail-closed, never a
             // false "qualified"); it never fails the always-on verdict.

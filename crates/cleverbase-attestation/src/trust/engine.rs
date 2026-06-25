@@ -28,10 +28,9 @@
 
 use std::collections::BTreeMap;
 
-use super::chain::verify_chain;
 use super::manifest::TrustListManifest;
 use super::xml::XmlTrustList;
-use super::{Reachability, TrustAnchorSource, TrustDecision, TrustError, TrustListEntry};
+use super::{Reachability, TrustAnchorSource, TrustDecision, TrustError};
 use crate::types::{Format, IssuerRole};
 
 /// A host-driven source of raw trust-list bytes (keeps the core sans-IO — research D5 / Principle
@@ -271,19 +270,15 @@ impl TrustAnchorSource for NativeTrustEngine {
         if !self.cache_is_fresh() {
             return TrustDecision::untrusted();
         }
-        let Some(anchors) = self.cache.anchors.get(&(role, format)) else {
-            return TrustDecision::untrusted();
-        };
-        if verify_chain(issuer_cert_der, anchors, self.now_unix).is_ok() {
-            TrustDecision::trusted(TrustListEntry {
-                role,
-                format,
-                anchor_cert_der: issuer_cert_der.to_vec(),
-                service_name: None,
-            })
-        } else {
-            TrustDecision::untrusted()
-        }
+        // Chain-validate the leaf against the cached anchors for its role/format (the shared,
+        // single-source resolve body — DRY).
+        super::resolve_chain(
+            self.cache.anchors.get(&(role, format)),
+            role,
+            format,
+            issuer_cert_der,
+            self.now_unix,
+        )
     }
 
     /// The sans-IO trait refresh has no fetcher seam, so it cannot fetch; production refresh goes

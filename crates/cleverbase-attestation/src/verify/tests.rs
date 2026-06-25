@@ -9,7 +9,8 @@ use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
 use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
 use crate::qualified::QualifiedTrustList;
 use crate::sdjwtvc::test_issuer::{
-    attach_kb_jwt, mint_sd_jwt, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_validity, HOLDER_KEY_PK8, ISSUER_CERT_DER,
+    ISSUER_KEY_PK8, NOW, WRONG_ISSUER_KEY_PK8,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
@@ -34,6 +35,28 @@ const QUALIFIED_TRUST_LIST_JSON: &[u8] =
 /// window (2026-09-01): `mdoc-ds` is a granted EAA/Q issuer → Qualified, `wrong-issuer` is absent →
 /// Indeterminate. (Mirrors `qualified::tests::RELEVANT_GRANTED`.)
 const RELEVANT_GRANTED: i64 = 1_788_220_800;
+/// The MSO `signed`/`validFrom` instant the qualified-gate mdoc fixtures are minted at: 2026-08-01,
+/// inside the `mdoc-ds` grant window (2026-07-01 .. withdrawn 2027-03-01) AND inside the IACA
+/// signer + DS-leaf cert validity windows. After the relevant-time fix the gate reads each issuer's
+/// status at the credential's OWN issuance time (the MSO `signed`), NOT at `RELEVANT_GRANTED`, so the
+/// minted credential must itself be issued in-window for `mdoc-ds` to read as a granted EAA/Q issuer.
+const MDOC_ISSUED_IN_GRANT: &str = "2026-08-01T00:00:00Z";
+/// The validity upper bound paired with [`MDOC_ISSUED_IN_GRANT`] (well after `RELEVANT_GRANTED`).
+const MDOC_VALID_UNTIL: &str = "2027-02-01T00:00:00Z";
+/// Verification instant AFTER the `mdoc-ds` withdrawal (2027-03-01), inside the signer + leaf cert
+/// windows (mirrors `qualified::tests::RELEVANT_AFTER_WITHDRAWN`). Used by the multi-document fold
+/// probe so BOTH appended documents are within their validity windows at `now`.
+const RELEVANT_AFTER_WITHDRAWN: i64 = 1_811_808_000; // 2027-06-01.
+/// The MSO `signed`/`validFrom` of the second fold-probe document: 2027-04-01, AFTER the `mdoc-ds`
+/// withdrawal (2027-03-01) but before `RELEVANT_AFTER_WITHDRAWN` — so it is valid-at-`now`, yet at its
+/// OWN issuance time `mdoc-ds` is withdrawn → NotQualified (the per-document relevant-time narrowing).
+const MDOC_ISSUED_AFTER_WITHDRAWN: &str = "2027-04-01T00:00:00Z";
+/// The validity upper bound paired with [`MDOC_ISSUED_AFTER_WITHDRAWN`] (after `RELEVANT_AFTER_WITHDRAWN`).
+const MDOC_AFTER_WITHDRAWN_VALID_UNTIL: &str = "2027-09-01T00:00:00Z";
+/// An SD-JWT VC issuance/relevant time BEFORE the `sdjwt-issuer` EAA/Q grant began (the grant starts
+/// 2026-07-01), yet AFTER the TL signer's notBefore (2026-06-25) so the TL still authenticates:
+/// 2026-06-26. The false-qualified probe for the relevant-time fix.
+const RELEVANT_BEFORE_GRANTED: i64 = 1_782_432_000; // 2026-06-26.
 
 fn sd_jwt_anchors() -> StaticTestAnchors {
     StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER)
@@ -428,7 +451,12 @@ fn single_document_mdoc_qualified_issuer_reports_qualified() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return; // self-skip: fixture absent
     };
-    let response = MdocBuilder::new().build();
+    // Mint the credential ISSUED in the grant window: the gate reads `mdoc-ds`'s status at the MSO
+    // `signed` (the credential's relevant time), not at `RELEVANT_GRANTED`.
+    let response = MdocBuilder::new()
+        .signed(MDOC_ISSUED_IN_GRANT)
+        .validity(MDOC_ISSUED_IN_GRANT, MDOC_VALID_UNTIL)
+        .build();
     let anchors = mdoc_anchors();
     let scheme = [CA_IACA.to_vec()];
     let ctx = VerifyContext {
@@ -457,25 +485,37 @@ fn single_document_mdoc_qualified_issuer_reports_qualified() {
     assert_eq!(
         result.qualified_status,
         Some(QualifiedStatus::Qualified),
-        "a single granted-EAA/Q issuer → Qualified"
+        "a single granted-EAA/Q issuer (issued in-window) → Qualified at the credential's relevant time"
     );
 }
 
 #[test]
 fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
-    // PROVENANCE PROBE: `documents[0]` is the granted EAA/Q `mdoc-ds` issuer (→ Qualified on its own),
-    // but a SECOND document carries a DIFFERENT issuer (`wrong-issuer`, absent from the TL →
-    // Indeterminate). Reading only `documents[0]` would report Qualified over a result whose merged
-    // attributes also cover the second, non-qualified issuer's document. The gate MUST decide over
-    // EVERY document and fold so a `Qualified` never under-covers → Indeterminate here.
+    // PROVENANCE + PER-DOCUMENT-RELEVANT-TIME PROBE: a VALID two-document response, BOTH signed by the
+    // trusted `mdoc-ds` DS (so the always-on bar accepts it and the qualified gate runs). documents[0]
+    // is issued IN the grant window (2026-08-01 → `mdoc-ds` is a granted EAA/Q issuer at that issuance
+    // time → Qualified on its own); documents[1] is issued AFTER the issuer's withdrawal (2027-04-01 →
+    // NotQualified at ITS issuance time). Both windows cover `now`, so the response is VALID. Reading
+    // only documents[0], OR reading the status at "now" for both, would mis-report the verdict; the
+    // gate MUST decide over EVERY document at EACH document's OWN relevant time and fold so a
+    // `Qualified` never under-covers documents[1] → NotQualified here.
     let Some(tl) = qualified_trust_list_fixture() else {
         return; // self-skip: fixture absent
     };
-    let response = MdocBuilder::new().append_second_issuer_document().build();
+    let response = MdocBuilder::new()
+        // documents[0]: issued in-grant, valid window covers `now` (RELEVANT_AFTER_WITHDRAWN).
+        .signed(MDOC_ISSUED_IN_GRANT)
+        .validity(MDOC_ISSUED_IN_GRANT, MDOC_AFTER_WITHDRAWN_VALID_UNTIL)
+        // documents[1]: same trusted DS, issued AFTER the withdrawal, valid window covers `now`.
+        .append_valid_document_issued_at(
+            MDOC_ISSUED_AFTER_WITHDRAWN,
+            MDOC_AFTER_WITHDRAWN_VALID_UNTIL,
+        )
+        .build();
     let anchors = mdoc_anchors();
     let scheme = [CA_IACA.to_vec()];
     let ctx = VerifyContext {
-        now_unix: RELEVANT_GRANTED,
+        now_unix: RELEVANT_AFTER_WITHDRAWN,
         role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
@@ -492,17 +532,22 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
         &ctx,
         None,
     );
-    // The gate runs independently of the always-on verdict (a multi-issuer response need not be
-    // VALID); the determination MUST NOT be a single Qualified read from documents[0].
+    // The response is VALID (both documents signed by the trusted DS), so the gate runs.
+    assert!(
+        result.valid,
+        "both documents are signed by the trusted DS: {:?}",
+        result.reasons
+    );
+    // The determination MUST NOT be a single Qualified read from documents[0].
     assert_ne!(
         result.qualified_status,
         Some(QualifiedStatus::Qualified),
-        "a multi-issuer mdoc must NOT report a Qualified that under-covers documents[1]"
+        "a multi-document mdoc must NOT report a Qualified that under-covers documents[1]"
     );
     assert_eq!(
         result.qualified_status,
-        Some(QualifiedStatus::Indeterminate),
-        "documents[1]'s issuer is undecidable → the folded status is Indeterminate (fail-closed)"
+        Some(QualifiedStatus::NotQualified),
+        "documents[1] is NotQualified at its own (post-withdrawal) relevant time → the fold is NotQualified"
     );
 }
 
@@ -519,4 +564,158 @@ fn fold_qualified_requires_every_document_to_qualify() {
     assert_eq!(fold_qualified([NotQualified, NotQualified]), NotQualified);
     assert_eq!(fold_qualified([Qualified]), Qualified);
     assert_eq!(fold_qualified(std::iter::empty()), Indeterminate);
+}
+
+// =================================================================================================
+// Qualified-status relevant-time + valid-gating (the FALSE-QUALIFIED fixes).
+// =================================================================================================
+
+#[test]
+fn qualified_status_uses_the_credentials_issuance_time_not_now() {
+    // FALSE-QUALIFIED FIX (relevant time): `sdjwt-issuer` is a granted EAA/Q issuer ONLY from
+    // 2026-07-01. A credential it issued BEFORE the grant (here `nbf`/relevant time 2026-06-26) must
+    // NOT be reported Qualified — even though the VERIFICATION instant (`now`) is well after the grant
+    // (2026-09-01). The status MUST be read at the credential's issuance/relevant time, NOT "now"
+    // (contracts/qualified-status-gate.md). Reading at "now" would falsely report Qualified.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    // Minted with `nbf` BEFORE the grant; the always-on validity window still includes `now` so the
+    // credential is VALID and the gate runs (the gate only computes status for a VALID credential).
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(RELEVANT_BEFORE_GRANTED), // nbf = issuance/relevant time, before the grant
+        serde_json::json!(RELEVANT_GRANTED + 1_000_000), // exp well after `now`
+    );
+    let presentation = sd_jwt.presentation();
+    let anchors = sd_jwt_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED, // verification instant AFTER the grant — yet must not drive status
+        role: IssuerRole::Pid,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "credential is in-window at now: {:?}",
+        result.reasons
+    );
+    // The issuer is on the TL but its grant had not yet begun at the credential's relevant time →
+    // found-but-not-granted → NotQualified. Critically NOT Qualified (the false-qualified bug).
+    assert_ne!(
+        result.qualified_status,
+        Some(QualifiedStatus::Qualified),
+        "an issuer granted only AFTER issuance must NOT report Qualified for the earlier credential"
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::NotQualified),
+        "found on the TL but not granted at the credential's relevant time → NotQualified"
+    );
+}
+
+#[test]
+fn forged_credential_with_a_real_qualified_cert_reports_no_qualified_status() {
+    // FALSE-QUALIFIED FIX (valid-gating): a forged SD-JWT VC whose `x5c` carries the REAL granted
+    // EAA/Q `sdjwt-issuer` certificate (X.509 certs are public, so an attacker can embed one) but is
+    // SIGNED WITH A DIFFERENT KEY (wrong-issuer). The always-on bar verifies the signature against the
+    // embedded cert's public key → it fails → `valid = false` (Tamper). The qualified gate MUST NOT
+    // report Qualified off that unverified claimed cert: `qualified_status` stays `None` because the
+    // gate only runs for a VALID credential (SC-002/SC-007).
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    // Embed the real qualified `sdjwt-issuer` cert in `x5c`, but sign with the wrong-issuer key.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        WRONG_ISSUER_KEY_PK8,
+        ISSUER_CERT_DER, // the REAL granted EAA/Q issuer cert in x5c (a public cert)
+        serde_json::json!(RELEVANT_GRANTED - 1_000),
+        serde_json::json!(RELEVANT_GRANTED + 1_000_000),
+    );
+    let presentation = sd_jwt.presentation();
+    // Trust the real issuer cert for the role/format (so trust is NOT what fails — the SIGNATURE is).
+    let anchors = sd_jwt_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Pid,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    // The signature does not verify under the embedded (real) cert → INVALID (Tamper).
+    assert!(!result.valid, "a forged signature must be INVALID");
+    assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
+    // And the gate must NOT have reported the embedded qualified cert's status on an INVALID verdict.
+    assert_eq!(
+        result.qualified_status, None,
+        "qualified status must be None for an INVALID credential (no Qualified off an unverified cert)"
+    );
+}
+
+#[test]
+fn credential_without_any_issuance_time_fails_closed_to_indeterminate() {
+    // FALSE-QUALIFIED FIX (fail-closed): a VALID credential that carries NO issuance time at all (no
+    // `iat`, no `nbf`) gives the gate no relevant time to read the status at. It MUST fail closed to
+    // Indeterminate — never silently substitute "now" (which could falsely report Qualified). Even
+    // though the issuer (sdjwt-issuer) IS a granted EAA/Q issuer at `now`, the absent issuance time
+    // means the determination is undecidable.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    // No `nbf` and no `exp` (both null = omitted) and no `iat` → the credential asserts no temporal
+    // bound, so it is in-window/VALID, but it carries NO issuance time for the gate to read.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::Value::Null, // nbf omitted
+        serde_json::Value::Null, // exp omitted
+    );
+    let presentation = sd_jwt.presentation();
+    let anchors = sd_jwt_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED, // the issuer IS granted at now — but now must NOT be used
+        role: IssuerRole::Pid,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "no temporal bound → in-window VALID: {:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::Indeterminate),
+        "no issuance time → fail closed to Indeterminate, never read status at now"
+    );
 }

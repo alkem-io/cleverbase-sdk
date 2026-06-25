@@ -128,6 +128,30 @@ pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
     issuer_cert_from_header(&header).ok()
 }
 
+/// The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
+/// §4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
+/// to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
+/// credential is in force, the closest available proxy for the relevant time).
+///
+/// Returns `None` when the presentation does not parse or carries **neither** `iat` nor `nbf` — the
+/// opt-in [`crate::qualified`] gate then fails closed ([`crate::types::QualifiedStatus::Indeterminate`])
+/// rather than read the issuer's status at the verification instant ("now"), which would falsely report
+/// `Qualified` for an issuer granted only AFTER it signed the credential (contracts/qualified-status-
+/// gate.md: the status is read **at the credential's issuance/relevant time, NOT "now"**). A present-
+/// but-non-canonical `iat`/`nbf` (RFC 7519 NumericDate must be a JSON number that fits `i64`) is
+/// likewise treated as absent — the gate must not assert qualification off an unreadable instant.
+#[must_use]
+pub fn issuance_time_unix(presentation: &str) -> Option<i64> {
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+    let claims = sd_jwt.claims();
+    // `iat` is the credential's issuance time; `nbf` (not-before) is the fallback relevant time. Only
+    // a canonical NumericDate (a JSON integer that fits `i64`) is accepted; anything else → `None`.
+    numeric_date(claims.get("iat"))
+        .ok()
+        .flatten()
+        .or_else(|| numeric_date(claims.get("nbf")).ok().flatten())
+}
+
 /// The verified, accepted view of a presentation, assembled once every always-on check has passed.
 fn accept(disclosed: BTreeMap<String, AttributeValue>) -> VerificationResult {
     VerificationResult {

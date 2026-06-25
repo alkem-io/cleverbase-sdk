@@ -18,8 +18,9 @@
 //! engine fetches/caches the signed trust-list XML/JSON; it is **host-driven** (not per-verification)
 //! and is the point at which the [`Reachability`] policy applies.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::trust::chain::verify_chain;
 use crate::types::{Format, IssuerRole};
 
 // The native trust-list engine, split into focused modules (the X.509 [`chain`] primitive, the
@@ -105,6 +106,117 @@ impl TrustDecision {
     }
 }
 
+/// Resolve an issuer leaf against a set of trusted anchors for one `(role, format)` by
+/// **chain-validation** — the single authoritative `resolve` body shared by every chain-validating
+/// [`TrustAnchorSource`] (the [`NativeTrustEngine`] and the C-ABI [`ChainValidatingAnchors`]), so the
+/// trust rule is defined once (DRY — Principle III).
+///
+/// The leaf is trusted iff it chains to one of `anchors_for_key` at `now_unix` via
+/// [`crate::trust::chain::verify_chain`] (issued-by-anchor name + signature, or a direct DER-equal
+/// pin — and in **both** cases the leaf must be within its own validity window at `now_unix`, so an
+/// expired pinned leaf is rejected). An empty/absent anchor set is untrusted (fail-closed). On
+/// success the matched [`TrustListEntry`] carries the leaf as its `anchor_cert_der` (matching the
+/// other sources; the entry is informational — the bar reads only `trusted`).
+fn resolve_chain(
+    anchors_for_key: Option<&Vec<Vec<u8>>>,
+    role: IssuerRole,
+    format: Format,
+    issuer_cert_der: &[u8],
+    now_unix: i64,
+) -> TrustDecision {
+    let Some(anchors) = anchors_for_key else {
+        return TrustDecision::untrusted();
+    };
+    if verify_chain(issuer_cert_der, anchors, now_unix).is_ok() {
+        TrustDecision::trusted(TrustListEntry {
+            role,
+            format,
+            anchor_cert_der: issuer_cert_der.to_vec(),
+            service_name: None,
+        })
+    } else {
+        TrustDecision::untrusted()
+    }
+}
+
+/// The chain-validating trust source for the **C-ABI / binding** verify path (contracts/verifier.md
+/// step 3; data-model.md `TrustAnchorSource`).
+///
+/// The host's trust-refresh step resolves the in-force anchors (EU LOTL / national Trusted Lists /
+/// IACA roots) out-of-process and passes them in as `(role, format, cert)` wire entries; this source
+/// treats each as a **trusted anchor/root** and, at `resolve` time, **chain-validates** the
+/// credential's signing leaf against the anchors configured for its role/format via
+/// [`crate::trust::chain::verify_chain`] (DRY — the same X.509 primitive the always-on bar and the
+/// [`NativeTrustEngine`] use; no re-implemented crypto). The core stays **sans-IO**: it does not
+/// fetch or refresh the trust list — it only chain-validates against the host-supplied anchors.
+///
+/// This is the production C-ABI trust semantics — distinct from [`StaticTestAnchors`] (exact DER
+/// equality only, an offline test seam):
+///
+/// - A host passing an **issuing CA / IACA root** trusts every credential whose leaf chains to it
+///   (the EUDI chain-to-root model), where exact-leaf-match would reject every real credential.
+/// - The leaf's **validity window** (and a directly-pinned anchor's) is enforced at the verification
+///   instant, so an expired/withdrawn pinned issuer leaf is rejected ([`crate::trust::chain::ChainError::LeafExpired`]),
+///   not silently accepted.
+///
+/// The verification instant `now_unix` (the relevant time the leaf-validity window is checked at) is
+/// carried on the source because [`TrustAnchorSource::resolve`] is sans-clock; the C-ABI builds one
+/// per verify call from the wire context.
+///
+/// Carries only issuer-public certificates (no secret), so deriving `Debug` is safe.
+#[derive(Debug, Clone)]
+pub struct ChainValidatingAnchors {
+    /// Trusted anchor/root certificates (DER), keyed by `(role, format)` so per-role/format anchoring
+    /// is preserved (an issuer trusted as a PID provider is not thereby trusted as a QEAA).
+    anchors: BTreeMap<(IssuerRole, Format), Vec<Vec<u8>>>,
+    /// The verification instant (Unix seconds) the leaf-validity window is enforced at.
+    now_unix: i64,
+}
+
+impl ChainValidatingAnchors {
+    /// Construct an empty source for the verification instant `now_unix` (trusts nothing until anchors
+    /// are added).
+    #[must_use]
+    pub fn new(now_unix: i64) -> Self {
+        Self {
+            anchors: BTreeMap::new(),
+            now_unix,
+        }
+    }
+
+    /// Add a host-resolved trusted anchor/root certificate (DER) for a `(role, format)`. A credential
+    /// whose leaf chains to it (or is a valid direct pin) for that role/format is trusted. Returns
+    /// `self` for builder-style configuration.
+    #[must_use]
+    pub fn trust(mut self, role: IssuerRole, format: Format, anchor_cert_der: &[u8]) -> Self {
+        self.anchors
+            .entry((role, format))
+            .or_default()
+            .push(anchor_cert_der.to_vec());
+        self
+    }
+}
+
+impl TrustAnchorSource for ChainValidatingAnchors {
+    fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision {
+        // Chain-validate the credential's leaf against the host-supplied anchors for its role/format
+        // (the shared, single-source resolve body — DRY).
+        resolve_chain(
+            self.anchors.get(&(role, format)),
+            role,
+            format,
+            issuer_cert_der,
+            self.now_unix,
+        )
+    }
+
+    /// A no-op: the host resolved + passed in the anchors out-of-process; the core stays sans-IO and
+    /// never fetches a trust list itself.
+    fn refresh(&mut self) -> Result<(), TrustError> {
+        Ok(())
+    }
+}
+
 /// An error from refreshing the trust anchors.
 ///
 /// The production engine fetches and authenticates signed trust-list XML/JSON in `refresh`; this
@@ -155,7 +267,7 @@ pub trait TrustAnchorSource {
 #[derive(Debug, Clone, Default)]
 pub struct StaticTestAnchors {
     /// The trusted issuer certificates, keyed by `(role, format)` → set of DER-encoded certs.
-    anchors: std::collections::BTreeMap<(IssuerRole, Format), BTreeSet<Vec<u8>>>,
+    anchors: BTreeMap<(IssuerRole, Format), BTreeSet<Vec<u8>>>,
 }
 
 impl StaticTestAnchors {
@@ -266,6 +378,102 @@ mod tests {
     #[test]
     fn refresh_is_infallible_for_the_offline_anchor() {
         let mut anchors = StaticTestAnchors::new();
+        assert!(anchors.refresh().is_ok());
+    }
+
+    // =============================================================================================
+    // ChainValidatingAnchors (the production C-ABI trust source — chain-to-root + leaf validity).
+    // =============================================================================================
+
+    use super::ChainValidatingAnchors;
+
+    /// The issuing IACA root the leaves below chain to.
+    const CA_IACA: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/ca-iaca.cert.der");
+    /// An SD-JWT VC issuer leaf signed by `ca-iaca`.
+    const SDJWT_ISSUER: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/sdjwt-issuer.cert.der");
+    /// A self-signed leaf that does NOT chain to `ca-iaca`.
+    const WRONG_ISSUER: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
+    /// A time inside every fixture leaf's validity window (2026-06-25 .. 2027-09-23).
+    const IN_WINDOW: i64 = 1_788_220_800; // 2026-09-01.
+    /// A time long past every fixture leaf's `notAfter` (≈2096).
+    const EXPIRED: i64 = 4_000_000_000;
+
+    #[test]
+    fn chain_validating_trusts_a_leaf_that_chains_to_the_passed_ca_root() {
+        // The EUDI chain-to-root model: a host passing the issuing CA/IACA root trusts every
+        // credential whose leaf chains to it (where exact-leaf-match would reject every real one).
+        let anchors =
+            ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER);
+        assert!(decision.trusted, "leaf chains to the passed CA root");
+        let entry = decision.entry.expect("trusted decision carries an entry");
+        assert_eq!(entry.role, IssuerRole::Pid);
+        assert_eq!(entry.format, Format::SdJwtVc);
+    }
+
+    #[test]
+    fn chain_validating_rejects_an_expired_pinned_leaf_as_untrusted() {
+        // A directly-pinned leaf (anchor == leaf) is STILL subject to its validity window: at a time
+        // past the leaf's notAfter it is rejected (UntrustedIssuer), never silently accepted — the
+        // false-accept `StaticTestAnchors` would allow (it ignores notAfter).
+        let anchors = ChainValidatingAnchors::new(EXPIRED).trust(
+            IssuerRole::Pid,
+            Format::SdJwtVc,
+            SDJWT_ISSUER, // pin the leaf directly
+        );
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER);
+        assert!(
+            !decision.trusted,
+            "an expired pinned leaf must be untrusted, not accepted"
+        );
+        assert!(decision.entry.is_none());
+    }
+
+    #[test]
+    fn chain_validating_rejects_a_leaf_that_does_not_chain() {
+        // A leaf that does not chain to the passed root (self-signed under a different name) is
+        // untrusted, even in-window.
+        let anchors =
+            ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
+        assert!(
+            !anchors
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER)
+                .trusted
+        );
+    }
+
+    #[test]
+    fn chain_validating_is_anchored_per_role_and_format() {
+        // The CA is configured for (PID, SD-JWT VC) only: the same leaf is untrusted under a different
+        // role or format (per-role/format anchoring, like the test anchor).
+        let anchors =
+            ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
+        assert!(
+            !anchors
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .trusted
+        );
+        assert!(
+            !anchors
+                .resolve(IssuerRole::Pid, Format::Mdoc, SDJWT_ISSUER)
+                .trusted
+        );
+        // No anchor configured at all → untrusted (fail-closed).
+        let empty = ChainValidatingAnchors::new(IN_WINDOW);
+        assert!(
+            !empty
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER)
+                .trusted
+        );
+    }
+
+    #[test]
+    fn chain_validating_refresh_is_infallible() {
+        // The host resolved the anchors out-of-process; the core's refresh is a sans-IO no-op.
+        let mut anchors = ChainValidatingAnchors::new(IN_WINDOW);
         assert!(anchors.refresh().is_ok());
     }
 }

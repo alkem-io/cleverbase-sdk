@@ -17,8 +17,14 @@ verify(presentation: bytes, policy: VerificationPolicy, anchors: TrustAnchors, r
 1. **Format** detected (SD-JWT VC or ISO mdoc); unsupported → INVALID `unsupported_format`.
 2. **Issuer signature** verifies (JOSE `ES256…` for SD-JWT VC; COSE_Sign1 IssuerAuth for mdoc) — via the
    SDK's existing RustCrypto (no hand-rolled crypto).
-3. **Issuer trust** — the issuer is present on the configured trust anchor for its role/format (EU
-   LOTL/Trusted List / IACA root / per-role list). Absent/expired/revoked TL entry → INVALID `untrusted_issuer`.
+3. **Issuer trust** — the issuer's signing leaf **chain-validates** to a configured trust anchor for its
+   role/format (EU LOTL/Trusted List / IACA root / per-role list), at the relevant time. The anchor MAY be
+   the issuing CA / IACA root (the EUDI chain-to-root model — a credential is trusted when its leaf chains
+   to a passed root) or a directly-pinned leaf; in **both** cases the leaf's validity window is enforced, so
+   an expired/withdrawn issuer leaf → INVALID `untrusted_issuer`. The C-ABI / binding path uses this same
+   chain-validating rule (`trust::chain::verify_chain`) over the host-passed anchors — it does **not** do
+   exact-leaf-equality (which would reject every credential under a CA/root and accept an expired pinned
+   leaf). Absent/expired/revoked anchor → INVALID `untrusted_issuer`.
 4. **Validity period** in range at the relevant time (SD-JWT VC `nbf`/`exp`; mdoc MSO `validityInfo`).
 5. **Revocation/status** — checked per the credential's status mechanism; **unreachable → fail-closed by
    default** (policy-configurable) → INVALID `status_unavailable` (never silent VALID).
@@ -31,7 +37,10 @@ verify(presentation: bytes, policy: VerificationPolicy, anchors: TrustAnchors, r
 
 `VerificationResult { valid, disclosedAttributes, trustStatus, qualifiedStatus?, reasons[] }`. INVALID
 always carries a **specific machine-readable reason** (FR-005/SC-002). `qualifiedStatus` is populated only
-when the opt-in gate (`qualified-status-gate.md`) ran.
+when the opt-in gate (`qualified-status-gate.md`) ran **and the credential is VALID** — it is only
+meaningful for a VALID credential (the gate matches the credential's *claimed* signing cert, which only a
+VALID verdict has signature-verified + trust-anchored), so on an INVALID credential `qualifiedStatus` is
+absent (never a `Qualified` read off an unverified claimed cert).
 
 ## Invariants
 

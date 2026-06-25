@@ -26,6 +26,16 @@
 //! unchained / stale TL — or no scheme anchor configured — yields `Indeterminate`, never `Qualified`
 //! (fail-closed). Disabling the gate leaves the always-on verdict **byte-identical** to a gate-off run
 //! (no false "qualified" — SC-007).
+//!
+//! `qualified_status` is **only meaningful for a VALID credential** and is therefore only computed
+//! when `valid == true`. The determination matches the credential's CLAIMED `x5c`/`x5chain` leaf
+//! against the TL **without re-verifying its signature**; since X.509 certificates are public, an
+//! attacker could embed a real qualified issuer's leaf and sign with their own key. Only a VALID
+//! verdict means the always-on bar has signature-verified AND trust-anchored that exact leaf, so the
+//! qualified status is trustworthy. On an INVALID credential `qualified_status` stays `None` (never a
+//! `Qualified` read off an unverified claimed cert — SC-002/SC-007). The status is read **at the
+//! credential's issuance/relevant time** (SD-JWT VC `iat`/`nbf`; mdoc MSO `signed`/`validFrom`), not
+//! at the verification instant.
 
 use crate::mdoc::{self, MdocVerifyParams};
 use crate::openid4vp::{self, MdocVpToken, PresentationRequest, VpToken};
@@ -253,34 +263,56 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     // is complete on its own; when the opt-in gate is enabled — via the verifier
     // [`VerificationPolicy::qualified_gate`] OR the per-call [`VerifyContext::qualified_gate`] flag —
     // it ADDITIVELY populates `result.qualified_status` (never changing the always-on
-    // `valid`/reasons — SC-007). It runs independently of the always-on verdict (even an INVALID
-    // credential can report its issuer's qualified status), and never fabricates "qualified": absent
-    // data → `Indeterminate`.
-    if policy.qualified_gate || ctx.qualified_gate {
+    // `valid`/reasons — SC-007), and never fabricates "qualified": absent data → `Indeterminate`.
+    //
+    // It is gated on `result.valid`: qualified status is computed ONLY for a VALID credential. The
+    // determination resolves the issuer cert from the credential's CLAIMED `x5c`/`x5chain` leaf
+    // WITHOUT re-verifying its signature — X.509 certs are public, so an attacker could embed a real
+    // qualified issuer's leaf in `x5c` and sign with their own key. On an INVALID credential the
+    // always-on bar already set `valid = false` (e.g. `Tamper`), so reporting `Qualified` off that
+    // claimed leaf would be a false "qualified". Only when `valid == true` has the always-on bar
+    // signature-verified AND trust-anchored that exact leaf, so the qualified status is meaningful;
+    // otherwise `qualified_status` stays `None` (SC-007).
+    if (policy.qualified_gate || ctx.qualified_gate) && result.valid {
         result.qualified_status = Some(qualified_status_for(presentation, ctx));
     }
 
     result
 }
 
-/// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer(s) at the relevant
-/// time (`ctx.now_unix`), reading the host-supplied national Trusted List ([`VerifyContext::
-/// qualified_trust_list`]) only after it **authenticates** against the host-configured
-/// scheme-operator anchors ([`VerifyContext::qualified_scheme_anchors`]).
+/// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer(s) at the
+/// **relevant time derived from the CREDENTIAL** — NOT the verification instant `ctx.now_unix` —
+/// reading the host-supplied national Trusted List ([`VerifyContext::qualified_trust_list`]) only
+/// after it **authenticates** against the host-configured scheme-operator anchors
+/// ([`VerifyContext::qualified_scheme_anchors`]).
 ///
-/// SD-JWT VC carries a single credential, so its claimed JWS `x5c` leaf decides the status directly.
-/// An mdoc `DeviceResponse` MAY carry MORE THAN ONE document (the always-on bar verifies + merges the
-/// attributes of every one, possibly from different issuers), so the determination is computed PER
-/// DOCUMENT and folded so a `Qualified` verdict requires **every** document to qualify — a single
-/// `Qualified` read from `documents[0]` must never under-cover a result that also surfaces a
-/// non-qualified `documents[1]`'s attributes (SC-007). The fold is fail-closed:
-/// `Qualified` only if all qualify; else `Indeterminate` if any document is undecidable; else
-/// `NotQualified`.
+/// ## Relevant time = the credential's issuance time (contracts/qualified-status-gate.md)
+///
+/// The status MUST be read **at the credential's issuance/relevant time, NOT "now"**: an issuer not
+/// yet granted `EAA/Q` when it signed a credential, but granted later, must NOT be reported
+/// `Qualified` for that credential (a false "qualified"). The relevant time is therefore derived from
+/// the credential itself — SD-JWT VC `iat` (fallback `nbf`) via [`sdjwtvc::issuance_time_unix`]; mdoc
+/// MSO `validityInfo.signed` (fallback `validFrom`) per document via
+/// [`mdoc::issuer_signing_certs_with_issuance_der`] — and passed as `relevant_time_unix`. A credential
+/// that carries **no** issuance time fails closed ([`QualifiedStatus::Indeterminate`]); `ctx.now_unix`
+/// is never silently substituted.
+///
+/// ## Multi-document fold
+///
+/// SD-JWT VC carries a single credential, so its claimed JWS `x5c` leaf + `iat` decide the status
+/// directly. An mdoc `DeviceResponse` MAY carry MORE THAN ONE document (the always-on bar verifies +
+/// merges the attributes of every one, possibly from different issuers), so the determination is
+/// computed PER DOCUMENT — each against that document's own issuer cert AND its own issuance time —
+/// and folded so a `Qualified` verdict requires **every** document to qualify: a single `Qualified`
+/// read from `documents[0]` must never under-cover a result that also surfaces a non-qualified
+/// `documents[1]`'s attributes (SC-007). The fold is fail-closed: `Qualified` only if all qualify;
+/// else `Indeterminate` if any document is undecidable; else `NotQualified`.
 ///
 /// Each per-document/credential delegate authenticates the TL (signer chains to a scheme anchor + not
-/// stale) BEFORE reading status. When a signing cert cannot be read, no trust list was supplied, or
-/// the list fails to authenticate, it yields [`QualifiedStatus::Indeterminate`] — the data needed to
-/// decide is absent or untrustworthy (never a false "qualified", SC-007).
+/// stale) at the relevant time BEFORE reading status. When a signing cert OR the issuance time cannot
+/// be read, no trust list was supplied, or the list fails to authenticate, it yields
+/// [`QualifiedStatus::Indeterminate`] — the data needed to decide is absent or untrustworthy (never a
+/// false "qualified", SC-007).
 ///
 /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 fn qualified_status_for(
@@ -292,28 +324,40 @@ fn qualified_status_for(
         // The gate is enabled but the host supplied no national TL → the data is unreachable.
         return QualifiedStatus::Indeterminate;
     };
-    // Resolve the status of one claimed signing cert (or Indeterminate when it cannot be read).
-    let status_of = |cert: Option<Vec<u8>>| -> QualifiedStatus {
-        cert.map_or(QualifiedStatus::Indeterminate, |cert_der| {
-            crate::qualified::qualified_status(
+    // Resolve the status of one claimed signing cert at the credential's OWN relevant time. A missing
+    // cert OR a missing issuance time fails closed (Indeterminate) — never read the status at "now".
+    let status_of = |cert: Option<Vec<u8>>, relevant_time: Option<i64>| -> QualifiedStatus {
+        match (cert, relevant_time) {
+            (Some(cert_der), Some(relevant_time_unix)) => crate::qualified::qualified_status(
                 &cert_der,
-                ctx.now_unix,
+                relevant_time_unix,
                 trust_list,
                 ctx.qualified_scheme_anchors,
-            )
-        })
+            ),
+            // No signing cert, or no issuance time to read the status at → undecidable, fail closed.
+            _ => QualifiedStatus::Indeterminate,
+        }
     };
     match presentation {
-        Presentation::SdJwtVc(p) => status_of(sdjwtvc::issuer_signing_cert_der(p)),
+        Presentation::SdJwtVc(p) => status_of(
+            sdjwtvc::issuer_signing_cert_der(p),
+            sdjwtvc::issuance_time_unix(p),
+        ),
         Presentation::Mdoc {
             device_response, ..
         } => {
-            // Decide over EVERY document's issuer; fold so `Qualified` requires all to qualify. No
-            // parseable `documents` array → the data needed is absent → Indeterminate.
-            mdoc::issuer_signing_certs_der(device_response)
-                .map_or(QualifiedStatus::Indeterminate, |certs| {
-                    fold_qualified(certs.into_iter().map(status_of))
-                })
+            // Decide over EVERY document's issuer at that document's OWN issuance time; fold so
+            // `Qualified` requires all to qualify. No parseable `documents` array → absent → Indeterminate.
+            mdoc::issuer_signing_certs_with_issuance_der(device_response).map_or(
+                QualifiedStatus::Indeterminate,
+                |per_doc| {
+                    fold_qualified(
+                        per_doc
+                            .into_iter()
+                            .map(|(cert, issued)| status_of(cert, issued)),
+                    )
+                },
+            )
         }
     }
 }

@@ -495,6 +495,30 @@ fn issuer_signing_cert_of_document(document: &CborValue) -> Option<Vec<u8>> {
     ds_cert_from_x5chain(&issuer_auth).ok()
 }
 
+/// Extract the claimed issuance/relevant time (Unix seconds) of a single `Document` from its MSO
+/// `validityInfo`: `signed` (the instant the issuer asserts it signed the MSO — ISO/IEC 18013-5
+/// §9.1.2.4, the credential's issuance time), falling back to `validFrom` when `signed` is absent
+/// (the start of the validity window, `validFrom >= signed`). Read-only, no verification.
+///
+/// Returns `None` when the document carries no parseable MSO or neither `signed` nor `validFrom` can
+/// be read — the opt-in [`crate::qualified`] gate then fails closed for this document rather than
+/// reading the issuer's status at "now" (contracts/qualified-status-gate.md: status is read at the
+/// credential's issuance/relevant time, NOT "now").
+fn issuance_time_of_document(document: &CborValue) -> Option<i64> {
+    let issuer_signed = get_map_entry(document, "issuerSigned")?;
+    let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
+    let issuer_auth = parse_cose_sign1(issuer_auth_value).ok()?;
+    let mso_bytes = issuer_auth.payload.as_ref()?;
+    let mso_inner = unwrap_bstr_tagged_payload(mso_bytes).ok()?;
+    let mso: CborValue = ciborium::from_reader(mso_inner.as_slice()).ok()?;
+    let info = get_map_entry(&mso, "validityInfo")?;
+    // `signed` is the issuance instant; `validFrom` is the fallback relevant time. `tdate_field`
+    // returns the RFC 3339 instant as Unix seconds; map its `Result` to `Option` (a read, not a gate).
+    tdate_field(info, "signed")
+        .ok()
+        .or_else(|| tdate_field(info, "validFrom").ok())
+}
+
 /// Extract the claimed Document Signer leaf certificate (DER) of **every** document in a
 /// `DeviceResponse`, in document order — the per-document input the opt-in [`crate::qualified`] gate
 /// needs so a multi-document response is decided over ALL its issuers, not just `documents[0]`.
@@ -516,6 +540,44 @@ pub fn issuer_signing_certs_der(device_response: &[u8]) -> Option<Vec<Option<Vec
         documents
             .iter()
             .map(issuer_signing_cert_of_document)
+            .collect(),
+    )
+}
+
+/// One document's *claimed* qualified-gate input: its Document Signer leaf certificate (DER) and its
+/// issuance/relevant time (Unix seconds), each `None` when that field cannot be read. The values are
+/// claimed (read-only, unverified); trust + signature are decided by the always-on bar.
+pub type ClaimedIssuer = (Option<Vec<u8>>, Option<i64>);
+
+/// Extract, per document in a `DeviceResponse`, the claimed Document Signer leaf certificate (DER)
+/// **paired with** that document's claimed issuance/relevant time (Unix seconds) — the input the
+/// opt-in [`crate::qualified`] gate folds across every document so the determination uses EACH
+/// issuer's own issuance time (the credential's relevant time, NOT "now").
+///
+/// Each [`ClaimedIssuer`] entry is `(claimed_cert, claimed_issuance_time)`: the leaf from the
+/// document's `IssuerAuth` `x5chain` and the MSO `validityInfo.signed` (fallback `validFrom`). Either
+/// element is `None` when that field cannot be read; a per-document `None` issuance time fails the
+/// gate closed for that document ([`crate::types::QualifiedStatus::Indeterminate`]) rather than
+/// substituting "now".
+///
+/// Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
+/// [`issuer_signing_cert_der`], the certs/times are *claimed* (trust + signature are decided by the
+/// always-on bar in [`verify`]); this read is only the gate's input, never an acceptance.
+#[must_use]
+pub fn issuer_signing_certs_with_issuance_der(
+    device_response: &[u8],
+) -> Option<Vec<ClaimedIssuer>> {
+    let root: CborValue = ciborium::from_reader(device_response).ok()?;
+    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
+    Some(
+        documents
+            .iter()
+            .map(|doc| {
+                (
+                    issuer_signing_cert_of_document(doc),
+                    issuance_time_of_document(doc),
+                )
+            })
             .collect(),
     )
 }

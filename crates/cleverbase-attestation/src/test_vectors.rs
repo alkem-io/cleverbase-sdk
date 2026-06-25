@@ -10,20 +10,43 @@
 //! modules (a panic on a broken fixed fixture is the intended signal).
 #![allow(clippy::expect_used, clippy::missing_panics_doc)]
 
-use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW};
+use crate::sdjwtvc::test_issuer::{
+    mint_sd_jwt, mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+};
 use crate::types::{Format, IssuerRole, VerificationPolicy};
 use crate::wire::{
     VerifyRequest, WireContext, WirePresentation, WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
 };
 
+/// The issuing **IACA root** (`ca-iaca`) the test SD-JWT VC issuer leaf chains to — the C-ABI trust
+/// path is chain-validating (chain-to-root), so the smoke-test request pins the CA, not the leaf.
+const CA_IACA_CERT_DER: &[u8] =
+    include_bytes!("../../../tests/fixtures/attestation/ca-iaca.cert.der");
+
+/// The verification instant the C-ABI smoke test runs at: 2026-09-01, INSIDE the `sdjwt-issuer` leaf
+/// (and `ca-iaca` root) validity window (2026-06-25 .. 2027-09-23). The chain-validating C-ABI trust
+/// path enforces the leaf's validity window at this instant, so the request must run in-window.
+const SMOKE_NOW: i64 = 1_788_220_800; // 2026-09-01.
+
 /// Build a CBOR-encoded [`VerifyRequest`] envelope for a **VALID** SD-JWT VC verification: a
 /// trusted-issuer credential, in its validity window, no status mechanism, no OpenID4VP request.
+///
+/// The credential is minted in-window and the anchor is the **issuing IACA root** (`ca-iaca`): the
+/// C-ABI trust path chain-validates the leaf to the passed CA (the EUDI chain-to-root model — a host
+/// configuring a CA/root trusts every credential whose leaf chains to it), so this exercises the
+/// production chain-validating trust, not an exact-leaf pin.
 ///
 /// Driving this through the C-ABI (`cleverbase_attestation_verify`) yields a `VerifyOutcome::Ok`
 /// with `valid = true` and the disclosed attributes — a true end-to-end VALID path.
 #[must_use]
 pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    // Mint in-window (nbf 2026-08-01, exp well after SMOKE_NOW but within the leaf cert's window).
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(1_785_542_400), // nbf = 2026-08-01
+        serde_json::json!(1_790_000_000), // exp = 2026-09-21 (inside the leaf cert window)
+    );
     let req = VerifyRequest {
         schema_version: ATTESTATION_SCHEMA_VERSION,
         presentation: WirePresentation::SdJwtVc {
@@ -33,10 +56,11 @@ pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
         anchors: vec![WireTrustAnchor {
             role: IssuerRole::Pid,
             format: Format::SdJwtVc,
-            cert_der: ISSUER_CERT_DER.to_vec(),
+            // The issuing CA root: the leaf chains to it (chain-to-root), not an exact-leaf pin.
+            cert_der: CA_IACA_CERT_DER.to_vec(),
         }],
         context: WireContext {
-            now_unix: NOW,
+            now_unix: SMOKE_NOW,
             role: IssuerRole::Pid,
             status: crate::status::StatusOutcome::NoStatus,
             session_transcript: None,

@@ -997,3 +997,30 @@ fn a_clear_array_element_nesting_a_disclosed_claim_is_reconstructed() {
         Some(&AttributeValue::Array(vec![AttributeValue::Map(locality)])),
     );
 }
+
+#[test]
+fn issuance_time_unix_prefers_iat_then_nbf_then_none() {
+    use super::issuance_time_unix;
+    // Build a parseable issuer-only presentation (`<jws>~`) over a chosen payload, to exercise the
+    // qualified-gate relevant-time reader directly.
+    let present = |payload: &Value| -> String {
+        let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, payload);
+        format!("{jws}~")
+    };
+    // `iat` is the credential's issuance time and takes precedence over `nbf`.
+    let both =
+        present(&json!({ "iss": "x", "vct": "y", "iat": 1_700_000_000, "nbf": 1_600_000_000 }));
+    assert_eq!(issuance_time_unix(&both), Some(1_700_000_000));
+    // Absent `iat` → fall back to `nbf` (the earliest in-force instant).
+    let nbf_only = present(&json!({ "iss": "x", "vct": "y", "nbf": 1_650_000_000 }));
+    assert_eq!(issuance_time_unix(&nbf_only), Some(1_650_000_000));
+    // Neither `iat` nor `nbf` → `None` (the gate then fails closed, never reading status at "now").
+    let neither = present(&json!({ "iss": "x", "vct": "y" }));
+    assert_eq!(issuance_time_unix(&neither), None);
+    // A present-but-non-canonical `iat` (a JSON string, not a NumericDate) is treated as absent, and
+    // a canonical `nbf` is used instead — never asserting qualification off an unreadable instant.
+    let bad_iat = present(&json!({ "iss": "x", "vct": "y", "iat": "soon", "nbf": 1_640_000_000 }));
+    assert_eq!(issuance_time_unix(&bad_iat), Some(1_640_000_000));
+    // Unparseable input → `None` (read-only and total).
+    assert_eq!(issuance_time_unix("not-a-sd-jwt"), None);
+}

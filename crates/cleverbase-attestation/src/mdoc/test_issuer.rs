@@ -104,6 +104,12 @@ pub(crate) struct MdocBuilder {
     /// DIFFERENT claimed DS) — the multi-issuer probe for the qualified-status gate (the gate must
     /// decide over every document's issuer, not just `documents[0]`).
     append_second_issuer_document: bool,
+    /// When `Some`, append a SECOND fully-VALID document signed by the SAME trusted DS, disclosing one
+    /// distinct (non-colliding) element, but with its OWN MSO `(signed, validUntil)` issuance window —
+    /// the multi-document qualified-status fold probe: a VALID response whose documents[0] is issued in
+    /// the grant window (Qualified) and documents[1] is issued after the issuer's withdrawal
+    /// (NotQualified), proving the gate reads EACH document at its OWN relevant time and folds.
+    append_valid_document_issued_at: Option<(String, String)>,
     /// When `Some`, set the top-level `DeviceResponse.status` to this value (non-zero drives the
     /// device-reported-error reject path).
     status_override: Option<i64>,
@@ -114,6 +120,9 @@ pub(crate) struct MdocBuilder {
     /// When set, add a top-level `documentErrors` entry (the device could not return a requested
     /// document — the response is not a complete success and must be rejected).
     add_document_errors: bool,
+    /// When set, omit the MSO `validityInfo.signed` field (keeping `validFrom`/`validUntil`) — used to
+    /// exercise the qualified-gate issuance-time reader's `signed → validFrom` fallback.
+    omit_mso_signed: bool,
 }
 
 /// The hash to compute `valueDigests` with, plus its MSO `digestAlgorithm` name.
@@ -216,11 +225,20 @@ impl MdocBuilder {
             append_forged_document: false,
             append_colliding_document: None,
             append_second_issuer_document: false,
+            append_valid_document_issued_at: None,
             status_override: None,
             omit_status: false,
             empty_documents: false,
             add_document_errors: false,
+            omit_mso_signed: false,
         }
+    }
+
+    /// Omit the MSO `validityInfo.signed` field (keeping `validFrom`) — drives the issuance-time
+    /// reader's `signed → validFrom` fallback.
+    pub(crate) fn omit_mso_signed(mut self) -> Self {
+        self.omit_mso_signed = true;
+        self
     }
 
     /// Emit an empty `documents` array (no credential to verify → reject).
@@ -260,6 +278,20 @@ impl MdocBuilder {
     /// every document's issuer, not just `documents[0]`.
     pub(crate) fn append_second_issuer_document(mut self) -> Self {
         self.append_second_issuer_document = true;
+        self
+    }
+
+    /// Append a second, fully-VALID document signed by the SAME trusted DS (so the always-on bar
+    /// accepts the whole response) but with its OWN issuance window `signed = validFrom = signed_at`,
+    /// `validUntil = valid_until`. Used by the qualified-status fold probe: documents[0] issued in the
+    /// grant window (Qualified) + this documents[1] issued after the issuer's withdrawal (NotQualified)
+    /// → the gate reads each document at its OWN relevant time and folds to NotQualified.
+    pub(crate) fn append_valid_document_issued_at(
+        mut self,
+        signed_at: &str,
+        valid_until: &str,
+    ) -> Self {
+        self.append_valid_document_issued_at = Some((signed_at.to_owned(), valid_until.to_owned()));
         self
     }
 
@@ -358,7 +390,7 @@ impl MdocBuilder {
     /// (`signed <= validFrom`, which the verifier enforces) without ever pushing `signed` into the
     /// future for a not-yet-valid window. RFC 3339 `Z` strings sort lexicographically by instant, so a
     /// string `min` is a correct instant `min`.
-    pub(super) fn validity(mut self, valid_from: &str, valid_until: &str) -> Self {
+    pub(crate) fn validity(mut self, valid_from: &str, valid_until: &str) -> Self {
         if valid_from < self.signed.as_str() {
             self.signed = valid_from.to_owned();
         }
@@ -368,8 +400,9 @@ impl MdocBuilder {
     }
 
     /// Override the MSO `validityInfo.signed` instant independently (RFC 3339 `Z` string) — used to
-    /// drive the future-`signed` reject path (a `signed` after `now`/`validFrom` is a tamper).
-    pub(super) fn signed(mut self, signed: &str) -> Self {
+    /// drive the future-`signed` reject path (a `signed` after `now`/`validFrom` is a tamper) and to
+    /// place a credential's issuance/relevant time inside the qualified-gate's grant window.
+    pub(crate) fn signed(mut self, signed: &str) -> Self {
         self.signed = signed.to_owned();
         self
     }
@@ -410,6 +443,14 @@ impl MdocBuilder {
         let second_issuer = self
             .append_second_issuer_document
             .then(build_wrong_issuer_document);
+        // A second VALID document (same trusted DS) issued in its OWN window — the multi-document
+        // qualified-status fold probe (documents[0] qualified-at-issuance, this one not-qualified).
+        let second_valid_issued_at =
+            self.append_valid_document_issued_at
+                .clone()
+                .map(|(signed_at, valid_until)| {
+                    build_single_valid_document_issued_at(&signed_at, &valid_until)
+                });
 
         // --- IssuerSignedItems (#6.24(bstr .cbor IssuerSignedItem)) + their digests. ----------------
         let mut issuer_items = Vec::new();
@@ -493,20 +534,21 @@ impl MdocBuilder {
                 CborValue::Text("docType".to_owned()),
                 CborValue::Text(mso_doc_type),
             ),
-            (
-                CborValue::Text("validityInfo".to_owned()),
-                CborValue::Map(vec![
-                    (CborValue::Text("signed".to_owned()), tdate(&self.signed)),
-                    (
-                        CborValue::Text("validFrom".to_owned()),
-                        tdate(&self.valid_from),
-                    ),
-                    (
-                        CborValue::Text("validUntil".to_owned()),
-                        tdate(&self.valid_until),
-                    ),
-                ]),
-            ),
+            (CborValue::Text("validityInfo".to_owned()), {
+                let mut info = Vec::new();
+                if !self.omit_mso_signed {
+                    info.push((CborValue::Text("signed".to_owned()), tdate(&self.signed)));
+                }
+                info.push((
+                    CborValue::Text("validFrom".to_owned()),
+                    tdate(&self.valid_from),
+                ));
+                info.push((
+                    CborValue::Text("validUntil".to_owned()),
+                    tdate(&self.valid_until),
+                ));
+                CborValue::Map(info)
+            }),
         ]);
         let mso_inner = encode(&mso);
         let mso_payload = encode(&CborValue::Tag(
@@ -662,6 +704,9 @@ impl MdocBuilder {
         if let Some(second_issuer_document) = second_issuer {
             documents.push(second_issuer_document);
         }
+        if let Some(second_valid_document) = second_valid_issued_at {
+            documents.push(second_valid_document);
+        }
 
         let mut response_entries = vec![
             (
@@ -714,6 +759,23 @@ fn build_single_valid_document(identifier: &'static str, value: CborValue) -> Cb
 /// DIFFERENT issuer — the multi-issuer probe for the qualified-status gate.
 fn build_wrong_issuer_document() -> CborValue {
     let response = MdocBuilder::new().use_wrong_issuer().build();
+    first_document_of_response(&response)
+}
+
+/// Mint a fresh, fully-VALID single document (same trusted DS + holder) issued in its own
+/// `(signed = validFrom = signed_at, validUntil = valid_until)` window, disclosing one DISTINCT
+/// (non-colliding) element so it merges cleanly with the primary document's attributes. Used to
+/// append a second VALID document at a chosen issuance time — the qualified-status fold probe.
+fn build_single_valid_document_issued_at(signed_at: &str, valid_until: &str) -> CborValue {
+    let response = MdocBuilder::new()
+        .elements(vec![Element {
+            digest_id: 0,
+            identifier: "document_number",
+            value: CborValue::Text("D-2027".to_owned()),
+        }])
+        .signed(signed_at)
+        .validity(signed_at, valid_until)
+        .build();
     first_document_of_response(&response)
 }
 
