@@ -721,6 +721,43 @@ fn document_errors_present_is_rejected_as_malformed() {
     assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
 }
 
+#[test]
+fn device_binding_machinery_classifies_sound_vs_faulty() {
+    use super::{device_binding_machinery, DeviceBindingMachinery};
+
+    // A well-formed (sound) binding — ES256 DeviceSignature, parseable DeviceKey, well-formed
+    // signature bytes — is `Sound` (a binding FAILURE on such a response is the fresh-nonce mismatch).
+    // The default builder mints exactly this, and even a wrong-KEY signature stays well-formed → Sound
+    // (a wrong-key signature is cryptographically indistinguishable from a stale-nonce one; only the
+    // signature MACHINERY is classified here, not the signature's correctness).
+    assert_eq!(
+        device_binding_machinery(&MdocBuilder::new().build()),
+        DeviceBindingMachinery::Sound
+    );
+    assert_eq!(
+        device_binding_machinery(&MdocBuilder::new().corrupt_device_signature().build()),
+        DeviceBindingMachinery::Sound,
+        "a wrong-key but well-formed signature is structurally sound (machinery intact)"
+    );
+
+    // A structurally-broken signature (garbled/truncated bytes) is `Faulty` — a transcript-independent
+    // holder-binding fault that must never be downgraded to a replay.
+    assert_eq!(
+        device_binding_machinery(&MdocBuilder::new().mangle_device_signature().build()),
+        DeviceBindingMachinery::Faulty
+    );
+    // A non-ES256 DeviceSignature alg is also `Faulty` (the binding machinery is wrong).
+    assert_eq!(
+        device_binding_machinery(&MdocBuilder::new().device_sig_wrong_alg().build()),
+        DeviceBindingMachinery::Faulty
+    );
+    // Garbage / non-DeviceResponse bytes are conservatively `Faulty` (never a silent replay).
+    assert_eq!(
+        device_binding_machinery(&[0xff, 0x00]),
+        DeviceBindingMachinery::Faulty
+    );
+}
+
 /// Encode a `ciborium` value to CBOR bytes (test helper).
 fn encode_cbor(value: &CborValue) -> Vec<u8> {
     let mut buf = Vec::new();

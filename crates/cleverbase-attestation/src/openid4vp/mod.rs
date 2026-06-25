@@ -39,7 +39,7 @@ use crate::mdoc::{self, MdocVerifyParams};
 use crate::sdjwtvc::{self, KeyBindingChallenge, SdJwtVcInput};
 use crate::status::StatusOutcome;
 use crate::trust::TrustAnchorSource;
-use crate::types::{IssuerRole, ReasonCode, VerificationPolicy, VerificationResult};
+use crate::types::{Format, IssuerRole, ReasonCode, VerificationPolicy, VerificationResult};
 
 /// A host-driven source of fresh entropy for the request `nonce` (keeps the core sans-IO — the
 /// entropy is host-provided, mirroring `cleverbase_core::HostContext.entropy`).
@@ -170,17 +170,31 @@ pub enum VpToken<'a> {
 ///   handover transcript reconstructed from the request nonce/audience (a fresh-nonce mismatch
 ///   surfaces as a failed holder binding, attributed to `Replay`).
 ///
-/// `now_unix`/`role`/`status` are the remaining per-format-bar inputs the [`verify()`](crate::verify()) entry
-/// point supplies (the validity instant, the trust-anchor role, and the resolved status outcome).
+/// `policy` carries the accepted-format restriction (`policy.formats`); a `vp_token` whose format the
+/// policy excludes is rejected with [`ReasonCode::UnsupportedFormat`] BEFORE any bar runs, so this
+/// public entry honors the gate even when a native caller invokes it directly (not only via the
+/// [`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`status` are the remaining per-format-bar
+/// inputs (the validity instant, the trust-anchor role, and the resolved status outcome).
 pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     vp_token: &VpToken<'_>,
     request: &PresentationRequest,
-    _policy: &VerificationPolicy,
+    policy: &VerificationPolicy,
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
     status: StatusOutcome,
 ) -> VerificationResult {
+    // Format gate (identical to the `verify()` entry point's, so the public `verify_response` honors
+    // the `policy` it takes): the policy may restrict accepted formats (an empty set = both). A
+    // presented format the policy excludes is rejected up front — never run through the bar.
+    let format = match vp_token {
+        VpToken::SdJwtVc(_) => Format::SdJwtVc,
+        VpToken::Mdoc(_) => Format::Mdoc,
+    };
+    if !policy.formats.is_empty() && !policy.formats.contains(&format) {
+        return VerificationResult::invalid(ReasonCode::UnsupportedFormat);
+    }
+
     match vp_token {
         VpToken::SdJwtVc(presentation) => {
             verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status)
@@ -256,10 +270,26 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
         status,
     };
     let result = mdoc::verify(&token.device_response, anchors, &params);
-    // A holder-binding failure here is the fresh-nonce mismatch (audience already matched in
-    // cleartext above) → attribute it to Replay; every other reason passes through unchanged.
+    // A holder-binding failure here is AMBIGUOUS: it can be the fresh-nonce mismatch we want to
+    // surface as Replay (the verifier rebuilt `DeviceAuthentication` over a different transcript than
+    // the holder signed — the audience already matched in cleartext above), OR a genuine
+    // DeviceKey/DeviceSignature fault (a corrupt/garbled signature, non-ES256 alg, unparseable
+    // DeviceKey, DeviceMac-only DeviceAuth, or a multi-document doc[1] binding failure). Blindly
+    // re-attributing every `HolderBinding` to `Replay` would MASK those real faults.
+    //
+    // Distinguish them by the transcript-INDEPENDENT binding machinery: a fresh-nonce mismatch fails
+    // ONLY the signature-over-transcript check while leaving the machinery intact (ES256
+    // DeviceSignature + parseable DeviceKey + well-formed signature bytes), whereas a genuine fault
+    // breaks the machinery itself (it would fail for ANY transcript). Only re-attribute to `Replay`
+    // when the machinery is sound; a structural fault keeps `HolderBinding`.
     if !result.valid && result.reasons == [ReasonCode::HolderBinding] {
-        return VerificationResult::invalid(ReasonCode::Replay);
+        return match mdoc::device_binding_machinery(&token.device_response) {
+            // Sound machinery + a binding failure ⇒ the rebuilt transcript (fresh nonce) is the only
+            // thing that can differ ⇒ a replay.
+            mdoc::DeviceBindingMachinery::Sound => VerificationResult::invalid(ReasonCode::Replay),
+            // A structurally-broken binding is a genuine holder-binding fault, never a replay.
+            mdoc::DeviceBindingMachinery::Faulty => result,
+        };
     }
     result
 }

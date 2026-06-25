@@ -77,6 +77,10 @@ pub(crate) struct MdocBuilder {
     /// When set, sign the DeviceSignature with a non-ES256 (ES384) algorithm header so the verifier's
     /// algorithm gate rejects it.
     device_sig_wrong_alg: bool,
+    /// When set, GARBLE the DeviceSignature bytes after signing (truncate to a non-`r‖s` length) so it
+    /// is a structurally-broken ES256 signature — a genuine, transcript-INDEPENDENT holder-binding
+    /// fault (distinct from a `corrupt_device_signature` wrong-key signature, which stays well-formed).
+    mangle_device_signature: bool,
     /// When set, sign the IssuerAuth with a non-ES256 (ES384) algorithm header (alg-gate reject).
     issuer_auth_wrong_alg: bool,
     /// When set, emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1 (the tagged form the verifier
@@ -215,6 +219,7 @@ impl MdocBuilder {
             device_key_override: None,
             session_transcript: None,
             device_sig_wrong_alg: false,
+            mangle_device_signature: false,
             issuer_auth_wrong_alg: false,
             tag_issuer_auth: false,
             x5chain_as_array: false,
@@ -261,10 +266,12 @@ impl MdocBuilder {
     }
 
     /// Append a second, fully-VALID document (signed by the SAME trusted DS) that discloses
-    /// `identifier` with `value` — a value that COLLIDES with a first-document identifier. The
-    /// cross-document attribute-shadowing probe: a 2nd authentic document must not silently overwrite
-    /// the consumer-visible claim.
-    pub(super) fn append_colliding_document(
+    /// `identifier` with `value`. Used both by the cross-document attribute-shadowing probe (a clashing
+    /// identifier must not silently overwrite the consumer-visible claim) and, with a DISTINCT
+    /// identifier, by the holder-present multi-document reject test (a clean second document making the
+    /// response multi-document). `pub(crate)` so the OpenID4VP / present test suites can build a
+    /// genuine multi-document `DeviceResponse`.
+    pub(crate) fn append_colliding_document(
         mut self,
         identifier: &'static str,
         value: CborValue,
@@ -382,6 +389,14 @@ impl MdocBuilder {
     /// Sign the DeviceSignature with a non-ES256 algorithm header (drives the alg-gate reject).
     pub(super) fn device_sig_wrong_alg(mut self) -> Self {
         self.device_sig_wrong_alg = true;
+        self
+    }
+
+    /// Garble the DeviceSignature bytes (truncate to a non-`r‖s` length) so it is a
+    /// structurally-broken ES256 signature — a transcript-INDEPENDENT holder-binding fault used to
+    /// prove the OID4VP layer keeps `HolderBinding` (does NOT mask it as `Replay`).
+    pub(crate) fn mangle_device_signature(mut self) -> Self {
+        self.mangle_device_signature = true;
         self
     }
 
@@ -642,12 +657,17 @@ impl MdocBuilder {
         let device_protected = HeaderBuilder::new().algorithm(device_alg).build();
         let device_signature_value = self.device_signature_override.as_ref().map_or_else(
             || {
-                let device_signature = CoseSign1Builder::new()
+                let mut device_signature = CoseSign1Builder::new()
                     .protected(device_protected)
                     .create_detached_signature(&device_auth_payload, &[], |tbs| {
                         es256_sign(&device_signing_key, tbs)
                     })
                     .build();
+                if self.mangle_device_signature {
+                    // Truncate the 64-byte `r‖s` to 10 bytes: no longer a well-formed ES256 signature
+                    // (neither raw nor DER) — a structurally-broken, transcript-independent binding.
+                    device_signature.signature.truncate(10);
+                }
                 let device_signature_bytes =
                     device_signature.to_vec().expect("encode DeviceSignature");
                 decode(&device_signature_bytes)

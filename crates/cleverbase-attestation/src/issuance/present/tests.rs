@@ -520,6 +520,38 @@ fn present_malformed_held_mdoc_is_an_error() {
 }
 
 #[test]
+fn present_multi_document_held_mdoc_is_rejected() {
+    // A held mdoc whose DeviceResponse carries TWO documents must be rejected: the present seam signs
+    // ONE DeviceSignature and would splice it into BOTH documents, so documents[1] would carry a
+    // signature over documents[0]'s data and FAIL the per-document verifier. The fix rejects this up
+    // front with MultiDocumentMdoc rather than emitting a silently-invalid token (no false token).
+    use crate::mdoc::test_issuer::MdocBuilder;
+    use ciborium::value::Value as CborValue;
+
+    // Two fully-valid documents (the second discloses a DISTINCT identifier, so it is a clean,
+    // independently-valid second document — the multi-document case, not a tamper).
+    let two_doc_response = MdocBuilder::new()
+        .append_colliding_document("nationality", CborValue::Text("NL".to_owned()))
+        .build();
+    let held = HeldAttestation::Mdoc {
+        device_response: two_doc_response,
+    };
+    let err = present(
+        &held,
+        &request(b"multi-doc-nonce"),
+        &holder_ctx(),
+        &subset(&[]),
+        &hsm(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PresentError::MultiDocumentMdoc(2)),
+        "a 2-document held mdoc must be rejected as MultiDocumentMdoc(2), got {err:?}"
+    );
+}
+
+#[test]
 fn present_mdoc_without_a_documents_array_is_an_error() {
     // A well-formed CBOR map that is not a DeviceResponse (no `documents`) → Malformed (first_doc_type
     // returns None), never a panic.

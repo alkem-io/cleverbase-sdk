@@ -99,6 +99,18 @@ pub enum PresentError {
     /// Building or splicing a ceremony envelope failed.
     #[error("failed to build the presentation: {0}")]
     Build(String),
+    /// The held mdoc `DeviceResponse` carries more than one `Document`. The holder `present` seam
+    /// signs ONE `DeviceSignature` (one [`PreparedPresentation::signing_input`], one host signature),
+    /// so it can bind exactly one document; a multi-document held credential is rejected rather than
+    /// producing a token whose extra documents carry a signature over the FIRST document's data (which
+    /// the verifier — checking each document against its OWN docType + `deviceSigned.nameSpaces` —
+    /// would reject). A holder presents individual credentials; multi-document binding is a separate,
+    /// multi-signature seam (a documented follow-on), never a silently-invalid token.
+    #[error(
+        "the held mdoc carries {0} documents; the holder present seam binds a single document \
+         (present each credential separately)"
+    )]
+    MultiDocumentMdoc(usize),
 }
 
 /// A `sha-256` [`sd_jwt_payload::Hasher`] over the SDK's own `sha2` (the SDK has no second crypto
@@ -435,6 +447,17 @@ fn prepare_mdoc(
 ) -> Result<PreparedPresentation, PresentError> {
     let response: CborValue = ciborium::from_reader(device_response)
         .map_err(|e| PresentError::Malformed(e.to_string()))?;
+    // The present seam signs ONE DeviceSignature and `finish` splices it into every document; a
+    // multi-document held response would therefore give documents[1..] a signature over documents[0]'s
+    // docType + deviceSigned.nameSpaces, which the per-document verifier rejects. Reject up front with
+    // a clear error rather than emit a silently-invalid token (no false token — multi-document binding
+    // is a separate multi-signature seam).
+    let document_count = map_get(&response, "documents")
+        .and_then(CborValue::as_array)
+        .map_or(0, Vec::len);
+    if document_count > 1 {
+        return Err(PresentError::MultiDocumentMdoc(document_count));
+    }
     let doc_type = first_doc_type(&response).ok_or_else(|| {
         PresentError::Malformed("DeviceResponse has no document docType".to_owned())
     })?;
@@ -512,8 +535,13 @@ fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentErro
     Ok(buf)
 }
 
-/// Replace the `deviceSigned.deviceAuth.deviceSignature` of every document with `device_signature`
-/// (the fresh, request-bound holder signature). Returns the rebuilt `DeviceResponse` value.
+/// Replace the `deviceSigned.deviceAuth.deviceSignature` with `device_signature` (the fresh,
+/// request-bound holder signature), returning the rebuilt `DeviceResponse` value.
+///
+/// [`prepare_mdoc`] rejects a multi-document held response (the present seam signs ONE signature), so
+/// the `documents` array carries exactly one document here; the per-document map below is kept simply
+/// to mirror the `DeviceResponse` shape (it would splice the single signature wherever a document
+/// appears, never a same-signature-over-different-documents token, which the guard makes unreachable).
 fn replace_device_signature(
     response: &CborValue,
     device_signature_cbor: &[u8],

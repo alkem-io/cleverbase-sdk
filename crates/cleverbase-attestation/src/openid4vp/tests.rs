@@ -289,6 +289,110 @@ fn mdoc_binding_failure_other_than_holder_binding_passes_through() {
 }
 
 #[test]
+fn verify_response_rejects_a_format_the_policy_excludes() {
+    // The public `verify_response` MUST honor the `policy.formats` gate it takes (a native caller can
+    // invoke it directly, bypassing the `verify()` wrapper that previously applied the gate). A
+    // presented format the policy excludes is rejected with UnsupportedFormat, before any bar runs.
+
+    // mdoc presented, but the policy accepts SD-JWT VC only → UnsupportedFormat.
+    let request = request_with(AUDIENCE, &[3u8; 16]);
+    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let sd_jwt_only = VerificationPolicy {
+        formats: vec![Format::SdJwtVc],
+        ..VerificationPolicy::default()
+    };
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request,
+        &sd_jwt_only,
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::UnsupportedFormat]);
+
+    // Symmetric: SD-JWT VC presented, but the policy accepts mdoc only → UnsupportedFormat.
+    let sd_request = request_with(AUDIENCE, &[9u8; 16]);
+    let presentation = sd_jwt_presentation(AUDIENCE, &sd_request.nonce_b64());
+    let mdoc_only = VerificationPolicy {
+        formats: vec![Format::Mdoc],
+        ..VerificationPolicy::default()
+    };
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &sd_request,
+        &mdoc_only,
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::UnsupportedFormat]);
+
+    // Control: the SAME mdoc under a policy that DOES accept mdoc verifies (so the rejection above is
+    // the format gate, not some other failure).
+    let ok_token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let mdoc_ok = VerificationPolicy {
+        formats: vec![Format::Mdoc],
+        ..VerificationPolicy::default()
+    };
+    let ok = verify_response(
+        &VpToken::Mdoc(ok_token),
+        &request,
+        &mdoc_ok,
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        ok.valid,
+        "an accepted-format mdoc verifies: {:?}",
+        ok.reasons
+    );
+}
+
+#[test]
+fn mdoc_bound_presentation_with_a_corrupt_device_signature_is_holder_binding_not_replay() {
+    // A presentation BOUND to the request (handover nonce == request nonce, so NOT a replay) whose
+    // DeviceSignature is structurally CORRUPT (garbled/truncated bytes) is a genuine holder-binding
+    // fault. The OID4VP layer must NOT mask it as Replay: before the fix it collapsed every
+    // `[HolderBinding]` into `Replay`; the fix re-attributes only a fresh-nonce mismatch (sound
+    // binding machinery) to Replay and KEEPS `HolderBinding` for a structurally-broken signature.
+    let request = request_with(AUDIENCE, &[0x44u8; 16]);
+    // Build over the SAME (request) handover so freshness is satisfied — the only fault is the corrupt
+    // signature.
+    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce, RESPONSE_URI);
+    let device_response = MdocBuilder::new()
+        .session_transcript(transcript)
+        .mangle_device_signature()
+        .build();
+    let token = MdocVpToken {
+        audience: AUDIENCE.to_owned(),
+        device_response,
+    };
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::HolderBinding],
+        "a corrupt DeviceSignature on a bound presentation must stay HolderBinding, not be masked \
+         as Replay"
+    );
+}
+
+#[test]
 fn handover_transcript_is_deterministic_and_binds_all_inputs() {
     // The same (audience, nonce, response_uri) yields identical bytes; varying any one changes them
     // (so a stale nonce, wrong audience, or tampered response_uri necessarily breaks the

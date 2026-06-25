@@ -7,9 +7,10 @@
 //!    with the Document Signer (DS) certificate's public key (ES256, via the SDK's `p256`/`ecdsa`),
 //!    and the DS certificate is resolved from the `x5chain` COSE header and checked for trust through
 //!    the pluggable [`crate::trust::TrustAnchorSource`] (the IACA root).
-//! 2. **`valueDigests` integrity (in-house)** — each disclosed `IssuerSignedItem` is re-hashed (with
-//!    the MSO `digestAlgorithm`) over its tagged-CBOR (`#6.24`) byte string and matched against the
-//!    MSO `valueDigests`; any mismatch is rejected. This is the selective-disclosure-integrity check.
+//! 2. **`valueDigests` integrity (in-house)** — each disclosed `IssuerSignedItem` is hashed (with the
+//!    MSO `digestAlgorithm`) over its **on-wire `IssuerSignedItemBytes`** — the `#6.24(bstr)` element
+//!    exactly as received (ISO/IEC 18013-5 §9.2.2.5), never a re-encode — and matched against the MSO
+//!    `valueDigests`; any mismatch is rejected. This is the selective-disclosure-integrity check.
 //! 3. **MSO `validityInfo` (in-house)** — the `signed` / `validFrom` / `validUntil` bounds are
 //!    enforced at the verification instant.
 //! 4. **`DeviceAuth` holder binding** — the `DeviceSignature` `COSE_Sign1` over the
@@ -182,6 +183,105 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     }
 }
 
+/// Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
+/// to tell a fresh-nonce/transcript mismatch apart from a genuine holder-binding fault when a
+/// [`verify`] run returns [`ReasonCode::HolderBinding`].
+///
+/// A nonce/transcript mismatch (a replayed presentation) fails the `DeviceSignature` check **only**
+/// because the verifier rebuilds `DeviceAuthentication` over a different transcript than the holder
+/// signed — the binding machinery itself is intact: the `DeviceAuth` is a `DeviceSignature`, its alg
+/// is ES256, the MSO `DeviceKey` parses, and the signature bytes form a well-formed ES256 signature.
+/// A genuine fault (a corrupt/garbled signature, a non-ES256 alg, an unparseable `DeviceKey`, or a
+/// `DeviceMac`-only `DeviceAuth`) is **transcript-independent** — it fails for ANY transcript — so it
+/// is NOT a freshness mismatch and must keep [`ReasonCode::HolderBinding`].
+///
+/// [`crate::openid4vp`] uses this to attribute the failure precisely: `Sound` (every document's
+/// binding machinery is intact) ⇒ the failure is the fresh-nonce mismatch ⇒ `Replay`; `Faulty` ⇒ a
+/// real holder-binding fault ⇒ `HolderBinding` (never masked as `Replay`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceBindingMachinery {
+    /// Every document's `DeviceAuth` is a well-formed ES256 `DeviceSignature` over a parseable MSO
+    /// `DeviceKey` — so a failed binding is consistent with (only) a transcript/nonce mismatch.
+    Sound,
+    /// At least one document's binding is structurally broken (corrupt signature, non-ES256 alg,
+    /// unparseable `DeviceKey`, or `DeviceMac`-only) — a transcript-INDEPENDENT holder-binding fault.
+    Faulty,
+}
+
+/// Classify whether the `DeviceAuth` holder-binding **machinery** of every document in a
+/// `DeviceResponse` is structurally sound (see [`DeviceBindingMachinery`]). Transcript-INDEPENDENT:
+/// it checks the `DeviceAuth` shape, the `DeviceSignature` algorithm, the MSO `DeviceKey`, and that
+/// the signature bytes form a well-formed ES256 signature — it deliberately does NOT verify the
+/// signature against any payload, so it isolates a genuine binding fault (which fails for every
+/// transcript) from a fresh-nonce mismatch (which fails only because the rebuilt transcript differs).
+///
+/// Used only to refine the failure attribution when [`verify`] already returned
+/// [`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
+/// holder-binding fault is never silently downgraded to a replay).
+#[must_use]
+pub fn device_binding_machinery(device_response: &[u8]) -> DeviceBindingMachinery {
+    let sound = classify_device_binding(device_response).unwrap_or(false);
+    if sound {
+        DeviceBindingMachinery::Sound
+    } else {
+        DeviceBindingMachinery::Faulty
+    }
+}
+
+/// The fallible body of [`device_binding_machinery`]: `Some(true)` iff EVERY document's binding
+/// machinery is sound, `Some(false)` iff at least one is structurally broken, `None` if the response
+/// is too malformed to classify (the caller treats `None`/`false` alike as `Faulty`).
+fn classify_device_binding(device_response: &[u8]) -> Option<bool> {
+    let root: CborValue = ciborium::from_reader(device_response).ok()?;
+    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
+    if documents.is_empty() {
+        return Some(false);
+    }
+    // Every document's binding machinery must be sound for the overall failure to be a (freshness)
+    // replay; one structurally-broken binding makes it a genuine holder-binding fault.
+    Some(documents.iter().all(device_binding_machinery_sound))
+}
+
+/// Whether a single `Document`'s `DeviceAuth` holder-binding machinery is structurally sound: the
+/// `DeviceAuth` carries a `DeviceSignature` (not `DeviceMac`-only), its protected alg is ES256, the
+/// MSO `DeviceKey` parses to a P-256 key, and the `DeviceSignature` bytes form a well-formed ES256
+/// (`r‖s` or DER) signature. No payload is checked (transcript-independent).
+fn device_binding_machinery_sound(document: &CborValue) -> bool {
+    let check = || -> Option<bool> {
+        // The MSO DeviceKey must parse (a malformed key is a binding fault, not a freshness issue).
+        let issuer_signed = get_map_entry(document, "issuerSigned")?;
+        let issuer_auth = parse_cose_sign1(get_map_entry(issuer_signed, "issuerAuth")?).ok()?;
+        let mso_inner = unwrap_bstr_tagged_payload(issuer_auth.payload.as_ref()?).ok()?;
+        let mso: CborValue = ciborium::from_reader(mso_inner.as_slice()).ok()?;
+        if mso_device_key(&mso).is_err() {
+            return Some(false);
+        }
+
+        // The DeviceAuth must be a DeviceSignature (a DeviceMac-only binding is a documented
+        // follow-on, treated as a binding fault here — never a freshness replay).
+        let device_signed = get_map_entry(document, "deviceSigned")?;
+        let device_auth = get_map_entry(device_signed, "deviceAuth")?;
+        let Some(device_signature_value) = get_map_entry(device_auth, "deviceSignature") else {
+            return Some(false);
+        };
+        let Ok(device_signature) = parse_cose_sign1(device_signature_value) else {
+            return Some(false);
+        };
+        // ES256 alg gate + a well-formed ES256 signature (r‖s or DER). A garbled/short signature is a
+        // structural fault; a well-formed signature that simply doesn't match the rebuilt transcript
+        // is the freshness signal.
+        if !cose_alg_is_es256(&device_signature) {
+            return Some(false);
+        }
+        let sig = &device_signature.signature;
+        let well_formed = p256::ecdsa::Signature::from_slice(sig).is_ok()
+            || p256::ecdsa::Signature::from_der(sig).is_ok();
+        Some(well_formed)
+    };
+    // A document too malformed to inspect is conservatively NOT sound (fault, never a silent replay).
+    check().unwrap_or(false)
+}
+
 /// The disclosed attributes recovered by the **issuer-side** conformance verification of an mdoc
 /// `DeviceResponse`'s first document, keyed by `elementIdentifier`.
 ///
@@ -223,7 +323,11 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
         let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
         let issuer_signed =
             get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
-        let verified = verify_issuer_signed(issuer_signed, anchors, &doc_type, params)?;
+        // Capture the first document's on-wire `IssuerSignedItemBytes` (ISO/IEC 18013-5 §9.2.2.5
+        // hashes the received bytes); the issuer-side check below consults these exact spans.
+        let raw_items = scan_raw_issuer_items(device_response);
+        let verified =
+            verify_issuer_signed(issuer_signed, raw_items.first(), anchors, &doc_type, params)?;
         Ok(verified.disclosed)
     };
     run().map_err(|failure| failure.reason)
@@ -266,14 +370,22 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         return Err(VerifyFailure::malformed());
     }
 
+    // Capture the on-wire `IssuerSignedItemBytes` of every document once, up front: ISO/IEC 18013-5
+    // §9.2.2.5 hashes the bytes AS RECEIVED, so the `valueDigests` check below feeds on these exact
+    // spans (keyed by `(namespace, digestID)`), never a re-encode. Indexed by document position.
+    let raw_items = scan_raw_issuer_items(device_response);
+
     // Verify EVERY document; the verdict is VALID only if all pass. Disclosed attributes are merged
     // across documents into the single result map WITHOUT silent shadowing: a second authentic
     // document (same trusted DS, or a holder presenting two credentials) MUST NOT be able to overwrite
     // a claim a consumer reads with a conflicting value. A same-identifier clash with a different value
     // is rejected (`DisclosureIntegrity`); an identical re-disclosure is harmless and merges cleanly.
     let mut disclosed = BTreeMap::new();
-    for document in documents {
-        let doc_disclosed = verify_one_document(document, anchors, params)?;
+    for (index, document) in documents.iter().enumerate() {
+        // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
+        // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
+        let doc_raw_items = raw_items.get(index);
+        let doc_disclosed = verify_one_document(document, doc_raw_items, anchors, params)?;
         for (identifier, value) in doc_disclosed {
             insert_no_shadow(&mut disclosed, identifier, value)?;
         }
@@ -304,8 +416,13 @@ fn enforce_device_response_status(root: &CborValue) -> Result<(), VerifyFailure>
 }
 
 /// Run the full always-on bar over a single `Document`, returning its disclosed attributes on success.
+///
+/// `raw_items` is the on-wire `IssuerSignedItemBytes` captured for THIS document (keyed by
+/// `(namespace, digestID)`), the digest input ISO/IEC 18013-5 §9.2.2.5 hashes; `None` when the raw
+/// pass could not place this document (then the `valueDigests` check fails its items closed).
 fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     document: &CborValue,
+    raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
     params: &MdocVerifyParams<'_>,
 ) -> Result<BTreeMap<String, AttributeValue>, VerifyFailure> {
@@ -314,7 +431,8 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
 
     // --- Issuer-side bar: IssuerAuth signature + DS trust + MSO validity + valueDigests integrity. --
-    let issuer_verified = verify_issuer_signed(issuer_signed, anchors, &doc_type, params)?;
+    let issuer_verified =
+        verify_issuer_signed(issuer_signed, raw_items, anchors, &doc_type, params)?;
 
     // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
     verify_device_binding(document, &issuer_verified.device_key, &doc_type, params)?;
@@ -345,6 +463,7 @@ struct IssuerVerified {
 /// so the two callers share one implementation (no parallel re-verification — Principle III/VIII).
 fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     issuer_signed: &CborValue,
+    raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
     doc_type: &str,
     params: &MdocVerifyParams<'_>,
@@ -394,7 +513,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     }
 
     // --- valueDigests integrity (in-house): recompute each disclosed item's digest. -----------------
-    let disclosed = verify_value_digests(issuer_signed, &mso, digest_alg)?;
+    let disclosed = verify_value_digests(issuer_signed, raw_items, &mso, digest_alg)?;
 
     // --- Extract the MSO DeviceKey (the input to the DeviceAuth holder binding the caller runs). -----
     let device_key = mso_device_key(&mso)?;
@@ -402,6 +521,270 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     Ok(IssuerVerified {
         disclosed,
         device_key,
+    })
+}
+
+// =================================================================================================
+// Raw `IssuerSignedItemBytes` capture (ISO/IEC 18013-5 §9.2.2.5 hashes the bytes AS RECEIVED).
+//
+// The MSO `valueDigests` digest is computed over "the binary data of the IssuerSignedItem"
+// (§9.2.2.5), i.e. each `IssuerSignedItemBytes = #6.24(bstr .cbor IssuerSignedItem)` element of
+// `IssuerSigned.nameSpaces`, hashed EXACTLY as it appears on the wire. Decoding to a `ciborium`
+// `Value` and re-encoding the tagged item is *not* guaranteed to reproduce those bytes: ciborium
+// preserves the inner `bstr` content verbatim but re-derives the outer tag + length framing, so a
+// valid-but-non-canonical issuer (one whose `#6.24`/length head is not minimal-length) would be
+// FALSE-REJECTED. ISO/IEC 18013-5 §9.1.1 requires Canonical-CBOR length encoding, so a conformant
+// issuer round-trips — but the digest input MUST still be the received bytes, never a re-encode, so
+// the verifier never depends on its own serializer reproducing another implementation's framing.
+//
+// `ciborium` 0.2 exposes no raw-value capture (no `RawValue`, and `ciborium-ll`'s decoder has no
+// byte-offset API), so this is a light, self-contained CBOR pass that walks ONLY the structure it
+// needs — `DeviceResponse → documents[i] → issuerSigned → nameSpaces → {ns: [items]}` — and records
+// the exact original byte span of every `#6.24(bstr)` element, keyed by `(namespace, digestID)`.
+// =================================================================================================
+
+/// The captured on-wire `IssuerSignedItemBytes` of one document, keyed by namespace then `digestID`:
+/// `raw[namespace][digestID]` is the exact original byte slice of that `#6.24(bstr)` element, the
+/// input ISO/IEC 18013-5 §9.2.2.5 hashes. Built by [`scan_raw_issuer_items`] from the original
+/// `DeviceResponse` bytes (one scan per response), then consulted by [`verify_value_digests`].
+type RawDocumentItems<'a> = BTreeMap<String, BTreeMap<i64, &'a [u8]>>;
+
+/// A minimal forward CBOR cursor over a byte slice, used only to walk the `IssuerSigned.nameSpaces`
+/// structure and capture each `IssuerSignedItemBytes` span verbatim. It is NOT a general decoder: it
+/// reads item heads, skips items it does not need, and hands back exact sub-slices.
+struct CborCursor<'a> {
+    /// The full input being walked (slices handed out borrow from this).
+    input: &'a [u8],
+    /// The current read position (byte offset into `input`).
+    pos: usize,
+}
+
+/// The major type + argument of one CBOR data-item head (RFC 8949 §3): the 3-bit major type and the
+/// decoded unsigned argument (the "additional information" value), with the head already consumed.
+struct CborHead {
+    /// The CBOR major type (0..=7).
+    major: u8,
+    /// The decoded argument (length for strings/containers, value for ints, tag number for tags).
+    arg: u64,
+}
+
+impl<'a> CborCursor<'a> {
+    /// Start a cursor at the beginning of `input`.
+    const fn new(input: &'a [u8]) -> Self {
+        Self { input, pos: 0 }
+    }
+
+    /// Read and consume one item head: the initial byte's major type + additional info, plus any
+    /// following 1/2/4/8 argument bytes (RFC 8949 §3). Indefinite-length (additional info 31) is
+    /// rejected — ISO/IEC 18013-5 §9.1.1 forbids it, and capturing a definite span is the whole point.
+    fn read_head(&mut self) -> Option<CborHead> {
+        let initial = *self.input.get(self.pos)?;
+        self.pos += 1;
+        let major = initial >> 5;
+        let info = initial & 0x1f;
+        let arg = match info {
+            0..=23 => u64::from(info),
+            24 => self.read_uint(1)?,
+            25 => self.read_uint(2)?,
+            26 => self.read_uint(4)?,
+            27 => self.read_uint(8)?,
+            // 28..=30 reserved; 31 indefinite-length — neither is valid Canonical CBOR here.
+            _ => return None,
+        };
+        Some(CborHead { major, arg })
+    }
+
+    /// Read `n` big-endian bytes as the head argument, advancing the cursor.
+    fn read_uint(&mut self, n: usize) -> Option<u64> {
+        let bytes = self.input.get(self.pos..self.pos + n)?;
+        self.pos += n;
+        let mut value = 0u64;
+        for &b in bytes {
+            value = (value << 8) | u64::from(b);
+        }
+        Some(value)
+    }
+
+    /// Skip exactly one complete data item (head + all content/children), advancing the cursor past
+    /// it. Returns `None` on malformed/indefinite input.
+    fn skip_item(&mut self) -> Option<()> {
+        let head = self.read_head()?;
+        self.skip_after_head(&head)
+    }
+
+    /// Skip the content of an item whose head has already been read (the recursive body of
+    /// [`Self::skip_item`], shared with the capturing walkers that read a head then skip its content).
+    fn skip_after_head(&mut self, head: &CborHead) -> Option<()> {
+        match head.major {
+            // Unsigned/negative integer, simple/float: the value lived entirely in the head args.
+            0 | 1 | 7 => Some(()),
+            // Byte / text string: `arg` content bytes follow.
+            2 | 3 => {
+                let len = usize::try_from(head.arg).ok()?;
+                self.pos = self.pos.checked_add(len)?;
+                (self.pos <= self.input.len()).then_some(())
+            }
+            // Array: `arg` items follow.
+            4 => {
+                for _ in 0..head.arg {
+                    self.skip_item()?;
+                }
+                Some(())
+            }
+            // Map: `arg` key/value PAIRS follow.
+            5 => {
+                for _ in 0..head.arg {
+                    self.skip_item()?;
+                    self.skip_item()?;
+                }
+                Some(())
+            }
+            // Tag: one tagged item follows.
+            6 => self.skip_item(),
+            _ => None,
+        }
+    }
+
+    /// Capture the exact byte slice of the next complete data item without interpreting it, advancing
+    /// the cursor past it.
+    fn take_item_slice(&mut self) -> Option<&'a [u8]> {
+        let start = self.pos;
+        self.skip_item()?;
+        self.input.get(start..self.pos)
+    }
+
+    /// Read a text-string item, returning its UTF-8 content (used to read map keys / namespace names).
+    fn take_text(&mut self) -> Option<&'a str> {
+        let head = self.read_head()?;
+        if head.major != 3 {
+            return None;
+        }
+        let len = usize::try_from(head.arg).ok()?;
+        let bytes = self.input.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        core::str::from_utf8(bytes).ok()
+    }
+
+    /// Expect a map head, returning its entry count.
+    fn read_map_len(&mut self) -> Option<u64> {
+        let head = self.read_head()?;
+        (head.major == 5).then_some(head.arg)
+    }
+
+    /// Expect an array head, returning its element count.
+    fn read_array_len(&mut self) -> Option<u64> {
+        let head = self.read_head()?;
+        (head.major == 4).then_some(head.arg)
+    }
+
+    /// Walk a map, invoking `on_entry` with a cursor positioned at each value after reading its text
+    /// key; `on_entry` MUST consume exactly its value. Non-text keys are skipped (with their values).
+    fn for_each_text_keyed_entry(
+        &mut self,
+        mut on_entry: impl FnMut(&str, &mut Self) -> Option<()>,
+    ) -> Option<()> {
+        let len = self.read_map_len()?;
+        for _ in 0..len {
+            // Peek whether the key is a text string; if not, skip key + value together.
+            let key_start = self.pos;
+            if let Some(key) = self.take_text() {
+                // `take_text` borrowed `self.input`; re-borrow the key for the callback by slicing the
+                // same range (avoids holding an immutable borrow across the &mut self call).
+                let key_range = key_start..self.pos;
+                let key_owned = self.input.get(key_range)?;
+                // Re-decode the (already-validated) key text from the captured bytes.
+                let mut key_cursor = Self {
+                    input: key_owned,
+                    pos: 0,
+                };
+                let key_text = key_cursor.take_text()?;
+                debug_assert_eq!(key_text, key);
+                on_entry(key_text, self)?;
+            } else {
+                // Reset to the key start, skip the key item and its value.
+                self.pos = key_start;
+                self.skip_item()?;
+                self.skip_item()?;
+            }
+        }
+        Some(())
+    }
+}
+
+/// Read the `digestID` of an `IssuerSignedItem` from its raw `#6.24(bstr .cbor IssuerSignedItem)`
+/// element bytes, by decoding the (tiny) inner item with `ciborium` and reading its `digestID` field.
+/// Returns `None` if the element is not a `#6.24(bstr)` wrapping a map with an integer `digestID`.
+fn raw_item_digest_id(item_bytes: &[u8]) -> Option<i64> {
+    let value: CborValue = ciborium::from_reader(item_bytes).ok()?;
+    let inner = unwrap_tagged_cbor_payload(&value).ok()?;
+    let item: CborValue = ciborium::from_reader(inner.as_slice()).ok()?;
+    get_integer(&item, "digestID")
+}
+
+/// Scan the original `DeviceResponse` bytes once and capture, per document (in document order), the
+/// exact on-wire `IssuerSignedItemBytes` of every disclosed element keyed by `(namespace, digestID)`
+/// — the digest input ISO/IEC 18013-5 §9.2.2.5 mandates (the bytes as received, not a re-encode).
+///
+/// This is a best-effort capture: a document/element this light pass cannot navigate (it never
+/// happens for a well-formed response, which the always-on bar parses in full via `ciborium`) simply
+/// yields no captured slice, and [`verify_value_digests`] then fails that item closed
+/// (`DisclosureIntegrity`) rather than silently re-encoding — so a parse the two paths disagree on can
+/// never become a FALSE-ACCEPT. The verdict is unchanged for every conformant response.
+fn scan_raw_issuer_items(device_response: &[u8]) -> Vec<RawDocumentItems<'_>> {
+    let mut per_document = Vec::new();
+    let mut cursor = CborCursor::new(device_response);
+    let _ = cursor.for_each_text_keyed_entry(|key, c| {
+        if key == "documents" {
+            let len = c.read_array_len()?;
+            for _ in 0..len {
+                per_document.push(scan_document_issuer_items(c).unwrap_or_default());
+            }
+            Some(())
+        } else {
+            c.skip_item()
+        }
+    });
+    per_document
+}
+
+/// Capture one `Document`'s `issuerSigned.nameSpaces` raw `IssuerSignedItemBytes`, keyed by
+/// `(namespace, digestID)`. The cursor enters positioned at the `Document` map and leaves positioned
+/// just past it (so the caller's array walk stays in step).
+fn scan_document_issuer_items<'a>(cursor: &mut CborCursor<'a>) -> Option<RawDocumentItems<'a>> {
+    let mut items: RawDocumentItems<'a> = BTreeMap::new();
+    cursor.for_each_text_keyed_entry(|doc_key, c| {
+        if doc_key == "issuerSigned" {
+            c.for_each_text_keyed_entry(|is_key, c2| {
+                if is_key == "nameSpaces" {
+                    scan_name_spaces(c2, &mut items)
+                } else {
+                    c2.skip_item()
+                }
+            })
+        } else {
+            c.skip_item()
+        }
+    })?;
+    Some(items)
+}
+
+/// Capture every `IssuerSignedItemBytes` of a `nameSpaces` map (`{ namespace: [ #6.24(bstr) … ] }`)
+/// into `items`, keyed by namespace then `digestID`. The cursor enters at the `nameSpaces` map value
+/// and leaves just past it.
+fn scan_name_spaces<'a>(
+    cursor: &mut CborCursor<'a>,
+    items: &mut RawDocumentItems<'a>,
+) -> Option<()> {
+    cursor.for_each_text_keyed_entry(|namespace, c| {
+        let ns_entry = items.entry(namespace.to_owned()).or_default();
+        let len = c.read_array_len()?;
+        for _ in 0..len {
+            let item_slice = c.take_item_slice()?;
+            if let Some(digest_id) = raw_item_digest_id(item_slice) {
+                ns_entry.insert(digest_id, item_slice);
+            }
+        }
+        Some(())
     })
 }
 
@@ -728,12 +1111,23 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
 
 /// Recompute every disclosed `IssuerSignedItem` digest and match it against the MSO `valueDigests`.
 ///
-/// For each namespace and each disclosed item: the digest is computed over the **tagged-CBOR bytes**
-/// of the item (`#6.24(bstr .cbor IssuerSignedItem)` — the exact bytes carried in `IssuerSigned`),
-/// then compared to the MSO `valueDigests[ns][digestID]`. Any missing or mismatched digest fails with
-/// `DisclosureIntegrity`. Returns the disclosed attributes (flattened across namespaces) on success.
+/// For each namespace and each disclosed item the digest is computed over the **on-wire
+/// `IssuerSignedItemBytes`** — the `#6.24(bstr .cbor IssuerSignedItem)` element exactly as it was
+/// received (ISO/IEC 18013-5 §9.2.2.5: "the input for the digest function is the binary data of the
+/// IssuerSignedItem"), taken verbatim from `raw_items` (the up-front [`scan_raw_issuer_items`]
+/// capture) rather than re-encoded from the decoded value — so the verifier never depends on its own
+/// CBOR serializer reproducing another conformant-but-non-canonical implementation's framing. The
+/// digest is then compared to `valueDigests[ns][digestID]`. Any missing/mismatched digest, or an item
+/// whose original bytes the raw pass did not capture, fails with `DisclosureIntegrity` (fail-closed —
+/// never a re-encode fallback that could mask a divergent parse). Returns the disclosed attributes
+/// (flattened across namespaces) on success.
+///
+/// The expected digests are indexed into a per-namespace `BTreeMap<digestID, &digest>` once before the
+/// item loop, so each disclosed item is an `O(log n)` lookup rather than a linear scan of both the
+/// namespace list and the digest list (`O(items × digests)` on attacker-controllable sizes).
 fn verify_value_digests(
     issuer_signed: &CborValue,
+    raw_items: Option<&RawDocumentItems<'_>>,
     mso: &CborValue,
     digest_alg: DigestAlgorithm,
 ) -> Result<BTreeMap<String, AttributeValue>, VerifyFailure> {
@@ -750,30 +1144,39 @@ fn verify_value_digests(
         let items = items_value
             .as_array()
             .ok_or_else(VerifyFailure::malformed)?;
-        let ns_digests = value_digests
+        // Build the `digestID → expected digest` index for this namespace ONCE (fixes the per-item
+        // linear scan): a missing namespace entry in `valueDigests` is a disclosure-integrity failure.
+        let ns_digests_map = value_digests
             .iter()
             .find_map(|(k, v)| (k.as_text() == Some(ns)).then_some(v))
             .and_then(CborValue::as_map)
             .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
+        let expected_by_id: BTreeMap<i64, &[u8]> = ns_digests_map
+            .iter()
+            .filter_map(|(k, v)| Some((integer_label(k)?, v.as_bytes()?.as_slice())))
+            .collect();
+        // The on-wire `IssuerSignedItemBytes` captured for this namespace (keyed by `digestID`).
+        let raw_ns_items = raw_items.and_then(|m| m.get(ns));
 
         for item_value in items {
-            // The item is a `#6.24(bstr)`; hash the *exact* tagged-CBOR encoding of the bstr content.
+            // Decode the item to read its `digestID` / `elementIdentifier` / `elementValue`. The
+            // digest, however, is computed over the ORIGINAL wire bytes (below), not this re-decode.
             let item_inner = unwrap_tagged_cbor_payload(item_value)?;
-            // ISO hashes the tagged item as it appears on the wire (`#6.24(bstr)`), i.e. the
-            // re-serialized tagged value — recompute that canonical encoding.
-            let tagged_bytes = encode_tagged_cbor(&item_inner)?;
-            let computed = digest_alg.digest(&tagged_bytes);
-
             let item: CborValue = ciborium::from_reader(item_inner.as_slice())
                 .map_err(|_| VerifyFailure::malformed())?;
             let digest_id = get_integer(&item, "digestID").ok_or_else(VerifyFailure::malformed)?;
-            let expected = ns_digests
-                .iter()
-                .find_map(|(k, v)| (integer_label(k) == Some(digest_id)).then_some(v))
-                .and_then(CborValue::as_bytes)
-                .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
 
-            if computed.as_slice() != expected.as_slice() {
+            // Hash the on-wire `IssuerSignedItemBytes` exactly as received (ISO/IEC 18013-5 §9.2.2.5).
+            // A `digestID` whose original bytes were not captured fails closed (no re-encode fallback).
+            let raw_item_bytes = raw_ns_items
+                .and_then(|items| items.get(&digest_id).copied())
+                .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
+            let computed = digest_alg.digest(raw_item_bytes);
+
+            let expected = expected_by_id
+                .get(&digest_id)
+                .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
+            if computed.as_slice() != *expected {
                 return Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity));
             }
 
@@ -819,8 +1222,12 @@ fn insert_no_shadow(
     }
 }
 
-/// Re-encode a byte string as a CBOR `#6.24(bstr)` tagged item — the canonical wire form whose digest
-/// the MSO `valueDigests` carries.
+/// Re-encode a byte string as a CBOR `#6.24(bstr)` tagged item — the `DeviceNameSpacesBytes` wire form
+/// the `DeviceAuthentication` payload embeds (see [`reencode_tagged`] / [`build_device_authentication`]).
+///
+/// This is used only for the holder-binding payload (which the verifier rebuilds and re-signs over);
+/// the `valueDigests` integrity check hashes the ORIGINAL on-wire `IssuerSignedItemBytes` instead
+/// (ISO/IEC 18013-5 §9.2.2.5), so it never re-encodes — see [`verify_value_digests`].
 fn encode_tagged_cbor(inner: &[u8]) -> Result<Vec<u8>, VerifyFailure> {
     let tagged = CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner.to_vec())));
     let mut buf = Vec::new();
@@ -899,17 +1306,17 @@ fn mso_device_key(mso: &CborValue) -> Result<DeviceKey, VerifyFailure> {
     );
     if !kty_ok {
         // Defensive: also accept a raw kty=2 carried in `params` if `coset` did not assign it.
-        if find_key_label_int(device_key_value, COSE_KEY_KTY) != Some(COSE_KTY_EC2) {
+        if find_key_label(device_key_value, COSE_KEY_KTY, integer_label) != Some(COSE_KTY_EC2) {
             return Err(VerifyFailure::malformed());
         }
     }
-    if find_key_label_int(device_key_value, COSE_KEY_CRV) != Some(COSE_CRV_P256) {
+    if find_key_label(device_key_value, COSE_KEY_CRV, integer_label) != Some(COSE_CRV_P256) {
         return Err(VerifyFailure::malformed());
     }
-    let x =
-        find_key_label_bytes(device_key_value, COSE_KEY_X).ok_or_else(VerifyFailure::malformed)?;
-    let y =
-        find_key_label_bytes(device_key_value, COSE_KEY_Y).ok_or_else(VerifyFailure::malformed)?;
+    let x = find_key_label(device_key_value, COSE_KEY_X, |v| v.as_bytes().cloned())
+        .ok_or_else(VerifyFailure::malformed)?;
+    let y = find_key_label(device_key_value, COSE_KEY_Y, |v| v.as_bytes().cloned())
+        .ok_or_else(VerifyFailure::malformed)?;
     // The 32-byte-coordinate check + `0x04 ‖ X ‖ Y` assembly is the shared
     // [`crate::crypto::p256_sec1_from_coords`] (DRY — the same SEC1 assembly the JWK path uses, just
     // fed from COSE labels here rather than a JWK).
@@ -917,22 +1324,18 @@ fn mso_device_key(mso: &CborValue) -> Result<DeviceKey, VerifyFailure> {
     Ok(DeviceKey { sec1 })
 }
 
-/// Find an integer-keyed (COSE label) integer value in a COSE_Key CBOR map.
-fn find_key_label_int(value: &CborValue, label: i64) -> Option<i64> {
+/// Find the value of an integer-keyed (COSE label) entry in a COSE_Key CBOR map, projected through
+/// `extract`. One generic finder for every label kind (integer value, byte-string value, …) so the
+/// per-type readers are a single shared lookup rather than copy-pasted scans (DRY — Principle III).
+fn find_key_label<T>(
+    value: &CborValue,
+    label: i64,
+    extract: impl Fn(&CborValue) -> Option<T>,
+) -> Option<T> {
     let map = value.as_map()?;
     map.iter().find_map(|(k, v)| {
         (integer_label(k) == Some(label))
-            .then(|| integer_label(v))
-            .flatten()
-    })
-}
-
-/// Find an integer-keyed (COSE label) byte-string value in a COSE_Key CBOR map.
-fn find_key_label_bytes(value: &CborValue, label: i64) -> Option<Vec<u8>> {
-    let map = value.as_map()?;
-    map.iter().find_map(|(k, v)| {
-        (integer_label(k) == Some(label))
-            .then(|| v.as_bytes().cloned())
+            .then(|| extract(v))
             .flatten()
     })
 }
@@ -1050,13 +1453,15 @@ mod unit {
     //! Direct unit tests of the pure helpers whose error branches are awkward to reach end-to-end.
 
     use super::{
-        cbor_to_attribute, cose_alg_is_es256, ds_cert_from_x5chain, insert_no_shadow,
-        integer_label, tdate_field, unwrap_tagged_cbor_payload, DigestAlgorithm,
-        COSE_HEADER_X5CHAIN, TAG_ENCODED_CBOR,
+        cbor_to_attribute, cose_alg_is_es256, ds_cert_from_x5chain, find_key_label,
+        insert_no_shadow, integer_label, scan_raw_issuer_items, tdate_field,
+        unwrap_tagged_cbor_payload, CborCursor, DigestAlgorithm, COSE_HEADER_X5CHAIN,
+        TAG_ENCODED_CBOR,
     };
     use crate::types::AttributeValue;
     use ciborium::Value as CborValue;
     use coset::{iana::Algorithm, CoseSign1Builder, HeaderBuilder};
+    use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1319,5 +1724,184 @@ mod unit {
             CborValue::Tag(0, Box::new(CborValue::Integer(7.into()))),
         )]);
         assert!(tdate_field(&info_bad_tag, "signed").is_err());
+    }
+
+    #[test]
+    fn find_key_label_reads_int_and_bytes_via_one_generic() {
+        // The generic `find_key_label` replaces the old copy-pasted int/bytes finders (DRY): the same
+        // lookup serves an integer projection and a byte-string projection, and a wrong-type
+        // projection returns None (the entry exists but is not the requested kind).
+        let key = CborValue::Map(vec![
+            (CborValue::Integer(1.into()), CborValue::Integer(2.into())), // label 1 → int 2
+            (
+                CborValue::Integer((-2).into()),
+                CborValue::Bytes(vec![9, 9, 9]),
+            ), // label -2 → bytes
+        ]);
+        assert_eq!(find_key_label(&key, 1, integer_label), Some(2));
+        assert_eq!(
+            find_key_label(&key, -2, |v| v.as_bytes().cloned()),
+            Some(vec![9, 9, 9])
+        );
+        // Label 1 holds an int, not bytes → the bytes projection finds nothing.
+        assert_eq!(find_key_label(&key, 1, |v| v.as_bytes().cloned()), None);
+        // An absent label → None. A non-map value → None.
+        assert_eq!(find_key_label(&key, 7, integer_label), None);
+        assert_eq!(
+            find_key_label(&CborValue::Integer(0.into()), 1, integer_label),
+            None
+        );
+    }
+
+    #[test]
+    fn cbor_cursor_skips_every_major_type_and_rejects_indefinite_length() {
+        // The raw cursor must skip exactly one complete item of each major type so the namespaces
+        // walk steps correctly over fields it does not capture.
+        let nested = CborValue::Array(vec![
+            CborValue::Integer(1.into()),        // major 0
+            CborValue::Integer((-1).into()),     // major 1
+            CborValue::Bytes(vec![1, 2, 3]),     // major 2
+            CborValue::Text("hello".to_owned()), // major 3
+            CborValue::Array(vec![CborValue::Bool(true), CborValue::Null]), // major 4 (nested)
+            CborValue::Map(vec![(
+                CborValue::Text("k".to_owned()),
+                CborValue::Integer(9.into()),
+            )]), // major 5
+            CborValue::Tag(0, Box::new(CborValue::Text("t".to_owned()))), // major 6
+            CborValue::Bool(false),              // major 7
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&nested, &mut buf).unwrap();
+        // A trailing sentinel byte after the encoded array proves `skip_item` consumed EXACTLY the
+        // array's bytes (the cursor lands precisely on the sentinel).
+        buf.push(0xAB);
+        let mut cursor = CborCursor::new(&buf);
+        assert!(cursor.skip_item().is_some(), "skips the whole nested array");
+        assert_eq!(cursor.pos, buf.len() - 1, "lands exactly on the sentinel");
+
+        // Indefinite-length (additional info 31) is rejected — ISO/IEC 18013-5 §9.1.1 forbids it and a
+        // definite span is required to capture exact bytes. 0x9f = array(*) indefinite.
+        let mut indefinite = CborCursor::new(&[0x9f, 0xff]);
+        assert!(indefinite.skip_item().is_none());
+        // Reserved additional-info 28..=30 (0x1c here) is also rejected.
+        let mut reserved = CborCursor::new(&[0x1c]);
+        assert!(reserved.read_head().is_none());
+    }
+
+    #[test]
+    fn scan_raw_issuer_items_captures_the_exact_on_wire_bytes_not_a_reencode() {
+        // The load-bearing property of fix #1: the digest input is the `IssuerSignedItemBytes` AS
+        // RECEIVED. Build a `DeviceResponse` skeleton whose single `#6.24(bstr)` item carries a
+        // DELIBERATELY NON-MINIMAL outer byte-string length header (`0x59 00 LL` — a 2-byte length
+        // where 1 byte suffices), which a re-encode (ciborium, canonical) would NEVER reproduce. The
+        // scanner must hand back those exact non-canonical bytes, so hashing them differs from hashing
+        // a canonical re-encode — proving the verifier hashes the wire bytes.
+        let inner = {
+            // A minimal IssuerSignedItem map with digestID = 5.
+            let item = CborValue::Map(vec![
+                (
+                    CborValue::Text("digestID".to_owned()),
+                    CborValue::Integer(5.into()),
+                ),
+                (
+                    CborValue::Text("elementIdentifier".to_owned()),
+                    CborValue::Text("x".to_owned()),
+                ),
+                (
+                    CborValue::Text("elementValue".to_owned()),
+                    CborValue::Integer(1.into()),
+                ),
+            ]);
+            let mut b = Vec::new();
+            ciborium::into_writer(&item, &mut b).unwrap();
+            b
+        };
+        // Hand-encode `#6.24(bstr)` with a NON-minimal 2-byte length head: tag 24 = `0xD8 0x18`,
+        // then `0x59 <len:u16>` for the byte string (canonical would be `0x58 <len:u8>` for len<256).
+        assert!(
+            inner.len() < 256,
+            "test item fits a 1-byte canonical length"
+        );
+        let mut non_canonical_item = vec![0xD8, 0x18, 0x59];
+        non_canonical_item.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
+        non_canonical_item.extend_from_slice(&inner);
+
+        // A canonical re-encode of the SAME inner bytes uses the shorter `0x58` length head, so the two
+        // framings differ — the precondition that makes this test meaningful.
+        let canonical_item = {
+            let tagged =
+                CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner.clone())));
+            let mut b = Vec::new();
+            ciborium::into_writer(&tagged, &mut b).unwrap();
+            b
+        };
+        assert_ne!(
+            non_canonical_item, canonical_item,
+            "the non-minimal framing must differ from the canonical re-encode"
+        );
+
+        // Build the minimal `DeviceResponse → documents[0] → issuerSigned → nameSpaces → {ns:[item]}`
+        // wrapper around the non-canonical item bytes, splicing the raw item in verbatim. (We encode
+        // the surrounding maps/arrays canonically, then replace the canonical item with the
+        // non-canonical one, which has the same inner content + a longer length head.)
+        let wire = build_device_response_with_raw_item("ns", &non_canonical_item, &canonical_item);
+
+        let per_doc = scan_raw_issuer_items(&wire);
+        assert_eq!(per_doc.len(), 1, "one document scanned");
+        let captured = per_doc[0]
+            .get("ns")
+            .and_then(|m| m.get(&5))
+            .expect("the digestID-5 item was captured");
+        assert_eq!(
+            *captured,
+            non_canonical_item.as_slice(),
+            "the scanner captures the EXACT on-wire bytes (non-minimal framing preserved)"
+        );
+        // The digest of the captured wire bytes differs from the digest of a canonical re-encode — so a
+        // verifier hashing the wire bytes (this fix) and one re-encoding would disagree.
+        assert_ne!(
+            Sha256::digest(captured).to_vec(),
+            Sha256::digest(&canonical_item).to_vec(),
+            "hashing the wire bytes is NOT the same as hashing a canonical re-encode"
+        );
+    }
+
+    /// Build a `DeviceResponse` whose `documents[0].issuerSigned.nameSpaces[namespace]` array holds a
+    /// single element, splicing `raw_item` (the exact bytes to land on the wire) in place of the
+    /// canonical encoding `canonical_item`. The rest of the structure is canonical CBOR.
+    fn build_device_response_with_raw_item(
+        namespace: &str,
+        raw_item: &[u8],
+        canonical_item: &[u8],
+    ) -> Vec<u8> {
+        // First encode the structure with the CANONICAL item as a placeholder, then byte-replace it
+        // with the raw (non-canonical) item — both share the identical inner content, so the only
+        // change is the spliced element's framing.
+        let canonical_value: CborValue =
+            ciborium::from_reader(canonical_item).expect("canonical item decodes");
+        let response = CborValue::Map(vec![(
+            CborValue::Text("documents".to_owned()),
+            CborValue::Array(vec![CborValue::Map(vec![(
+                CborValue::Text("issuerSigned".to_owned()),
+                CborValue::Map(vec![(
+                    CborValue::Text("nameSpaces".to_owned()),
+                    CborValue::Map(vec![(
+                        CborValue::Text(namespace.to_owned()),
+                        CborValue::Array(vec![canonical_value]),
+                    )]),
+                )]),
+            )])]),
+        )]);
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&response, &mut encoded).unwrap();
+        // Splice: find the canonical item bytes and replace with the raw (non-canonical) bytes.
+        let at = encoded
+            .windows(canonical_item.len())
+            .position(|w| w == canonical_item)
+            .expect("canonical item present in the encoded response");
+        let mut spliced = encoded[..at].to_vec();
+        spliced.extend_from_slice(raw_item);
+        spliced.extend_from_slice(&encoded[at + canonical_item.len()..]);
+        spliced
     }
 }
