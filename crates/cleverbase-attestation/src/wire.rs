@@ -14,15 +14,18 @@
 //! **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
 //! seam), and the optional OpenID4VP **request** the presentation must be bound to.
 //!
-//! ## Schema version 3
+//! ## Schema version 4
 //!
 //! Version 2 replaced the version-1 foundation seam (which carried only `presentation` + `policy` and
-//! returned `NotImplemented`) with the full always-on verifier wiring. Version 3 (this) additively
-//! carries the opt-in qualified-status gate's national Trusted List
-//! ([`WireContext::qualified_trust_list`]) alongside the existing `qualified_gate` flag (T020), so
-//! the C-ABI gate has data. The CBOR shape changed (an additive field), so the schema version was
-//! bumped (Principle VII); a binding speaking an older version is refused with a clear message rather
-//! than mis-parsed.
+//! returned `NotImplemented`) with the full always-on verifier wiring. Version 3 additively carried
+//! the opt-in qualified-status gate's national Trusted List ([`WireContext::qualified_trust_list`])
+//! alongside the existing `qualified_gate` flag (T020). Version 4 (this) additively carries the
+//! gate's **scheme-operator trust anchors** ([`WireContext::qualified_scheme_anchors`]) — the X.509
+//! anchor(s) the gate chain-authenticates the national TL's signer against before reading any status,
+//! so a forged / unsigned / unchained / stale TL can never report `Qualified` (fail-closed, SC-007);
+//! with the gate enabled but no scheme anchor the determination is `Indeterminate`. The CBOR shape
+//! changed (an additive field), so the schema version was bumped (Principle VII); a binding speaking
+//! an older version is refused with a clear message rather than mis-parsed.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +38,7 @@ use crate::verify::{verify, Presentation, VerifyContext};
 /// Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
 /// SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
 /// verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
-pub const ATTESTATION_SCHEMA_VERSION: u32 = 3;
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 4;
 
 /// A single configured trust anchor passed across the wire: a trusted issuer/anchor certificate for
 /// a `(role, format)` (the host resolved these from the EU LOTL / national TLs / IACA roots in its
@@ -98,6 +101,23 @@ pub struct WireContext {
     /// `Indeterminate` (unreachable data — never a false "qualified").
     #[serde(default, with = "serde_bytes")]
     pub qualified_trust_list: Option<Vec<u8>>,
+    /// The scheme-operator trust anchor certificate(s) (DER) the opt-in gate chain-authenticates the
+    /// national TL's signer against **before** reading any status, carried additively on the wire.
+    /// Empty (the default) with the gate enabled means the TL cannot be authenticated → an honest
+    /// `Indeterminate` (can't authenticate ⇒ can't assert qualified — never a false "qualified").
+    #[serde(default)]
+    pub qualified_scheme_anchors: Vec<WireSchemeAnchor>,
+}
+
+/// One scheme-operator (national-TL-operator) trust anchor carried across the wire: the DER-encoded
+/// anchor certificate the opt-in qualified gate authenticates the national Trusted List's signer
+/// against. Distinct from [`WireTrustAnchor`] (which is role/format-scoped issuer trust for the
+/// always-on bar); a scheme anchor is only the TL-signing root, so it carries no role/format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSchemeAnchor {
+    /// The DER-encoded scheme-operator anchor certificate.
+    #[serde(with = "serde_bytes")]
+    pub cert_der: Vec<u8>,
 }
 
 /// A `verify` request: the presented credential, the policy, the configured anchors, the
@@ -204,6 +224,14 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
                 .qualified_trust_list
                 .as_deref()
                 .and_then(|bytes| crate::qualified::QualifiedTrustList::parse(bytes).ok());
+            // The scheme-operator anchor(s) the gate authenticates the national TL against. Empty
+            // (the default) with the gate enabled → the TL can't be authenticated → Indeterminate.
+            let qualified_scheme_anchors: Vec<Vec<u8>> = req
+                .context
+                .qualified_scheme_anchors
+                .iter()
+                .map(|a| a.cert_der.clone())
+                .collect();
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,
@@ -211,6 +239,7 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
                 session_transcript: req.context.session_transcript.as_deref(),
                 qualified_gate: req.context.qualified_gate,
                 qualified_trust_list: qualified_trust_list.as_ref(),
+                qualified_scheme_anchors: &qualified_scheme_anchors,
             };
             let presentation = match &req.presentation {
                 WirePresentation::SdJwtVc { presentation } => Presentation::SdJwtVc(presentation),

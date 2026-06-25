@@ -42,6 +42,7 @@ pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
+            qualified_scheme_anchors: Vec::new(),
         },
         request: None,
     };

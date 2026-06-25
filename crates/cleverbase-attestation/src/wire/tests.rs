@@ -5,8 +5,8 @@
 
 use super::{
     decode_verify_request, encode_verify_response, process_verify_bytes, VerifyOutcome,
-    VerifyRequest, VerifyResponse, WireContext, WirePresentation, WireTrustAnchor,
-    ATTESTATION_SCHEMA_VERSION,
+    VerifyRequest, VerifyResponse, WireContext, WirePresentation, WireSchemeAnchor,
+    WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
 };
 use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
 use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW};
@@ -40,6 +40,7 @@ fn valid_sd_jwt_request() -> VerifyRequest {
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
+            qualified_scheme_anchors: Vec::new(),
         },
         request: None,
     }
@@ -100,6 +101,7 @@ fn well_formed_mdoc_request_verifies_valid() {
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
+            qualified_scheme_anchors: Vec::new(),
         },
         request: None,
     };
@@ -138,18 +140,27 @@ fn response_round_trips_through_cbor() {
 /// The optional national-TL fixture the opt-in C-ABI gate reads (qualified EAA/Q services).
 const QUALIFIED_TRUST_LIST_JSON: &[u8] =
     include_bytes!("../../../../tests/fixtures/attestation/qualified-trust-list.json");
+/// The scheme-operator anchor (the IACA root) the C-ABI gate authenticates the national TL against.
+const CA_IACA: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/ca-iaca.cert.der");
+/// A self-signed cert that does NOT chain to `ca-iaca` — a forged national-TL signer over the wire.
+const WRONG_ISSUER: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
 
 #[test]
 fn opt_in_gate_over_the_c_abi_populates_qualified_status_and_is_additive() {
-    // T020: the wire envelope additively carries the gate flag + the national TL bytes. Driving the
-    // SAME credential with the gate OFF vs ON yields an identical always-on verdict; only ON carries
-    // the qualified_status (sdjwt-issuer is a granted EAA/Q issuer at NOW → Qualified).
+    // T020: the wire envelope additively carries the gate flag, the national TL bytes, and the
+    // scheme-operator anchor. Driving the SAME credential with the gate OFF vs ON yields an identical
+    // always-on verdict; only ON carries the qualified_status (sdjwt-issuer is a granted EAA/Q issuer
+    // at NOW, and the TL authenticates against the supplied scheme anchor → Qualified).
     let base = valid_sd_jwt_request();
 
     let gate_on = {
         let mut req = base.clone();
         req.context.qualified_gate = true;
         req.context.qualified_trust_list = Some(QUALIFIED_TRUST_LIST_JSON.to_vec());
+        req.context.qualified_scheme_anchors = vec![WireSchemeAnchor {
+            cert_der: CA_IACA.to_vec(),
+        }];
         req
     };
 
@@ -194,5 +205,53 @@ fn opt_in_gate_over_the_c_abi_with_malformed_trust_list_is_indeterminate_not_an_
             );
         }
         VerifyOutcome::Err { message } => panic!("a bad TL must not error the verify: {message}"),
+    }
+}
+
+#[test]
+fn opt_in_gate_over_the_c_abi_with_a_forged_trust_list_signer_is_indeterminate() {
+    // A genuine fixture TL but driven with a FORGED scheme anchor (wrong-issuer, which the fixture's
+    // ca-iaca signer does not chain to) over the wire → the gate cannot authenticate the TL →
+    // Indeterminate, never Qualified (the false-trust bug fix, end-to-end through the C-ABI envelope).
+    let mut req = valid_sd_jwt_request();
+    req.context.qualified_gate = true;
+    req.context.qualified_trust_list = Some(QUALIFIED_TRUST_LIST_JSON.to_vec());
+    req.context.qualified_scheme_anchors = vec![WireSchemeAnchor {
+        cert_der: WRONG_ISSUER.to_vec(),
+    }];
+    let resp: VerifyResponse =
+        ciborium::from_reader(&process_verify_bytes(&encode(&req))[..]).expect("response decodes");
+    match resp.outcome {
+        VerifyOutcome::Ok { result } => {
+            assert!(result.valid, "always-on bar unaffected");
+            assert_eq!(
+                result.qualified_status,
+                Some(crate::types::QualifiedStatus::Indeterminate),
+                "an unauthenticated TL must never report Qualified over the C-ABI"
+            );
+        }
+        VerifyOutcome::Err { message } => panic!("must not error: {message}"),
+    }
+}
+
+#[test]
+fn opt_in_gate_over_the_c_abi_without_a_scheme_anchor_is_indeterminate() {
+    // The gate is on with a genuine fixture TL but NO scheme anchor supplied over the wire → the TL
+    // cannot be authenticated → Indeterminate (can't authenticate ⇒ can't assert qualified).
+    let mut req = valid_sd_jwt_request();
+    req.context.qualified_gate = true;
+    req.context.qualified_trust_list = Some(QUALIFIED_TRUST_LIST_JSON.to_vec());
+    // qualified_scheme_anchors left empty (the default).
+    let resp: VerifyResponse =
+        ciborium::from_reader(&process_verify_bytes(&encode(&req))[..]).expect("response decodes");
+    match resp.outcome {
+        VerifyOutcome::Ok { result } => {
+            assert!(result.valid);
+            assert_eq!(
+                result.qualified_status,
+                Some(crate::types::QualifiedStatus::Indeterminate)
+            );
+        }
+        VerifyOutcome::Err { message } => panic!("must not error: {message}"),
     }
 }

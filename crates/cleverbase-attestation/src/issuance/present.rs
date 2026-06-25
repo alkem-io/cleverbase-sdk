@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use ciborium::value::Value as CborValue;
 use serde::{Deserialize, Serialize};
 
-use super::device::build_device_signature;
+use super::device::{build_device_signature, empty_device_name_spaces_bytes};
 use super::signer::{build_kb_jwt, HolderContext, Signer};
 use crate::openid4vp::{oid4vp_handover_transcript, MdocVpToken, PresentationRequest, VpToken};
 
@@ -258,26 +258,59 @@ fn prepare_sd_jwt_vc(
     let sd_jwt =
         sd_jwt_payload::SdJwt::parse(issued).map_err(|e| PresentError::Malformed(e.to_string()))?;
 
-    // The full set of disclosable claim names in the issued credential (top-level object disclosures).
-    let disclosable: BTreeSet<String> = sd_jwt
+    // The named (object-property) disclosable claims — those that carry a `claim_name` (RFC 9901).
+    let named_disclosable: BTreeSet<String> = sd_jwt
         .disclosures()
         .iter()
         .filter_map(|d| d.claim_name.clone())
         .collect();
+
+    // Array-element disclosures carry NO `claim_name` (RFC 9901), so the named set never covers them —
+    // left untouched they would ALWAYS ride on the wire regardless of `disclose`, an over-disclosure
+    // leak. Map each array-element disclosure to its JSON-pointer path + the top-level claim that
+    // contains it, so it can be concealed/disclosed in step with that claim.
+    let array_element_paths = array_element_disclosure_paths(&sd_jwt)?;
+
+    // A claim is selectable if it is a named disclosure OR a (possibly always-visible) claim that
+    // holds array-element disclosures — so `disclose` can reference the parent of an array.
+    let disclosable: BTreeSet<&str> = named_disclosable
+        .iter()
+        .map(String::as_str)
+        .chain(
+            array_element_paths
+                .iter()
+                .map(|p| p.top_level_claim.as_str()),
+        )
+        .collect();
     for name in disclose {
-        if !disclosable.contains(name) {
+        if !disclosable.contains(name.as_str()) {
             return Err(PresentError::UndisclosableClaim(name.clone()));
         }
     }
 
-    // Conceal every disclosable claim NOT in the requested subset (selective disclosure).
     let mut builder = sd_jwt
         .into_presentation(&Sha2Hasher)
         .map_err(|e| PresentError::Build(e.to_string()))?;
-    for name in disclosable.difference(disclose) {
-        builder = builder
-            .conceal(&format!("/{name}"))
-            .map_err(|e| PresentError::Build(e.to_string()))?;
+
+    // Conceal every named claim NOT in the requested subset (selective disclosure). Concealing a
+    // claim also drops its concealable sub-values, so an explicitly-concealed parent takes its
+    // array-element disclosures with it.
+    for name in &named_disclosable {
+        if !disclose.contains(name) {
+            builder = builder
+                .conceal(&format!("/{name}"))
+                .map_err(|e| PresentError::Build(e.to_string()))?;
+        }
+    }
+    // Conceal every array-element disclosure whose top-level parent claim is NOT disclosed (a narrow
+    // `disclose` subset must keep array elements off the wire too — no over-disclosure). Elements
+    // under a concealed parent were already removed above; concealing them again is idempotent.
+    for path in &array_element_paths {
+        if !disclose.contains(&path.top_level_claim) {
+            builder = builder
+                .conceal(&path.pointer)
+                .map_err(|e| PresentError::Build(e.to_string()))?;
+        }
     }
     let (presented_sd_jwt, _omitted) = builder.finish();
     let presentation_prefix = presented_sd_jwt.presentation();
@@ -298,6 +331,95 @@ fn prepare_sd_jwt_vc(
     })
 }
 
+/// An array-element disclosure located in the issued credential: the JSON-pointer `pointer` the
+/// presentation builder conceals it at, and the `top_level_claim` that contains it (so it is
+/// concealed/disclosed in step with that claim).
+struct ArrayElementPath {
+    pointer: String,
+    top_level_claim: String,
+}
+
+/// Locate every array-element disclosure in the issued SD-JWT and resolve its conceal path.
+///
+/// Array-element disclosures (RFC 9901) appear in the issuer-signed claims as `{ "...": "<digest>" }`
+/// redaction entries inside an array; the matching disclosure has no `claim_name`. We walk the claims
+/// structure, and for each redaction whose digest matches a presented array-element disclosure we
+/// record its JSON-pointer (`/<claim>/…/<index>`) and its top-level claim.
+fn array_element_disclosure_paths(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<Vec<ArrayElementPath>, PresentError> {
+    use sd_jwt_payload::Hasher as _;
+
+    // The base64url digest of every array-element disclosure (those without a claim name).
+    let hasher = Sha2Hasher;
+    let array_element_digests: BTreeSet<String> = sd_jwt
+        .disclosures()
+        .iter()
+        .filter(|d| d.claim_name.is_none())
+        .map(|d| hasher.encoded_digest(d.as_str()))
+        .collect();
+    if array_element_digests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let claims =
+        serde_json::to_value(sd_jwt.claims()).map_err(|e| PresentError::Build(e.to_string()))?;
+    let mut paths = Vec::new();
+    collect_array_element_paths(&claims, "", None, &array_element_digests, &mut paths);
+    Ok(paths)
+}
+
+/// Recursively walk `value`, recording the conceal path of every `{ "...": digest }` array redaction
+/// whose digest is in `targets`. `pointer` is the JSON pointer to `value`; `top_level` is the first
+/// path segment (the top-level claim the redaction belongs to).
+fn collect_array_element_paths(
+    value: &serde_json::Value,
+    pointer: &str,
+    top_level: Option<&str>,
+    targets: &BTreeSet<String>,
+    out: &mut Vec<ArrayElementPath>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                // `_sd` holds object-property digests (handled by named conceal); never an array path.
+                if key == "_sd" {
+                    continue;
+                }
+                let child_pointer = format!("{pointer}/{}", escape_json_pointer(key));
+                let child_top_level = top_level.or(Some(key.as_str()));
+                collect_array_element_paths(child, &child_pointer, child_top_level, targets, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let item_pointer = format!("{pointer}/{idx}");
+                if let serde_json::Value::Object(obj) = item {
+                    if let Some(serde_json::Value::String(digest)) = obj.get("...") {
+                        if targets.contains(digest) {
+                            if let Some(claim) = top_level {
+                                out.push(ArrayElementPath {
+                                    pointer: item_pointer.clone(),
+                                    top_level_claim: claim.to_owned(),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                }
+                collect_array_element_paths(item, &item_pointer, top_level, targets, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Escape a JSON object key for use as a single JSON-pointer reference token (RFC 6901 §3: `~` → `~0`,
+/// `/` → `~1`).
+fn escape_json_pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
 /// Prepare the mdoc presentation: reconstruct the `DeviceAuthentication` over the request's OID4VP
 /// handover and build the `DeviceSignature` input (the holder signs it next; the held `DeviceResponse`
 /// is carried so [`PreparedPresentation::finish`] can splice the fresh signature in).
@@ -316,11 +438,18 @@ fn prepare_mdoc(
     let doc_type = first_doc_type(&response).ok_or_else(|| {
         PresentError::Malformed("DeviceResponse has no document docType".to_owned())
     })?;
+    // The verifier rebuilds DeviceAuthentication from the document's ACTUAL deviceSigned.nameSpaces,
+    // so the DeviceSignature must be computed over the SAME bytes (`finish` keeps these namespaces
+    // unchanged and only replaces deviceAuth.deviceSignature). Carry the first document's exact
+    // `DeviceNameSpacesBytes` (`#6.24(bstr .cbor DeviceNameSpaces)`), defaulting to the empty map when
+    // the document discloses no device namespaces.
+    let device_name_spaces_bytes = first_device_name_spaces_bytes(&response)?;
 
     let transcript = oid4vp_handover_transcript(&request.audience, &request.nonce);
     let build = build_device_signature(
         &doc_type,
         &transcript,
+        &device_name_spaces_bytes,
         &request.audience,
         &request.nonce_b64(),
     )
@@ -339,6 +468,47 @@ fn first_doc_type(response: &CborValue) -> Option<String> {
     let documents = map_get(response, "documents")?.as_array()?;
     let first = documents.first()?;
     map_get(first, "docType")?.as_text().map(str::to_owned)
+}
+
+/// The first document's `deviceSigned.nameSpaces` re-encoded to its canonical `DeviceNameSpacesBytes`
+/// (`#6.24(bstr .cbor DeviceNameSpaces)`) — the exact bytes the verifier rebuilds `DeviceAuthentication`
+/// from. Defaults to the empty namespace map (`#6.24(bstr .cbor {})`) when the document carries no
+/// `deviceSigned.nameSpaces` (the empty-disclosure case), so a placeholder document still round-trips.
+fn first_device_name_spaces_bytes(response: &CborValue) -> Result<Vec<u8>, PresentError> {
+    let device_name_spaces = map_get(response, "documents")
+        .and_then(CborValue::as_array)
+        .and_then(|docs| docs.first())
+        .and_then(|doc| map_get(doc, "deviceSigned"))
+        .and_then(|ds| map_get(ds, "nameSpaces"));
+    device_name_spaces.map_or_else(
+        || empty_device_name_spaces_bytes().map_err(|e| PresentError::Build(e.to_string())),
+        reencode_device_name_spaces,
+    )
+}
+
+/// Re-encode a `deviceSigned.nameSpaces` value (`#6.24(bstr .cbor DeviceNameSpaces)`) to its canonical
+/// `DeviceNameSpacesBytes` — extracting the tagged byte string's inner CBOR and re-wrapping it in a
+/// `#6.24(bstr)` tag, matching the verifier's reconstruction byte-for-byte.
+fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentError> {
+    let inner = match value {
+        CborValue::Tag(24, boxed) => match boxed.as_ref() {
+            CborValue::Bytes(bytes) => bytes.clone(),
+            _ => {
+                return Err(PresentError::Malformed(
+                    "deviceSigned.nameSpaces is not a #6.24(bstr)".to_owned(),
+                ))
+            }
+        },
+        _ => {
+            return Err(PresentError::Malformed(
+                "deviceSigned.nameSpaces is not a #6.24-tagged value".to_owned(),
+            ))
+        }
+    };
+    let tagged = CborValue::Tag(24, Box::new(CborValue::Bytes(inner)));
+    let mut buf = Vec::new();
+    ciborium::into_writer(&tagged, &mut buf).map_err(|e| PresentError::Build(e.to_string()))?;
+    Ok(buf)
 }
 
 /// Replace the `deviceSigned.deviceAuth.deviceSignature` of every document with `device_signature`

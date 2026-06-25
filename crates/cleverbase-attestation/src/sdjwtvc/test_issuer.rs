@@ -126,16 +126,42 @@ pub(crate) fn holder_cnf() -> RequiredKeyBinding {
 /// Mint a fresh SD-JWT VC (no KB-JWT yet) from the given issuer key/cert, with `given_name`,
 /// `family_name`, `birthdate` as selective disclosures + `iss`/`nbf`/`exp`/`vct` + a `cnf` binding.
 pub(crate) fn mint_sd_jwt(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
+    mint_sd_jwt_with_validity(
+        issuer_pk8,
+        issuer_cert_der,
+        json!(NOW - 1_000),
+        json!(NOW + 1_000_000),
+    )
+}
+
+/// Mint an SD-JWT VC with caller-supplied `nbf`/`exp` JSON values, so the issuer signature is valid
+/// over a *non-canonical* `NumericDate` (a JSON string, a non-integer float, or an out-of-`i64`-range
+/// integer) — the false-accept probes for [`super::check_validity`]. The non-canonical bound is
+/// signed by the real issuer key, so the credential clears the signature/trust checks and reaches the
+/// validity check, exactly as a forged credential with a non-canonical `exp` would.
+pub(crate) fn mint_sd_jwt_with_validity(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    nbf: Value,
+    exp: Value,
+) -> SdJwt {
     let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
-    let claims = json!({
+    let mut claims = json!({
         "iss": "https://issuer.example/cb",
         "vct": "https://credentials.example/identity_credential",
-        "nbf": NOW - 1_000,
-        "exp": NOW + 1_000_000,
         "given_name": "Ada",
         "family_name": "Lovelace",
         "birthdate": "1815-12-10",
     });
+    let object = claims.as_object_mut().expect("claims is a JSON object");
+    // A `null` bound means "omit the claim entirely" — the way to mint a credential that ASSERTS no
+    // `nbf`/`exp` (the absent case), distinct from a present-but-malformed bound (any other value).
+    if !nbf.is_null() {
+        object.insert("nbf".to_owned(), nbf);
+    }
+    if !exp.is_null() {
+        object.insert("exp".to_owned(), exp);
+    }
     let signer = Es256Signer::from_pkcs8(issuer_pk8);
     block_on(
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)

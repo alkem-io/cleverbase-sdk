@@ -22,6 +22,7 @@
 //! mdoc into a [`HeldAttestation`]. The pre-authorized-code grant is the self-contained flow the
 //! reference issuer supports without an interactive browser leg.
 
+use cleverbase_core::Secret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -197,11 +198,15 @@ pub struct ObtainSession {
     holder: HolderContext,
     offer: CredentialOffer,
     now_unix: i64,
-    /// The OpenID4VCI access token (set after the token exchange).
-    access_token: Option<String>,
+    /// The OpenID4VCI access token (set after the token exchange). Held as a redacting [`Secret`] so
+    /// the bearer token never appears in `Debug`/log/panic output (FR-010, Constitution Principle IV);
+    /// the host still receives it on the wire when the session is CBOR-serialized (by design in the
+    /// sans-IO model — only the `Debug` exposure was the leak).
+    access_token: Option<Secret>,
     /// The issuer `c_nonce` the PoP-JWT must echo (carried from the token response to the `Sign`
-    /// resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in).
-    pending_c_nonce: Option<String>,
+    /// resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in). Held as
+    /// a redacting [`Secret`] so the one-time nonce never appears in `Debug`/log output.
+    pending_c_nonce: Option<Secret>,
     /// The compact PoP-JWT spliced after the holder signed its input (set after the `Sign` step).
     proof_jwt: Option<String>,
 }
@@ -262,7 +267,7 @@ pub fn resume_obtain(
                 Ok(t) => t,
                 Err(e) => return Ok(fail(session, ObtainError::TokenRequest(e))),
             };
-            session.access_token = Some(token.access_token);
+            session.access_token = Some(Secret::new(token.access_token));
             // Build the PoP-JWT signing input bound to the credential-issuer `aud` + the issuer
             // `c_nonce`; the host signs it next (the signer-hook effect). The build is deterministic,
             // so the `Sign` arm re-derives the identical PoP-JWT and splices the returned signature —
@@ -277,15 +282,17 @@ pub fn resume_obtain(
                 Err(e) => return Ok(fail(session, ObtainError::Proof(e.to_string()))),
             };
             session.phase = ObtainPhase::ProofPending;
-            session.pending_c_nonce = Some(token.c_nonce);
+            session.pending_c_nonce = Some(Secret::new(token.c_nonce));
             Ok((session, ObtainStep::Sign(pop.input)))
         }
         ObtainPhase::ProofPending => {
             let signature = require_signature(input)?;
             let c_nonce = session
                 .pending_c_nonce
-                .clone()
-                .ok_or(ObtainError::UnexpectedInput)?;
+                .as_ref()
+                .ok_or(ObtainError::UnexpectedInput)?
+                .expose()
+                .to_owned();
             let pop = super::signer::build_pop_jwt(
                 &session.holder,
                 &session.backend.credential_issuer,
@@ -300,8 +307,10 @@ pub fn resume_obtain(
             session.phase = ObtainPhase::CredentialPending;
             let access_token = session
                 .access_token
-                .clone()
-                .ok_or(ObtainError::UnexpectedInput)?;
+                .as_ref()
+                .ok_or(ObtainError::UnexpectedInput)?
+                .expose()
+                .to_owned();
             let effect =
                 credential_request(&session.backend, &session.offer, &access_token, &proof_jwt);
             Ok((session, ObtainStep::PerformHttp(effect)))

@@ -20,8 +20,12 @@
 //! default gate. [`VerifyContext::qualified_gate`] is the seam: it is **off by default**, in which
 //! case the always-on bar runs and returns a complete verdict and `qualified_status` stays `None`.
 //! When enabled (and a [`VerifyContext::qualified_trust_list`] is supplied), the gate populates
-//! `VerificationResult.qualified_status` via [`crate::qualified::qualified_status`]; disabling it
-//! leaves the always-on verdict **byte-identical** to a gate-off run (no false "qualified" — SC-007).
+//! `VerificationResult.qualified_status` via [`crate::qualified::qualified_status`], which first
+//! **authenticates** the national TL (chain-validates its signer against
+//! [`VerifyContext::qualified_scheme_anchors`] + checks `NextUpdate` staleness): a forged / unsigned /
+//! unchained / stale TL — or no scheme anchor configured — yields `Indeterminate`, never `Qualified`
+//! (fail-closed). Disabling the gate leaves the always-on verdict **byte-identical** to a gate-off run
+//! (no false "qualified" — SC-007).
 
 use crate::mdoc::{self, MdocVerifyParams};
 use crate::openid4vp::{self, MdocVpToken, PresentationRequest, VpToken};
@@ -93,6 +97,14 @@ pub struct VerifyContext<'a> {
     ///
     /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
     pub qualified_trust_list: Option<&'a crate::qualified::QualifiedTrustList>,
+    /// The scheme-operator trust anchor(s) (DER) the opt-in gate authenticates the national TL
+    /// against (off-path unless `qualified_gate` is set). The gate chain-validates the TL's embedded
+    /// signer against these before reading status; an empty set (the default) with the gate enabled
+    /// means the TL cannot be authenticated → [`QualifiedStatus::Indeterminate`] (can't authenticate
+    /// ⇒ can't assert qualified — never a false "qualified"). Host-supplied (the core stays sans-IO).
+    ///
+    /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
+    pub qualified_scheme_anchors: &'a [Vec<u8>],
 }
 
 impl Default for VerifyContext<'_> {
@@ -106,6 +118,7 @@ impl Default for VerifyContext<'_> {
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
+            qualified_scheme_anchors: &[],
         }
     }
 }
@@ -252,12 +265,15 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 
 /// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer at the relevant
 /// time (`ctx.now_unix`), reading the host-supplied national Trusted List ([`VerifyContext::
-/// qualified_trust_list`]).
+/// qualified_trust_list`]) only after it **authenticates** against the host-configured
+/// scheme-operator anchors ([`VerifyContext::qualified_scheme_anchors`]).
 ///
 /// Resolves the credential's claimed signing certificate (the SD-JWT VC JWS `x5c` leaf / the mdoc
-/// `IssuerAuth` x5chain leaf) and delegates to [`crate::qualified::qualified_status`]. When the cert
-/// cannot be read, or no trust list was supplied, it returns [`QualifiedStatus::Indeterminate`] —
-/// the data needed to decide is absent (never a false "qualified", SC-007).
+/// `IssuerAuth` x5chain leaf) and delegates to [`crate::qualified::qualified_status`], which
+/// chain-authenticates the TL's signer against the scheme anchors and checks `NextUpdate` staleness
+/// before reading any status. When the cert cannot be read, no trust list was supplied, or the list
+/// fails to authenticate, it returns [`QualifiedStatus::Indeterminate`] — the data needed to decide
+/// is absent or untrustworthy (never a false "qualified", SC-007).
 ///
 /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 fn qualified_status_for(
@@ -275,9 +291,16 @@ fn qualified_status_for(
             device_response, ..
         } => mdoc::issuer_signing_cert_der(device_response),
     };
-    // The signing cert cannot be read from the presentation → the data needed is absent.
+    // The signing cert cannot be read from the presentation → the data needed is absent. Otherwise
+    // the determination authenticates the TL (signer chains to a scheme anchor + not stale) BEFORE
+    // reading status — a forged/unsigned/unchained/stale TL yields Indeterminate, never Qualified.
     issuer_cert_der.map_or(QualifiedStatus::Indeterminate, |cert_der| {
-        crate::qualified::qualified_status(&cert_der, ctx.now_unix, trust_list)
+        crate::qualified::qualified_status(
+            &cert_der,
+            ctx.now_unix,
+            trust_list,
+            ctx.qualified_scheme_anchors,
+        )
     })
 }
 

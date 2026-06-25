@@ -13,8 +13,9 @@ use sd_jwt_payload::{Hasher, KeyBindingJwt, RequiredKeyBinding, SdJwtBuilder};
 use serde_json::{json, Value};
 
 use super::test_issuer::{
-    attach_kb_jwt, block_on, mint_sd_jwt, Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8,
-    ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
+    attach_kb_jwt, block_on, mint_sd_jwt, mint_sd_jwt_with_validity, Es256Signer, Sha2Hasher,
+    HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER,
+    WRONG_ISSUER_KEY_PK8,
 };
 use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
 use crate::trust::StaticTestAnchors;
@@ -166,6 +167,127 @@ fn not_yet_valid_credential_is_rejected_as_expired() {
 }
 
 #[test]
+fn non_integer_string_exp_is_rejected_not_ignored() {
+    // FALSE-ACCEPT PROBE: an `exp` that is a JSON string ("200") is not a NumericDate. The old code
+    // read it via `as_i64()` → `None` and SKIPPED the check, accepting an expired credential as having
+    // unbounded validity. A present-but-unparseable `exp` MUST reject, never be ignored.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        json!(NOW - 1_000),
+        json!("200"),
+    );
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    // `now` is well past the (intended) 200-second epoch instant — the credential is expired, and the
+    // verifier must not silently treat the unreadable `exp` as "no upper bound".
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn non_integer_float_exp_is_rejected_not_ignored() {
+    // FALSE-ACCEPT PROBE: a non-integer float `exp` (200.5) is not an `i64`; the old `as_i64()` path
+    // returned `None` and skipped the bound. A present-but-non-integer NumericDate MUST reject.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        json!(NOW - 1_000),
+        json!(200.5),
+    );
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn out_of_i64_range_exp_is_rejected_not_ignored() {
+    // FALSE-ACCEPT PROBE: an `exp` of 2^64-1 (u64::MAX) is a JSON number but exceeds i64::MAX, so
+    // `as_i64()` returns `None` and the old code skipped the bound — an effectively-unbounded credential
+    // would be accepted. An out-of-range NumericDate MUST reject.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        json!(NOW - 1_000),
+        json!(u64::MAX),
+    );
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn non_integer_string_nbf_is_rejected_not_ignored() {
+    // The same false-accept hole applies to `nbf`: a present-but-unparseable not-before MUST reject
+    // rather than be skipped (skipping a future `nbf` would accept a not-yet-valid credential).
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        json!("not-a-date"),
+        json!(NOW + 1_000_000),
+    );
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn credential_without_exp_or_nbf_is_accepted_with_no_temporal_bound() {
+    // DOCUMENTED POLICY (#2): per RFC 9901 / SD-JWT VC, `nbf`/`exp` are OPTIONAL. A credential that
+    // asserts neither bound carries no temporal window here and is accepted — intentionally, not
+    // accidentally (the absent-vs-present distinction is what `numeric_date` encodes). A relying party
+    // that requires an upper bound rejects a no-`exp` credential at the policy layer.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        Value::Null, // a null bound means "omit the claim entirely" → `nbf`/`exp` are ABSENT.
+        Value::Null,
+    );
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert!(
+        result.valid,
+        "an RFC-valid no-exp/no-nbf credential must still verify; reasons {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn check_validity_distinguishes_absent_from_malformed_bounds() {
+    // Direct unit coverage of the absent-vs-present-but-malformed distinction the false-accept fix
+    // turns on, exercised over `numeric_date` via `check_validity`.
+    use super::check_validity;
+    use sd_jwt_payload::SdJwtClaims;
+
+    // Both bounds absent → no window, always OK.
+    let none: SdJwtClaims = serde_json::from_value(json!({})).unwrap();
+    assert!(check_validity(&none, NOW).is_ok());
+
+    // A present integer window inside which `now` falls → OK.
+    let ok: SdJwtClaims =
+        serde_json::from_value(json!({ "nbf": NOW - 1, "exp": NOW + 1 })).unwrap();
+    assert!(check_validity(&ok, NOW).is_ok());
+
+    // A present-but-string `exp` → MalformedCredential (never skipped).
+    let bad_exp: SdJwtClaims = serde_json::from_value(json!({ "exp": "200" })).unwrap();
+    assert_eq!(
+        check_validity(&bad_exp, NOW),
+        Err(ReasonCode::MalformedCredential)
+    );
+
+    // A present float `nbf` → MalformedCredential.
+    let bad_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 1.5 })).unwrap();
+    assert_eq!(
+        check_validity(&bad_nbf, NOW),
+        Err(ReasonCode::MalformedCredential)
+    );
+}
+
+#[test]
 fn untrusted_issuer_certificate_is_rejected_as_untrusted_issuer() {
     // A credential validly self-signed by the wrong-issuer key+cert: its own signature verifies, but
     // the cert is NOT on the configured anchor → UntrustedIssuer (no false-accept).
@@ -218,6 +340,23 @@ fn forged_disclosure_with_unsigned_digest_is_rejected_as_disclosure_integrity() 
     let forged = splice_forged_disclosure(&presentation);
     let anchors = trusted_anchors();
     let mut inp = input(&forged, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::DisclosureIntegrity);
+}
+
+#[test]
+fn duplicate_disclosure_is_rejected_as_disclosure_integrity() {
+    // RFC 9901 §7.3: a digest occurring more than once makes the SD-JWT invalid. Duplicate a
+    // legitimately-issued disclosure (its digest IS signed, so it passes the membership check) — the
+    // SECOND occurrence of the same digest must be rejected, not silently accepted. Use an issuer-only
+    // presentation so disclosure integrity is the failing check under test (a KB-bound presentation
+    // would also break the `sd_hash` over the mutated prefix).
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = sd_jwt.presentation();
+    let duplicated = duplicate_first_disclosure(&presentation);
+    let anchors = trusted_anchors();
+    let mut inp = input(&duplicated, &anchors);
     inp.key_binding = None;
     let result = verify_sd_jwt_vc(&inp);
     assert_invalid(&result, ReasonCode::DisclosureIntegrity);
@@ -323,6 +462,23 @@ fn splice_forged_disclosure(presentation: &str) -> String {
     let kb_idx = segments.len() - 1;
     segments.insert(kb_idx, &forged);
     segments.join("~")
+}
+
+/// Duplicate the first disclosure segment, inserting a second copy before the (empty) KB segment so
+/// the same issuer-signed digest appears twice (RFC 9901 §7.3 invalidates a repeated digest).
+fn duplicate_first_disclosure(presentation: &str) -> String {
+    // presentation = jws~D1~...~Dn~  (issuer-only: a trailing `~`, no KB segment).
+    let segments: Vec<&str> = presentation.split('~').collect();
+    assert!(
+        segments.len() >= 3,
+        "need at least one disclosure to duplicate"
+    );
+    let first_disclosure = segments[1].to_owned();
+    let mut out: Vec<String> = segments.iter().map(ToString::to_string).collect();
+    // Insert the duplicate right after the original disclosure (before the remaining segments / the
+    // trailing empty KB slot).
+    out.insert(2, first_disclosure);
+    out.join("~")
 }
 
 /// Split off the first `~`-delimited segment (the issuer JWS) from the rest.

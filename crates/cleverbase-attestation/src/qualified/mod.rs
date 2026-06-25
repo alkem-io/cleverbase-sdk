@@ -26,13 +26,23 @@
 //! (`1.4.1`) and is **off by default** ([`crate::verify::VerifyContext::qualified_gate`]) — enabling
 //! it is opt-in, and absent fixtures honestly yield `Indeterminate`.
 //!
-//! ## Trust-list authentication (scope)
+//! ## Trust-list authentication (fail-closed — SC-007)
 //!
-//! The national TL is **authenticated** by chain-validating its embedded signer certificate against
-//! a configured scheme-operator anchor, reusing [`crate::trust::chain::verify_chain`] (the same X.509
-//! primitive the always-on bar uses — DRY). The full enveloped XML-DSig `SignatureValue`/C14N check
-//! is the always-on engine's remaining production hardening ([`crate::trust::xml`]); the offline
-//! JSON form here carries the signer cert so the gate exercises the same chain-authentication seam.
+//! Before any status is read, the national TL is **authenticated** by
+//! [`QualifiedTrustList::authenticate`]: it chain-validates the list's embedded signer certificate
+//! ([`QualifiedTrustList::signer_cert_der`]) against a host-configured **scheme-operator trust
+//! anchor**, reusing [`crate::trust::chain::verify_chain`] (the same X.509 primitive the always-on
+//! bar uses — DRY; no re-implemented crypto), and rejects a **stale** list (`now_unix` at/after its
+//! `NextUpdate`). An unsigned list (no signer), a signer that does not chain to the scheme anchor,
+//! and a stale list all **fail** authentication. [`qualified_status`] runs `authenticate` first and
+//! returns [`QualifiedStatus::Indeterminate`] (NEVER [`QualifiedStatus::Qualified`]) on any failure
+//! — fail-closed, consistent with the always-on engine's stale/auth policy ([`crate::trust::engine`])
+//! and the spec-003 pattern. A forged / attacker-supplied / unsigned TL can therefore never make an
+//! unchained issuer report `Qualified`.
+//!
+//! The full enveloped XML-DSig `SignatureValue`/C14N check is the always-on engine's remaining
+//! production hardening ([`crate::trust::xml`]); the offline JSON form here carries the signer cert
+//! so the gate exercises the same chain-authentication seam against the same X.509 stack.
 
 #[cfg(test)]
 mod tests;
@@ -73,6 +83,28 @@ pub enum QualifiedTrustListError {
     /// A `nextUpdate` or status `startingTime` was not an RFC 3339 UTC timestamp.
     #[error("qualified trust list timestamp is not a valid RFC 3339 UTC instant: {0}")]
     Time(String),
+}
+
+/// Why authenticating a national Trusted List failed (before any status is read).
+///
+/// Every failure is fail-closed: [`qualified_status`] maps any of these onto
+/// [`QualifiedStatus::Indeterminate`] (never [`QualifiedStatus::Qualified`] — SC-007). The variants
+/// keep the rejection specific so a forged / unsigned / unchained / stale list is never opaque.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QualifiedTrustError {
+    /// No scheme-operator trust anchor was configured, so the list's authenticity cannot be
+    /// established (can't authenticate ⇒ can't assert qualified).
+    #[error("no scheme-operator trust anchor configured to authenticate the qualified trust list")]
+    NoSchemeAnchor,
+    /// The list carries no embedded signer certificate (an unsigned list cannot be authenticated).
+    #[error("qualified trust list is unsigned (no embedded signer certificate)")]
+    Unsigned,
+    /// The list's signer certificate did not chain-validate to any configured scheme-operator anchor.
+    #[error("qualified trust list signer does not chain to a scheme-operator anchor: {0}")]
+    SignerNotTrusted(crate::trust::chain::ChainError),
+    /// The list is stale: `now` is at or after its `NextUpdate` (or it carries no `NextUpdate`).
+    #[error("qualified trust list is stale (now is at/after its NextUpdate)")]
+    Stale,
 }
 
 /// One status-history record of a trust service: a status URI in force from `starting_time` onward
@@ -235,6 +267,52 @@ impl QualifiedTrustList {
         self.next_update_unix
     }
 
+    /// Authenticate the national Trusted List **before** any status is read (the fail-closed gate —
+    /// SC-007).
+    ///
+    /// Authentication has two parts, both mandatory:
+    ///
+    /// 1. **Signer chain** — the list's embedded signer certificate
+    ///    ([`Self::signer_cert_der`]) must chain-validate to one of the host-configured
+    ///    `scheme_anchors` (the scheme-operator / national-TL-operator trust anchors), at `now_unix`,
+    ///    via [`crate::trust::chain::verify_chain`] (DRY — the same X.509 primitive the always-on bar
+    ///    uses; no re-implemented crypto). An **unsigned** list (no signer) or a signer that does not
+    ///    chain fails. When `scheme_anchors` is empty the list cannot be authenticated at all
+    ///    ([`QualifiedTrustError::NoSchemeAnchor`]).
+    /// 2. **Freshness** — the list must not be **stale**: `now_unix` must be strictly before its
+    ///    `NextUpdate` (a list with an absent/zero `NextUpdate` is treated as stale). This mirrors the
+    ///    always-on engine's `now >= NextUpdate ⇒ stale` policy ([`crate::trust::engine`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QualifiedTrustError`] when no scheme anchor is configured, the list is unsigned, the
+    /// signer does not chain to a scheme anchor, or the list is stale. Every variant is mapped to
+    /// [`QualifiedStatus::Indeterminate`] by [`qualified_status`] (never `Qualified`).
+    pub fn authenticate(
+        &self,
+        scheme_anchors: &[Vec<u8>],
+        now_unix: i64,
+    ) -> Result<(), QualifiedTrustError> {
+        // Can't authenticate ⇒ can't assert qualified: an empty scheme-anchor set fails closed.
+        if scheme_anchors.is_empty() {
+            return Err(QualifiedTrustError::NoSchemeAnchor);
+        }
+        // An unsigned list (no embedded signer) cannot be authenticated.
+        let signer = self
+            .signer_cert_der
+            .as_deref()
+            .ok_or(QualifiedTrustError::Unsigned)?;
+        // Chain-validate the signer against the scheme-operator anchor(s) — reuse the always-on X.509
+        // primitive (DRY); a forged/attacker-supplied signer that does not chain is rejected.
+        crate::trust::chain::verify_chain(signer, scheme_anchors, now_unix)
+            .map_err(QualifiedTrustError::SignerNotTrusted)?;
+        // Freshness: a list at/after its NextUpdate (or with none) is stale — never authoritative.
+        if self.next_update_unix <= 0 || now_unix >= self.next_update_unix {
+            return Err(QualifiedTrustError::Stale);
+        }
+        Ok(())
+    }
+
     /// The trust-service entries covering an issuer signing certificate (matched by exact DER
     /// equality — the trust-list entry pins the signing cert), or an empty slice if absent.
     fn services_for(&self, issuer_cert_der: &[u8]) -> &[ServiceEntry] {
@@ -247,23 +325,40 @@ impl QualifiedTrustList {
 /// Determine the eIDAS qualified status of an attestation issuer at a relevant time (TS 119 615
 /// v1.4.1 cl. 4.12 — the opt-in gate, research D6).
 ///
-/// Matches `issuer_cert_der` (the credential's signing certificate) against the national TL's
-/// trust-service entries, then reads the effective service status **at `relevant_time_unix`** (the
-/// credential's issuance/relevant time, NOT "now"):
+/// **Authenticates the national TL first** ([`QualifiedTrustList::authenticate`] against the
+/// host-configured scheme-operator `scheme_anchors`, at `relevant_time_unix`): an unsigned / forged /
+/// unchained / stale list yields [`QualifiedStatus::Indeterminate`] before any status is read
+/// (fail-closed — a forged TL can never make an unchained issuer report `Qualified`, SC-007). Only an
+/// authenticated list is consulted.
+///
+/// On an authenticated list it then matches `issuer_cert_der` (the credential's signing certificate)
+/// against the trust-service entries and reads the effective service status **at
+/// `relevant_time_unix`** (the credential's issuance/relevant time, NOT "now"):
 ///
 /// - [`QualifiedStatus::Qualified`] — some matched [`EAA_Q_SERVICE_TYPE`] service is
 ///   [`SERVICE_STATUS_GRANTED`] at the relevant time.
 /// - [`QualifiedStatus::NotQualified`] — the issuer is **found** on the TL, but no `EAA/Q` service is
 ///   granted at the relevant time (it is withdrawn/suspended, the grant had not begun, or the only
 ///   matched service is non-`EAA/Q`).
-/// - [`QualifiedStatus::Indeterminate`] — the issuer is on **no** service entry (the data needed to
-///   decide is absent). Never assumes qualified (no false "qualified" — SC-007).
+/// - [`QualifiedStatus::Indeterminate`] — the TL did not authenticate, **or** the issuer is on **no**
+///   service entry (the data needed to decide is absent/unreachable). Never assumes qualified (no
+///   false "qualified" — SC-007).
 #[must_use]
 pub fn qualified_status(
     issuer_cert_der: &[u8],
     relevant_time_unix: i64,
     trust_list: &QualifiedTrustList,
+    scheme_anchors: &[Vec<u8>],
 ) -> QualifiedStatus {
+    // Authenticate the list against the scheme-operator anchor BEFORE reading any status. A forged /
+    // unsigned / unchained / stale list cannot be authoritative → Indeterminate, never Qualified.
+    if trust_list
+        .authenticate(scheme_anchors, relevant_time_unix)
+        .is_err()
+    {
+        return QualifiedStatus::Indeterminate;
+    }
+
     let services = trust_list.services_for(issuer_cert_der);
     if services.is_empty() {
         // The issuer is on no service entry — the trust-list data needed to decide is absent.

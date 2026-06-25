@@ -12,6 +12,9 @@ documentation = "https://docs.rs/cleverbase-attestation"
 description = "Sans-IO EUDI attestation core for the Cleverbase SDK: SD-JWT VC + ISO 18013-5 mdoc verification, EU trust-list anchoring, and OpenID4VP binding."
 
 [dependencies]
+# The signing core's redacting `Secret` newtype is reused for the OAuth bearer token (DRY — one
+# authoritative secret-redaction type; Constitution Principle IV: never leak secrets via Debug).
+cleverbase-core = { path = "../cleverbase-core" }
 serde.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true

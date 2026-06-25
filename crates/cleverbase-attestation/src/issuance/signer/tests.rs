@@ -88,6 +88,61 @@ fn holder_context_carries_only_public_material_no_private_key() {
 }
 
 #[test]
+fn private_jwk_members_are_stripped_before_embedding_in_pop_jwt_and_cnf() {
+    // A common JWK-export mistake leaves private/symmetric members attached to a "public" JWK. The
+    // SDK is the documented last line of defense (FR-010 / Constitution IV): it MUST strip them before
+    // the JWK is embedded anywhere on the wire (the PoP-JWT JOSE header POSTed to the issuer, and the
+    // `cnf` the issuer binds).
+    let mut leaky = serde_json::from_slice::<Value>(HOLDER_JWK_JSON).expect("holder JWK");
+    let obj = leaky.as_object_mut().expect("jwk object");
+    // The EC private scalar plus every RSA CRT / symmetric member the SDK promises to drop.
+    for member in ["d", "p", "q", "dp", "dq", "qi", "k", "oth"] {
+        obj.insert(
+            member.to_owned(),
+            Value::String("LEAKED-PRIVATE".to_owned()),
+        );
+    }
+    let ctx = HolderContext::new(leaky, "holder-key-handle");
+
+    // public_jwk_only() / cnf() emit only the public key.
+    let public = ctx.public_jwk_only();
+    let cnf = ctx.cnf();
+    for member in ["d", "p", "q", "dp", "dq", "qi", "k", "oth"] {
+        assert!(
+            public.get(member).is_none(),
+            "public_jwk_only must strip `{member}`"
+        );
+        assert!(
+            cnf["jwk"].get(member).is_none(),
+            "cnf must strip `{member}`"
+        );
+    }
+    // The public coordinates survive (the key is still usable).
+    assert_eq!(public.get("kty").and_then(Value::as_str), Some("EC"));
+    assert!(public.get("x").is_some() && public.get("y").is_some());
+
+    // The PoP-JWT JOSE header carries the STRIPPED JWK — no private member rides to the issuer, and
+    // the raw token text never contains the leaked sentinel.
+    let build = build_pop_jwt(&ctx, ISSUER_ID, C_NONCE, NOW).expect("build PoP-JWT");
+    let pop_jwt = build.assemble(&[0u8; 64]).expect("assemble PoP-JWT");
+    let header_b64 = pop_jwt.split('.').next().expect("header");
+    let header: Value =
+        serde_json::from_slice(&Base64UrlUnpadded::decode_vec(header_b64).expect("hdr b64"))
+            .expect("hdr json");
+    let header_jwk = header.get("jwk").expect("header jwk");
+    for member in ["d", "p", "q", "dp", "dq", "qi", "k", "oth"] {
+        assert!(
+            header_jwk.get(member).is_none(),
+            "the PoP-JWT header JWK must not carry `{member}`"
+        );
+    }
+    assert!(
+        !pop_jwt.contains("LEAKED-PRIVATE"),
+        "no private member value may appear anywhere in the PoP-JWT"
+    );
+}
+
+#[test]
 fn public_sec1_rejects_non_p256_jwk() {
     assert!(HolderContext::new(json!({"kty": "RSA"}), "h")
         .public_sec1()
@@ -234,9 +289,15 @@ fn device_signature_built_via_signer_hook_verifies_under_us1_openid4vp() {
     // The SDK builds the DeviceSignature signing input over the DeviceAuthentication; the stub HSM
     // signs the COSE Sig_structure; the SDK splices → a detached COSE_Sign1.
     let doc_type = "org.iso.18013.5.1.mDL";
+    // The test issuer's DeviceResponse carries an empty DeviceNameSpaces, so sign over the matching
+    // empty `DeviceNameSpacesBytes` (the verifier rebuilds DeviceAuthentication from the document's
+    // actual deviceSigned.nameSpaces).
+    let device_name_spaces_bytes =
+        crate::issuance::device::empty_device_name_spaces_bytes().expect("empty device namespaces");
     let build = build_device_signature(
         doc_type,
         &transcript,
+        &device_name_spaces_bytes,
         &request.audience,
         request.nonce_b64().as_str(),
     )

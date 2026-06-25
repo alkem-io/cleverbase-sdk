@@ -256,9 +256,22 @@ fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::Verifying
 }
 
 /// Check the `nbf`/`exp` validity window against `now` (RFC 9901 carries the JWT `nbf`/`exp` claims).
+///
+/// `nbf`/`exp` are JWT `NumericDate`s (RFC 7519 §2): a JSON number of seconds since the epoch. A
+/// **present** bound MUST be a NumericDate this verifier can evaluate; a present-but-unparseable bound
+/// (a JSON string `"200"`, a non-integer float `200.5`, or a magnitude outside `i64`) is NOT silently
+/// ignored — that would let an expired credential with a non-canonical `exp` be accepted as having
+/// unbounded validity (a false-accept). Instead it rejects: a malformed bound is `MalformedCredential`
+/// (we cannot trust a window we cannot read).
+///
+/// A bound that is **absent** is permitted (RFC 9901 / SD-JWT VC make `exp`/`nbf` optional). This is
+/// an intentional, documented policy: a credential with no `exp` carries no upper temporal bound here.
+/// A relying party that requires an upper bound MUST reject a no-`exp` credential at the
+/// [`crate::status`] / policy layer (the seam where reachability/qualified policy already lives); the
+/// always-on bar does not fabricate a bound the issuer did not assert.
 fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Validity, ReasonCode> {
-    let not_before = claims.get("nbf").and_then(Value::as_i64);
-    let not_after = claims.get("exp").and_then(Value::as_i64);
+    let not_before = numeric_date(claims.get("nbf"))?;
+    let not_after = numeric_date(claims.get("exp"))?;
     if let Some(nbf) = not_before {
         if now < nbf {
             return Err(ReasonCode::Expired);
@@ -272,6 +285,25 @@ fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Vali
     Ok(Validity {
         not_before,
         not_after,
+    })
+}
+
+/// Read an optional JWT `NumericDate` claim (`nbf`/`exp`), distinguishing **absent** from
+/// **present-but-malformed**.
+///
+/// - `None` (claim absent) → `Ok(None)`: the bound is optional and simply not asserted.
+/// - A JSON integer that fits `i64` → `Ok(Some(_))`: the canonical NumericDate.
+/// - A claim that is **present** but is not an `i64`-representable integer (a JSON string, a
+///   non-integer float, `null`, or a number outside `i64`) → `Err(MalformedCredential)`: the window
+///   is uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential
+///   with a non-canonical `exp` would read as unbounded). RFC 7519 §2 defines NumericDate as a JSON
+///   number; we reject anything we cannot evaluate against `now` rather than ignore it.
+fn numeric_date(claim: Option<&Value>) -> Result<Option<i64>, ReasonCode> {
+    claim.map_or(Ok(None), |value| {
+        value
+            .as_i64()
+            .map(Some)
+            .ok_or(ReasonCode::MalformedCredential)
     })
 }
 
@@ -396,9 +428,16 @@ fn collect_disclosed_attributes(
     collect_signed_digests(&claims_value, &mut signed_digests);
 
     let mut disclosed = BTreeMap::new();
+    let mut seen_digests = std::collections::BTreeSet::new();
     for disclosure in sd_jwt.disclosures() {
         let digest = Base64UrlUnpadded::encode_string(&sha256(disclosure.as_str().as_bytes()));
         if !signed_digests.contains(&digest) {
+            return Err(ReasonCode::DisclosureIntegrity);
+        }
+        // RFC 9901 §7.3: if any digest is encountered more than once during processing the SD-JWT is
+        // invalid. A presentation that repeats the same disclosure (same digest) is rejected — a
+        // duplicate could otherwise pass the membership check and be silently accepted.
+        if !seen_digests.insert(digest) {
             return Err(ReasonCode::DisclosureIntegrity);
         }
         // Object-property disclosures carry a claim name; array-element disclosures do not — the

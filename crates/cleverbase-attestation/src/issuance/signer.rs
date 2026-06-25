@@ -188,11 +188,25 @@ impl HolderContext {
         }
     }
 
+    /// The holder JWK with **every private/symmetric member stripped** (`d`, `p`, `q`, `dp`, `dq`,
+    /// `qi`, `k`, `oth`) so only the public key is ever emitted on the wire (FR-010, Constitution
+    /// Principle IV — the SDK MUST NEVER leak secrets).
+    ///
+    /// A [`HolderContext`] is supposed to carry only the holder *public* JWK, but a common JWK-export
+    /// mistake leaves the private scalar `d` (or the RSA CRT params) attached. The SDK is the
+    /// documented last line of defense, so it strips them here rather than trusting the integrator to
+    /// have done so — used at **every** embed site (the PoP-JWT JOSE header and the `cnf`).
+    #[must_use]
+    pub fn public_jwk_only(&self) -> Value {
+        public_jwk_only(&self.holder_public_jwk)
+    }
+
     /// The holder public key as a `cnf` confirmation object (`{"jwk": <public JWK>}`, RFC 7800) — the
-    /// shape an SD-JWT VC issuer embeds so the verifier can check the KB-JWT against the bound key.
+    /// shape an SD-JWT VC issuer embeds so the verifier can check the KB-JWT against the bound key. The
+    /// embedded JWK is stripped of any private members via [`Self::public_jwk_only`] (FR-010).
     #[must_use]
     pub fn cnf(&self) -> Value {
-        json!({ "jwk": self.holder_public_jwk.clone() })
+        json!({ "jwk": self.public_jwk_only() })
     }
 
     /// The raw uncompressed SEC1 public point (`0x04 ‖ X ‖ Y`, 65 bytes) of the holder key, decoded
@@ -319,7 +333,9 @@ pub fn build_pop_jwt(
     let header = json!({
         "typ": "openid4vci-proof+jwt",
         "alg": alg.jose_alg(),
-        "jwk": holder.holder_public_jwk.clone(),
+        // Strip any private members before the holder JWK travels in the JOSE header POSTed to the
+        // issuer (FR-010 — never leak a private scalar a mis-exported HolderContext might carry).
+        "jwk": holder.public_jwk_only(),
     });
     let payload = json!({
         "aud": audience,
@@ -400,6 +416,23 @@ pub fn build_kb_jwt(
         },
         prefix,
     })
+}
+
+/// The JWK members that carry **private** or **symmetric** key material (RFC 7517 §4 / RFC 7518
+/// §6) — the EC private scalar, the RSA private exponent + CRT factors, and the `oct` symmetric key.
+/// Stripped before a JWK is embedded anywhere on the wire so a private key can never leak (FR-010).
+const JWK_PRIVATE_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "k", "oth"];
+
+/// Return a copy of `jwk` with every private/symmetric member removed (see [`JWK_PRIVATE_MEMBERS`]),
+/// leaving only the public key. A non-object value is returned unchanged (there is nothing to strip).
+fn public_jwk_only(jwk: &Value) -> Value {
+    let mut jwk = jwk.clone();
+    if let Some(obj) = jwk.as_object_mut() {
+        for member in JWK_PRIVATE_MEMBERS {
+            obj.remove(*member);
+        }
+    }
+    jwk
 }
 
 /// SHA-256 of `input` (the SDK's own `sha2` — research D1, no second crypto stack).

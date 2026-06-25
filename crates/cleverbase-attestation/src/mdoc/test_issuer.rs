@@ -93,6 +93,19 @@ pub(crate) struct MdocBuilder {
     /// When `Some`, splice this externally-built `deviceSignature` COSE_Sign1 (CBOR) in place of one
     /// signed in-process — the US2 signer-hook round-trip (the SDK built + spliced it via the hook).
     device_signature_override: Option<Vec<u8>>,
+    /// When set, append a SECOND document (a clone of the first with a corrupted IssuerAuth signature)
+    /// to drive the multi-document false-accept probe.
+    append_forged_document: bool,
+    /// When `Some`, set the top-level `DeviceResponse.status` to this value (non-zero drives the
+    /// device-reported-error reject path).
+    status_override: Option<i64>,
+    /// When set, omit the top-level `DeviceResponse.status` entirely (drives the absent-status reject).
+    omit_status: bool,
+    /// When set, emit an EMPTY `documents` array (drives the no-documents-to-verify reject).
+    empty_documents: bool,
+    /// When set, add a top-level `documentErrors` entry (the device could not return a requested
+    /// document — the response is not a complete success and must be rejected).
+    add_document_errors: bool,
 }
 
 /// The hash to compute `valueDigests` with, plus its MSO `digestAlgorithm` name.
@@ -192,7 +205,43 @@ impl MdocBuilder {
             tdate_tagged: false,
             mso_doc_type_mismatch: false,
             device_signature_override: None,
+            append_forged_document: false,
+            status_override: None,
+            omit_status: false,
+            empty_documents: false,
+            add_document_errors: false,
         }
+    }
+
+    /// Emit an empty `documents` array (no credential to verify → reject).
+    pub(super) fn empty_documents(mut self) -> Self {
+        self.empty_documents = true;
+        self
+    }
+
+    /// Add a top-level `documentErrors` entry (the device reported it could not return a document).
+    pub(super) fn add_document_errors(mut self) -> Self {
+        self.add_document_errors = true;
+        self
+    }
+
+    /// Append a second, forged document (a clone of the first with a broken IssuerAuth signature) so
+    /// the response carries two documents — the multi-document false-accept probe.
+    pub(super) fn append_forged_document(mut self) -> Self {
+        self.append_forged_document = true;
+        self
+    }
+
+    /// Set the top-level `DeviceResponse.status` (a non-zero value is a device-reported error).
+    pub(super) fn status(mut self, status: i64) -> Self {
+        self.status_override = Some(status);
+        self
+    }
+
+    /// Omit the top-level `DeviceResponse.status` field entirely (a malformed response).
+    pub(super) fn omit_status(mut self) -> Self {
+        self.omit_status = true;
+        self
     }
 
     /// Splice an externally-built `deviceSignature` COSE_Sign1 (CBOR) — the US2 signer-hook
@@ -273,10 +322,24 @@ impl MdocBuilder {
         self
     }
 
-    /// Set the validity window (RFC 3339 `Z` strings).
+    /// Set the validity window (RFC 3339 `Z` strings). `signed` is clamped to the EARLIER of the
+    /// existing `signed` and the new `valid_from` so the MSO stays internally consistent
+    /// (`signed <= validFrom`, which the verifier enforces) without ever pushing `signed` into the
+    /// future for a not-yet-valid window. RFC 3339 `Z` strings sort lexicographically by instant, so a
+    /// string `min` is a correct instant `min`.
     pub(super) fn validity(mut self, valid_from: &str, valid_until: &str) -> Self {
+        if valid_from < self.signed.as_str() {
+            self.signed = valid_from.to_owned();
+        }
         self.valid_from = valid_from.to_owned();
         self.valid_until = valid_until.to_owned();
+        self
+    }
+
+    /// Override the MSO `validityInfo.signed` instant independently (RFC 3339 `Z` string) — used to
+    /// drive the future-`signed` reject path (a `signed` after `now`/`validFrom` is a tamper).
+    pub(super) fn signed(mut self, signed: &str) -> Self {
+        self.signed = signed.to_owned();
         self
     }
 
@@ -538,22 +601,94 @@ impl MdocBuilder {
             (CborValue::Text("issuerSigned".to_owned()), issuer_signed),
             (CborValue::Text("deviceSigned".to_owned()), device_signed),
         ]);
-        let device_response = CborValue::Map(vec![
+
+        // `documents` is normally a single verified document. The multi-document false-accept probe
+        // appends a SECOND document whose IssuerAuth signature is corrupted: if the verifier checks
+        // only `documents[0]`, this forged document rides inside a VALID verdict; a correct verifier
+        // (verifying every document) rejects it on the IssuerAuth signature.
+        let mut documents = if self.empty_documents {
+            Vec::new()
+        } else {
+            vec![document.clone()]
+        };
+        if self.append_forged_document {
+            documents.push(forge_document_with_broken_issuer_auth(&document));
+        }
+
+        let mut response_entries = vec![
             (
                 CborValue::Text("version".to_owned()),
                 CborValue::Text("1.0".to_owned()),
             ),
             (
                 CborValue::Text("documents".to_owned()),
-                CborValue::Array(vec![document]),
+                CborValue::Array(documents),
             ),
             (
                 CborValue::Text("status".to_owned()),
-                CborValue::Integer(0.into()),
+                CborValue::Integer(self.status_override.unwrap_or(0).into()),
             ),
-        ]);
-        encode(&device_response)
+        ];
+        if self.add_document_errors {
+            // A `documentErrors` map: one requested docType the device could not return.
+            response_entries.push((
+                CborValue::Text("documentErrors".to_owned()),
+                CborValue::Array(vec![CborValue::Map(vec![(
+                    CborValue::Text("org.iso.18013.5.1.mDL".to_owned()),
+                    CborValue::Integer(0.into()),
+                )])]),
+            ));
+        }
+        if self.omit_status {
+            response_entries.retain(|(k, _)| k.as_text() != Some("status"));
+        }
+        encode(&CborValue::Map(response_entries))
     }
+}
+
+/// Clone a built `Document` and corrupt its IssuerAuth signature byte, producing a forged document
+/// whose issuer signature must fail verification (the multi-document false-accept probe).
+fn forge_document_with_broken_issuer_auth(document: &CborValue) -> CborValue {
+    let CborValue::Map(entries) = document else {
+        panic!("document is a CBOR map")
+    };
+    let forged = entries
+        .iter()
+        .map(|(k, v)| {
+            if k.as_text() == Some("issuerSigned") {
+                (k.clone(), corrupt_issuer_auth_in_issuer_signed(v))
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    CborValue::Map(forged)
+}
+
+/// Within an `issuerSigned` map, re-encode the `issuerAuth` COSE_Sign1 with a flipped signature byte.
+fn corrupt_issuer_auth_in_issuer_signed(issuer_signed: &CborValue) -> CborValue {
+    let CborValue::Map(entries) = issuer_signed else {
+        panic!("issuerSigned is a CBOR map")
+    };
+    let forged = entries
+        .iter()
+        .map(|(k, v)| {
+            if k.as_text() == Some("issuerAuth") {
+                let mut sign1 =
+                    coset::CoseSign1::from_slice(&encode(v)).expect("decode IssuerAuth");
+                if let Some(byte) = sign1.signature.first_mut() {
+                    *byte ^= 0xff;
+                }
+                (
+                    k.clone(),
+                    decode(&sign1.to_vec().expect("encode IssuerAuth")),
+                )
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    CborValue::Map(forged)
 }
 
 /// Encode a `ciborium` value to CBOR bytes.

@@ -152,6 +152,41 @@ fn reference_backend_obtains_a_credential_that_verifies_under_us1() {
     assert!(result.disclosed_attributes.contains_key("given_name"));
 }
 
+// --- Secret handling: the bearer token never leaks via Debug (FR-010 / Constitution IV) ----------
+
+#[test]
+fn obtain_session_debug_does_not_leak_the_access_token_or_c_nonce() {
+    // Drive begin → token, so the session holds the OAuth access token + the issuer c_nonce.
+    let (session, _step) = begin_obtain(an_offer(), reference_backend(), holder_ctx(), NOW);
+    let access_token = "super-secret-bearer-token-xyz";
+    let c_nonce = "issuer-one-time-c-nonce-abc";
+    let token = json!({ "access_token": access_token, "c_nonce": c_nonce });
+    let (session, _step) = resume_obtain(
+        session,
+        ResumeObtain::Http {
+            status: 200,
+            body: serde_json::to_vec(&token).unwrap(),
+        },
+    )
+    .unwrap();
+
+    // Formatting the session (a log line / panic message) must NOT print the bearer token or the
+    // one-time nonce — they are held as redacting `Secret`s.
+    let dbg = format!("{session:?}");
+    assert!(
+        !dbg.contains(access_token),
+        "the access token must never appear in Debug output: {dbg}"
+    );
+    assert!(
+        !dbg.contains(c_nonce),
+        "the one-time c_nonce must never appear in Debug output: {dbg}"
+    );
+    assert!(
+        dbg.contains("Secret(***)"),
+        "the redacted secret marker must be present: {dbg}"
+    );
+}
+
 // --- Protocol failure paths (no false success) --------------------------------------------------
 
 #[test]

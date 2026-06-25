@@ -77,24 +77,29 @@ impl DeviceSignatureBuild {
 /// bound to a session-transcript handover that folds in `audience`/`nonce`.
 ///
 /// `session_transcript` is the CBOR `SessionTranscript` the holder signs over (for OpenID4VP, the
-/// [`crate::openid4vp::oid4vp_handover_transcript`] of `audience`+`nonce`); the empty
-/// `DeviceNameSpaces` (`#6.24(bstr .cbor {})`) is used (the device discloses no extra namespaces).
+/// [`crate::openid4vp::oid4vp_handover_transcript`] of `audience`+`nonce`). `device_name_spaces_bytes`
+/// is the **exact** `DeviceNameSpacesBytes` (`#6.24(bstr .cbor DeviceNameSpaces)`) of the
+/// `deviceSigned.nameSpaces` being presented — the verifier rebuilds `DeviceAuthentication` from the
+/// document's *actual* `deviceSigned.nameSpaces` ([`crate::mdoc`]), so the signature MUST cover the
+/// same bytes or a device-disclosed (non-empty) namespace map would be rejected. Use
+/// [`empty_device_name_spaces_bytes`] for the empty-disclosure case.
 /// The host signs [`DeviceSignatureBuild::input`]; [`DeviceSignatureBuild::assemble`] splices the
 /// result.
 ///
 /// # Errors
 ///
-/// [`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value.
+/// [`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value, or a
+/// malformed `session_transcript` / `device_name_spaces_bytes` (not decodable CBOR).
 pub fn build_device_signature(
     doc_type: &str,
     session_transcript: &[u8],
+    device_name_spaces_bytes: &[u8],
     audience: &str,
     nonce: &str,
 ) -> Result<DeviceSignatureBuild, SignerError> {
-    // DeviceNameSpacesBytes = #6.24(bstr .cbor {}) — an empty device-disclosed namespace map.
-    let device_ns_inner = encode(&CborValue::Map(vec![]))?;
-    let device_name_spaces_bytes = encode(&tagged_cbor(device_ns_inner))?;
-    let device_ns_value = decode(&device_name_spaces_bytes)?;
+    // Carry the presented DeviceNameSpacesBytes verbatim: the verifier rebuilds DeviceAuthentication
+    // from the document's actual deviceSigned.nameSpaces, so the signed payload must match it exactly.
+    let device_ns_value = decode(device_name_spaces_bytes)?;
 
     let transcript_value = decode(session_transcript)?;
     let device_auth_inner = encode(&CborValue::Array(vec![
@@ -138,6 +143,17 @@ pub fn build_device_signature(
         device_auth_payload,
         protected_header_value,
     })
+}
+
+/// The `DeviceNameSpacesBytes` for an empty device-disclosed namespace map (`#6.24(bstr .cbor {})`)
+/// — the bytes to sign over when the device discloses no extra namespaces.
+///
+/// # Errors
+///
+/// [`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value.
+pub fn empty_device_name_spaces_bytes() -> Result<Vec<u8>, SignerError> {
+    let device_ns_inner = encode(&CborValue::Map(vec![]))?;
+    encode(&tagged_cbor(device_ns_inner))
 }
 
 /// Wrap inner CBOR bytes in a `#6.24` tag (the encoded-CBOR-data-item form).

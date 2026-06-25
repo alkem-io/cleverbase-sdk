@@ -11,7 +11,7 @@ use pkcs8::DecodePrivateKey as _;
 use serde_json::Value;
 
 use super::super::signer::{HolderContext, Signer, SigningInput};
-use super::super::{present, HeldAttestation, PresentError};
+use super::super::{present, HeldAttestation, HolderPresentation, PresentError};
 use crate::openid4vp::{verify_response, Dcql, PresentationRequest};
 use crate::trust::StaticTestAnchors;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
@@ -200,6 +200,138 @@ fn present_malformed_held_credential_is_an_error() {
     assert!(matches!(err, PresentError::Malformed(_)));
 }
 
+#[test]
+fn sd_jwt_vc_present_conceals_array_element_disclosures_outside_the_subset() {
+    // A credential with ARRAY-ELEMENT disclosures (RFC 9901, no claim_name): `nationalities` is an
+    // array of two concealable elements. A narrow `disclose` subset must keep them OFF the wire (no
+    // over-disclosure). Before the present.rs fix the conceal set was built only from named
+    // disclosures, so the array elements ALWAYS rode in the vp_token regardless of `disclose`.
+    use crate::sdjwtvc::test_issuer::ISSUER_CERT_DER;
+
+    let issued = mint_with_array_disclosures();
+    let request = request(b"array-ns-nonce");
+
+    // Disclose ONLY given_name → the array-element disclosures (NL / DE) must NOT be present.
+    let vp = present(
+        &HeldAttestation::SdJwtVc {
+            issued: issued.clone(),
+        },
+        &request,
+        &holder_ctx(),
+        &subset(&["given_name"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present");
+    let HolderPresentationVpToken(token) = vp_token(&vp);
+    assert!(
+        !disclosed_array_values(&issued, &token)
+            .iter()
+            .any(|v| v == "NL" || v == "DE"),
+        "array-element disclosures must be concealed when not selected; token: {token}"
+    );
+
+    // It still verifies under US1, revealing only the disclosed named claim.
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER);
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        crate::sdjwtvc::test_issuer::NOW,
+        IssuerRole::Pid,
+        crate::status::StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "must verify under US1; reasons {:?}",
+        result.reasons
+    );
+    assert!(result.disclosed_attributes.contains_key("given_name"));
+
+    // Disclosing `nationalities` brings the array-element disclosures back onto the wire.
+    let vp_full = present(
+        &HeldAttestation::SdJwtVc {
+            issued: issued.clone(),
+        },
+        &request,
+        &holder_ctx(),
+        &subset(&["given_name", "nationalities"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present full");
+    let HolderPresentationVpToken(token_full) = vp_token(&vp_full);
+    let disclosed = disclosed_array_values(&issued, &token_full);
+    assert!(
+        disclosed.iter().any(|v| v == "NL") && disclosed.iter().any(|v| v == "DE"),
+        "selecting the parent claim must disclose its array elements; token: {token_full}"
+    );
+}
+
+/// Mint an SD-JWT VC with `given_name` (named object disclosure) + `nationalities` (an array of two
+/// array-element disclosures), bound to the holder cnf so the holder KB-JWT verifies under US1.
+fn mint_with_array_disclosures() -> String {
+    use crate::sdjwtvc::test_issuer::{
+        block_on, holder_cnf, Es256Signer, Sha2Hasher, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    };
+    use base64ct::{Base64, Encoding as _};
+    use sd_jwt_payload::SdJwtBuilder;
+    use serde_json::json;
+
+    let cert_b64 = Base64::encode_string(ISSUER_CERT_DER);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "given_name": "Ada",
+        "nationalities": ["NL", "DE"],
+    });
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .expect("builder")
+            .header("x5c", json!([cert_b64]))
+            .make_concealable("/given_name")
+            .expect("conceal given_name")
+            .make_concealable("/nationalities/0")
+            .expect("conceal nationalities[0]")
+            .make_concealable("/nationalities/1")
+            .expect("conceal nationalities[1]")
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing")
+    .presentation()
+}
+
+/// The compact SD-JWT VC `vp_token` string of a presentation (panics for an mdoc presentation).
+struct HolderPresentationVpToken(String);
+fn vp_token(vp: &HolderPresentation) -> HolderPresentationVpToken {
+    match vp {
+        HolderPresentation::SdJwtVc { vp_token } => HolderPresentationVpToken(vp_token.clone()),
+        HolderPresentation::Mdoc { .. } => panic!("expected an SD-JWT VC presentation"),
+    }
+}
+
+/// Decode the array-element disclosure VALUES (RFC 9901 two-element disclosures) present in `token`,
+/// restricted to those the `issued` credential actually carried as array elements. A disclosure
+/// present in `token` means it rode on the wire (was NOT concealed).
+fn disclosed_array_values(_issued: &str, token: &str) -> Vec<String> {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    // The presentation is `<JWS>~<D.1>~…~<KB-JWT>`. Each `D.i` is a base64url JSON array; an
+    // array-element disclosure decodes to `[salt, value]` (length 2, no claim name).
+    token
+        .split('~')
+        .filter_map(|seg| Base64UrlUnpadded::decode_vec(seg).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+        .filter(|arr| arr.len() == 2)
+        .filter_map(|arr| arr.into_iter().nth(1))
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+}
+
 // --- mdoc: present bound to the request, verify under US1 ----------------------------------------
 
 #[test]
@@ -233,6 +365,106 @@ fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
     );
     // The issued elements are revealed (family_name/given_name/age_over_18 from the issuer double).
     assert!(result.disclosed_attributes.contains_key("family_name"));
+}
+
+#[test]
+fn mdoc_present_with_non_empty_device_namespaces_verifies_under_us1() {
+    // A device-disclosed mdoc: the held DeviceResponse carries a NON-EMPTY deviceSigned.nameSpaces.
+    // The US1 verifier rebuilds DeviceAuthentication from the document's ACTUAL deviceSigned.nameSpaces,
+    // so the fresh holder DeviceSignature MUST be computed over those same bytes (the device.rs fix).
+    // Before the fix the signature was always over an EMPTY DeviceNameSpaces → the verifier rejected.
+    use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
+    use ciborium::value::Value as CborValue;
+
+    let held = HeldAttestation::Mdoc {
+        device_response: with_device_namespaces(
+            &MdocBuilder::new().build(),
+            "org.iso.18013.5.1",
+            "device_signed_marker",
+            CborValue::Text("present".to_owned()),
+        ),
+    };
+    let request = request(b"mdoc-dev-ns-nonce");
+
+    let vp =
+        present(&held, &request, &holder_ctx(), &subset(&[]), &hsm(), NOW).expect("present mdoc");
+
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        1_700_000_000,
+        IssuerRole::Pid,
+        crate::status::StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "a device-disclosed (non-empty device namespaces) mdoc must verify under US1; reasons {:?}",
+        result.reasons
+    );
+}
+
+/// Replace the first document's `deviceSigned.nameSpaces` with a non-empty `DeviceNameSpacesBytes`
+/// (`#6.24(bstr .cbor { namespace: { element: value } })`) and re-encode the `DeviceResponse`.
+fn with_device_namespaces(
+    device_response: &[u8],
+    namespace: &str,
+    element: &str,
+    value: ciborium::value::Value,
+) -> Vec<u8> {
+    use ciborium::value::Value as CborValue;
+    const TAG_ENCODED_CBOR: u64 = 24;
+
+    let device_name_spaces = CborValue::Map(vec![(
+        CborValue::Text(namespace.to_owned()),
+        CborValue::Map(vec![(CborValue::Text(element.to_owned()), value)]),
+    )]);
+    let mut inner = Vec::new();
+    ciborium::into_writer(&device_name_spaces, &mut inner).expect("encode DeviceNameSpaces");
+    let tagged = CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner)));
+
+    let response: CborValue =
+        ciborium::from_reader(device_response).expect("decode DeviceResponse");
+    let rebuilt = map_replace(&response, "documents", |documents| {
+        let docs = documents.as_array().expect("documents array");
+        let rebuilt_docs = docs
+            .iter()
+            .map(|doc| {
+                map_replace(doc, "deviceSigned", |device_signed| {
+                    map_replace(device_signed, "nameSpaces", |_| tagged.clone())
+                })
+            })
+            .collect();
+        CborValue::Array(rebuilt_docs)
+    });
+    let mut out = Vec::new();
+    ciborium::into_writer(&rebuilt, &mut out).expect("encode DeviceResponse");
+    out
+}
+
+/// Rebuild a CBOR map, replacing the value at text key `key` via `f` (leaving other entries as-is).
+fn map_replace(
+    value: &ciborium::value::Value,
+    key: &str,
+    f: impl FnOnce(&ciborium::value::Value) -> ciborium::value::Value,
+) -> ciborium::value::Value {
+    use ciborium::value::Value as CborValue;
+    let map = value.as_map().expect("CBOR map");
+    let mut f = Some(f);
+    let entries = map
+        .iter()
+        .map(|(k, v)| {
+            if k.as_text() == Some(key) {
+                let f = f.take().expect("key appears once");
+                (k.clone(), f(v))
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    CborValue::Map(entries)
 }
 
 #[test]
@@ -365,4 +597,124 @@ fn finish_rejects_a_wrong_length_signature_for_both_formats() {
         prepared.finish(&[0u8; 10]).unwrap_err(),
         PresentError::Build(_)
     ));
+}
+
+// --- Direct unit coverage of the device-namespaces + array-element helpers (the fix paths) --------
+
+#[test]
+fn reencode_device_name_spaces_rejects_a_non_tagged_or_non_bstr_value() {
+    use super::reencode_device_name_spaces;
+    use ciborium::value::Value as CborValue;
+
+    // A bare (untagged) value is not a `#6.24`-wrapped DeviceNameSpacesBytes → Malformed.
+    let bare = CborValue::Map(vec![]);
+    assert!(matches!(
+        reencode_device_name_spaces(&bare).unwrap_err(),
+        PresentError::Malformed(_)
+    ));
+    // A `#6.24` tag over a non-bstr payload is also malformed.
+    let tag_over_text = CborValue::Tag(24, Box::new(CborValue::Text("x".to_owned())));
+    assert!(matches!(
+        reencode_device_name_spaces(&tag_over_text).unwrap_err(),
+        PresentError::Malformed(_)
+    ));
+}
+
+#[test]
+fn first_device_name_spaces_bytes_defaults_to_empty_when_absent() {
+    use super::super::device::empty_device_name_spaces_bytes;
+    use super::first_device_name_spaces_bytes;
+    use ciborium::value::Value as CborValue;
+
+    // A DeviceResponse whose document carries NO deviceSigned.nameSpaces → the empty map default.
+    let response = CborValue::Map(vec![(
+        CborValue::Text("documents".to_owned()),
+        CborValue::Array(vec![CborValue::Map(vec![(
+            CborValue::Text("deviceSigned".to_owned()),
+            CborValue::Map(vec![]),
+        )])]),
+    )]);
+    assert_eq!(
+        first_device_name_spaces_bytes(&response).expect("default"),
+        empty_device_name_spaces_bytes().expect("empty")
+    );
+}
+
+#[test]
+fn array_element_paths_recurse_through_nested_and_non_redaction_items() {
+    // A credential with `given_name` (named) + a NESTED structure containing array-element
+    // disclosures (`tags` is an array holding a redaction AND a plain element, and an object whose
+    // own array holds a redaction) exercises the recursion fall-through in collect_array_element_paths.
+    use crate::sdjwtvc::test_issuer::{
+        block_on, holder_cnf, Es256Signer, Sha2Hasher, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    };
+    use base64ct::{Base64, Encoding as _};
+    use sd_jwt_payload::SdJwtBuilder;
+    use serde_json::json;
+
+    let cert_b64 = Base64::encode_string(ISSUER_CERT_DER);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "given_name": "Ada",
+        // A nested object whose array holds one concealable element + one plain element.
+        "profile": { "tags": ["alpha", "beta"] },
+    });
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    let issued = block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .expect("builder")
+            .header("x5c", json!([cert_b64]))
+            .make_concealable("/given_name")
+            .expect("conceal given_name")
+            // Conceal only the FIRST tag → the array holds a redaction object AND a plain string,
+            // so the walker recurses past the non-redaction element.
+            .make_concealable("/profile/tags/0")
+            .expect("conceal profile.tags[0]")
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing")
+    .presentation();
+
+    let request = request(b"nested-array-nonce");
+    // Disclose only given_name → the nested array-element disclosure (`alpha`) must be concealed.
+    let vp = present(
+        &HeldAttestation::SdJwtVc {
+            issued: issued.clone(),
+        },
+        &request,
+        &holder_ctx(),
+        &subset(&["given_name"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present");
+    let HolderPresentationVpToken(token) = vp_token(&vp);
+    assert!(
+        !disclosed_array_values(&issued, &token).iter().any(|v| v == "alpha"),
+        "the nested array-element disclosure must be concealed when its parent claim is not selected"
+    );
+
+    // Disclosing the nested parent claim (`profile`) brings the array element back.
+    let vp_full = present(
+        &HeldAttestation::SdJwtVc {
+            issued: issued.clone(),
+        },
+        &request,
+        &holder_ctx(),
+        &subset(&["given_name", "profile"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present full");
+    let HolderPresentationVpToken(token_full) = vp_token(&vp_full);
+    assert!(
+        disclosed_array_values(&issued, &token_full)
+            .iter()
+            .any(|v| v == "alpha"),
+        "selecting the nested parent claim must disclose its array element"
+    );
 }

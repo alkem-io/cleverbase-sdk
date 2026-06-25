@@ -160,10 +160,13 @@ impl Default for MdocVerifyParams<'_> {
 /// Verify a presented ISO/IEC 18013-5 mdoc `DeviceResponse`.
 ///
 /// Runs the mdoc always-on bar — `IssuerAuth` signature + DS trust, in-house `valueDigests`
-/// integrity, MSO `validityInfo`, and the `DeviceAuth` holder binding — over the first document in
-/// the response. Returns a [`VerificationResult`]: `valid = true` with the disclosed attributes when
-/// every check passes, or `valid = false` carrying a single specific [`ReasonCode`] on the first
-/// failure (no false-accept — SC-002).
+/// integrity, MSO `validityInfo` (including the `signed` consistency check), and the `DeviceAuth`
+/// holder binding — over **every** document in the response (and enforces the top-level
+/// `DeviceResponse.status`). Returns a [`VerificationResult`]: `valid = true` with the disclosed
+/// attributes only when every document clears every check, or `valid = false` carrying a single
+/// specific [`ReasonCode`] on the first failure (no false-accept — SC-002). Verifying every document
+/// is essential: a verdict that covered only `documents[0]` would let a forged second document ride
+/// inside a VALID result unverified.
 ///
 /// `anchors` is the configured trust-anchor source (the IACA root for mdoc); `params` carries the
 /// verification instant, the session transcript for the holder binding, and the issuer role.
@@ -180,6 +183,14 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 }
 
 /// The fallible verification body; `verify` maps its error to a specific-reason INVALID verdict.
+///
+/// A `DeviceResponse` MAY carry more than one `Document`. The verdict is VALID only when **every**
+/// document clears the full always-on bar — verifying just `documents[0]` would let a forged second
+/// document ride inside a VALID verdict, with no signature/trust/validity/status/holder-binding check
+/// (a false-accept). The top-level `DeviceResponse.status` is also enforced (a non-zero `status`
+/// signals the holder reported an error and the response MUST NOT be treated as a clean success), and
+/// a present `documentErrors` entry rejects the response (the device could not return a requested
+/// document, so the response is not a complete success).
 fn verify_inner<A: TrustAnchorSource + ?Sized>(
     device_response: &[u8],
     anchors: &A,
@@ -187,7 +198,65 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
 ) -> Result<VerificationResult, VerifyFailure> {
     let root: CborValue =
         ciborium::from_reader(device_response).map_err(|_| VerifyFailure::malformed())?;
-    let document = first_document(&root)?;
+
+    // --- DeviceResponse.status: a non-zero status (ISO/IEC 18013-5 §8.3.2.1.2.2) means the holder
+    //     reported an error; a clean success is `status == 0`. A non-zero status MUST NOT carry a
+    //     VALID verdict. -------------------------------------------------------------------------------
+    enforce_device_response_status(&root)?;
+
+    // --- documentErrors: if the device could not return a requested document, the response is not a
+    //     complete success — reject rather than silently accept a partial response. ------------------
+    if get_map_entry(&root, "documentErrors").is_some() {
+        return Err(VerifyFailure::reason(ReasonCode::MalformedCredential));
+    }
+
+    let documents = get_map_entry(&root, "documents")
+        .and_then(CborValue::as_array)
+        .ok_or_else(VerifyFailure::malformed)?;
+    // An empty `documents` array carries nothing to verify; a VALID verdict over zero credentials is
+    // meaningless, so reject it.
+    if documents.is_empty() {
+        return Err(VerifyFailure::malformed());
+    }
+
+    // Verify EVERY document; the verdict is VALID only if all pass. Disclosed attributes are merged
+    // across documents (each document's identifiers are surfaced in the single result map).
+    let mut disclosed = BTreeMap::new();
+    for document in documents {
+        let doc_disclosed = verify_one_document(document, anchors, params)?;
+        disclosed.extend(doc_disclosed);
+    }
+
+    Ok(VerificationResult {
+        valid: true,
+        disclosed_attributes: disclosed,
+        trust_status: TrustStatus::Trusted,
+        qualified_status: None,
+        reasons: Vec::new(),
+    })
+}
+
+/// Enforce the top-level `DeviceResponse.status` (ISO/IEC 18013-5 §8.3.2.1.2.2): the field is an
+/// unsigned integer where `0` is OK; any other value (or a non-integer/absent status) is rejected.
+/// A non-zero status (e.g. `10` general error, `11` CBOR decoding, `12` CBOR validation) means the
+/// device did not return a clean success, so the response MUST NOT be accepted as VALID.
+fn enforce_device_response_status(root: &CborValue) -> Result<(), VerifyFailure> {
+    match get_integer(root, "status") {
+        Some(0) => Ok(()),
+        // A present-but-non-zero status is an explicit device-reported error.
+        Some(_) => Err(VerifyFailure::reason(ReasonCode::MalformedCredential)),
+        // `status` is a mandatory field of `DeviceResponse`; an absent/non-integer status is a
+        // structurally malformed response.
+        None => Err(VerifyFailure::malformed()),
+    }
+}
+
+/// Run the full always-on bar over a single `Document`, returning its disclosed attributes on success.
+fn verify_one_document<A: TrustAnchorSource + ?Sized>(
+    document: &CborValue,
+    anchors: &A,
+    params: &MdocVerifyParams<'_>,
+) -> Result<BTreeMap<String, AttributeValue>, VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
@@ -219,7 +288,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let digest_alg_name = get_text(&mso, "digestAlgorithm").ok_or_else(VerifyFailure::malformed)?;
     let digest_alg =
         DigestAlgorithm::from_name(&digest_alg_name).ok_or_else(VerifyFailure::malformed)?;
-    let validity = parse_validity_info(&mso)?;
+    let validity = parse_validity_info(&mso, params.now_unix)?;
     enforce_validity(&validity, params.now_unix)?;
 
     // --- Revocation / status (the T014 seam): the canonical outcome maps onto the bar. -------------
@@ -243,13 +312,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let device_key = mso_device_key(&mso)?;
     verify_device_binding(document, &device_key, &doc_type, params)?;
 
-    Ok(VerificationResult {
-        valid: true,
-        disclosed_attributes: disclosed,
-        trust_status: TrustStatus::Trusted,
-        qualified_status: None,
-        reasons: Vec::new(),
-    })
+    Ok(disclosed)
 }
 
 // =================================================================================================
@@ -406,17 +469,30 @@ fn verify_issuer_auth_signature(
 // MSO validityInfo.
 // =================================================================================================
 
-/// Parse the MSO `validityInfo` into the SDK's [`Validity`] (Unix seconds). `validFrom`/`validUntil`
-/// are RFC 3339 `tdate` strings (often CBOR `#6.0`-tagged); a missing/unparseable bound is malformed.
-fn parse_validity_info(mso: &CborValue) -> Result<Validity, VerifyFailure> {
+/// Parse the MSO `validityInfo` into the SDK's [`Validity`] (Unix seconds). `signed`/`validFrom`/
+/// `validUntil` are RFC 3339 `tdate` strings (often CBOR `#6.0`-tagged); a missing/unparseable bound
+/// is malformed.
+///
+/// `signed` is the instant the issuer asserts it signed the MSO (ISO/IEC 18013-5 §9.1.2.4). It is
+/// inside the IssuerAuth-signed MSO, so it is not itself a forgery vector, but it is enforced for
+/// internal consistency: a `signed` after `validFrom` is contradictory (the credential claims it was
+/// valid from before it was signed), and a `signed` in the future (after `now`) is impossible for a
+/// genuinely issued credential — either is a tamper/malformed MSO and is rejected, not ignored.
+fn parse_validity_info(mso: &CborValue, now_unix: i64) -> Result<Validity, VerifyFailure> {
     let info = get_map_entry(mso, "validityInfo").ok_or_else(VerifyFailure::malformed)?;
     let signed = tdate_field(info, "signed")?;
     let valid_from = tdate_field(info, "validFrom")?;
     let valid_until = tdate_field(info, "validUntil")?;
-    // `signed` must not be in the future relative to `validFrom`; ISO models them independently but
-    // both gate validity. We keep `validFrom`/`validUntil` as the window and check `signed <= now`
-    // implicitly via the not_before bound (validFrom >= signed for a well-formed MSO).
-    let _ = signed;
+    // `signed` must not be in the future relative to the verification instant — an MSO cannot have
+    // been signed after `now`.
+    if signed > now_unix {
+        return Err(VerifyFailure::reason(ReasonCode::Tamper));
+    }
+    // `signed` must not be after `validFrom`: the issuer cannot assert the credential was valid before
+    // it was signed (an inconsistent window).
+    if signed > valid_from {
+        return Err(VerifyFailure::reason(ReasonCode::Tamper));
+    }
     Ok(Validity {
         not_before: Some(valid_from),
         not_after: Some(valid_until),

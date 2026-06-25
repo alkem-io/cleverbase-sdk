@@ -480,6 +480,109 @@ fn mso_doc_type_mismatch_is_rejected_as_tamper() {
     assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
 }
 
+#[test]
+fn multi_document_response_with_a_forged_second_document_is_rejected() {
+    // FALSE-ACCEPT PROBE: a DeviceResponse with TWO documents where `documents[1]` has a corrupted
+    // IssuerAuth signature. Verifying only `documents[0]` (the old behavior) returns VALID while the
+    // forged second document rides along unverified. The verifier MUST verify every document, so this
+    // response is rejected on the forged document's IssuerAuth signature (Tamper).
+    let response = MdocBuilder::new().append_forged_document().build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a multi-document response with a forged second document must NOT be VALID"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
+    assert!(result.disclosed_attributes.is_empty());
+}
+
+#[test]
+fn future_signed_mso_is_rejected_as_tamper() {
+    // The MSO `validityInfo.signed` is the instant the issuer asserts it signed the MSO; it cannot be
+    // after `now`. A `signed` of 2029 (verifying at 2024) is impossible for a genuinely issued
+    // credential and must be rejected, not discarded.
+    let response = MdocBuilder::new().signed("2029-01-01T00:00:00Z").build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid, "a future-signed MSO must not verify");
+    assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
+}
+
+#[test]
+fn signed_after_valid_from_is_rejected_as_tamper() {
+    // `signed` must not be after `validFrom`: the issuer cannot claim the credential was valid before
+    // it was signed. signed=2023-06 with validFrom=2023-01 is an inconsistent window. (signed stays
+    // before `now`=2024-06, so this isolates the signed<=validFrom consistency check.)
+    let response = MdocBuilder::new()
+        .validity("2023-01-01T00:00:00Z", "2030-01-01T00:00:00Z")
+        .signed("2023-06-01T00:00:00Z")
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid, "signed after validFrom must not verify");
+    assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
+}
+
+#[test]
+fn non_zero_device_response_status_is_rejected() {
+    // A non-zero top-level DeviceResponse.status (e.g. 10 = general error) means the device did not
+    // return a clean success; it MUST NOT carry a VALID verdict.
+    let response = MdocBuilder::new().status(10).build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a non-zero DeviceResponse.status must not verify"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+}
+
+#[test]
+fn absent_device_response_status_is_rejected_as_malformed() {
+    // `status` is a mandatory DeviceResponse field; an absent status is a structurally malformed
+    // response (and must not be defaulted to success).
+    let response = MdocBuilder::new().omit_status().build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+}
+
+#[test]
+fn issuer_signing_cert_der_reads_the_claimed_ds_leaf() {
+    // The qualified-gate cert-matching helper reads the claimed DS leaf from `documents[0]`'s
+    // IssuerAuth x5chain without verifying anything; a well-formed response yields the DS cert DER,
+    // and unparseable bytes yield `None` (never a panic). This also covers the `first_document` read
+    // path the helper relies on.
+    let response = MdocBuilder::new().build();
+    assert_eq!(
+        super::issuer_signing_cert_der(&response).as_deref(),
+        Some(mdoc_ds_cert_der())
+    );
+    // Not CBOR at all → no claimed cert (the helper is read-only and total).
+    assert!(super::issuer_signing_cert_der(&[0xff, 0x00]).is_none());
+    // Valid CBOR but no `documents` → no claimed cert.
+    let mut empty = Vec::new();
+    ciborium::into_writer(&CborValue::Map(vec![]), &mut empty).unwrap();
+    assert!(super::issuer_signing_cert_der(&empty).is_none());
+}
+
+#[test]
+fn empty_documents_array_is_rejected_as_malformed() {
+    // A DeviceResponse with an empty `documents` array carries no credential to verify; a VALID
+    // verdict over zero documents is meaningless and must be rejected.
+    let response = MdocBuilder::new().empty_documents().build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+}
+
+#[test]
+fn document_errors_present_is_rejected_as_malformed() {
+    // A `documentErrors` entry means the device could not return a requested document; the response
+    // is not a complete success and must be rejected rather than partially accepted.
+    let response = MdocBuilder::new().add_document_errors().build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+}
+
 /// Encode a `ciborium` value to CBOR bytes (test helper).
 fn encode_cbor(value: &CborValue) -> Vec<u8> {
     let mut buf = Vec::new();

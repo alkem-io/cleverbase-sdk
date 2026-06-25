@@ -188,7 +188,11 @@ JSON
 # Trusted List whose EAA/Q services carry a per-service status HISTORY so the gate can read the
 # granted/withdrawn status AT the relevant time (the credential's issuance time, not "now"). This is
 # the JSON counterpart of a signed TS 119 612 national TL; the SDK's qualified module parses it. It
-# is SYNTHETIC and OFFLINE: the list is "signed" by the IACA root (signerCertDerB64), and it lists:
+# is SYNTHETIC and OFFLINE: the list is SIGNED by the IACA root (signerCertDerB64 = ca-iaca), which is
+# ALSO the scheme-operator trust anchor the gate authenticates the list against. Before reading any
+# status the gate chain-validates the signer against the scheme anchor (here ca-iaca signs/IS the
+# signer, a direct DER-equal pin) and rejects a stale list (now >= nextUpdate); a forged/unsigned/
+# unchained/stale list yields the honest Indeterminate, never Qualified (SC-007). It lists:
 #   * sdjwt-issuer  as an EAA/Q service, GRANTED from 2020-01-01 (qualified at the test instants);
 #   * mdoc-ds       as an EAA/Q service, GRANTED then WITHDRAWN on 2025-09-01 (status-at-time matters);
 #   * ca-iaca       as a plain EAA (NON-qualified) service — a trusted-but-not-qualified issuer.

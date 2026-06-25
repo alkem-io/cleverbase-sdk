@@ -1,7 +1,7 @@
 //! Direct unit tests for the mdoc `DeviceSignature` ceremony builder (the error/edge paths the
 //! end-to-end round-trip in `signer/tests.rs` does not exercise).
 
-use crate::issuance::device::build_device_signature;
+use crate::issuance::device::{build_device_signature, empty_device_name_spaces_bytes};
 use crate::issuance::signer::{Ceremony, SignatureAlgorithm, SignerError};
 use crate::openid4vp::oid4vp_handover_transcript;
 
@@ -9,8 +9,15 @@ const AUDIENCE: &str = "https://verifier.example/cb";
 
 fn a_build() -> crate::issuance::device::DeviceSignatureBuild {
     let transcript = oid4vp_handover_transcript(AUDIENCE, b"nonce-bytes-here");
-    build_device_signature("org.iso.18013.5.1.mDL", &transcript, AUDIENCE, "bm9uY2U")
-        .expect("build DeviceSignature")
+    let device_ns = empty_device_name_spaces_bytes().expect("empty device namespaces");
+    build_device_signature(
+        "org.iso.18013.5.1.mDL",
+        &transcript,
+        &device_ns,
+        AUDIENCE,
+        "bm9uY2U",
+    )
+    .expect("build DeviceSignature")
 }
 
 #[test]
@@ -51,6 +58,7 @@ fn assemble_with_a_64_byte_signature_produces_decodable_cose_sign1() {
 fn malformed_session_transcript_is_a_serialize_error_not_a_panic() {
     // A truncated/invalid CBOR transcript (an indefinite-length map header with no break) surfaces as
     // a clean error (never a panic — the strict bar forbids them).
-    let err = build_device_signature("doc", &[0xbf, 0x00], AUDIENCE, "n").unwrap_err();
+    let device_ns = empty_device_name_spaces_bytes().expect("empty device namespaces");
+    let err = build_device_signature("doc", &[0xbf, 0x00], &device_ns, AUDIENCE, "n").unwrap_err();
     assert!(matches!(err, SignerError::Serialize(_)));
 }
