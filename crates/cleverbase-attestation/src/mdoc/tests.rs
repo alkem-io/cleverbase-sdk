@@ -10,7 +10,7 @@ use super::test_issuer::{
     default_session_transcript, mdoc_ds_cert_der, wrong_issuer_cert_der, DigestAlg, Element,
     MdocBuilder,
 };
-use super::{verify, MdocVerifyParams};
+use super::{verify, verify_with_meta, DeviceBindingMachinery, MdocVerifyParams};
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
 use crate::types::{AttributeValue, Format, IssuerRole, ReasonCode, TrustStatus};
@@ -977,8 +977,22 @@ fn document_errors_present_is_rejected_as_malformed() {
 }
 
 #[test]
+fn a_response_with_no_documents_array_is_rejected_as_malformed() {
+    // A clean-status `DeviceResponse` carrying NO `documents` array at all has nothing to verify and
+    // is structurally malformed — the bar rejects it (and the surfaced meta is empty: the failure is
+    // not a `HolderBinding`, so no binding-machinery is computed).
+    let response = encode_cbor(&CborValue::Map(vec![(
+        CborValue::Text("status".to_owned()),
+        CborValue::Integer(0.into()),
+    )]));
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+}
+
+#[test]
 fn device_binding_machinery_classifies_sound_vs_faulty() {
-    use super::{device_binding_machinery, DeviceBindingMachinery};
+    use super::device_binding_machinery;
 
     // A well-formed (sound) binding — ES256 DeviceSignature, parseable DeviceKey, well-formed
     // signature bytes — is `Sound` (a binding FAILURE on such a response is the fresh-nonce mismatch).
@@ -1011,6 +1025,51 @@ fn device_binding_machinery_classifies_sound_vs_faulty() {
         device_binding_machinery(&[0xff, 0x00]),
         DeviceBindingMachinery::Faulty
     );
+}
+
+#[test]
+fn verify_with_meta_surfaces_claimed_issuers_on_valid_and_binding_machinery_on_holder_failure() {
+    // VALID → the same verdict as `verify`, PLUS the cached per-document `(ds_cert_der, issuance_time)`
+    // the qualified gate folds: one document, the DS leaf, and the MSO `signed` (2023-01-01T00:00:00Z =
+    // 1_672_531_200). No `HolderBinding` failure ⇒ `binding_machinery` is `None`.
+    let response = MdocBuilder::new().build();
+    let (result, meta) = verify_with_meta(&response, &trusted_anchors(), &params());
+    assert!(result.valid, "the meta path returns the same VALID verdict");
+    assert_eq!(meta.document_count, 1);
+    assert_eq!(meta.claimed_issuers.len(), 1);
+    assert_eq!(meta.claimed_issuers[0].0, mdoc_ds_cert_der());
+    assert_eq!(meta.claimed_issuers[0].1, 1_672_531_200, "the MSO `signed`");
+    assert!(
+        meta.binding_machinery.is_none(),
+        "binding-machinery is computed only on a HolderBinding failure"
+    );
+
+    // A `HolderBinding` failure (here: a sound default binding verified against a DIFFERENT, present
+    // transcript — the fresh-nonce/replay shape) surfaces `binding_machinery: Some(Sound)` so the
+    // OpenID4VP classifier can read it without re-decoding; no document is verified ⇒ no claimed issuer.
+    let wrong_transcript = encode_cbor(&CborValue::Array(vec![
+        CborValue::Null,
+        CborValue::Null,
+        CborValue::Text("a-different-handover".to_owned()),
+    ]));
+    let mismatched = MdocVerifyParams {
+        session_transcript: Some(&wrong_transcript),
+        ..params()
+    };
+    let (result, meta) = verify_with_meta(&response, &trusted_anchors(), &mismatched);
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::HolderBinding]);
+    assert_eq!(meta.document_count, 1);
+    assert!(meta.claimed_issuers.is_empty());
+    assert_eq!(meta.binding_machinery, Some(DeviceBindingMachinery::Sound));
+
+    // A structurally-broken (mangled) DeviceSignature also fails `HolderBinding`, but the binding
+    // machinery is `Faulty` (a transcript-INDEPENDENT fault the classifier must never call a replay).
+    let mangled = MdocBuilder::new().mangle_device_signature().build();
+    let (result, meta) = verify_with_meta(&mangled, &trusted_anchors(), &params());
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::HolderBinding]);
+    assert_eq!(meta.binding_machinery, Some(DeviceBindingMachinery::Faulty));
 }
 
 /// Encode a `ciborium` value to CBOR bytes (test helper).

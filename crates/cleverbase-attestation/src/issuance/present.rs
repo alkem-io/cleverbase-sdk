@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use super::device::{build_device_signature, empty_device_name_spaces_bytes};
 use super::signer::{build_kb_jwt, HolderContext, Signer};
+use crate::mdoc::get_map_entry;
 use crate::openid4vp::{oid4vp_handover_transcript, MdocVpToken, PresentationRequest, VpToken};
-use crate::TAG_ENCODED_CBOR;
 
 /// An owned holder OpenID4VP `vp_token`, the output of [`present`]. The caller borrows it as a
 /// [`VpToken`] via [`HolderPresentation::as_vp_token`] to verify it under
@@ -461,7 +461,7 @@ fn prepare_mdoc(
     // docType + deviceSigned.nameSpaces, which the per-document verifier rejects. Reject up front with
     // a clear error rather than emit a silently-invalid token (no false token — multi-document binding
     // is a separate multi-signature seam).
-    let document_count = map_get(&response, "documents")
+    let document_count = get_map_entry(&response, "documents")
         .and_then(CborValue::as_array)
         .map_or(0, Vec::len);
     if document_count > 1 {
@@ -497,9 +497,11 @@ fn prepare_mdoc(
 
 /// The `docType` of the first document in a `DeviceResponse`.
 fn first_doc_type(response: &CborValue) -> Option<String> {
-    let documents = map_get(response, "documents")?.as_array()?;
+    let documents = get_map_entry(response, "documents")?.as_array()?;
     let first = documents.first()?;
-    map_get(first, "docType")?.as_text().map(str::to_owned)
+    get_map_entry(first, "docType")?
+        .as_text()
+        .map(str::to_owned)
 }
 
 /// The first document's `deviceSigned.nameSpaces` re-encoded to its canonical `DeviceNameSpacesBytes`
@@ -507,11 +509,11 @@ fn first_doc_type(response: &CborValue) -> Option<String> {
 /// from. Defaults to the empty namespace map (`#6.24(bstr .cbor {})`) when the document carries no
 /// `deviceSigned.nameSpaces` (the empty-disclosure case), so a placeholder document still round-trips.
 fn first_device_name_spaces_bytes(response: &CborValue) -> Result<Vec<u8>, PresentError> {
-    let device_name_spaces = map_get(response, "documents")
+    let device_name_spaces = get_map_entry(response, "documents")
         .and_then(CborValue::as_array)
         .and_then(|docs| docs.first())
-        .and_then(|doc| map_get(doc, "deviceSigned"))
-        .and_then(|ds| map_get(ds, "nameSpaces"));
+        .and_then(|doc| get_map_entry(doc, "deviceSigned"))
+        .and_then(|ds| get_map_entry(ds, "nameSpaces"));
     device_name_spaces.map_or_else(
         || empty_device_name_spaces_bytes().map_err(|e| PresentError::Build(e.to_string())),
         reencode_device_name_spaces,
@@ -521,25 +523,16 @@ fn first_device_name_spaces_bytes(response: &CborValue) -> Result<Vec<u8>, Prese
 /// Re-encode a `deviceSigned.nameSpaces` value (`#6.24(bstr .cbor DeviceNameSpaces)`) to its canonical
 /// `DeviceNameSpacesBytes` — extracting the tagged byte string's inner CBOR and re-wrapping it in a
 /// `#6.24(bstr)` tag, matching the verifier's reconstruction byte-for-byte.
+///
+/// The unwrap+re-wrap goes through the crate's single `#6.24(bstr)` pair
+/// ([`crate::unwrap_tagged_cbor_payload`] then [`crate::encode_tagged_cbor`]) (DRY — Principle III), the
+/// SAME pair the mdoc verifier's `reencode_tagged` uses: the verifier rebuilds `DeviceAuthentication`
+/// from these exact bytes, so this holder half and the verifier half MUST produce byte-identical output
+/// (correctness-critical). A value that is not a `#6.24(bstr)` is malformed.
 fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentError> {
-    let inner = match value {
-        CborValue::Tag(TAG_ENCODED_CBOR, boxed) => match boxed.as_ref() {
-            CborValue::Bytes(bytes) => bytes.clone(),
-            _ => {
-                return Err(PresentError::Malformed(
-                    "deviceSigned.nameSpaces is not a #6.24(bstr)".to_owned(),
-                ))
-            }
-        },
-        _ => {
-            return Err(PresentError::Malformed(
-                "deviceSigned.nameSpaces is not a #6.24-tagged value".to_owned(),
-            ))
-        }
-    };
-    // The crate's single `#6.24(bstr)` wrap-then-encode (DRY — Principle III): the verifier rebuilds
-    // `DeviceAuthentication` from these exact bytes, so they MUST match the mdoc verifier / device
-    // ceremony's encoding byte-for-byte.
+    let inner = crate::unwrap_tagged_cbor_payload(value).ok_or_else(|| {
+        PresentError::Malformed("deviceSigned.nameSpaces is not a #6.24(bstr)".to_owned())
+    })?;
     Ok(crate::encode_tagged_cbor(&inner))
 }
 
@@ -610,14 +603,6 @@ fn replace_map_entry(
         }
     }
     Ok(CborValue::Map(out))
-}
-
-/// Get a text-keyed entry from a CBOR map value.
-fn map_get<'a>(value: &'a CborValue, key: &str) -> Option<&'a CborValue> {
-    value
-        .as_map()?
-        .iter()
-        .find_map(|(k, v)| (k.as_text() == Some(key)).then_some(v))
 }
 
 #[cfg(test)]

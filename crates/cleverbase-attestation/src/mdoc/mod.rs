@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 use ciborium::Value as CborValue;
-use coset::{CborSerializable, CoseKey, CoseSign1, Label, RegisteredLabelWithPrivate};
+use coset::{AsCborValue, CborSerializable, CoseKey, CoseSign1, Label, RegisteredLabelWithPrivate};
 use sha2::{Digest, Sha384, Sha512};
 
 use crate::status::StatusOutcome;
@@ -48,7 +48,8 @@ type DisclosedByNamespace = BTreeMap<String, BTreeMap<String, AttributeValue>>;
 
 /// The CBOR tag for an "encoded CBOR data item" (`#6.24`) — re-exported from the crate-level
 /// [`crate::TAG_ENCODED_CBOR`] (the one authoritative definition; DRY — Principle III) so this
-/// module's match arms and the test helper read it under the local name.
+/// module's raw cursor (which recognizes the `#6.24(bstr)` wrapper head directly) and test helpers
+/// read it under the local name.
 use crate::TAG_ENCODED_CBOR;
 
 /// The COSE header label for an X.509 certificate chain (`x5chain`), RFC 9360 — carried in the
@@ -206,27 +207,55 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     params: &MdocVerifyParams<'_>,
 ) -> VerificationResult {
-    match verify_inner(device_response, anchors, params) {
-        Ok(result) => result,
-        Err(failure) => VerificationResult::invalid(failure.reason),
-    }
+    verify_with_meta(device_response, anchors, params).0
 }
 
-/// The number of `Document`s a `DeviceResponse` carries (its `documents` array length), or `None` when
-/// the bytes do not parse as a `DeviceResponse` with a `documents` array.
+/// The byproducts the single always-on-bar pass already computed about a `DeviceResponse`, surfaced
+/// alongside the [`VerificationResult`] so the callers that would otherwise RE-DECODE the same response
+/// (the OpenID4VP replay classifier and the opt-in qualified gate) read these cached results instead.
 ///
-/// [`crate::openid4vp`] uses this to bound the `Replay` re-attribution to the SINGLE-document case: the
-/// fresh-nonce-mismatch→`Replay` heuristic only holds when there is exactly one document whose ONLY
-/// transcript-dependent variable is the request nonce (the audience already matched in cleartext). With
-/// more than one document a `HolderBinding` failure cannot be safely attributed to a replay (e.g. a
-/// wrong-key `DeviceSignature` on `documents[1]` is structurally sound yet a genuine fault), so the
-/// binding fault is kept as `HolderBinding`.
+/// Every field is derived from the ONE `ciborium` decode + per-document parse [`verify_with_meta`]
+/// already performs; nothing here changes the verdict (it is the same `VerificationResult` [`verify`]
+/// returns) — it only avoids the duplicate decodes those callers used to trigger (an
+/// attacker-multipliable soft-DoS lever: documents × IssuerAuth/MSO size).
+#[derive(Debug, Clone, Default)]
+pub struct MdocVerifyMeta {
+    /// The `documents` array length (`0` when the response is too malformed to read it). The OpenID4VP
+    /// replay classifier bounds its `Replay` re-attribution to the single-document case via this count,
+    /// read from the bar's own decode (no separate `DeviceResponse` re-decode).
+    pub document_count: usize,
+    /// Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix)` — the Document Signer leaf
+    /// (DER) from `IssuerAuth.x5chain` PAIRED with the MSO `validityInfo.signed` — collected during a
+    /// VALID bar pass (and EMPTY on any INVALID verdict). The opt-in [`crate::qualified`] gate folds
+    /// these (it runs only on a VALID credential), reading EACH document's already-extracted cert + its
+    /// issuance/relevant time rather than re-decoding the response. On a VALID credential `signed` is
+    /// mandatory (the bar requires it), so this equals what [`issuer_signing_certs_with_issuance_der`]
+    /// would yield for the gate's use; the standalone reader keeps its own `validFrom` fallback for the
+    /// (bar-rejected) `signed`-absent case.
+    pub claimed_issuers: Vec<(Vec<u8>, i64)>,
+    /// The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
+    /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
+    /// classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
+    /// (no second `DeviceResponse` decode), and identical to the standalone [`device_binding_machinery`].
+    pub binding_machinery: Option<DeviceBindingMachinery>,
+}
+
+/// Verify a presented mdoc `DeviceResponse` (exactly as [`verify`]) AND surface the [`MdocVerifyMeta`]
+/// the single bar pass already computed — the per-document claimed issuer `(cert, issuance_time)`, the
+/// document count, and (on a `HolderBinding` failure) the holder-binding-machinery soundness — so the
+/// OpenID4VP binding verifier and the qualified gate read these cached results instead of re-decoding
+/// the response. The [`VerificationResult`] is byte-identical to [`verify`]'s (this is the path
+/// [`verify`] delegates to); only the redundant re-decodes those callers used to trigger are removed.
 #[must_use]
-pub fn document_count(device_response: &[u8]) -> Option<usize> {
-    let root: CborValue = ciborium::from_reader(device_response).ok()?;
-    get_map_entry(&root, "documents")
-        .and_then(CborValue::as_array)
-        .map(Vec::len)
+pub fn verify_with_meta<A: TrustAnchorSource + ?Sized>(
+    device_response: &[u8],
+    anchors: &A,
+    params: &MdocVerifyParams<'_>,
+) -> (VerificationResult, MdocVerifyMeta) {
+    match verify_inner(device_response, anchors, params) {
+        Ok((result, meta)) => (result, meta),
+        Err((failure, meta)) => (VerificationResult::invalid(failure.reason), meta),
+    }
 }
 
 /// Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
@@ -264,28 +293,38 @@ pub enum DeviceBindingMachinery {
 /// Used only to refine the failure attribution when [`verify`] already returned
 /// [`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
 /// holder-binding fault is never silently downgraded to a replay).
+///
+/// This is the standalone (bytes-in) entry; [`verify_with_meta`] surfaces the SAME classification from
+/// its own already-decoded `documents` (no second decode) via [`MdocVerifyMeta::binding_machinery`], so
+/// the OpenID4VP replay classifier reads that cached value instead of calling this. Both route through
+/// the shared `classify_binding_machinery` core, so the bytes-in and decoded-in answers are identical.
 #[must_use]
 pub fn device_binding_machinery(device_response: &[u8]) -> DeviceBindingMachinery {
-    let sound = classify_device_binding(device_response).unwrap_or(false);
-    if sound {
+    let Ok(root) = ciborium::from_reader::<CborValue, _>(device_response) else {
+        // Unparseable bytes can't be classified → conservatively `Faulty` (never a silent replay).
+        return DeviceBindingMachinery::Faulty;
+    };
+    // No `documents` array → too malformed to classify → conservatively `Faulty`.
+    get_map_entry(&root, "documents")
+        .and_then(CborValue::as_array)
+        .map_or(DeviceBindingMachinery::Faulty, |documents| {
+            classify_binding_machinery(documents)
+        })
+}
+
+/// Classify the `DeviceAuth` holder-binding machinery soundness across an ALREADY-DECODED `documents`
+/// array — the shared core of [`device_binding_machinery`] (bytes-in) and [`verify_with_meta`]'s meta
+/// (which feeds its OWN decoded documents in, avoiding a second `DeviceResponse` decode). `Sound` iff
+/// EVERY document's binding machinery is intact; an empty array, or any structurally-broken document,
+/// is `Faulty` (a holder-binding fault is never silently downgraded to a replay).
+fn classify_binding_machinery(documents: &[CborValue]) -> DeviceBindingMachinery {
+    // Every document's binding machinery must be sound for the overall failure to be a (freshness)
+    // replay; one structurally-broken binding (or an empty array) makes it a genuine binding fault.
+    if !documents.is_empty() && documents.iter().all(device_binding_machinery_sound) {
         DeviceBindingMachinery::Sound
     } else {
         DeviceBindingMachinery::Faulty
     }
-}
-
-/// The fallible body of [`device_binding_machinery`]: `Some(true)` iff EVERY document's binding
-/// machinery is sound, `Some(false)` iff at least one is structurally broken, `None` if the response
-/// is too malformed to classify (the caller treats `None`/`false` alike as `Faulty`).
-fn classify_device_binding(device_response: &[u8]) -> Option<bool> {
-    let root: CborValue = ciborium::from_reader(device_response).ok()?;
-    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
-    if documents.is_empty() {
-        return Some(false);
-    }
-    // Every document's binding machinery must be sound for the overall failure to be a (freshness)
-    // replay; one structurally-broken binding makes it a genuine holder-binding fault.
-    Some(documents.iter().all(device_binding_machinery_sound))
 }
 
 /// Whether a single `Document`'s `DeviceAuth` holder-binding machinery is structurally sound: the
@@ -324,10 +363,11 @@ fn device_binding_machinery_sound(document: &CborValue) -> bool {
         if !cose_alg_is_es256(&device_signature) {
             return Some(false);
         }
-        let sig = &device_signature.signature;
-        // Raw fixed-width `r‖s` ONLY (RFC 9053 §2.1) — the same accepted set the verifier enforces.
-        // A DER-encoded signature is a structural fault (fails for any transcript), not a freshness mismatch.
-        let well_formed = p256::ecdsa::Signature::from_slice(sig).is_ok();
+        // Raw fixed-width `r‖s` ONLY (RFC 9053 §2.1) — the same accepted set the verifier enforces,
+        // parsed through the SHARED [`parse_es256_sig`] (DRY — Principle III) so "well-formed" here is
+        // exactly what the verifier accepts. A DER-encoded signature is `None` (a structural fault that
+        // fails for any transcript), not a freshness mismatch.
+        let well_formed = parse_es256_sig(&device_signature.signature).is_some();
         Some(well_formed)
     };
     // A document too malformed to inspect is conservatively NOT sound (fault, never a silent replay).
@@ -390,7 +430,12 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
     run().map_err(|failure| failure.reason)
 }
 
-/// The fallible verification body; `verify` maps its error to a specific-reason INVALID verdict.
+/// The fallible verification body; [`verify_with_meta`] maps its error to a specific-reason INVALID
+/// verdict. Returns the [`VerificationResult`] PAIRED with the [`MdocVerifyMeta`] the single decode +
+/// bar pass produced (on BOTH the `Ok` and `Err` arms, so the cached byproducts are available whatever
+/// the verdict): the per-document claimed issuer `(cert, issuance_time)` on success, and the document
+/// count + (on a `HolderBinding` failure) the binding-machinery soundness — all from the ONE decode of
+/// `root`, never a second `DeviceResponse` decode.
 ///
 /// A `DeviceResponse` MAY carry more than one `Document`. The verdict is VALID only when **every**
 /// document clears the full always-on bar — verifying just `documents[0]` would let a forged second
@@ -399,33 +444,62 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
 /// signals the holder reported an error and the response MUST NOT be treated as a clean success), and
 /// a present `documentErrors` entry rejects the response (the device could not return a requested
 /// document, so the response is not a complete success).
+#[allow(clippy::type_complexity)] // the (result, meta) pair on both arms is the function's whole point
 fn verify_inner<A: TrustAnchorSource + ?Sized>(
     device_response: &[u8],
     anchors: &A,
     params: &MdocVerifyParams<'_>,
-) -> Result<VerificationResult, VerifyFailure> {
-    let root: CborValue =
-        ciborium::from_reader(device_response).map_err(|_| VerifyFailure::malformed())?;
+) -> Result<(VerificationResult, MdocVerifyMeta), (VerifyFailure, MdocVerifyMeta)> {
+    let root: CborValue = match ciborium::from_reader(device_response) {
+        Ok(root) => root,
+        // Unparseable bytes: nothing decoded, so the meta is empty (the failure is not `HolderBinding`).
+        Err(_) => return Err((VerifyFailure::malformed(), MdocVerifyMeta::default())),
+    };
+
+    // The early structural gates below are NOT `HolderBinding`, so they need no binding-machinery meta;
+    // `documents` may not even be readable yet. A tiny closure pairs each early failure with an empty
+    // meta (the document count is filled once `documents` is in hand).
+    let early = |failure: VerifyFailure| (failure, MdocVerifyMeta::default());
 
     // --- DeviceResponse.status: a non-zero status (ISO/IEC 18013-5 §8.3.2.1.2.2) means the holder
     //     reported an error; a clean success is `status == 0`. A non-zero status MUST NOT carry a
     //     VALID verdict. -------------------------------------------------------------------------------
-    enforce_device_response_status(&root)?;
+    enforce_device_response_status(&root).map_err(early)?;
 
     // --- documentErrors: if the device could not return a requested document, the response is not a
     //     complete success — reject rather than silently accept a partial response. ------------------
     if get_map_entry(&root, "documentErrors").is_some() {
-        return Err(VerifyFailure::reason(ReasonCode::MalformedCredential));
+        return Err(early(VerifyFailure::reason(
+            ReasonCode::MalformedCredential,
+        )));
     }
 
-    let documents = get_map_entry(&root, "documents")
-        .and_then(CborValue::as_array)
-        .ok_or_else(VerifyFailure::malformed)?;
+    let documents = match get_map_entry(&root, "documents").and_then(CborValue::as_array) {
+        Some(documents) => documents,
+        None => return Err(early(VerifyFailure::malformed())),
+    };
     // An empty `documents` array carries nothing to verify; a VALID verdict over zero credentials is
     // meaningless, so reject it.
     if documents.is_empty() {
-        return Err(VerifyFailure::malformed());
+        return Err(early(VerifyFailure::malformed()));
     }
+
+    // From here on `documents` is decoded, so every meta carries the document count; the binding
+    // machinery is computed (from these SAME decoded documents — no re-decode) only when the bar fails
+    // with `HolderBinding` (the one case the OpenID4VP replay classifier consults it).
+    let document_count = documents.len();
+    let fail = |failure: VerifyFailure| {
+        let binding_machinery = (failure.reason == ReasonCode::HolderBinding)
+            .then(|| classify_binding_machinery(documents));
+        (
+            failure,
+            MdocVerifyMeta {
+                document_count,
+                claimed_issuers: Vec::new(),
+                binding_machinery,
+            },
+        )
+    };
 
     // Capture the on-wire `IssuerSignedItemBytes` of every document once, up front: ISO/IEC 18013-5
     // §9.2.2.5 hashes the bytes AS RECEIVED, so the `valueDigests` check below feeds on these exact
@@ -439,22 +513,28 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     // conflict rule is keyed on the FULL `(namespace, id)` — the SAME `id` in two different namespaces
     // is a DISTINCT attribute and never collides. A same-`(namespace, id)` clash with a different value
     // is rejected (`DisclosureIntegrity`); an identical re-disclosure is harmless and merges cleanly.
+    //
+    // Each verified document also contributes its claimed-issuer `(cert, issuance_time)` to the meta the
+    // qualified gate folds (the gate runs only on the VALID verdict this loop completing produces).
     let mut disclosed: DisclosedByNamespace = BTreeMap::new();
+    let mut claimed_issuers: Vec<(Vec<u8>, i64)> = Vec::with_capacity(document_count);
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
         let doc_raw_items = raw_items.get(index);
-        let doc_disclosed = verify_one_document(document, doc_raw_items, anchors, params)?;
+        let (doc_disclosed, claimed_issuer) =
+            verify_one_document(document, doc_raw_items, anchors, params).map_err(fail)?;
+        claimed_issuers.push(claimed_issuer);
         // `doc_disclosed` is namespace-grouped (`{ ns: { id: value } }`); merge each `(namespace, id,
         // value)` triple so the cross-document no-shadow rule is keyed per `(namespace, id)`.
         for (namespace, ns_map) in doc_disclosed {
             for (identifier, value) in ns_map {
-                insert_no_shadow(&mut disclosed, &namespace, identifier, value)?;
+                insert_no_shadow(&mut disclosed, &namespace, identifier, value).map_err(fail)?;
             }
         }
     }
 
-    Ok(VerificationResult {
+    let result = VerificationResult {
         valid: true,
         // Project the strongly-typed nested disclosure to the public wire shape (`{ ns:
         // AttributeValue::Map({ id: value }) }`) exactly once, at the boundary.
@@ -462,7 +542,15 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         trust_status: TrustStatus::Trusted,
         qualified_status: None,
         reasons: Vec::new(),
-    })
+    };
+    Ok((
+        result,
+        MdocVerifyMeta {
+            document_count,
+            claimed_issuers,
+            binding_machinery: None,
+        },
+    ))
 }
 
 /// Project the strongly-typed namespace-grouped disclosure (`{ ns → { id → value } }`) to the public
@@ -494,7 +582,9 @@ fn enforce_device_response_status(root: &CborValue) -> Result<(), VerifyFailure>
 }
 
 /// Run the full always-on bar over a single `Document`, returning its disclosed attributes (GROUPED BY
-/// NAMESPACE — `{ ns: { id: value } }`; see [`verify_value_digests`]) on success.
+/// NAMESPACE — `{ ns: { id: value } }`; see [`verify_value_digests`]) PAIRED with that document's
+/// claimed-issuer `(ds_cert_der, issuance_time)` (the signature/trust-verified Document Signer leaf and
+/// the MSO `signed`) on success — the cached input the opt-in qualified gate folds per document.
 ///
 /// `raw_items` is the on-wire `IssuerSignedItemBytes` captured for THIS document (keyed by
 /// `(namespace, digestID)`), the digest input ISO/IEC 18013-5 §9.2.2.5 hashes; `None` when the raw
@@ -504,7 +594,7 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
     params: &MdocVerifyParams<'_>,
-) -> Result<DisclosedByNamespace, VerifyFailure> {
+) -> Result<(DisclosedByNamespace, (Vec<u8>, i64)), VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
@@ -516,18 +606,25 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
     verify_device_binding(document, &issuer_verified.device_key, &doc_type, params)?;
 
-    Ok(issuer_verified.disclosed)
+    let claimed_issuer = (issuer_verified.ds_cert_der, issuer_verified.issuance_time);
+    Ok((issuer_verified.disclosed, claimed_issuer))
 }
 
 /// The result of verifying the **issuer-signed** half of an mdoc document: the disclosed attributes
-/// (after the `valueDigests` integrity recompute) and the MSO `DeviceKey` the holder binding is
-/// checked against.
+/// (after the `valueDigests` integrity recompute), the MSO `DeviceKey` the holder binding is checked
+/// against, and the claimed-issuer `(ds_cert_der, issuance_time)` the opt-in qualified gate reads.
 struct IssuerVerified {
     /// The disclosed attributes (GROUPED BY NAMESPACE — `{ ns: { id: value } }`), after each
     /// `IssuerSignedItem` digest was recomputed and matched. See [`verify_value_digests`].
     disclosed: DisclosedByNamespace,
     /// The holder's `DeviceKey` extracted from the MSO (the input to the `DeviceAuth` binding check).
     device_key: DeviceKey,
+    /// The Document Signer leaf certificate (DER) from the `IssuerAuth` `x5chain` — the signature- and
+    /// trust-verified leaf, surfaced so the qualified gate need not re-resolve it from the response.
+    ds_cert_der: Vec<u8>,
+    /// The credential's issuance/relevant time (Unix seconds) — the MSO `validityInfo.signed` (always
+    /// present on this VALID path; ISO/IEC 18013-5 §9.1.2.4) the qualified gate reads status AT.
+    issuance_time: i64,
 }
 
 /// Verify the **issuer-signed** half of an mdoc `Document` (everything the issuer signs, independent
@@ -569,7 +666,8 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     let (ds_cert_der, supplied_intermediates) = ds_chain
         .split_first()
         .ok_or_else(VerifyFailure::malformed)?;
-    verify_issuer_auth_signature(&issuer_auth, ds_cert_der)?;
+    // Verify the IssuerAuth ES256 signature over the MSO with the DS certificate's key.
+    verify_cose_sign1_es256(&issuer_auth, ds_cert_der)?;
 
     // --- IssuerAuth trust: the DS leaf's certification path (leaf + supplied x5chain intermediates)
     //     must validate to the configured anchor for the role/format. -------------------------------
@@ -587,7 +685,9 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     let digest_alg_name = get_text(&mso, "digestAlgorithm").ok_or_else(VerifyFailure::malformed)?;
     let digest_alg =
         DigestAlgorithm::from_name(&digest_alg_name).ok_or_else(VerifyFailure::malformed)?;
-    let validity = parse_validity_info(&mso, params.now_unix)?;
+    // `signed` is the credential's issuance/relevant time (the qualified gate reads status AT it); it is
+    // mandatory here, so on this VALID path it is the value the gate would otherwise re-parse the MSO for.
+    let (validity, issuance_time) = parse_validity_info(&mso, params.now_unix)?;
     enforce_validity(&validity, params.now_unix)?;
 
     // --- Revocation / status (the T014 seam): the canonical outcome maps onto the bar. -------------
@@ -613,6 +713,8 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     Ok(IssuerVerified {
         disclosed,
         device_key,
+        ds_cert_der: ds_cert_der.clone(),
+        issuance_time,
     })
 }
 
@@ -645,18 +747,36 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
 // =================================================================================================
 
 /// One captured on-wire `IssuerSignedItem`: its exact `#6.24(bstr .cbor IssuerSignedItem)` byte span
-/// (the digest input ISO/IEC 18013-5 §9.2.2.5 hashes) PAIRED with the `digestID` /
-/// `elementIdentifier` / `elementValue` decoded from those SAME bytes — so the value disclosed is
-/// inseparable from the bytes hashed (no decoupled-lookup false-accept).
+/// (the digest input ISO/IEC 18013-5 §9.2.2.5 hashes) PAIRED with the decoded inner `IssuerSignedItem`
+/// map (and the `digestID` / `elementIdentifier` read from it) — ALL from those SAME bytes, so the
+/// value disclosed is inseparable from the bytes hashed (no decoupled-lookup false-accept).
+///
+/// The `elementValue` is NOT materialized into an [`AttributeValue`] here: it stays as the decoded
+/// `item` map, and [`verify_value_digests`] projects it via [`Self::element_value`] only AFTER this
+/// item's digest matches the MSO — so an item whose digest later mismatches (or a never-disclosed item)
+/// never pays the deep `cbor_to_attribute` clone of its (attacker-sized) value. The inner map itself is
+/// decoded ONCE (a single `ciborium` pass over the bstr content), not twice.
 struct RawIssuerItem<'a> {
     /// The exact on-wire `IssuerSignedItemBytes` span (`#6.24(bstr)`), hashed verbatim.
     raw_bytes: &'a [u8],
-    /// The `digestID` decoded from `raw_bytes` (the MSO `valueDigests` index for this item).
+    /// The `digestID` decoded from the inner map (the MSO `valueDigests` index for this item).
     digest_id: i64,
-    /// The `elementIdentifier` (claim name) decoded from `raw_bytes`.
+    /// The `elementIdentifier` (claim name) decoded from the inner map.
     identifier: String,
-    /// The `elementValue` (claim value) decoded from `raw_bytes`.
-    element_value: AttributeValue,
+    /// The decoded inner `IssuerSignedItem` map (the SAME bytes as `raw_bytes`). The `elementValue`
+    /// is projected lazily from here via [`Self::element_value`], only once the digest has matched.
+    item: CborValue,
+}
+
+impl RawIssuerItem<'_> {
+    /// Materialize this item's `elementValue` into the SDK's [`AttributeValue`]. Called by
+    /// [`verify_value_digests`] ONLY after the item's digest matches the MSO `valueDigests` entry, so
+    /// the deep `cbor_to_attribute` clone of an (attacker-sized) value is paid only for disclosed,
+    /// digest-authenticated items — never for an item whose digest mismatches. The decode validated an
+    /// `elementValue` is present (a record is only created when it is), so this is total.
+    fn element_value(&self) -> AttributeValue {
+        get_map_entry(&self.item, "elementValue").map_or(AttributeValue::Null, cbor_to_attribute)
+    }
 }
 
 /// The captured on-wire `IssuerSignedItem`s of one document, keyed by namespace: each value is the
@@ -782,12 +902,39 @@ impl<'a> CborCursor<'a> {
         Some(())
     }
 
-    /// Capture the exact byte slice of the next complete data item without interpreting it, advancing
-    /// the cursor past it.
-    fn take_item_slice(&mut self) -> Option<&'a [u8]> {
+    /// Read the next item expecting it to be a `#6.24(bstr)` ("encoded CBOR data item") and return BOTH
+    /// the element's exact full on-wire span (`raw`, tag + bstr head + content — the digest input
+    /// ISO/IEC 18013-5 §9.2.2.5 hashes verbatim) AND the inner bstr's content slice (`inner`, the
+    /// `.cbor IssuerSignedItem` bytes), in ONE structural pass. The cursor leaves positioned just past
+    /// the element.
+    ///
+    /// This reads only item HEADS (the `#6.24` tag head + the inner byte-string head) and hands back
+    /// sub-slices — it never re-decodes the wrapper through `ciborium`. The caller then runs a SINGLE
+    /// `ciborium` decode over `inner` to reach the `IssuerSignedItem` map, instead of decoding the
+    /// `#6.24(bstr)` wrapper and then decoding the inner bytes a second time (the former double parse —
+    /// an attacker-multipliable soft-DoS lever across documents × namespaces × items). Returns `None`
+    /// (fails closed) for anything that is not a `#6.24` tag wrapping a definite-length byte string.
+    fn take_tagged_bstr_item(&mut self) -> Option<(&'a [u8], &'a [u8])> {
         let start = self.pos;
-        self.skip_item()?;
-        self.input.get(start..self.pos)
+        // The `#6.24` "encoded CBOR data item" tag head (major 6, arg = the tag number).
+        let tag = self.read_head()?;
+        if tag.major != 6 || tag.arg != TAG_ENCODED_CBOR {
+            return None;
+        }
+        // The inner byte string: a definite-length bstr (major 2) whose content bytes are the inner
+        // `.cbor IssuerSignedItem` serialization, taken verbatim (no copy).
+        let bstr = self.read_head()?;
+        if bstr.major != 2 {
+            return None;
+        }
+        let len = usize::try_from(bstr.arg).ok()?;
+        let content_start = self.pos;
+        // `checked_add` so an attacker-declared giant `len` fails closed (`None`), never overflows.
+        let content_end = content_start.checked_add(len)?;
+        let inner = self.input.get(content_start..content_end)?;
+        self.pos = content_end;
+        let raw = self.input.get(start..self.pos)?;
+        Some((raw, inner))
     }
 
     /// Read a text-string item, returning its UTF-8 content (used to read map keys / namespace names).
@@ -852,24 +999,31 @@ impl<'a> CborCursor<'a> {
     }
 }
 
-/// Decode a [`RawIssuerItem`] record from one on-wire `#6.24(bstr .cbor IssuerSignedItem)` element's
-/// exact bytes (`item_bytes`): unwrap the tag, decode the inner `IssuerSignedItem` map, and read its
-/// `digestID` / `elementIdentifier` / `elementValue` — ALL from those same bytes. `raw_bytes` (the
-/// hash input) and the decoded `(identifier, value)` (the disclosure) are therefore one and the same
-/// item by construction. Returns `None` if the element is not a `#6.24(bstr)` wrapping a map with an
-/// integer `digestID`, a text `elementIdentifier`, and an `elementValue`.
-fn decode_raw_issuer_item(item_bytes: &[u8]) -> Option<RawIssuerItem<'_>> {
-    let value: CborValue = ciborium::from_reader(item_bytes).ok()?;
-    let inner = unwrap_tagged_cbor_payload(&value).ok()?;
-    let item: CborValue = ciborium::from_reader(inner.as_slice()).ok()?;
+/// Decode a [`RawIssuerItem`] record for one on-wire `#6.24(bstr .cbor IssuerSignedItem)` element from
+/// its exact full span (`raw_bytes`, the digest input) and the inner bstr content (`inner`, the
+/// `.cbor IssuerSignedItem` bytes) — the two slices the cursor's [`CborCursor::take_tagged_bstr_item`]
+/// hands back from a single structural pass over the SAME element (so `raw_bytes` and the decoded item
+/// are one and the same on-wire item by construction; no decoupled-lookup false-accept).
+///
+/// The `#6.24(bstr)` wrapper is recognized by the cursor, so this performs ONE `ciborium` decode (of
+/// `inner` → the `IssuerSignedItem` map), not the former two (the tag wrapper, then the inner bytes).
+/// It reads + retains `digestID` / `elementIdentifier` (needed for the digest match + disclosure key)
+/// but DEFERS the `elementValue` materialization to [`RawIssuerItem::element_value`] (run only after a
+/// digest match). Returns `None` if `inner` is not a map with an integer `digestID`, a text
+/// `elementIdentifier`, and a present `elementValue`.
+fn decode_raw_issuer_item<'a>(raw_bytes: &'a [u8], inner: &[u8]) -> Option<RawIssuerItem<'a>> {
+    let item: CborValue = ciborium::from_reader(inner).ok()?;
     let digest_id = get_integer(&item, "digestID")?;
     let identifier = get_text(&item, "elementIdentifier")?;
-    let element_value = cbor_to_attribute(get_map_entry(&item, "elementValue")?);
+    // Require `elementValue` to be present (a record stands for a disclosable item), but DON'T
+    // materialize it yet — the deep `cbor_to_attribute` clone is deferred to `element_value()`, run
+    // only after this item's digest matches the MSO (an item that later mismatches never pays it).
+    get_map_entry(&item, "elementValue")?;
     Some(RawIssuerItem {
-        raw_bytes: item_bytes,
+        raw_bytes,
         digest_id,
         identifier,
-        element_value,
+        item,
     })
 }
 
@@ -933,13 +1087,15 @@ fn scan_name_spaces<'a>(
         let ns_entry = items.entry(namespace.to_owned()).or_default();
         let len = c.read_array_len()?;
         for _ in 0..len {
-            // Capture this element's EXACT on-wire span, then decode its `digestID` / identifier /
-            // value from that SAME span into one self-contained record (bytes↔value tied together).
-            // An element the raw decode cannot parse simply produces no record, so the per-namespace
-            // record count falls short of the decoded item count and `verify_value_digests` fails the
-            // document closed (`DisclosureIntegrity`) — never a silent skip that drops an item.
-            let item_slice = c.take_item_slice()?;
-            if let Some(record) = decode_raw_issuer_item(item_slice) {
+            // Capture this element's EXACT on-wire `#6.24(bstr)` span AND its inner bstr content in one
+            // structural pass, then decode `digestID` / `elementIdentifier` from that SAME inner span
+            // into one self-contained record (bytes↔value tied together; the `elementValue` is left
+            // unmaterialized until a digest match). An element the raw pass cannot parse produces no
+            // record, so the per-namespace record count falls short of the decoded item count and
+            // `verify_value_digests` fails the document closed (`DisclosureIntegrity`) — never a silent
+            // skip that drops an item.
+            let (raw_item, inner) = c.take_tagged_bstr_item()?;
+            if let Some(record) = decode_raw_issuer_item(raw_item, inner) {
                 ns_entry.push(record);
             }
         }
@@ -951,8 +1107,11 @@ fn scan_name_spaces<'a>(
 // CBOR map/value helpers (ciborium uses an association-list `Value::Map`; these read it by key).
 // =================================================================================================
 
-/// Look up a text-keyed entry in a CBOR map value, returning a reference to the value.
-fn get_map_entry<'a>(value: &'a CborValue, key: &str) -> Option<&'a CborValue> {
+/// Look up a text-keyed entry in a CBOR map value, returning a reference to the value. The **one**
+/// CBOR-map-by-text-key lookup the crate shares (DRY — Principle III): the holder presentation splice
+/// ([`crate::issuance::present`]) reads the same `DeviceResponse` shape through this exact helper, so
+/// both halves resolve a `Document`/`issuerSigned`/`deviceSigned` key identically.
+pub(crate) fn get_map_entry<'a>(value: &'a CborValue, key: &str) -> Option<&'a CborValue> {
     let map = value.as_map()?;
     map.iter().find_map(|(k, v)| match k {
         Value::Text(t) if t == key => Some(v),
@@ -973,16 +1132,13 @@ fn first_document(root: &CborValue) -> Result<&CborValue, VerifyFailure> {
     documents.first().ok_or_else(VerifyFailure::malformed)
 }
 
-/// Unwrap a CBOR `#6.24(bstr)` ("encoded CBOR data item") to its inner byte string. The inner bytes
-/// are the exact serialization that was hashed/signed, so they must be used verbatim.
+/// Unwrap a CBOR `#6.24(bstr)` ("encoded CBOR data item") to its inner byte string, mapping a non-tag/
+/// non-bytes value to a malformed-credential failure. The inner bytes are the exact serialization that
+/// was hashed/signed, so they must be used verbatim. Delegates to the crate's single `#6.24(bstr)`
+/// unwrap [`crate::unwrap_tagged_cbor_payload`] (DRY — Principle III; the holder presentation splice
+/// shares it, so both halves unwrap identically).
 fn unwrap_tagged_cbor_payload(value: &CborValue) -> Result<Vec<u8>, VerifyFailure> {
-    match value {
-        CborValue::Tag(TAG_ENCODED_CBOR, inner) => match inner.as_ref() {
-            CborValue::Bytes(b) => Ok(b.clone()),
-            _ => Err(VerifyFailure::malformed()),
-        },
-        _ => Err(VerifyFailure::malformed()),
-    }
+    crate::unwrap_tagged_cbor_payload(value).ok_or_else(VerifyFailure::malformed)
 }
 
 /// Unwrap a byte string that is itself a `#6.24`-tagged encoded CBOR item. The `IssuerAuth`/`Device`
@@ -1000,17 +1156,24 @@ fn unwrap_bstr_tagged_payload(bstr: &[u8]) -> Result<Vec<u8>, VerifyFailure> {
 /// Parse a COSE_Sign1 from a CBOR value. ISO/IEC 18013-5 carries the `IssuerAuth`/`DeviceSignature`
 /// as the bare `[protected, unprotected, payload, signature]` array (RFC 8152 §4.2 untagged form),
 /// though a `#6.18`-tagged form is also accepted defensively.
+///
+/// The value is ALREADY decoded (it came from the single `ciborium` decode of the `DeviceResponse`),
+/// so this builds the `CoseSign1` straight from it via `coset`'s [`coset::AsCborValue::from_cbor_value`]
+/// — the very codec `from_slice` runs after its own decode — rather than re-serializing the whole
+/// `[protected, unprotected, payload, signature]` array (its large MSO-bearing payload bstr included)
+/// and re-decoding it. The resulting `CoseSign1` (and therefore the `Sig_structure` the signature is
+/// verified over) is byte-identical to the former serialize→`from_slice` round-trip; only the redundant
+/// re-encode + re-decode of the MSO payload (an attacker-multipliable soft-DoS lever — documents ×
+/// IssuerAuth × MSO size) is removed. `from_cbor_value` MOVES the payload bstr out of the array, so the
+/// MSO bytes are copied at most once (the borrowed value's clone), never the prior twice.
 fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(value, &mut buf).map_err(|_| VerifyFailure::malformed())?;
-    // `from_slice` accepts the untagged array; if the value is the tagged form, strip the tag first.
-    if let CborValue::Tag(_, inner) = value {
-        let mut inner_buf = Vec::new();
-        ciborium::into_writer(inner.as_ref(), &mut inner_buf)
-            .map_err(|_| VerifyFailure::malformed())?;
-        return CoseSign1::from_slice(&inner_buf).map_err(|_| VerifyFailure::malformed());
-    }
-    CoseSign1::from_slice(&buf).map_err(|_| VerifyFailure::malformed())
+    // The untagged `[protected, unprotected, payload, signature]` array is the COSE_Sign1 itself; a
+    // `#6.18`-tagged form (accepted defensively) carries that array as its single tagged item.
+    let array = match value {
+        CborValue::Tag(_, inner) => inner.as_ref(),
+        other => other,
+    };
+    CoseSign1::from_cbor_value(array.clone()).map_err(|_| VerifyFailure::malformed())
 }
 
 /// Extract the Document Signer signing certificate (DER) a presented mdoc claims in its `IssuerAuth`
@@ -1190,32 +1353,44 @@ fn verify_p256_es256_sig(
     tbs: &[u8],
 ) -> Result<(), ()> {
     use p256::ecdsa::signature::Verifier as _;
-    let signature = p256::ecdsa::Signature::from_slice(sig_bytes).map_err(|_| ())?;
+    let signature = parse_es256_sig(sig_bytes).ok_or(())?;
     vk.verify(tbs, &signature).map_err(|_| ())
 }
 
-/// Verify the `IssuerAuth` signature over the MSO with the DS certificate's key.
-fn verify_issuer_auth_signature(
-    issuer_auth: &CoseSign1,
-    ds_cert_der: &[u8],
-) -> Result<(), VerifyFailure> {
-    verify_cose_sign1_es256(issuer_auth, ds_cert_der)
+/// Parse the bytes of a COSE/JOSE ES256 signature into a [`p256::ecdsa::Signature`], accepting ONLY
+/// the fixed-width raw `r‖s` form (RFC 9053 §2.1 / RFC 7515 §3 — NEVER an ASN.1/DER `SEQUENCE`), or
+/// `None` for any other encoding.
+///
+/// This is the **single** definition of "what counts as a well-formed ES256 signature" the verifier
+/// honors (DRY — Principle III). Both the cryptographic check ([`verify_p256_es256_sig`]) and the
+/// structural binding-machinery probe ([`device_binding_machinery_sound`]) parse through this one
+/// helper, so the probe's notion of "well-formed" is the verifier's accepted set BY CONSTRUCTION: a
+/// DER-encoded signature the verifier rejects is likewise `None` here (classified a transcript-
+/// INDEPENDENT binding fault, never a freshness/replay signal), and the two can never drift apart.
+fn parse_es256_sig(sig_bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
+    p256::ecdsa::Signature::from_slice(sig_bytes).ok()
 }
 
 // =================================================================================================
 // MSO validityInfo.
 // =================================================================================================
 
-/// Parse the MSO `validityInfo` into the SDK's [`Validity`] (Unix seconds). `signed`/`validFrom`/
-/// `validUntil` are RFC 3339 `tdate` strings (often CBOR `#6.0`-tagged); a missing/unparseable bound
-/// is malformed.
+/// Parse the MSO `validityInfo` into the SDK's [`Validity`] (Unix seconds) PAIRED with the `signed`
+/// instant. `signed`/`validFrom`/`validUntil` are RFC 3339 `tdate` strings (often CBOR `#6.0`-tagged);
+/// a missing/unparseable bound is malformed.
 ///
 /// `signed` is the instant the issuer asserts it signed the MSO (ISO/IEC 18013-5 §9.1.2.4). It is
 /// inside the IssuerAuth-signed MSO, so it is not itself a forgery vector, but it is enforced for
 /// internal consistency: a `signed` after `validFrom` is contradictory (the credential claims it was
 /// valid from before it was signed), and a `signed` in the future (after `now`) is impossible for a
 /// genuinely issued credential — either is a tamper/malformed MSO and is rejected, not ignored.
-fn parse_validity_info(mso: &CborValue, now_unix: i64) -> Result<Validity, VerifyFailure> {
+///
+/// `signed` is returned because it is the credential's issuance/relevant time (ISO/IEC 18013-5 §9.1.2.4
+/// — what the opt-in qualified gate reads status at). The bar REQUIRES `signed` (this errors when it is
+/// absent), so on a VALID credential the returned `signed` equals what the standalone
+/// [`issuance_time_of_document`] would compute (its `validFrom` fallback only fires for a `signed`-absent
+/// MSO, which the bar rejects), letting the gate read this cached value instead of re-parsing the MSO.
+fn parse_validity_info(mso: &CborValue, now_unix: i64) -> Result<(Validity, i64), VerifyFailure> {
     let info = get_map_entry(mso, "validityInfo").ok_or_else(VerifyFailure::malformed)?;
     let signed = tdate_field(info, "signed")?;
     let valid_from = tdate_field(info, "validFrom")?;
@@ -1230,10 +1405,13 @@ fn parse_validity_info(mso: &CborValue, now_unix: i64) -> Result<Validity, Verif
     if signed > valid_from {
         return Err(VerifyFailure::reason(ReasonCode::Tamper));
     }
-    Ok(Validity {
-        not_before: Some(valid_from),
-        not_after: Some(valid_until),
-    })
+    Ok((
+        Validity {
+            not_before: Some(valid_from),
+            not_after: Some(valid_until),
+        },
+        signed,
+    ))
 }
 
 /// Read a `tdate` (RFC 3339) field from `validityInfo`, accepting the bare text or a `#6.0`-tagged
@@ -1383,16 +1561,18 @@ fn verify_value_digests(
             }
 
             // Disclose this record's `(identifier → value)` UNDER its namespace (the namespace-grouped
-            // shape — `elementIdentifier`s are unique only within a namespace, ISO/IEC 18013-5). Insert
-            // without ever silently shadowing a CONFLICTING value for the SAME `(namespace, id)` — a
-            // same-key clash with a different value is a structurally untrustworthy disclosure set (a
-            // consumer cannot know which value is authoritative); an identical re-disclosure is harmless.
-            // Two namespaces carrying the same `id` land in distinct sub-maps and never collide.
+            // shape — `elementIdentifier`s are unique only within a namespace, ISO/IEC 18013-5). The
+            // `elementValue` is materialized HERE — only now, AFTER the digest matched — so an item
+            // whose digest mismatched (rejected above) never pays the deep clone. Insert without ever
+            // silently shadowing a CONFLICTING value for the SAME `(namespace, id)` — a same-key clash
+            // with a different value is a structurally untrustworthy disclosure set (a consumer cannot
+            // know which value is authoritative); an identical re-disclosure is harmless. Two namespaces
+            // carrying the same `id` land in distinct sub-maps and never collide.
             insert_no_shadow(
                 &mut disclosed,
                 ns,
                 record.identifier.clone(),
-                record.element_value.clone(),
+                record.element_value(),
             )?;
         }
     }
@@ -1430,18 +1610,6 @@ fn insert_no_shadow(
             Ok(())
         }
     }
-}
-
-/// Re-encode a byte string as a CBOR `#6.24(bstr)` tagged item — the `DeviceNameSpacesBytes` wire form
-/// the `DeviceAuthentication` payload embeds (see [`reencode_tagged`] / [`build_device_authentication`]).
-///
-/// This is used only for the holder-binding payload (which the verifier rebuilds and re-signs over);
-/// the `valueDigests` integrity check hashes the ORIGINAL on-wire `IssuerSignedItemBytes` instead
-/// (ISO/IEC 18013-5 §9.2.2.5), so it never re-encodes — see [`verify_value_digests`]. Delegates to
-/// the crate's single `#6.24(bstr)` wrap-then-encode [`crate::encode_tagged_cbor`] (DRY — Principle
-/// III; the holder issuance ceremonies share the same helper, so the bytes are identical).
-fn encode_tagged_cbor(inner: &[u8]) -> Vec<u8> {
-    crate::encode_tagged_cbor(inner)
 }
 
 /// Read an integer-valued, text-keyed field from a CBOR map.
@@ -1597,7 +1765,7 @@ fn verify_device_binding(
 /// Re-encode a `#6.24(bstr)` CBOR value to its canonical bytes (the `DeviceNameSpacesBytes` form).
 fn reencode_tagged(value: &CborValue) -> Result<Vec<u8>, VerifyFailure> {
     let inner = unwrap_tagged_cbor_payload(value)?;
-    Ok(encode_tagged_cbor(&inner))
+    Ok(crate::encode_tagged_cbor(&inner))
 }
 
 /// Decode the supplied `SessionTranscript` bytes to a CBOR value. The transcript is REQUIRED to verify
@@ -1626,7 +1794,7 @@ fn build_device_authentication(
     ]);
     let mut inner = Vec::new();
     ciborium::into_writer(&device_auth, &mut inner).map_err(|_| VerifyFailure::malformed())?;
-    Ok(encode_tagged_cbor(&inner))
+    Ok(crate::encode_tagged_cbor(&inner))
 }
 
 /// Verify a COSE_Sign1 ES256 signature over a **detached** payload against a SEC1 P-256 public key.
@@ -2208,9 +2376,10 @@ mod unit {
             "the scanner captures the EXACT on-wire bytes (non-minimal framing preserved)"
         );
         // The bytes captured and the value decoded are ONE record (the integrity tie): the identifier
-        // and value were decoded from the SAME bytes the digest is computed over.
+        // and value were decoded from the SAME bytes the digest is computed over. `element_value()`
+        // materializes the (deferred) value lazily from the record's stored inner map.
         assert_eq!(record.identifier, "x");
-        assert_eq!(record.element_value, AttributeValue::Integer(1));
+        assert_eq!(record.element_value(), AttributeValue::Integer(1));
         // The digest of the captured wire bytes differs from the digest of a canonical re-encode — so a
         // verifier hashing the wire bytes (this fix) and one re-encoding would disagree.
         assert_ne!(

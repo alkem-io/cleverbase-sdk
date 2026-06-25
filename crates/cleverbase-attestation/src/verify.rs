@@ -37,7 +37,7 @@
 //! credential's issuance/relevant time** (SD-JWT VC `iat`/`nbf`; mdoc MSO `signed`/`validFrom`), not
 //! at the verification instant.
 
-use crate::mdoc::{self, MdocVerifyParams};
+use crate::mdoc::{self, MdocVerifyMeta, MdocVerifyParams};
 use crate::openid4vp::{self, MdocVpToken, PresentationRequest, VpToken};
 use crate::sdjwtvc::{self, KeyBindingChallenge, SdJwtVcInput};
 use crate::status::StatusOutcome;
@@ -192,73 +192,82 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
         return VerificationResult::invalid(ReasonCode::UnsupportedFormat);
     }
 
-    let mut result = match (presentation, request) {
-        // --- With an OpenID4VP request: run the binding verifier (bar + nonce/audience). ----------
-        (Presentation::SdJwtVc(p), Some(req)) => openid4vp::verify_response(
-            &VpToken::SdJwtVc(p),
-            req,
-            policy,
-            anchors,
-            ctx.now_unix,
-            ctx.role,
-            ctx.status,
-        ),
-        (
-            Presentation::Mdoc {
-                device_response,
-                audience,
-            },
-            Some(req),
-        ) => {
-            // An mdoc verified against a request must carry the addressed audience (the OpenID4VP
-            // delivery channel's `client_id`); without it the binding cannot be checked.
-            let Some(audience) = audience else {
-                return VerificationResult::invalid(ReasonCode::MissingRequestBinding);
-            };
-            openid4vp::verify_response(
-                &VpToken::Mdoc(MdocVpToken {
-                    audience: (*audience).to_owned(),
-                    device_response: (*device_response).to_vec(),
-                }),
-                req,
-                policy,
-                anchors,
-                ctx.now_unix,
-                ctx.role,
-                ctx.status,
-            )
-        }
+    // The per-format bar produces the verdict AND, for mdoc, the `MdocVerifyMeta` byproducts (the
+    // per-document claimed `(cert, issuance_time)` the qualified gate folds) the SAME decode already
+    // computed — so the gate reads those cached values rather than re-decoding the `DeviceResponse`.
+    // SD-JWT VC has no mdoc meta (`None`).
+    let (mut result, mdoc_meta): (VerificationResult, Option<MdocVerifyMeta>) =
+        match (presentation, request) {
+            // --- With an OpenID4VP request: run the binding verifier (bar + nonce/audience). ------
+            (Presentation::SdJwtVc(p), Some(req)) => (
+                openid4vp::verify_response(
+                    &VpToken::SdJwtVc(p),
+                    req,
+                    policy,
+                    anchors,
+                    ctx.now_unix,
+                    ctx.role,
+                    ctx.status,
+                ),
+                None,
+            ),
+            (
+                Presentation::Mdoc {
+                    device_response,
+                    audience,
+                },
+                Some(req),
+            ) => {
+                // An mdoc verified against a request must carry the addressed audience (the OpenID4VP
+                // delivery channel's `client_id`); without it the binding cannot be checked.
+                let Some(audience) = audience else {
+                    return VerificationResult::invalid(ReasonCode::MissingRequestBinding);
+                };
+                openid4vp::verify_response_with_meta(
+                    &VpToken::Mdoc(MdocVpToken {
+                        audience: (*audience).to_owned(),
+                        device_response: (*device_response).to_vec(),
+                    }),
+                    req,
+                    policy,
+                    anchors,
+                    ctx.now_unix,
+                    ctx.role,
+                    ctx.status,
+                )
+            }
 
-        // --- Without a request: the per-format always-on bar alone. -------------------------------
-        (Presentation::SdJwtVc(p), None) => {
-            let input = SdJwtVcInput {
-                presentation: p,
-                anchors,
-                role: ctx.role,
-                // No request ⇒ no `aud`/`nonce` challenge (so no replay/audience protection). A
-                // present KB-JWT is STILL signature- and `sd_hash`-verified by the bar; only the
-                // request-binding (`aud`/`nonce`) checks are skipped. See `kb_challenge_without_request`.
-                key_binding: kb_challenge_without_request(p),
-                now_unix: ctx.now_unix,
-                status: ctx.status,
-            };
-            sdjwtvc::verify_sd_jwt_vc(&input)
-        }
-        (
-            Presentation::Mdoc {
-                device_response, ..
-            },
-            None,
-        ) => {
-            let params = MdocVerifyParams {
-                now_unix: ctx.now_unix,
-                session_transcript: ctx.session_transcript,
-                role: ctx.role,
-                status: ctx.status,
-            };
-            mdoc::verify(device_response, anchors, &params)
-        }
-    };
+            // --- Without a request: the per-format always-on bar alone. ---------------------------
+            (Presentation::SdJwtVc(p), None) => {
+                let input = SdJwtVcInput {
+                    presentation: p,
+                    anchors,
+                    role: ctx.role,
+                    // No request ⇒ no `aud`/`nonce` challenge (so no replay/audience protection). A
+                    // present KB-JWT is STILL signature- and `sd_hash`-verified by the bar; only the
+                    // request-binding (`aud`/`nonce`) checks are skipped. See `kb_challenge_without_request`.
+                    key_binding: kb_challenge_without_request(p),
+                    now_unix: ctx.now_unix,
+                    status: ctx.status,
+                };
+                (sdjwtvc::verify_sd_jwt_vc(&input), None)
+            }
+            (
+                Presentation::Mdoc {
+                    device_response, ..
+                },
+                None,
+            ) => {
+                let params = MdocVerifyParams {
+                    now_unix: ctx.now_unix,
+                    session_transcript: ctx.session_transcript,
+                    role: ctx.role,
+                    status: ctx.status,
+                };
+                let (result, meta) = mdoc::verify_with_meta(device_response, anchors, &params);
+                (result, Some(meta))
+            }
+        };
 
     // Qualified-status gate (T019) — OFF by default. The seam is here so the always-on verdict above
     // is complete on its own; when the opt-in gate is enabled — via the verifier
@@ -273,9 +282,10 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     // always-on bar already set `valid = false` (e.g. `Tamper`), so reporting `Qualified` off that
     // claimed leaf would be a false "qualified". Only when `valid == true` has the always-on bar
     // signature-verified AND trust-anchored that exact leaf, so the qualified status is meaningful;
-    // otherwise `qualified_status` stays `None` (SC-007).
+    // otherwise `qualified_status` stays `None` (SC-007). For mdoc the gate folds the cached
+    // `mdoc_meta.claimed_issuers` the VALID bar pass surfaced (no second `DeviceResponse` decode).
     if (policy.qualified_gate || ctx.qualified_gate) && result.valid {
-        result.qualified_status = Some(qualified_status_for(presentation, ctx));
+        result.qualified_status = Some(qualified_status_for(presentation, ctx, mdoc_meta.as_ref()));
     }
 
     result
@@ -323,6 +333,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 fn qualified_status_for(
     presentation: &Presentation<'_>,
     ctx: &VerifyContext<'_>,
+    mdoc_meta: Option<&MdocVerifyMeta>,
 ) -> crate::types::QualifiedStatus {
     use crate::types::QualifiedStatus;
     let Some(trust_list) = ctx.qualified_trust_list else {
@@ -352,20 +363,21 @@ fn qualified_status_for(
             sdjwtvc::issuer_signing_cert_der(p),
             sdjwtvc::issuance_time_unix(p),
         ),
-        Presentation::Mdoc {
-            device_response, ..
-        } => {
+        Presentation::Mdoc { .. } => {
             // Decide over EVERY document's issuer at that document's OWN issuance time; fold so
-            // `Qualified` requires all to qualify. No parseable `documents` array → absent → Indeterminate.
-            mdoc::issuer_signing_certs_with_issuance_der(device_response).map_or(
-                QualifiedStatus::Indeterminate,
-                |per_doc| {
-                    fold_qualified(
-                        per_doc
-                            .into_iter()
-                            .map(|(cert, issued)| status_of(cert, issued)),
-                    )
-                },
+            // `Qualified` requires all to qualify. The gate runs only on a VALID credential, where the
+            // always-on bar already extracted EACH document's `(ds_cert_der, signed)` and surfaced them
+            // in `mdoc_meta.claimed_issuers` — fold those CACHED pairs (the bar's single decode; no
+            // second `DeviceResponse` decode + per-document COSE/MSO re-parse). On a VALID mdoc `signed`
+            // is mandatory, so a cached `(cert, signed)` equals what `issuer_signing_certs_with_issuance_der`
+            // would re-derive. A `None` meta (no claimed issuers to fold) fails closed — empty fold →
+            // `Indeterminate` — never a false "qualified".
+            let claimed = mdoc_meta.map(|meta| meta.claimed_issuers.as_slice());
+            fold_qualified(
+                claimed
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|(cert, issued)| status_of(Some(cert.clone()), Some(*issued))),
             )
         }
     }

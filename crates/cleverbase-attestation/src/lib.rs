@@ -103,3 +103,21 @@ pub(crate) fn encode_tagged_cbor(inner: &[u8]) -> Vec<u8> {
         Box::new(ciborium::value::Value::Bytes(inner.to_vec())),
     ))
 }
+
+/// Unwrap a CBOR `#6.24(bstr)` "encoded CBOR data item" to its inner byte string — the **one**
+/// authoritative `#6.24(bstr)` unwrap for the crate (DRY — Principle III), the inverse of
+/// [`encode_tagged_cbor`]. Returns `None` for any value that is not a [`TAG_ENCODED_CBOR`] tag
+/// wrapping a byte string. The inner bytes are the exact serialization that was hashed/signed, so a
+/// caller MUST use them verbatim. Both the mdoc verifier ([`mdoc`]) and the holder presentation splice
+/// ([`issuance::present`]) unwrap+re-wrap the correctness-sensitive `DeviceNameSpacesBytes` through
+/// this single helper (paired with [`encode_tagged_cbor`]), so the bytes both halves produce are
+/// byte-identical.
+pub(crate) fn unwrap_tagged_cbor_payload(value: &ciborium::value::Value) -> Option<Vec<u8>> {
+    match value {
+        ciborium::value::Value::Tag(TAG_ENCODED_CBOR, inner) => match inner.as_ref() {
+            ciborium::value::Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}

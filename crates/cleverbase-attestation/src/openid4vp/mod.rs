@@ -35,7 +35,7 @@
 use ciborium::value::Value as CborValue;
 use serde::{Deserialize, Serialize};
 
-use crate::mdoc::{self, MdocVerifyParams};
+use crate::mdoc::{self, MdocVerifyMeta, MdocVerifyParams};
 use crate::sdjwtvc::{self, KeyBindingChallenge, SdJwtVcInput};
 use crate::status::StatusOutcome;
 use crate::trust::TrustAnchorSource;
@@ -184,6 +184,24 @@ pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     role: IssuerRole,
     status: StatusOutcome,
 ) -> VerificationResult {
+    verify_response_with_meta(vp_token, request, policy, anchors, now_unix, role, status).0
+}
+
+/// Verify an OpenID4VP `vp_token` exactly as [`verify_response`] AND surface the mdoc
+/// [`MdocVerifyMeta`] the bar pass produced (when the token is an mdoc), so the [`crate::verify`]
+/// entry point feeds the opt-in qualified gate from those cached per-document `(cert, issuance_time)`
+/// pairs instead of re-decoding the `DeviceResponse`. The [`VerificationResult`] is byte-identical to
+/// [`verify_response`]'s (that public entry delegates here and drops the meta); an SD-JWT VC token has
+/// no mdoc meta (`None`).
+pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
+    vp_token: &VpToken<'_>,
+    request: &PresentationRequest,
+    policy: &VerificationPolicy,
+    anchors: &A,
+    now_unix: i64,
+    role: IssuerRole,
+    status: StatusOutcome,
+) -> (VerificationResult, Option<MdocVerifyMeta>) {
     // Format gate (identical to the `verify()` entry point's, so the public `verify_response` honors
     // the `policy` it takes): the policy may restrict accepted formats (an empty set = both). A
     // presented format the policy excludes is rejected up front — never run through the bar.
@@ -192,14 +210,21 @@ pub fn verify_response<A: TrustAnchorSource + ?Sized>(
         VpToken::Mdoc(_) => Format::Mdoc,
     };
     if !policy.formats.is_empty() && !policy.formats.contains(&format) {
-        return VerificationResult::invalid(ReasonCode::UnsupportedFormat);
+        return (
+            VerificationResult::invalid(ReasonCode::UnsupportedFormat),
+            None,
+        );
     }
 
     match vp_token {
-        VpToken::SdJwtVc(presentation) => {
-            verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status)
+        VpToken::SdJwtVc(presentation) => (
+            verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status),
+            None,
+        ),
+        VpToken::Mdoc(token) => {
+            let (result, meta) = verify_mdoc_bound(token, request, anchors, now_unix, role, status);
+            (result, Some(meta))
         }
-        VpToken::Mdoc(token) => verify_mdoc_bound(token, request, anchors, now_unix, role, status),
     }
 }
 
@@ -246,6 +271,8 @@ fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
 
 /// mdoc binding: compare the addressed audience (→ `WrongAudience`), then run the always-on bar
 /// against the handover transcript reconstructed from the request (a nonce mismatch → `Replay`).
+/// Returns the [`MdocVerifyMeta`] the bar pass produced so the caller can feed the qualified gate the
+/// cached per-document `(cert, issuance_time)` instead of re-decoding the response.
 fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     token: &MdocVpToken,
     request: &PresentationRequest,
@@ -253,9 +280,12 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     now_unix: i64,
     role: IssuerRole,
     status: StatusOutcome,
-) -> VerificationResult {
+) -> (VerificationResult, MdocVerifyMeta) {
     if token.audience != request.audience {
-        return VerificationResult::invalid(ReasonCode::WrongAudience);
+        return (
+            VerificationResult::invalid(ReasonCode::WrongAudience),
+            MdocVerifyMeta::default(),
+        );
     }
 
     // Reconstruct the conformant OpenID4VP-1.0 `OpenID4VPHandover` transcript the holder must have
@@ -269,7 +299,9 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
         role,
         status,
     };
-    let result = mdoc::verify(&token.device_response, anchors, &params);
+    // Run the bar ONCE and read the byproducts it already computed (document count + binding-machinery
+    // soundness) from the returned meta — no second `DeviceResponse` decode for the replay classifier.
+    let (result, meta) = mdoc::verify_with_meta(&token.device_response, anchors, &params);
     // A holder-binding failure here is AMBIGUOUS: it can be the fresh-nonce mismatch we want to
     // surface as Replay (the verifier rebuilt `DeviceAuthentication` over a different transcript than
     // the holder signed — the audience already matched in cleartext above), OR a genuine
@@ -291,22 +323,21 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     // a reasonable single-document attribution. But in a MULTI-document response a real wrong-key fault
     // on `documents[1]` must NOT be laundered into `Replay` (it would mis-report a genuine holder-
     // binding fault as a freshness replay). So restrict the Replay re-attribution to `documents.len()
-    // == 1`; for more than one document (or when the count cannot be read) KEEP `HolderBinding`.
+    // == 1`; for more than one document KEEP `HolderBinding`. (On a `HolderBinding` failure the bar
+    // decoded a non-empty `documents`, so `meta.document_count` is the read count and
+    // `meta.binding_machinery` is `Some(..)` — both cached from that decode.)
     if !result.valid && result.reasons == [ReasonCode::HolderBinding] {
-        let single_document = mdoc::document_count(&token.device_response) == Some(1);
-        if single_document
-            && mdoc::device_binding_machinery(&token.device_response)
-                == mdoc::DeviceBindingMachinery::Sound
-        {
+        let single_document = meta.document_count == 1;
+        if single_document && meta.binding_machinery == Some(mdoc::DeviceBindingMachinery::Sound) {
             // Single document + sound machinery + a binding failure ⇒ the rebuilt transcript (fresh
             // nonce) is the only thing that can differ ⇒ a replay.
-            return VerificationResult::invalid(ReasonCode::Replay);
+            return (VerificationResult::invalid(ReasonCode::Replay), meta);
         }
-        // Multi-document, an unreadable count, or a structurally-broken binding ⇒ a genuine
-        // holder-binding fault, never laundered into `Replay`.
-        return result;
+        // Multi-document or a structurally-broken binding ⇒ a genuine holder-binding fault, never
+        // laundered into `Replay`.
+        return (result, meta);
     }
-    result
+    (result, meta)
 }
 
 /// Build the conformant OpenID4VP-1.0 / ISO 18013-7 mdoc `SessionTranscript` bytes for a
