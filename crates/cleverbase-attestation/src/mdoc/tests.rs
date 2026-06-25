@@ -522,6 +522,80 @@ fn multi_document_response_with_a_forged_second_document_is_rejected() {
 }
 
 #[test]
+fn forged_item_reusing_a_genuine_digest_id_is_rejected_no_disclosure() {
+    // CRITICAL FALSE-ACCEPT PROBE (SC-002, selective-disclosure integrity). A genuine issuer-signed
+    // mdoc is given an APPENDED forged `IssuerSignedItem` that REUSES a real element's `digestID` (0,
+    // the genuine `family_name`) but carries an attacker-chosen `elementIdentifier`/`elementValue`
+    // ("forged_claim" → "EVIL") the issuer NEVER signed. The MSO `valueDigests[0]` still holds only
+    // the genuine item's digest. A verifier that hashes a digestID-keyed wire slice but discloses a
+    // DECOUPLED decoded item would hash the genuine bytes (digest matches) yet disclose the forged
+    // claim — a false-accept. The fix ties the hashed bytes to the disclosed value (one record per
+    // on-wire item) and rejects a `digestID` appearing on two on-wire items, so BOTH orderings (forged
+    // first and forged last) are rejected as `DisclosureIntegrity` and "EVIL" is never disclosed.
+    for forged_first in [true, false] {
+        let response = MdocBuilder::new()
+            .append_forged_item(
+                0,
+                "forged_claim",
+                CborValue::Text("EVIL".to_owned()),
+                forged_first,
+            )
+            .build();
+        let result = verify(&response, &trusted_anchors(), &params());
+        assert!(
+            !result.valid,
+            "a forged item reusing a genuine digestID must NOT be VALID (forged_first={forged_first})"
+        );
+        assert_eq!(
+            result.reasons,
+            vec![ReasonCode::DisclosureIntegrity],
+            "the reused-digestID forgery is a disclosure-integrity failure (forged_first={forged_first})"
+        );
+        assert!(
+            result.disclosed_attributes.is_empty(),
+            "an INVALID verdict discloses nothing — the forged claim never surfaces"
+        );
+        assert!(
+            !result.disclosed_attributes.contains_key("forged_claim"),
+            "the attacker-chosen claim the issuer never signed must NEVER be disclosed"
+        );
+        assert_ne!(
+            result.disclosed_attributes.get("family_name"),
+            Some(&AttributeValue::Text("EVIL".to_owned())),
+            "the forged value must never be served under any identifier"
+        );
+    }
+}
+
+#[test]
+fn duplicate_digest_id_within_a_namespace_is_rejected() {
+    // Two on-wire `IssuerSignedItem`s sharing the SAME `digestID` within one namespace is structurally
+    // ambiguous (which item does `valueDigests[id]` attest?) and is the lever the false-accept above
+    // rides on, so a duplicate `digestID` is rejected outright as `DisclosureIntegrity`.
+    let response = MdocBuilder::new()
+        .elements(vec![
+            Element {
+                digest_id: 0,
+                identifier: "family_name",
+                value: CborValue::Text("Doe".to_owned()),
+            },
+            Element {
+                digest_id: 0, // DUPLICATE digestID on a second, distinct on-wire item
+                identifier: "given_name",
+                value: CborValue::Text("Ada".to_owned()),
+            },
+        ])
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "two on-wire items with the same digestID must NOT be VALID"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::DisclosureIntegrity]);
+    assert!(result.disclosed_attributes.is_empty());
+}
+
+#[test]
 fn cross_document_attribute_collision_is_rejected_no_silent_shadow() {
     // SHADOWING PROBE: `documents[0]` discloses given_name="Ada"; a SECOND fully-VALID document
     // (signed by the SAME trusted DS) discloses given_name="EVIL". With a flat last-writer-wins merge

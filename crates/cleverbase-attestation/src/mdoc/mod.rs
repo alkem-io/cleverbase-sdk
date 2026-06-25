@@ -24,7 +24,7 @@
 //! All crypto routes through the SDK's vetted RustCrypto stack plus `coset` (a COSE *codec*, not
 //! crypto) and `ciborium` (CBOR) — no hand-rolled crypto (Principle IV).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 use ciborium::Value as CborValue;
@@ -542,15 +542,41 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
 //
 // `ciborium` 0.2 exposes no raw-value capture (no `RawValue`, and `ciborium-ll`'s decoder has no
 // byte-offset API), so this is a light, self-contained CBOR pass that walks ONLY the structure it
-// needs — `DeviceResponse → documents[i] → issuerSigned → nameSpaces → {ns: [items]}` — and records
-// the exact original byte span of every `#6.24(bstr)` element, keyed by `(namespace, digestID)`.
+// needs — `DeviceResponse → documents[i] → issuerSigned → nameSpaces → {ns: [items]}` — and records,
+// for EACH on-wire `#6.24(bstr)` element, ONE record that carries together its exact original byte
+// span AND the `digestID` / `elementIdentifier` / `elementValue` decoded from THOSE SAME bytes.
+//
+// SECURITY (SC-002 — selective-disclosure integrity): the bytes that get HASHED and the value that
+// gets DISCLOSED MUST be the same on-wire item. A digestID-keyed map decoupled from the disclosed
+// value is a FALSE-ACCEPT lever — a forged item reusing a genuine item's `digestID` could hash the
+// genuine bytes (digest matches the MSO) while disclosing an attacker-chosen identifier/value the
+// issuer never signed. Capturing one self-contained record per item ties bytes↔value inseparably,
+// and per-namespace `digestID` uniqueness is enforced ([`verify_value_digests`]) so a reused digestID
+// is rejected outright.
 // =================================================================================================
 
-/// The captured on-wire `IssuerSignedItemBytes` of one document, keyed by namespace then `digestID`:
-/// `raw[namespace][digestID]` is the exact original byte slice of that `#6.24(bstr)` element, the
-/// input ISO/IEC 18013-5 §9.2.2.5 hashes. Built by [`scan_raw_issuer_items`] from the original
-/// `DeviceResponse` bytes (one scan per response), then consulted by [`verify_value_digests`].
-type RawDocumentItems<'a> = BTreeMap<String, BTreeMap<i64, &'a [u8]>>;
+/// One captured on-wire `IssuerSignedItem`: its exact `#6.24(bstr .cbor IssuerSignedItem)` byte span
+/// (the digest input ISO/IEC 18013-5 §9.2.2.5 hashes) PAIRED with the `digestID` /
+/// `elementIdentifier` / `elementValue` decoded from those SAME bytes — so the value disclosed is
+/// inseparable from the bytes hashed (no decoupled-lookup false-accept).
+struct RawIssuerItem<'a> {
+    /// The exact on-wire `IssuerSignedItemBytes` span (`#6.24(bstr)`), hashed verbatim.
+    raw_bytes: &'a [u8],
+    /// The `digestID` decoded from `raw_bytes` (the MSO `valueDigests` index for this item).
+    digest_id: i64,
+    /// The `elementIdentifier` (claim name) decoded from `raw_bytes`.
+    identifier: String,
+    /// The `elementValue` (claim value) decoded from `raw_bytes`.
+    element_value: AttributeValue,
+}
+
+/// The captured on-wire `IssuerSignedItem`s of one document, keyed by namespace: each value is the
+/// list of [`RawIssuerItem`] records for that namespace, IN WIRE ORDER. Built by
+/// [`scan_raw_issuer_items`] from the original `DeviceResponse` bytes (one scan per response), then
+/// consumed by [`verify_value_digests`] (which recomputes each record's digest over its OWN bytes and
+/// discloses that record's OWN identifier/value). A `Vec` (not a `digestID`-keyed map) so duplicate
+/// `digestID`s are visible and rejected rather than silently collapsed.
+type RawDocumentItems<'a> = BTreeMap<String, Vec<RawIssuerItem<'a>>>;
 
 /// A minimal forward CBOR cursor over a byte slice, used only to walk the `IssuerSigned.nameSpaces`
 /// structure and capture each `IssuerSignedItemBytes` span verbatim. It is NOT a general decoder: it
@@ -599,8 +625,12 @@ impl<'a> CborCursor<'a> {
 
     /// Read `n` big-endian bytes as the head argument, advancing the cursor.
     fn read_uint(&mut self, n: usize) -> Option<u64> {
-        let bytes = self.input.get(self.pos..self.pos + n)?;
-        self.pos += n;
+        // `checked_add` for the end offset: attacker-controlled head bytes must never overflow `usize`
+        // into a panic (overflow-checks on) — an out-of-range read fails closed via `get` returning
+        // `None`. (Consistent with `skip_pending` / `take_text`.)
+        let end = self.pos.checked_add(n)?;
+        let bytes = self.input.get(self.pos..end)?;
+        self.pos = end;
         let mut value = 0u64;
         for &b in bytes {
             value = (value << 8) | u64::from(b);
@@ -611,41 +641,56 @@ impl<'a> CborCursor<'a> {
     /// Skip exactly one complete data item (head + all content/children), advancing the cursor past
     /// it. Returns `None` on malformed/indefinite input.
     fn skip_item(&mut self) -> Option<()> {
-        let head = self.read_head()?;
-        self.skip_after_head(&head)
+        self.skip_pending(1)
     }
 
-    /// Skip the content of an item whose head has already been read (the recursive body of
-    /// [`Self::skip_item`], shared with the capturing walkers that read a head then skip its content).
-    fn skip_after_head(&mut self, head: &CborHead) -> Option<()> {
+    /// The number of complete data items that follow this head as its content: arrays contribute
+    /// `arg` items, maps `2 * arg` (key/value pairs), tags `1`, and scalars/strings `0` (a string's
+    /// bytes are not separate items — they are consumed by the caller). Returns `None` for an
+    /// unsupported major type (indefinite/reserved were already rejected by `read_head`). Uses
+    /// `checked_mul` so a maliciously-large map length cannot overflow `usize` into a panic.
+    fn head_child_count(head: &CborHead) -> Option<usize> {
         match head.major {
-            // Unsigned/negative integer, simple/float: the value lived entirely in the head args.
-            0 | 1 | 7 => Some(()),
-            // Byte / text string: `arg` content bytes follow.
-            2 | 3 => {
-                let len = usize::try_from(head.arg).ok()?;
-                self.pos = self.pos.checked_add(len)?;
-                (self.pos <= self.input.len()).then_some(())
-            }
+            // Integers, simple/float, byte/text string: no child *items* follow.
+            0 | 1 | 2 | 3 | 7 => Some(0),
             // Array: `arg` items follow.
-            4 => {
-                for _ in 0..head.arg {
-                    self.skip_item()?;
-                }
-                Some(())
-            }
-            // Map: `arg` key/value PAIRS follow.
-            5 => {
-                for _ in 0..head.arg {
-                    self.skip_item()?;
-                    self.skip_item()?;
-                }
-                Some(())
-            }
-            // Tag: one tagged item follows.
-            6 => self.skip_item(),
+            4 => usize::try_from(head.arg).ok(),
+            // Map: `arg` key/value PAIRS = `2 * arg` items follow.
+            5 => usize::try_from(head.arg).ok()?.checked_mul(2),
+            // Tag: exactly one tagged item follows.
+            6 => Some(1),
             _ => None,
         }
+    }
+
+    /// Iteratively skip `pending` complete data items, advancing the cursor past all of them.
+    ///
+    /// This is the depth-bound for the raw cursor: ISO/IEC 18013-5 CBOR is walked over a strictly
+    /// forward byte stream, so skipping nested containers needs no per-level call frame — each
+    /// container head simply ADDS its child-item count to the flat work counter, and the loop consumes
+    /// items until the counter drains. An adversarially-nested `DeviceResponse` (hundreds of thousands
+    /// of nested arrays) therefore costs O(1) stack and a single `usize` counter instead of recursing
+    /// once per level — it can never overflow the stack (a former DoS: an uncatchable SIGABRT). A
+    /// malformed/truncated stream drains the input first and fails closed (`read_head`/string-byte read
+    /// returns `None`); a length that would overflow the counter likewise fails closed via `checked_add`.
+    fn skip_pending(&mut self, mut pending: usize) -> Option<()> {
+        while pending > 0 {
+            pending -= 1;
+            let head = self.read_head()?;
+            // A string's content bytes are consumed inline (they are not separate items); a container
+            // contributes its children to the remaining work.
+            if matches!(head.major, 2 | 3) {
+                let len = usize::try_from(head.arg).ok()?;
+                self.pos = self.pos.checked_add(len)?;
+                if self.pos > self.input.len() {
+                    return None;
+                }
+                continue;
+            }
+            let children = Self::head_child_count(&head)?;
+            pending = pending.checked_add(children)?;
+        }
+        Some(())
     }
 
     /// Capture the exact byte slice of the next complete data item without interpreting it, advancing
@@ -663,8 +708,12 @@ impl<'a> CborCursor<'a> {
             return None;
         }
         let len = usize::try_from(head.arg).ok()?;
-        let bytes = self.input.get(self.pos..self.pos + len)?;
-        self.pos += len;
+        // `checked_add` for the end offset: a giant declared `len` (attacker-controlled) must fail
+        // closed (`None`), never overflow `usize` into a panic. (Matches `skip_pending`'s string
+        // arm and `read_uint`.)
+        let end = self.pos.checked_add(len)?;
+        let bytes = self.input.get(self.pos..end)?;
+        self.pos = end;
         core::str::from_utf8(bytes).ok()
     }
 
@@ -714,25 +763,38 @@ impl<'a> CborCursor<'a> {
     }
 }
 
-/// Read the `digestID` of an `IssuerSignedItem` from its raw `#6.24(bstr .cbor IssuerSignedItem)`
-/// element bytes, by decoding the (tiny) inner item with `ciborium` and reading its `digestID` field.
-/// Returns `None` if the element is not a `#6.24(bstr)` wrapping a map with an integer `digestID`.
-fn raw_item_digest_id(item_bytes: &[u8]) -> Option<i64> {
+/// Decode a [`RawIssuerItem`] record from one on-wire `#6.24(bstr .cbor IssuerSignedItem)` element's
+/// exact bytes (`item_bytes`): unwrap the tag, decode the inner `IssuerSignedItem` map, and read its
+/// `digestID` / `elementIdentifier` / `elementValue` — ALL from those same bytes. `raw_bytes` (the
+/// hash input) and the decoded `(identifier, value)` (the disclosure) are therefore one and the same
+/// item by construction. Returns `None` if the element is not a `#6.24(bstr)` wrapping a map with an
+/// integer `digestID`, a text `elementIdentifier`, and an `elementValue`.
+fn decode_raw_issuer_item(item_bytes: &[u8]) -> Option<RawIssuerItem<'_>> {
     let value: CborValue = ciborium::from_reader(item_bytes).ok()?;
     let inner = unwrap_tagged_cbor_payload(&value).ok()?;
     let item: CborValue = ciborium::from_reader(inner.as_slice()).ok()?;
-    get_integer(&item, "digestID")
+    let digest_id = get_integer(&item, "digestID")?;
+    let identifier = get_text(&item, "elementIdentifier")?;
+    let element_value = cbor_to_attribute(get_map_entry(&item, "elementValue")?);
+    Some(RawIssuerItem {
+        raw_bytes: item_bytes,
+        digest_id,
+        identifier,
+        element_value,
+    })
 }
 
-/// Scan the original `DeviceResponse` bytes once and capture, per document (in document order), the
-/// exact on-wire `IssuerSignedItemBytes` of every disclosed element keyed by `(namespace, digestID)`
-/// — the digest input ISO/IEC 18013-5 §9.2.2.5 mandates (the bytes as received, not a re-encode).
+/// Scan the original `DeviceResponse` bytes once and capture, per document (in document order), one
+/// [`RawIssuerItem`] record per on-wire `IssuerSignedItem` (its exact `IssuerSignedItemBytes` span —
+/// the digest input ISO/IEC 18013-5 §9.2.2.5 mandates — plus the `digestID` / identifier / value
+/// decoded from those same bytes), grouped by namespace in wire order.
 ///
 /// This is a best-effort capture: a document/element this light pass cannot navigate (it never
 /// happens for a well-formed response, which the always-on bar parses in full via `ciborium`) simply
-/// yields no captured slice, and [`verify_value_digests`] then fails that item closed
-/// (`DisclosureIntegrity`) rather than silently re-encoding — so a parse the two paths disagree on can
-/// never become a FALSE-ACCEPT. The verdict is unchanged for every conformant response.
+/// yields fewer records than the decoded `nameSpaces` carries, and [`verify_value_digests`] then fails
+/// that document closed (`DisclosureIntegrity`) rather than silently re-encoding or dropping an item —
+/// so a parse the two paths disagree on can never become a FALSE-ACCEPT. The verdict is unchanged for
+/// every conformant response.
 fn scan_raw_issuer_items(device_response: &[u8]) -> Vec<RawDocumentItems<'_>> {
     let mut per_document = Vec::new();
     let mut cursor = CborCursor::new(device_response);
@@ -750,9 +812,9 @@ fn scan_raw_issuer_items(device_response: &[u8]) -> Vec<RawDocumentItems<'_>> {
     per_document
 }
 
-/// Capture one `Document`'s `issuerSigned.nameSpaces` raw `IssuerSignedItemBytes`, keyed by
-/// `(namespace, digestID)`. The cursor enters positioned at the `Document` map and leaves positioned
-/// just past it (so the caller's array walk stays in step).
+/// Capture one `Document`'s `issuerSigned.nameSpaces` as per-namespace [`RawIssuerItem`] record lists
+/// (in wire order). The cursor enters positioned at the `Document` map and leaves positioned just past
+/// it (so the caller's array walk stays in step).
 fn scan_document_issuer_items<'a>(cursor: &mut CborCursor<'a>) -> Option<RawDocumentItems<'a>> {
     let mut items: RawDocumentItems<'a> = BTreeMap::new();
     cursor.for_each_text_keyed_entry(|doc_key, c| {
@@ -771,9 +833,9 @@ fn scan_document_issuer_items<'a>(cursor: &mut CborCursor<'a>) -> Option<RawDocu
     Some(items)
 }
 
-/// Capture every `IssuerSignedItemBytes` of a `nameSpaces` map (`{ namespace: [ #6.24(bstr) … ] }`)
-/// into `items`, keyed by namespace then `digestID`. The cursor enters at the `nameSpaces` map value
-/// and leaves just past it.
+/// Capture every `IssuerSignedItem` of a `nameSpaces` map (`{ namespace: [ #6.24(bstr) … ] }`) into
+/// `items` as per-namespace [`RawIssuerItem`] record lists (in wire order). The cursor enters at the
+/// `nameSpaces` map value and leaves just past it.
 fn scan_name_spaces<'a>(
     cursor: &mut CborCursor<'a>,
     items: &mut RawDocumentItems<'a>,
@@ -782,9 +844,14 @@ fn scan_name_spaces<'a>(
         let ns_entry = items.entry(namespace.to_owned()).or_default();
         let len = c.read_array_len()?;
         for _ in 0..len {
+            // Capture this element's EXACT on-wire span, then decode its `digestID` / identifier /
+            // value from that SAME span into one self-contained record (bytes↔value tied together).
+            // An element the raw decode cannot parse simply produces no record, so the per-namespace
+            // record count falls short of the decoded item count and `verify_value_digests` fails the
+            // document closed (`DisclosureIntegrity`) — never a silent skip that drops an item.
             let item_slice = c.take_item_slice()?;
-            if let Some(digest_id) = raw_item_digest_id(item_slice) {
-                ns_entry.insert(digest_id, item_slice);
+            if let Some(record) = decode_raw_issuer_item(item_slice) {
+                ns_entry.push(record);
             }
         }
         Some(())
@@ -1124,22 +1191,32 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
 // valueDigests integrity (in-house, MANDATORY).
 // =================================================================================================
 
-/// Recompute every disclosed `IssuerSignedItem` digest and match it against the MSO `valueDigests`.
+/// Recompute every on-wire `IssuerSignedItem` digest and match it against the MSO `valueDigests`,
+/// returning the disclosed attributes only for items whose digest matches.
 ///
-/// For each namespace and each disclosed item the digest is computed over the **on-wire
-/// `IssuerSignedItemBytes`** — the `#6.24(bstr .cbor IssuerSignedItem)` element exactly as it was
-/// received (ISO/IEC 18013-5 §9.2.2.5: "the input for the digest function is the binary data of the
-/// IssuerSignedItem"), taken verbatim from `raw_items` (the up-front [`scan_raw_issuer_items`]
-/// capture) rather than re-encoded from the decoded value — so the verifier never depends on its own
-/// CBOR serializer reproducing another conformant-but-non-canonical implementation's framing. The
-/// digest is then compared to `valueDigests[ns][digestID]`. Any missing/mismatched digest, or an item
-/// whose original bytes the raw pass did not capture, fails with `DisclosureIntegrity` (fail-closed —
-/// never a re-encode fallback that could mask a divergent parse). Returns the disclosed attributes
-/// (flattened across namespaces) on success.
+/// The disclosure works from the [`scan_raw_issuer_items`] **records** (`raw_items`): each record
+/// carries the item's exact `IssuerSignedItemBytes` span (`#6.24(bstr .cbor IssuerSignedItem)`)
+/// PAIRED with the `digestID` / `elementIdentifier` / `elementValue` decoded from THOSE SAME bytes.
+/// For each record the digest is computed over its OWN `raw_bytes` — the bytes as received (ISO/IEC
+/// 18013-5 §9.2.2.5: "the input for the digest function is the binary data of the IssuerSignedItem"),
+/// never a re-encode — and matched against `valueDigests[ns][digestID]`; ONLY on a match is that
+/// record's OWN identifier/value disclosed. Because the hashed bytes and the disclosed value are one
+/// inseparable record, a forged item cannot hash a genuine item's bytes while disclosing an
+/// attacker-chosen claim (SC-002 — the selective-disclosure-integrity false-accept).
 ///
-/// The expected digests are indexed into a per-namespace `BTreeMap<digestID, &digest>` once before the
-/// item loop, so each disclosed item is an `O(log n)` lookup rather than a linear scan of both the
-/// namespace list and the digest list (`O(items × digests)` on attacker-controllable sizes).
+/// Integrity rules (all → `DisclosureIntegrity`):
+/// * `digestID` uniqueness within a namespace — a `digestID` appearing on two on-wire items is
+///   rejected (the lever the false-accept rides on: two items competing for one MSO digest slot).
+/// * Each item's `digestID` MUST resolve to exactly one MSO digest for its namespace, and the
+///   recomputed digest MUST equal it.
+/// * The captured record count MUST equal the decoded `issuer_signed.nameSpaces` item count, per
+///   namespace and overall — so an item the raw pass could not capture (it produces no record) fails
+///   the document closed rather than being silently dropped from the verified set.
+///
+/// `issuer_signed` is consulted ONLY to cross-check the per-namespace item COUNT (the decoded view);
+/// the verified disclosure comes entirely from the records, so the decoded value is never disclosed
+/// decoupled from the bytes that were hashed. The expected digests are indexed into a per-namespace
+/// `BTreeMap<digestID, &digest>` once, so each item is an `O(log n)` lookup.
 fn verify_value_digests(
     issuer_signed: &CborValue,
     raw_items: Option<&RawDocumentItems<'_>>,
@@ -1152,15 +1229,29 @@ fn verify_value_digests(
     let value_digests = get_map_entry(mso, "valueDigests")
         .and_then(CborValue::as_map)
         .ok_or_else(VerifyFailure::malformed)?;
+    // The records are the authoritative on-wire item set (bytes↔value tied); an absent capture fails
+    // every item closed rather than disclosing the decoded view decoupled from the hashed bytes.
+    let raw_items =
+        raw_items.ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
 
     let mut disclosed = BTreeMap::new();
     for (ns_key, items_value) in name_spaces {
         let ns = ns_key.as_text().ok_or_else(VerifyFailure::malformed)?;
-        let items = items_value
+        let decoded_items = items_value
             .as_array()
             .ok_or_else(VerifyFailure::malformed)?;
-        // Build the `digestID → expected digest` index for this namespace ONCE (fixes the per-item
-        // linear scan): a missing namespace entry in `valueDigests` is a disclosure-integrity failure.
+        // The captured records for this namespace (one per on-wire item, in wire order). Their count
+        // MUST equal the decoded item count: a shortfall means the raw pass could not capture some
+        // item — fail closed (never verify a subset and silently drop the rest).
+        let ns_records = raw_items
+            .get(ns)
+            .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
+        if ns_records.len() != decoded_items.len() {
+            return Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity));
+        }
+
+        // Build the `digestID → expected digest` index for this namespace ONCE: a missing namespace
+        // entry in `valueDigests` is a disclosure-integrity failure.
         let ns_digests_map = value_digests
             .iter()
             .find_map(|(k, v)| (k.as_text() == Some(ns)).then_some(v))
@@ -1170,41 +1261,36 @@ fn verify_value_digests(
             .iter()
             .filter_map(|(k, v)| Some((integer_label(k)?, v.as_bytes()?.as_slice())))
             .collect();
-        // The on-wire `IssuerSignedItemBytes` captured for this namespace (keyed by `digestID`).
-        let raw_ns_items = raw_items.and_then(|m| m.get(ns));
 
-        for item_value in items {
-            // Decode the item to read its `digestID` / `elementIdentifier` / `elementValue`. The
-            // digest, however, is computed over the ORIGINAL wire bytes (below), not this re-decode.
-            let item_inner = unwrap_tagged_cbor_payload(item_value)?;
-            let item: CborValue = ciborium::from_reader(item_inner.as_slice())
-                .map_err(|_| VerifyFailure::malformed())?;
-            let digest_id = get_integer(&item, "digestID").ok_or_else(VerifyFailure::malformed)?;
+        // Track the `digestID`s already seen on an on-wire item in THIS namespace: a duplicate is the
+        // false-accept lever (two items competing for one MSO digest slot) and is rejected.
+        let mut seen_digest_ids: BTreeSet<i64> = BTreeSet::new();
+        for record in ns_records {
+            if !seen_digest_ids.insert(record.digest_id) {
+                return Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity));
+            }
 
-            // Hash the on-wire `IssuerSignedItemBytes` exactly as received (ISO/IEC 18013-5 §9.2.2.5).
-            // A `digestID` whose original bytes were not captured fails closed (no re-encode fallback).
-            let raw_item_bytes = raw_ns_items
-                .and_then(|items| items.get(&digest_id).copied())
-                .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
-            let computed = digest_alg.digest(raw_item_bytes);
-
+            // Hash THIS record's OWN on-wire bytes (ISO/IEC 18013-5 §9.2.2.5) and match the MSO digest
+            // recorded for its `digestID`. The disclosed value below is this SAME record's value, so a
+            // matching digest authenticates exactly the claim that is disclosed.
+            let computed = digest_alg.digest(record.raw_bytes);
             let expected = expected_by_id
-                .get(&digest_id)
+                .get(&record.digest_id)
                 .ok_or_else(|| VerifyFailure::reason(ReasonCode::DisclosureIntegrity))?;
             if computed.as_slice() != *expected {
                 return Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity));
             }
 
-            let identifier =
-                get_text(&item, "elementIdentifier").ok_or_else(VerifyFailure::malformed)?;
-            let element_value =
-                get_map_entry(&item, "elementValue").ok_or_else(VerifyFailure::malformed)?;
             // The disclosed map is keyed by `elementIdentifier` alone (the format's flat claim view),
             // but a credential MAY carry the same identifier in more than one namespace. Merging
             // last-writer-wins would let one namespace silently SHADOW another's value, so insert
             // without overwriting a conflicting value — a clash is a structurally untrustworthy
             // disclosure set (a consumer cannot know which value is authoritative).
-            insert_no_shadow(&mut disclosed, identifier, cbor_to_attribute(element_value))?;
+            insert_no_shadow(
+                &mut disclosed,
+                record.identifier.clone(),
+                record.element_value.clone(),
+            )?;
         }
     }
     Ok(disclosed)
@@ -1801,6 +1887,97 @@ mod unit {
         // Reserved additional-info 28..=30 (0x1c here) is also rejected.
         let mut reserved = CborCursor::new(&[0x1c]);
         assert!(reserved.read_head().is_none());
+
+        // A byte/text string whose declared length OVERRUNS the remaining input fails closed in the
+        // iterative skip (the `pos > input.len()` guard), never reading past the buffer. `0x43` =
+        // bstr(3) but only 1 content byte follows.
+        let mut truncated = CborCursor::new(&[0x43, 0x01]);
+        assert!(
+            truncated.skip_item().is_none(),
+            "a string length overrunning the input is rejected (no out-of-bounds read)"
+        );
+
+        // A 4-byte length head (additional info 26) is decoded like the 1/2/8-byte forms. `0x5a` =
+        // bstr with a u32 length; here a length-2 string with two content bytes round-trips.
+        let mut len4 = CborCursor::new(&[0x5a, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB]);
+        assert!(
+            len4.skip_item().is_some(),
+            "a 4-byte (u32) length head skips its content correctly"
+        );
+        assert_eq!(len4.pos, 7, "the whole 4-byte-length string was consumed");
+    }
+
+    #[test]
+    fn cbor_cursor_bounds_recursion_depth_no_stack_overflow() {
+        // DoS PROBE (fix #2): the raw cursor's skip walk recurses once per nested array/map/tag level
+        // over ATTACKER-controlled CBOR. With no bound, a deeply-nested item overflows the stack and
+        // aborts the process (uncatchable SIGABRT). Build a chain of `DEPTH` nested 1-element arrays
+        // (each `0x81` = array(1)) far deeper than the cursor's bound; `skip_item` must return `None`
+        // (MalformedCredential upstream), NEVER overflow the stack.
+        const DEPTH: usize = 500_000;
+        let deep = vec![0x81u8; DEPTH]; // DEPTH nested array(1) heads, no terminal element
+        let mut cursor = CborCursor::new(&deep);
+        assert!(
+            cursor.skip_item().is_none(),
+            "over-deep nesting yields None (bounded), never a stack overflow"
+        );
+
+        // A nesting depth WITHIN the bound still walks correctly: a modest nested array round-trips.
+        let nested = CborValue::Array(vec![CborValue::Array(vec![CborValue::Array(vec![
+            CborValue::Integer(7.into()),
+        ])])]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&nested, &mut buf).unwrap();
+        let mut ok_cursor = CborCursor::new(&buf);
+        assert!(
+            ok_cursor.skip_item().is_some(),
+            "a legitimately-nested item within the bound still skips cleanly"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_deeply_nested_response_without_abort() {
+        // End-to-end: a deeply-nested `DeviceResponse` must yield a clean `MalformedCredential`
+        // verdict, never a process abort — neither the always-on `ciborium` parse nor the raw cursor
+        // may overflow the stack on adversarial nesting.
+        use super::{verify, MdocVerifyParams};
+        use crate::trust::StaticTestAnchors;
+        // 400 nested arrays (deeper than ciborium's 256 recursion limit) wrapped so the bytes parse as
+        // far as the nesting bound, then bottom out — the verifier must reject, not abort.
+        let mut deep = vec![0x81u8; 400];
+        deep.push(0x00); // a terminal 0 so the innermost array has its one element
+        let result = verify(
+            &deep,
+            &StaticTestAnchors::new(),
+            &MdocVerifyParams::default(),
+        );
+        assert!(!result.valid, "a deeply-nested response must not be VALID");
+        assert_eq!(
+            result.reasons,
+            vec![crate::types::ReasonCode::MalformedCredential],
+            "adversarial nesting is MalformedCredential, never an abort"
+        );
+    }
+
+    #[test]
+    fn cbor_cursor_take_text_rejects_giant_declared_length_no_panic() {
+        // OVERFLOW PROBE (fix #3): a text head declaring length 0xFFFF_FFFF_FFFF_FFFF (`0x7b` + 8
+        // length bytes) must NOT compute `pos + len` with an unchecked add (which panics under the
+        // overflow-checks the dev/test profile enables). `take_text` must return `None` on the
+        // overflow, never panic.
+        let giant_text = [0x7b, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut cursor = CborCursor::new(&giant_text);
+        assert!(
+            cursor.take_text().is_none(),
+            "a giant declared text length yields None (checked add), never an overflow panic"
+        );
+        // The sibling skip path over the same giant byte/text length head is likewise overflow-safe.
+        let giant_bytes = [0x5b, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut skip_cursor = CborCursor::new(&giant_bytes);
+        assert!(
+            skip_cursor.skip_item().is_none(),
+            "skipping a giant declared byte-string length is overflow-safe too"
+        );
     }
 
     #[test]
@@ -1863,19 +2040,28 @@ mod unit {
 
         let per_doc = scan_raw_issuer_items(&wire);
         assert_eq!(per_doc.len(), 1, "one document scanned");
-        let captured = per_doc[0]
+        let ns_records = per_doc[0]
             .get("ns")
-            .and_then(|m| m.get(&5))
-            .expect("the digestID-5 item was captured");
+            .expect("the `ns` namespace was captured");
+        assert_eq!(ns_records.len(), 1, "one item captured for the namespace");
+        let record = &ns_records[0];
         assert_eq!(
-            *captured,
+            record.digest_id, 5,
+            "the digestID was decoded from the item"
+        );
+        assert_eq!(
+            record.raw_bytes,
             non_canonical_item.as_slice(),
             "the scanner captures the EXACT on-wire bytes (non-minimal framing preserved)"
         );
+        // The bytes captured and the value decoded are ONE record (the integrity tie): the identifier
+        // and value were decoded from the SAME bytes the digest is computed over.
+        assert_eq!(record.identifier, "x");
+        assert_eq!(record.element_value, AttributeValue::Integer(1));
         // The digest of the captured wire bytes differs from the digest of a canonical re-encode — so a
         // verifier hashing the wire bytes (this fix) and one re-encoding would disagree.
         assert_ne!(
-            Sha256::digest(captured).to_vec(),
+            Sha256::digest(record.raw_bytes).to_vec(),
             Sha256::digest(&canonical_item).to_vec(),
             "hashing the wire bytes is NOT the same as hashing a canonical re-encode"
         );

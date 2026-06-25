@@ -127,6 +127,28 @@ pub(crate) struct MdocBuilder {
     /// When set, omit the MSO `validityInfo.signed` field (keeping `validFrom`/`validUntil`) — used to
     /// exercise the qualified-gate issuance-time reader's `signed → validFrom` fallback.
     omit_mso_signed: bool,
+    /// When `Some`, append a forged `IssuerSignedItem` to the FIRST namespace that REUSES a genuine
+    /// element's `digestID` but carries an attacker-chosen `(elementIdentifier, elementValue)` the
+    /// issuer never signed — the selective-disclosure-integrity false-accept probe (SC-002). The MSO
+    /// `valueDigests` still holds only the genuine item's digest under that `digestID`, so the forged
+    /// item's own bytes do NOT hash to the recorded digest. `forged_first = true` places the forged
+    /// item BEFORE the genuine one in the on-wire array (so a last-wins capture would let the forged
+    /// item's bytes win the slot); `false` places it after. Either ordering MUST be rejected
+    /// (`DisclosureIntegrity`) and the forged claim never disclosed.
+    append_forged_item: Option<ForgedItem>,
+}
+
+/// A forged `IssuerSignedItem` to splice into the on-wire `nameSpaces` array (the false-accept probe):
+/// it reuses `digest_id` (a genuine element's id) but discloses an attacker-chosen identifier/value.
+pub(crate) struct ForgedItem {
+    /// The genuine `digestID` the forged item REUSES (so its slot collides with a real digest).
+    pub digest_id: i64,
+    /// The attacker-chosen `elementIdentifier` (a claim the issuer never signed).
+    pub identifier: &'static str,
+    /// The attacker-chosen `elementValue`.
+    pub value: CborValue,
+    /// When `true`, place the forged item BEFORE the genuine items in the array (else after).
+    pub forged_first: bool,
 }
 
 /// The hash to compute `valueDigests` with, plus its MSO `digestAlgorithm` name.
@@ -236,7 +258,28 @@ impl MdocBuilder {
             empty_documents: false,
             add_document_errors: false,
             omit_mso_signed: false,
+            append_forged_item: None,
         }
+    }
+
+    /// Append a forged `IssuerSignedItem` reusing `digest_id` (a genuine element's id) but disclosing
+    /// `(identifier, value)` the issuer never signed — the selective-disclosure-integrity false-accept
+    /// probe. `forged_first` places the forged item before the genuine ones (else after). The MSO
+    /// `valueDigests` is left untouched (only the genuine digest is recorded under `digest_id`).
+    pub(crate) fn append_forged_item(
+        mut self,
+        digest_id: i64,
+        identifier: &'static str,
+        value: CborValue,
+        forged_first: bool,
+    ) -> Self {
+        self.append_forged_item = Some(ForgedItem {
+            digest_id,
+            identifier,
+            value,
+            forged_first,
+        });
+        self
     }
 
     /// Omit the MSO `validityInfo.signed` field (keeping `validFrom`) — drives the issuance-time
@@ -501,6 +544,38 @@ impl MdocBuilder {
                 CborValue::Bytes(digest),
             ));
             issuer_items.push(tagged);
+        }
+
+        // --- false-accept probe: splice a forged IssuerSignedItem that REUSES a genuine digestID but
+        //     discloses an attacker-chosen identifier/value, WITHOUT recording its own valueDigests
+        //     entry. Placed first or last per the knob, so both orderings exercise the integrity tie. ---
+        if let Some(forged) = &self.append_forged_item {
+            let forged_item = CborValue::Map(vec![
+                (
+                    CborValue::Text("digestID".to_owned()),
+                    CborValue::Integer(forged.digest_id.into()),
+                ),
+                (
+                    CborValue::Text("random".to_owned()),
+                    CborValue::Bytes(vec![0xAA; 16]),
+                ),
+                (
+                    CborValue::Text("elementIdentifier".to_owned()),
+                    CborValue::Text(forged.identifier.to_owned()),
+                ),
+                (
+                    CborValue::Text("elementValue".to_owned()),
+                    forged.value.clone(),
+                ),
+            ]);
+            let forged_inner = encode(&forged_item);
+            let forged_tagged =
+                CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(forged_inner)));
+            if forged.forged_first {
+                issuer_items.insert(0, forged_tagged);
+            } else {
+                issuer_items.push(forged_tagged);
+            }
         }
 
         // --- holder DeviceKey (COSE_Key) from the holder private key's public point. ----------------
