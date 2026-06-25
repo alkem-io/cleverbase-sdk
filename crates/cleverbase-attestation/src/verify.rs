@@ -263,17 +263,24 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     result
 }
 
-/// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer at the relevant
+/// Run the opt-in TS 119 615 cl. 4.12 determination for the presentation's issuer(s) at the relevant
 /// time (`ctx.now_unix`), reading the host-supplied national Trusted List ([`VerifyContext::
 /// qualified_trust_list`]) only after it **authenticates** against the host-configured
 /// scheme-operator anchors ([`VerifyContext::qualified_scheme_anchors`]).
 ///
-/// Resolves the credential's claimed signing certificate (the SD-JWT VC JWS `x5c` leaf / the mdoc
-/// `IssuerAuth` x5chain leaf) and delegates to [`crate::qualified::qualified_status`], which
-/// chain-authenticates the TL's signer against the scheme anchors and checks `NextUpdate` staleness
-/// before reading any status. When the cert cannot be read, no trust list was supplied, or the list
-/// fails to authenticate, it returns [`QualifiedStatus::Indeterminate`] — the data needed to decide
-/// is absent or untrustworthy (never a false "qualified", SC-007).
+/// SD-JWT VC carries a single credential, so its claimed JWS `x5c` leaf decides the status directly.
+/// An mdoc `DeviceResponse` MAY carry MORE THAN ONE document (the always-on bar verifies + merges the
+/// attributes of every one, possibly from different issuers), so the determination is computed PER
+/// DOCUMENT and folded so a `Qualified` verdict requires **every** document to qualify — a single
+/// `Qualified` read from `documents[0]` must never under-cover a result that also surfaces a
+/// non-qualified `documents[1]`'s attributes (SC-007). The fold is fail-closed:
+/// `Qualified` only if all qualify; else `Indeterminate` if any document is undecidable; else
+/// `NotQualified`.
+///
+/// Each per-document/credential delegate authenticates the TL (signer chains to a scheme anchor + not
+/// stale) BEFORE reading status. When a signing cert cannot be read, no trust list was supplied, or
+/// the list fails to authenticate, it yields [`QualifiedStatus::Indeterminate`] — the data needed to
+/// decide is absent or untrustworthy (never a false "qualified", SC-007).
 ///
 /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 fn qualified_status_for(
@@ -285,23 +292,63 @@ fn qualified_status_for(
         // The gate is enabled but the host supplied no national TL → the data is unreachable.
         return QualifiedStatus::Indeterminate;
     };
-    let issuer_cert_der = match presentation {
-        Presentation::SdJwtVc(p) => sdjwtvc::issuer_signing_cert_der(p),
+    // Resolve the status of one claimed signing cert (or Indeterminate when it cannot be read).
+    let status_of = |cert: Option<Vec<u8>>| -> QualifiedStatus {
+        cert.map_or(QualifiedStatus::Indeterminate, |cert_der| {
+            crate::qualified::qualified_status(
+                &cert_der,
+                ctx.now_unix,
+                trust_list,
+                ctx.qualified_scheme_anchors,
+            )
+        })
+    };
+    match presentation {
+        Presentation::SdJwtVc(p) => status_of(sdjwtvc::issuer_signing_cert_der(p)),
         Presentation::Mdoc {
             device_response, ..
-        } => mdoc::issuer_signing_cert_der(device_response),
-    };
-    // The signing cert cannot be read from the presentation → the data needed is absent. Otherwise
-    // the determination authenticates the TL (signer chains to a scheme anchor + not stale) BEFORE
-    // reading status — a forged/unsigned/unchained/stale TL yields Indeterminate, never Qualified.
-    issuer_cert_der.map_or(QualifiedStatus::Indeterminate, |cert_der| {
-        crate::qualified::qualified_status(
-            &cert_der,
-            ctx.now_unix,
-            trust_list,
-            ctx.qualified_scheme_anchors,
-        )
-    })
+        } => {
+            // Decide over EVERY document's issuer; fold so `Qualified` requires all to qualify. No
+            // parseable `documents` array → the data needed is absent → Indeterminate.
+            mdoc::issuer_signing_certs_der(device_response)
+                .map_or(QualifiedStatus::Indeterminate, |certs| {
+                    fold_qualified(certs.into_iter().map(status_of))
+                })
+        }
+    }
+}
+
+/// Fold the per-document qualified statuses of a multi-document response into one verdict, fail-closed:
+/// `Qualified` only if **every** document qualifies; otherwise `Indeterminate` if any document is
+/// undecidable; otherwise `NotQualified`. An empty iterator yields `Indeterminate` (nothing to
+/// decide). This guarantees a `Qualified` verdict never under-covers a response whose merged
+/// attributes include a non-qualified document (SC-007).
+fn fold_qualified<I>(statuses: I) -> crate::types::QualifiedStatus
+where
+    I: IntoIterator<Item = crate::types::QualifiedStatus>,
+{
+    use crate::types::QualifiedStatus;
+    let mut saw_any = false;
+    let mut saw_indeterminate = false;
+    let mut saw_not_qualified = false;
+    for status in statuses {
+        saw_any = true;
+        match status {
+            QualifiedStatus::Qualified => {}
+            QualifiedStatus::Indeterminate => saw_indeterminate = true,
+            QualifiedStatus::NotQualified => saw_not_qualified = true,
+        }
+    }
+    if !saw_any || saw_indeterminate {
+        // Nothing to decide, or at least one document is undecidable → cannot assert all-qualified.
+        QualifiedStatus::Indeterminate
+    } else if saw_not_qualified {
+        // No undecidable document, but at least one is definitively not qualified.
+        QualifiedStatus::NotQualified
+    } else {
+        // Every document qualified.
+        QualifiedStatus::Qualified
+    }
 }
 
 /// For a request-less SD-JWT VC, do not impose a holder-binding challenge: a presentation that omits

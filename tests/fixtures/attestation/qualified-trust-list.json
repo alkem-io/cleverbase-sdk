@@ -9,7 +9,7 @@
       "serviceTypeIdentifier": "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q",
       "signingCertDerB64": "MIIB/zCCAaSgAwIBAgIUNGct5xwU3rIRcMGXc7P6y0OKIYkwCgYIKoZIzj0EAwIwTDEmMCQGA1UEAwwdQ2xldmVyYmFzZSBTREsgVGVzdCBJQUNBIFJvb3QxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwHhcNMjYwNjI1MDkxMTQxWhcNMjcwOTIzMDkxMTQxWjBTMS0wKwYDVQQDDCRDbGV2ZXJiYXNlIFNESyBUZXN0IFNELUpXVCBWQyBJc3N1ZXIxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQpDtM5ZmUkPlhEjOBPFjh51WDT1n4Uk7pvAvmBRqlIQXNqWzROpcy5WvDJXiR95tvZHTfQIAWfiKqiOCDyMOV+o10wWzAJBgNVHRMEAjAAMA4GA1UdDwEB/wQEAwIHgDAdBgNVHQ4EFgQUvSFlSpBAYq2mTCDHXBSx9WSAjrwwHwYDVR0jBBgwFoAUsj7CodDYIruKAvMDMT5eyB6KruEwCgYIKoZIzj0EAwIDSQAwRgIhAOQdsDpN5KzVroUVvajhfo/+WnRUd/Yixexd3crMPAAGAiEA44M7Z75ctlx3apKyxKq/v9Mb5zuC4OM7cjVwAcD6cbU=",
       "statusHistory": [
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2020-01-01T00:00:00Z" }
+        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2026-07-01T00:00:00Z" }
       ]
     },
     {
@@ -17,8 +17,8 @@
       "serviceTypeIdentifier": "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q",
       "signingCertDerB64": "MIICGDCCAb+gAwIBAgIUNGct5xwU3rIRcMGXc7P6y0OKIYowCgYIKoZIzj0EAwIwTDEmMCQGA1UEAwwdQ2xldmVyYmFzZSBTREsgVGVzdCBJQUNBIFJvb3QxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwHhcNMjYwNjI1MDkxMTQxWhcNMjcwOTIzMDkxMTQxWjBXMTEwLwYDVQQDDChDbGV2ZXJiYXNlIFNESyBUZXN0IG1kb2MgRG9jdW1lbnQgU2lnbmVyMRUwEwYDVQQKDAxBbGtlbWlvIFRlc3QxCzAJBgNVBAYTAk5MMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhfiV+mh1jYr2rr35Gpg7Gy0HBdgdLGIc6vq9m3j1d9ZSQTdlDe0lYgaF3J0Rsp8hu30d8G5cHTQfzVVKyYDQ7qN0MHIwCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwFQYDVR0lAQH/BAswCQYHKIGMXQUBAjAdBgNVHQ4EFgQUDB/ewDG1u5CVi6UeekfpEnNJ9powHwYDVR0jBBgwFoAUsj7CodDYIruKAvMDMT5eyB6KruEwCgYIKoZIzj0EAwIDRwAwRAIgLmHr37XiKRhPbzpyjrECYeI0rIH66sPRF26PecI+gOsCIFfGMw8UvKTjl4DweECATbnZ3+Y8xebGLLhR+560oMEX",
       "statusHistory": [
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2020-01-01T00:00:00Z" },
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn", "startingTime": "2025-09-01T00:00:00Z" }
+        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2026-07-01T00:00:00Z" },
+        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn", "startingTime": "2027-03-01T00:00:00Z" }
       ]
     },
     {

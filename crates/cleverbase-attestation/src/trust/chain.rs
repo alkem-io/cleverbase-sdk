@@ -12,7 +12,9 @@
 //! relevant time. ISO 18013-5 IACA hierarchies and the eIDAS trusted lists are one-level (root →
 //! document-signer / service); a configured anchor *is* the root, so a one-hop chain is the
 //! production shape. The matcher also accepts an exact DER-equal leaf (a self-issued anchor that is
-//! itself the listed entry), which covers a trusted-list entry that pins the leaf directly.
+//! itself the listed entry), which covers a trusted-list entry that pins the leaf directly — but
+//! even that direct-pin path still enforces the leaf's validity window, so an expired pinned leaf
+//! is rejected rather than trusted.
 
 use der::{Decode as _, Encode as _};
 use x509_cert::Certificate;
@@ -93,7 +95,8 @@ impl SigAlg {
 /// This is the trust-anchoring primitive: a leaf is trusted iff some anchor either (a) is DER-equal
 /// to the leaf (the anchor pins the leaf directly), or (b) issued the leaf — the leaf's `issuer`
 /// name equals the anchor's `subject` name **and** the leaf's signature verifies under the anchor's
-/// public key — and in case (b) the leaf is within its own validity window at `now_unix`. Returns
+/// public key. In **both** cases the leaf must be within its own validity window at `now_unix` (an
+/// expired directly-pinned leaf is rejected as [`ChainError::LeafExpired`], never trusted). Returns
 /// the first specific [`ChainError`] when no anchor matches.
 ///
 /// # Errors
@@ -109,12 +112,19 @@ pub fn verify_chain(
         .map_err(|e| ChainError::Malformed(format!("leaf: {e}")))?;
 
     // (a) Direct pin: an anchor that is byte-for-byte the leaf is trusted as-is (a trusted-list
-    // entry that lists the leaf certificate itself), no signature step needed.
+    // entry that lists the leaf certificate itself), no signature step needed — but the leaf must
+    // still be within its own validity window at `now_unix`. Otherwise an EXPIRED directly-pinned
+    // leaf (e.g. the qualified-gate's TL-signer cert, which the fixtures pin as both signer and
+    // scheme anchor) would authenticate, contradicting the documented "within its validity window
+    // at the relevant time" contract.
     if anchor_certs_der
         .iter()
         .any(|a| a.as_slice() == leaf_cert_der)
     {
-        return Ok(());
+        if leaf_is_valid_at(&leaf, now_unix) {
+            return Ok(());
+        }
+        return Err(ChainError::LeafExpired);
     }
 
     // (b) Issued-by-anchor: find name-matching anchors, then verify the leaf signature under one.
@@ -261,6 +271,20 @@ mod tests {
         // The root chained against itself: DER-equal direct pin (no issuer step needed).
         let anchors = vec![CA_IACA.to_vec()];
         assert!(verify_chain(CA_IACA, &anchors, NOW).is_ok());
+    }
+
+    #[test]
+    fn expired_direct_pinned_leaf_is_rejected_not_trusted() {
+        // A leaf that is byte-equal to a configured anchor (the direct-pin path — reachable for the
+        // qualified-gate's TL-signer cert, pinned as both signer and scheme anchor) must STILL be
+        // within its validity window. At a time past the cert's notAfter the direct pin must be
+        // rejected as expired, not silently trusted (regression guard for the skipped-window bug).
+        let anchors = vec![CA_IACA.to_vec()];
+        let far_future = 4_000_000_000; // year ~2096, past every fixture's validity.
+        assert_eq!(
+            verify_chain(CA_IACA, &anchors, far_future),
+            Err(ChainError::LeafExpired)
+        );
     }
 
     #[test]

@@ -4,19 +4,33 @@
 //! the global `verify` (both formats VALID + a negative path each); the OpenID4VP binding through
 //! `verify` (bound VALID, replay/wrong-audience INVALID, both formats); and the policy format gate.
 
-use super::{detect_format, verify, Presentation, VerifyContext};
+use super::{detect_format, fold_qualified, verify, Presentation, VerifyContext};
 use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
 use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
+use crate::qualified::QualifiedTrustList;
 use crate::sdjwtvc::test_issuer::{
     attach_kb_jwt, mint_sd_jwt, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
-use crate::types::{Format, IssuerRole, ReasonCode, TrustStatus, VerificationPolicy};
+use crate::types::{
+    Format, IssuerRole, QualifiedStatus, ReasonCode, TrustStatus, VerificationPolicy,
+};
 
 const AUDIENCE: &str = "https://verifier.example/cb";
 const WRONG_AUDIENCE: &str = "https://attacker.example/evil";
 const MDOC_NOW: i64 = 1_717_200_000;
+
+/// The scheme-operator anchor (the IACA root) the qualified-gate fixture's national TL is signed by.
+const CA_IACA: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/ca-iaca.cert.der");
+/// The qualified-status national-TL fixture (`mdoc-ds` = granted EAA/Q at `RELEVANT_GRANTED`;
+/// `wrong-issuer` = absent → Indeterminate).
+const QUALIFIED_TRUST_LIST_JSON: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/qualified-trust-list.json");
+/// Relevant/verification instant inside the mdoc validity window AND the qualified-gate `granted`
+/// window (2026-09-01): `mdoc-ds` is a granted EAA/Q issuer → Qualified, `wrong-issuer` is absent →
+/// Indeterminate. (Mirrors `qualified::tests::RELEVANT_GRANTED`.)
+const RELEVANT_GRANTED: i64 = 1_788_220_800;
 
 fn sd_jwt_anchors() -> StaticTestAnchors {
     StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER)
@@ -385,7 +399,120 @@ fn qualified_gate_off_by_default_leaves_qualified_status_none_and_bar_unchanged(
     assert_eq!(r_off.trust_status, r_on.trust_status);
     assert_eq!(
         r_on.qualified_status,
-        Some(crate::types::QualifiedStatus::Indeterminate),
+        Some(QualifiedStatus::Indeterminate),
         "gate on with no trust list → Indeterminate, never a false qualified"
     );
+}
+
+// =================================================================================================
+// Qualified-status multi-document provenance (the gate must cover EVERY document, not documents[0]).
+// =================================================================================================
+
+/// Load + parse the optional qualified-TL fixture, or `None` if it is absent/empty (self-skip seam,
+/// mirroring `qualified::tests`).
+fn qualified_trust_list_fixture() -> Option<QualifiedTrustList> {
+    if QUALIFIED_TRUST_LIST_JSON.is_empty() {
+        return None;
+    }
+    Some(QualifiedTrustList::parse(QUALIFIED_TRUST_LIST_JSON).expect("qualified TL fixture parses"))
+}
+
+#[test]
+fn single_document_mdoc_qualified_issuer_reports_qualified() {
+    // Baseline: a SINGLE-document mdoc from the granted EAA/Q `mdoc-ds` issuer → Qualified (so the
+    // multi-document fix below is shown to be a genuine narrowing, not a blanket Indeterminate).
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    let response = MdocBuilder::new().build();
+    let anchors = mdoc_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Pid,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "single-doc mdoc must verify: {:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::Qualified),
+        "a single granted-EAA/Q issuer → Qualified"
+    );
+}
+
+#[test]
+fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
+    // PROVENANCE PROBE: `documents[0]` is the granted EAA/Q `mdoc-ds` issuer (→ Qualified on its own),
+    // but a SECOND document carries a DIFFERENT issuer (`wrong-issuer`, absent from the TL →
+    // Indeterminate). Reading only `documents[0]` would report Qualified over a result whose merged
+    // attributes also cover the second, non-qualified issuer's document. The gate MUST decide over
+    // EVERY document and fold so a `Qualified` never under-covers → Indeterminate here.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    let response = MdocBuilder::new().append_second_issuer_document().build();
+    let anchors = mdoc_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Pid,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    // The gate runs independently of the always-on verdict (a multi-issuer response need not be
+    // VALID); the determination MUST NOT be a single Qualified read from documents[0].
+    assert_ne!(
+        result.qualified_status,
+        Some(QualifiedStatus::Qualified),
+        "a multi-issuer mdoc must NOT report a Qualified that under-covers documents[1]"
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::Indeterminate),
+        "documents[1]'s issuer is undecidable → the folded status is Indeterminate (fail-closed)"
+    );
+}
+
+#[test]
+fn fold_qualified_requires_every_document_to_qualify() {
+    // Unit-cover the fold: Qualified only if ALL qualify; else Indeterminate if any is undecidable;
+    // else NotQualified; an empty set is Indeterminate (nothing to decide).
+    use QualifiedStatus::{Indeterminate, NotQualified, Qualified};
+    assert_eq!(fold_qualified([Qualified, Qualified]), Qualified);
+    assert_eq!(fold_qualified([Qualified, Indeterminate]), Indeterminate);
+    assert_eq!(fold_qualified([Qualified, NotQualified]), NotQualified);
+    // Indeterminate dominates NotQualified (a definitive NotQualified-for-all cannot be asserted).
+    assert_eq!(fold_qualified([NotQualified, Indeterminate]), Indeterminate);
+    assert_eq!(fold_qualified([NotQualified, NotQualified]), NotQualified);
+    assert_eq!(fold_qualified([Qualified]), Qualified);
+    assert_eq!(fold_qualified(std::iter::empty()), Indeterminate);
 }

@@ -96,6 +96,14 @@ pub(crate) struct MdocBuilder {
     /// When set, append a SECOND document (a clone of the first with a corrupted IssuerAuth signature)
     /// to drive the multi-document false-accept probe.
     append_forged_document: bool,
+    /// When `Some`, append a SECOND fully-VALID document (signed by the SAME trusted DS) whose single
+    /// disclosed element collides with a first-document identifier but carries this DIFFERENT value —
+    /// the cross-document attribute-shadowing probe (a 2nd authentic doc must not overwrite a claim).
+    append_colliding_document: Option<(&'static str, CborValue)>,
+    /// When set, append a SECOND document whose `IssuerAuth` x5chain leaf is the WRONG-issuer cert (a
+    /// DIFFERENT claimed DS) — the multi-issuer probe for the qualified-status gate (the gate must
+    /// decide over every document's issuer, not just `documents[0]`).
+    append_second_issuer_document: bool,
     /// When `Some`, set the top-level `DeviceResponse.status` to this value (non-zero drives the
     /// device-reported-error reject path).
     status_override: Option<i64>,
@@ -206,6 +214,8 @@ impl MdocBuilder {
             mso_doc_type_mismatch: false,
             device_signature_override: None,
             append_forged_document: false,
+            append_colliding_document: None,
+            append_second_issuer_document: false,
             status_override: None,
             omit_status: false,
             empty_documents: false,
@@ -229,6 +239,27 @@ impl MdocBuilder {
     /// the response carries two documents — the multi-document false-accept probe.
     pub(super) fn append_forged_document(mut self) -> Self {
         self.append_forged_document = true;
+        self
+    }
+
+    /// Append a second, fully-VALID document (signed by the SAME trusted DS) that discloses
+    /// `identifier` with `value` — a value that COLLIDES with a first-document identifier. The
+    /// cross-document attribute-shadowing probe: a 2nd authentic document must not silently overwrite
+    /// the consumer-visible claim.
+    pub(super) fn append_colliding_document(
+        mut self,
+        identifier: &'static str,
+        value: CborValue,
+    ) -> Self {
+        self.append_colliding_document = Some((identifier, value));
+        self
+    }
+
+    /// Append a second document signed by the WRONG-issuer DS (a different claimed `IssuerAuth`
+    /// x5chain leaf), producing a multi-ISSUER response — the qualified-status gate must decide over
+    /// every document's issuer, not just `documents[0]`.
+    pub(crate) fn append_second_issuer_document(mut self) -> Self {
+        self.append_second_issuer_document = true;
         self
     }
 
@@ -369,6 +400,17 @@ impl MdocBuilder {
 
     /// Build the CBOR-encoded `DeviceResponse` bytes.
     pub(crate) fn build(self) -> Vec<u8> {
+        // Captured before `self` is partially moved below: a second valid document (signed by the
+        // same trusted DS) disclosing one colliding identifier with a DIFFERENT value.
+        let colliding = self
+            .append_colliding_document
+            .map(|(identifier, value)| build_single_valid_document(identifier, value));
+        // A second document signed by the WRONG-issuer DS (a different claimed signing cert) — the
+        // multi-issuer probe for the qualified-status gate.
+        let second_issuer = self
+            .append_second_issuer_document
+            .then(build_wrong_issuer_document);
+
         // --- IssuerSignedItems (#6.24(bstr .cbor IssuerSignedItem)) + their digests. ----------------
         let mut issuer_items = Vec::new();
         let mut value_digests = Vec::new();
@@ -614,6 +656,12 @@ impl MdocBuilder {
         if self.append_forged_document {
             documents.push(forge_document_with_broken_issuer_auth(&document));
         }
+        if let Some(colliding_document) = colliding {
+            documents.push(colliding_document);
+        }
+        if let Some(second_issuer_document) = second_issuer {
+            documents.push(second_issuer_document);
+        }
 
         let mut response_entries = vec![
             (
@@ -644,6 +692,46 @@ impl MdocBuilder {
         }
         encode(&CborValue::Map(response_entries))
     }
+}
+
+/// Mint a fresh, fully-VALID single document (signed by the same trusted DS + holder) that discloses
+/// exactly one element `identifier → value`, and return its `Document` CBOR value. Used to append a
+/// genuine second document whose claim collides with the first — the cross-document shadowing probe.
+fn build_single_valid_document(identifier: &'static str, value: CborValue) -> CborValue {
+    // Re-use the full minting path for a one-element document, then lift out `documents[0]`.
+    let response = MdocBuilder::new()
+        .elements(vec![Element {
+            digest_id: 0,
+            identifier,
+            value,
+        }])
+        .build();
+    first_document_of_response(&response)
+}
+
+/// Mint a single document whose `IssuerAuth` is signed by the WRONG-issuer DS (a different claimed
+/// x5chain leaf), and return its `Document` CBOR value. Used to append a SECOND document with a
+/// DIFFERENT issuer — the multi-issuer probe for the qualified-status gate.
+fn build_wrong_issuer_document() -> CborValue {
+    let response = MdocBuilder::new().use_wrong_issuer().build();
+    first_document_of_response(&response)
+}
+
+/// Decode a freshly-minted `DeviceResponse` and lift out its `documents[0]` `Document` CBOR value —
+/// the shared body of the single-document re-mint helpers above.
+fn first_document_of_response(response: &[u8]) -> CborValue {
+    let root = decode(response);
+    let CborValue::Map(entries) = &root else {
+        panic!("DeviceResponse is a CBOR map")
+    };
+    let documents = entries
+        .iter()
+        .find_map(|(k, v)| (k.as_text() == Some("documents")).then_some(v))
+        .expect("documents present");
+    let CborValue::Array(docs) = documents else {
+        panic!("documents is a CBOR array")
+    };
+    docs.first().expect("one document minted").clone()
 }
 
 /// Clone a built `Document` and corrupt its IssuerAuth signature byte, producing a forged document

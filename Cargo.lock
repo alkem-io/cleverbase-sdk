@@ -201,7 +201,6 @@ dependencies = [
  "async-trait",
  "base64ct",
  "ciborium",
- "cleverbase-core",
  "cms",
  "const-oid",
  "coset",

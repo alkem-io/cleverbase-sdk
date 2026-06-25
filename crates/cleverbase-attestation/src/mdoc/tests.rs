@@ -234,10 +234,23 @@ fn session_transcript_mismatch_fails_holder_binding() {
 #[test]
 fn device_signature_with_non_es256_alg_fails_holder_binding() {
     // The device-auth algorithm gate is ES256; a DeviceSignature with an ES384 header is rejected.
+    // This reason (`HolderBinding`) is SHARED with the signature-math failure
+    // (`bad_device_signature_is_rejected_as_holder_binding`), so prove the ALGORITHM gate is the
+    // discriminator: the ONLY difference from the VALID baseline below is the alg header — flipping it
+    // back to ES256 (everything else identical) verifies, so the rejection is the alg gate, not bad
+    // signature math. The `cose_alg_gate_accepts_only_es256` unit probe isolates the gate itself.
     let response = MdocBuilder::new().device_sig_wrong_alg().build();
     let result = verify(&response, &trusted_anchors(), &params());
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::HolderBinding]);
+
+    // Baseline: the same builder WITHOUT the wrong-alg flip (an ES256 DeviceSignature) verifies — so
+    // the algorithm header is the sole cause of the rejection above.
+    let baseline = MdocBuilder::new().build();
+    assert!(
+        verify(&baseline, &trusted_anchors(), &params()).valid,
+        "the only change driving HolderBinding above is the non-ES256 device-sig alg header"
+    );
 }
 
 #[test]
@@ -433,10 +446,22 @@ fn sha512_digest_algorithm_verifies() {
 #[test]
 fn issuer_auth_non_es256_alg_is_rejected_as_tamper() {
     // The IssuerAuth algorithm gate is ES256; an ES384 header is rejected before any verify attempt.
+    // This reason (`Tamper`) is SHARED with the signature-math failure
+    // (`tampered_issuer_auth_signature_is_rejected_as_tamper`), so prove the ALGORITHM gate is the
+    // discriminator: the ONLY difference from the VALID baseline below is the alg header. The
+    // `cose_alg_gate_accepts_only_es256` unit probe isolates the gate predicate itself.
     let response = MdocBuilder::new().issuer_auth_wrong_alg().build();
     let result = verify(&response, &trusted_anchors(), &params());
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
+
+    // Baseline: the same builder WITHOUT the wrong-alg flip (an ES256 IssuerAuth) verifies — so the
+    // algorithm header is the sole cause of the rejection above (not bad signature math).
+    let baseline = MdocBuilder::new().build();
+    assert!(
+        verify(&baseline, &trusted_anchors(), &params()).valid,
+        "the only change driving Tamper above is the non-ES256 IssuerAuth alg header"
+    );
 }
 
 #[test]
@@ -494,6 +519,79 @@ fn multi_document_response_with_a_forged_second_document_is_rejected() {
     );
     assert_eq!(result.reasons, vec![ReasonCode::Tamper]);
     assert!(result.disclosed_attributes.is_empty());
+}
+
+#[test]
+fn cross_document_attribute_collision_is_rejected_no_silent_shadow() {
+    // SHADOWING PROBE: `documents[0]` discloses given_name="Ada"; a SECOND fully-VALID document
+    // (signed by the SAME trusted DS) discloses given_name="EVIL". With a flat last-writer-wins merge
+    // a consumer reading `given_name` would silently be served "EVIL". The verifier MUST make silent
+    // shadowing impossible: a conflicting same-identifier value across documents is rejected as a
+    // structurally untrustworthy disclosure set (never a quiet overwrite, never "EVIL").
+    let response = MdocBuilder::new()
+        .append_colliding_document("given_name", CborValue::Text("EVIL".to_owned()))
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a cross-document claim collision must NOT be silently merged"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::DisclosureIntegrity]);
+    assert!(
+        result.disclosed_attributes.is_empty(),
+        "an INVALID verdict discloses nothing — the shadowing value never surfaces"
+    );
+    // Prove the shadow specifically did NOT win (defence in depth against a future regression that
+    // returns attributes on this path).
+    assert_ne!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("EVIL".to_owned())),
+        "the second document's value must never shadow the first"
+    );
+}
+
+#[test]
+fn cross_document_distinct_identifiers_merge_cleanly() {
+    // Positive control: a second VALID document disclosing a DIFFERENT identifier (no collision) is
+    // merged into the single result map — every document's identifiers are surfaced.
+    let response = MdocBuilder::new()
+        .append_colliding_document("nationality", CborValue::Text("NL".to_owned()))
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        result.valid,
+        "non-colliding documents must merge: {:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_owned())),
+        "the first document's claim is preserved"
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("nationality"),
+        Some(&AttributeValue::Text("NL".to_owned())),
+        "the second document's distinct claim is surfaced too"
+    );
+}
+
+#[test]
+fn cross_document_identical_redisclosure_is_accepted() {
+    // A second VALID document re-disclosing the SAME identifier with the SAME value is harmless (no
+    // shadowing of a different value), so it merges cleanly rather than being rejected.
+    let response = MdocBuilder::new()
+        .append_colliding_document("given_name", CborValue::Text("Ada".to_owned()))
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+    assert!(
+        result.valid,
+        "an identical re-disclosure must not be treated as a conflict: {:?}",
+        result.reasons
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_owned()))
+    );
 }
 
 #[test]

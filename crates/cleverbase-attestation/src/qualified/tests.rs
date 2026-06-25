@@ -23,7 +23,9 @@ use super::{
     qualified_status, QualifiedTrustError, QualifiedTrustList, QualifiedTrustListError,
     EAA_Q_SERVICE_TYPE, SERVICE_STATUS_GRANTED, TS_119_615_VERSION,
 };
-use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW};
+use crate::sdjwtvc::test_issuer::{
+    mint_sd_jwt, mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+};
 use crate::trust::chain::ChainError;
 use crate::trust::StaticTestAnchors;
 use crate::types::{Format, IssuerRole, QualifiedStatus, TrustStatus, VerificationPolicy};
@@ -49,15 +51,28 @@ const WRONG_ISSUER: &[u8] =
 const QUALIFIED_TRUST_LIST_JSON: &[u8] =
     include_bytes!("../../../../tests/fixtures/attestation/qualified-trust-list.json");
 
-/// Relevant time INSIDE the `granted` window (after the 2020-01-01 grant) and BEFORE the mdoc-ds
-/// withdrawal (2025-09-01T00:00:00Z = 1_756_684_800). Equals the SD-JWT test instant [`NOW`], so the
-/// `verify()` gate tests can reuse it as the verification instant.
-const RELEVANT_GRANTED: i64 = NOW; // 2025-06-15 — granted, not yet withdrawn.
-/// Relevant time AFTER the mdoc-ds `withdrawn` starting time (2025-09-01T00:00:00Z = 1_756_684_800).
-const RELEVANT_AFTER_WITHDRAWN: i64 = 1_800_000_000; // ~2027-01-15.
-/// Relevant time BEFORE any `granted` entry started (the grants begin 2020-01-01T00:00:00Z =
-/// 1_577_836_800).
-const RELEVANT_BEFORE_GRANTED: i64 = 1_500_000_000; // 2017-07-14 — before the TL granted anything.
+// RCA — the qualified gate authenticates the national TL's signer (`ca-iaca`, valid
+// 2026-06-25..2036) by chain-validating it at the SAME instant it reads the status (the relevant
+// time). After the chain-validity fix (trust/chain.rs now enforces the leaf validity window on the
+// direct-pin path too — previously skipped), the relevant-time constants MUST fall inside the
+// signer cert's validity window, or authentication fails (Indeterminate). The earlier 2017/2025
+// constants only ever "worked" because the direct-pin path skipped the validity check — the very
+// false-trust bug now fixed. So every relevant time below sits inside `[2026-06-25, 2027-09-23]`
+// (the IACA signer + the leaf issuer windows), and the fixture's granted/withdrawn `startingTime`s
+// were moved into the same window (grant 2026-07-01, withdrawal 2027-03-01) to preserve the
+// granted→withdrawn ordering the determination tests exercise.
+
+/// Relevant time INSIDE the `granted` window (after the 2026-07-01 grant) and BEFORE the mdoc-ds
+/// withdrawal (2027-03-01T00:00:00Z). Inside the signer + leaf cert validity windows so the TL
+/// authenticates and the status is read as granted.
+const RELEVANT_GRANTED: i64 = 1_788_220_800; // 2026-09-01 — granted, not yet withdrawn, in-window.
+/// Relevant time AFTER the mdoc-ds `withdrawn` starting time (2027-03-01T00:00:00Z), still inside the
+/// signer + leaf cert validity windows.
+const RELEVANT_AFTER_WITHDRAWN: i64 = 1_811_808_000; // 2027-06-01.
+/// Relevant time BEFORE any `granted` entry started (the grants begin 2026-07-01T00:00:00Z) yet
+/// AFTER the signer cert's notBefore (2026-06-25), so the TL still authenticates but the grant has
+/// not yet begun → NotQualified ("found, not granted at the relevant time").
+const RELEVANT_BEFORE_GRANTED: i64 = 1_782_432_000; // 2026-06-26 — signer valid, grant not yet begun.
 
 /// The scheme-operator trust anchor(s) the gate authenticates the national TL against: the IACA root
 /// that signs the fixture. Helper so every determination call passes the authenticated anchor set.
@@ -280,6 +295,21 @@ fn sd_jwt_anchors() -> StaticTestAnchors {
     StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_CERT_DER)
 }
 
+/// Mint an SD-JWT VC whose `nbf`/`exp` window straddles [`RELEVANT_GRANTED`] (2026-09-01), so the
+/// always-on bar accepts it at the same in-window instant the qualified gate authenticates the
+/// national TL signer (`ca-iaca`, valid 2026-06-25..). The canonical [`mint_sd_jwt`] credential is
+/// pinned to the 2025 [`NOW`] instant, which is outside the signer cert's validity window — so the
+/// `verify()` gate tests mint an in-window credential instead (see the RCA on the `RELEVANT_*`
+/// constants).
+fn mint_in_window_sd_jwt() -> sd_jwt_payload::SdJwt {
+    mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(RELEVANT_GRANTED - 1_000),
+        serde_json::json!(RELEVANT_GRANTED + 1_000_000),
+    )
+}
+
 #[test]
 fn gate_disabled_leaves_the_always_on_verdict_unchanged_and_qualified_status_none() {
     // The load-bearing SC-007 invariant: with the gate OFF the always-on VerificationResult is
@@ -336,16 +366,17 @@ fn gate_enabled_populates_qualified_status_qualified_for_a_qualified_issuer() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
     let anchors = sd_jwt_anchors();
 
-    // The credential's leaf is sdjwt-issuer (granted EAA/Q); NOW (2025-06-15) is within the leaf's
-    // validity, and the grant is read at the verification instant. The scheme anchor (the IACA root)
+    // The credential's leaf is sdjwt-issuer (granted EAA/Q); RELEVANT_GRANTED (2026-09-01) is within
+    // the leaf's validity AND the signer cert's validity, so the always-on bar accepts the credential
+    // and the grant is read at the verification instant. The scheme anchor (the IACA root)
     // authenticates the national TL before the status is read.
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Qeaa,
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
@@ -404,7 +435,7 @@ fn policy_qualified_gate_flag_also_enables_the_gate() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
     let anchors = sd_jwt_anchors();
     let policy = VerificationPolicy {
@@ -413,7 +444,7 @@ fn policy_qualified_gate_flag_also_enables_the_gate() {
     };
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED, // in-window for both the credential and the TL signer
         role: IssuerRole::Qeaa,
         qualified_gate: false, // the context flag is OFF; the policy flag drives the gate
         qualified_trust_list: Some(&tl),

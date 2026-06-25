@@ -9,7 +9,9 @@ use super::{
     WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
 };
 use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
-use crate::sdjwtvc::test_issuer::{mint_sd_jwt, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW};
+use crate::sdjwtvc::test_issuer::{
+    mint_sd_jwt, mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+};
 use crate::status::StatusOutcome;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
 
@@ -146,13 +148,35 @@ const CA_IACA: &[u8] = include_bytes!("../../../../tests/fixtures/attestation/ca
 const WRONG_ISSUER: &[u8] =
     include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
 
+/// The relevant/verification instant the qualified-gate wire test runs at: 2026-09-01, inside both
+/// the credential leaf's and the national-TL signer's (`ca-iaca`) validity windows. The canonical
+/// [`valid_sd_jwt_request`] runs at the 2025 `NOW`, which is OUTSIDE the signer cert's validity — so
+/// the gate test mints an in-window credential and verifies at this instant (see the RCA on the
+/// qualified gate's `RELEVANT_*` constants; the gate authenticates the TL signer at the verification
+/// instant, which the chain-validity fix now enforces against the signer cert's window).
+const QUALIFIED_RELEVANT_GRANTED: i64 = 1_788_220_800; // 2026-09-01.
+
 #[test]
 fn opt_in_gate_over_the_c_abi_populates_qualified_status_and_is_additive() {
     // T020: the wire envelope additively carries the gate flag, the national TL bytes, and the
     // scheme-operator anchor. Driving the SAME credential with the gate OFF vs ON yields an identical
     // always-on verdict; only ON carries the qualified_status (sdjwt-issuer is a granted EAA/Q issuer
-    // at NOW, and the TL authenticates against the supplied scheme anchor → Qualified).
-    let base = valid_sd_jwt_request();
+    // at the relevant time, and the TL authenticates against the supplied scheme anchor → Qualified).
+    // The credential + verification instant are in-window for both the leaf and the TL signer certs.
+    let base = {
+        let mut req = valid_sd_jwt_request();
+        let sd_jwt = mint_sd_jwt_with_validity(
+            ISSUER_KEY_PK8,
+            ISSUER_CERT_DER,
+            serde_json::json!(QUALIFIED_RELEVANT_GRANTED - 1_000),
+            serde_json::json!(QUALIFIED_RELEVANT_GRANTED + 1_000_000),
+        );
+        req.presentation = WirePresentation::SdJwtVc {
+            presentation: sd_jwt.presentation(),
+        };
+        req.context.now_unix = QUALIFIED_RELEVANT_GRANTED;
+        req
+    };
 
     let gate_on = {
         let mut req = base.clone();

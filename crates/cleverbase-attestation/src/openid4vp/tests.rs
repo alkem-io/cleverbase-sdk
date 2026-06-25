@@ -294,3 +294,63 @@ fn handover_transcript_is_deterministic_and_binds_both_inputs() {
     assert_ne!(a, diff_nonce);
     assert_ne!(a, diff_aud);
 }
+
+#[test]
+fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
+    // Pin the SessionTranscript to the OpenID4VP 1.0 / ISO 18013-7 `OpenID4VPHandover`
+    // (Appendix B.2.6.1) — NOT the old self-invented `["OID4VPHandover", clientIdHash, nonceHash]`.
+    // SessionTranscript = [null, null, OpenID4VPHandover]
+    // OpenID4VPHandover = ["OpenID4VPHandover", sha256(OpenID4VPHandoverInfoBytes)]
+    // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint(null), responseUri]
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    use ciborium::value::Value as CborValue;
+    use sha2::{Digest as _, Sha256};
+
+    let nonce = [1u8, 2, 3];
+    let transcript_bytes = oid4vp_handover_transcript(AUDIENCE, &nonce);
+    let transcript: CborValue = ciborium::from_reader(transcript_bytes.as_slice()).unwrap();
+
+    // SessionTranscript = [null, null, OpenID4VPHandover].
+    let CborValue::Array(st) = &transcript else {
+        panic!("SessionTranscript is a 3-element array")
+    };
+    assert_eq!(st.len(), 3);
+    assert_eq!(st[0], CborValue::Null, "DeviceEngagementBytes MUST be null");
+    assert_eq!(st[1], CborValue::Null, "EReaderKeyBytes MUST be null");
+
+    // OpenID4VPHandover = ["OpenID4VPHandover", OpenID4VPHandoverInfoHash].
+    let CborValue::Array(handover) = &st[2] else {
+        panic!("Handover is a 2-element array")
+    };
+    assert_eq!(handover.len(), 2);
+    assert_eq!(
+        handover[0],
+        CborValue::Text("OpenID4VPHandover".to_owned()),
+        "the fixed handover identifier is the spec string, not the old custom one"
+    );
+
+    // Recompute the expected single SHA-256 over the inner OpenID4VPHandoverInfo array and assert the
+    // handover carries exactly that hash (so every request parameter is bound by one digest).
+    let expected_info = CborValue::Array(vec![
+        CborValue::Text(AUDIENCE.to_owned()),
+        CborValue::Text(Base64UrlUnpadded::encode_string(&nonce)),
+        CborValue::Null,
+        CborValue::Text(AUDIENCE.to_owned()),
+    ]);
+    let mut info_bytes = Vec::new();
+    ciborium::into_writer(&expected_info, &mut info_bytes).unwrap();
+    let expected_hash = Sha256::digest(&info_bytes).to_vec();
+    assert_eq!(
+        handover[1],
+        CborValue::Bytes(expected_hash),
+        "the handover hash MUST be sha256(CBOR(OpenID4VPHandoverInfo))"
+    );
+
+    // The old custom structure had THREE handover elements (id + two per-field hashes); the
+    // conformant one has exactly two — guard against a regression to the non-interoperable shape.
+    assert_ne!(
+        handover.len(),
+        3,
+        "must not regress to the self-invented 3-element handover"
+    );
+}

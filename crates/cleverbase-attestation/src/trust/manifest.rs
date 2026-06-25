@@ -103,7 +103,7 @@ impl TrustListManifest {
     /// base64, or `nextUpdate` is not a valid RFC 3339 UTC timestamp.
     pub fn parse(bytes: &[u8]) -> Result<Self, ManifestError> {
         let raw: RawManifest = serde_json::from_slice(bytes)?;
-        let next_update_unix = parse_rfc3339_utc(&raw.next_update)
+        let next_update_unix = crate::datetime::parse_rfc3339_utc(&raw.next_update)
             .ok_or_else(|| ManifestError::NextUpdate(raw.next_update.clone()))?;
         let mut anchors: BTreeMap<(IssuerRole, Format), Vec<Vec<u8>>> = BTreeMap::new();
         for entry in raw.anchors {
@@ -138,62 +138,18 @@ impl TrustListManifest {
     }
 }
 
-/// Crate-internal re-export of [`parse_rfc3339_utc`] for the sibling XML parser ([`super::xml`]) and
-/// the qualified-status gate ([`crate::qualified`]), keeping the RFC 3339 UTC timestamp grammar
-/// defined once (DRY — the same `…Z` form TS 119 612 `NextUpdate` / status `startingTime` use).
+/// Crate-internal re-export of the one shared RFC 3339 UTC parser ([`crate::datetime`]) for the
+/// sibling XML parser ([`super::xml`]) and the qualified-status gate ([`crate::qualified`]), keeping
+/// the RFC 3339 UTC timestamp grammar defined once (DRY — the same `…Z` form TS 119 612
+/// `NextUpdate` / status `startingTime` use).
 pub(crate) fn parse_rfc3339_utc_pub(s: &str) -> Option<i64> {
-    parse_rfc3339_utc(s)
-}
-
-/// Parse an RFC 3339 / ISO 8601 UTC timestamp (`YYYY-MM-DDThh:mm:ssZ`) to Unix seconds.
-///
-/// Deliberately minimal — no chrono/time dependency — it accepts the exact `…Z` form the manifest
-/// (and TS 119 612 `NextUpdate`) uses. Returns `None` on any deviation so a malformed timestamp
-/// fails closed rather than parsing to a wrong instant.
-fn parse_rfc3339_utc(s: &str) -> Option<i64> {
-    let s = s.strip_suffix('Z')?;
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: i64 = date_parts.next()?.parse().ok()?;
-    let day: i64 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() {
-        return None;
-    }
-    let mut time_parts = time.split(':');
-    let hour: i64 = time_parts.next()?.parse().ok()?;
-    let minute: i64 = time_parts.next()?.parse().ok()?;
-    let second: i64 = time_parts.next()?.parse().ok()?;
-    if time_parts.next().is_some() {
-        return None;
-    }
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=60).contains(&second)
-    {
-        return None;
-    }
-    Some(civil_to_unix(year, month, day, hour, minute, second))
-}
-
-/// Convert a civil UTC date-time to Unix seconds via the days-from-civil algorithm (Howard Hinnant),
-/// the same self-contained civil-date math the signing core uses (DRY, no date crate).
-fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
-    // days_from_civil: days since 1970-01-01 for a proleptic-Gregorian (y, m, d).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era * 146_097 + doe - 719_468;
-    days * 86_400 + hour * 3_600 + minute * 60 + second
+    crate::datetime::parse_rfc3339_utc(s)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rfc3339_utc, ManifestError, TrustListManifest};
+    use super::{ManifestError, TrustListManifest};
+    use crate::datetime::parse_rfc3339_utc;
     use crate::types::{Format, IssuerRole};
 
     const TRUST_LIST_JSON: &[u8] =

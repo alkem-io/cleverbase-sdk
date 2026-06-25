@@ -22,9 +22,10 @@
 //! mdoc into a [`HeldAttestation`]. The pre-authorized-code grant is the self-contained flow the
 //! reference issuer supports without an interactive browser leg.
 
-use cleverbase_core::Secret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::secret::Secret;
 
 use super::present::HeldAttestation;
 use super::signer::{HolderContext, SigningInput};

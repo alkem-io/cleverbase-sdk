@@ -17,9 +17,9 @@
 //! ## Binding checks (FR-015 / SC-008)
 //!
 //! - **Nonce**: the presentation echoes the request's fresh `nonce` — SD-JWT VC in the KB-JWT
-//!   (`nonce`); mdoc in the `SessionTranscript` / OID4VPHandover the `DeviceAuth` signs over. A
-//!   missing/mismatched nonce ⇒ INVALID [`ReasonCode::Replay`] (a replayed presentation cannot
-//!   satisfy a fresh nonce).
+//!   (`nonce`); mdoc in the `SessionTranscript` / `OpenID4VPHandover` (OpenID4VP 1.0 Appendix
+//!   B.2.6.1) the `DeviceAuth` signs over. A missing/mismatched nonce ⇒ INVALID
+//!   [`ReasonCode::Replay`] (a replayed presentation cannot satisfy a fresh nonce).
 //! - **Audience**: the presentation is addressed to this verifier's `client_id` — SD-JWT VC KB-JWT
 //!   `aud`; mdoc the handover/`client_id`. Wrong audience ⇒ INVALID [`ReasonCode::WrongAudience`].
 //!
@@ -230,9 +230,9 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
         return VerificationResult::invalid(ReasonCode::WrongAudience);
     }
 
-    // Reconstruct the OID4VP handover transcript the holder must have signed over (from the request
-    // nonce + audience). If the DeviceAuth does not verify against it, the presentation is not bound
-    // to this fresh request → a replay.
+    // Reconstruct the conformant OpenID4VP-1.0 `OpenID4VPHandover` transcript the holder must have
+    // signed over (from the request nonce + audience). If the DeviceAuth does not verify against it,
+    // the presentation is not bound to this fresh request → a replay.
     let transcript = oid4vp_handover_transcript(&request.audience, &request.nonce);
     let params = MdocVerifyParams {
         now_unix,
@@ -249,31 +249,77 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     result
 }
 
-/// Build the OpenID4VP handover `SessionTranscript` bytes for an mdoc presentation from the
-/// `audience` (`client_id`) and `nonce`.
+/// Build the conformant OpenID4VP-1.0 / ISO 18013-7 mdoc `SessionTranscript` bytes for a
+/// redirect-invoked presentation, from the verifier's `client_id` (`audience`) and request `nonce`.
 ///
-/// Modelled as the ISO 18013-5 `SessionTranscript` shape `[null, null, OID4VPHandover]` where the
-/// handover is `["OID4VPHandover", clientIdHash, nonceHash]` (SHA-256 over the audience and nonce) —
-/// the holder folds the same handover into the `DeviceAuthentication` it signs, so reconstructing it
-/// here binds the device signature to this exact request. Both the holder (test issuer) and the
-/// verifier MUST build it identically.
+/// This is the **`OpenID4VPHandover`** of OpenID4VP 1.0 Appendix B.2.6.1 ("Invocation via
+/// Redirects"), NOT a custom structure — a conformant EUDI wallet signs `DeviceAuth` over exactly
+/// this `SessionTranscript`, so the verifier reconstructs it identically (CDDL reproduced verbatim):
+///
+/// ```text
+/// SessionTranscript = [null, null, OpenID4VPHandover]   ; ISO 18013-5 §9.1.5.1, with
+///                                                       ; DeviceEngagementBytes = EReaderKeyBytes = null
+/// OpenID4VPHandover = ["OpenID4VPHandover", OpenID4VPHandoverInfoHash]
+/// OpenID4VPHandoverInfoHash  = bstr            ; SHA-256 of OpenID4VPHandoverInfoBytes
+/// OpenID4VPHandoverInfoBytes = bstr .cbor OpenID4VPHandoverInfo
+/// OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri]
+///   clientId      = tstr   ; the `client_id` request parameter (the audience)
+///   nonce         = tstr   ; the `nonce` request parameter value
+///   jwkThumbprint = bstr / null  ; RFC 7638 thumbprint of the response-encryption key, else null
+///   responseUri   = tstr   ; the `response_uri` (or `redirect_uri`) request parameter
+/// ```
+///
+/// The handover folds **one** SHA-256 over the CBOR-encoded inner `OpenID4VPHandoverInfo` array
+/// (not a per-field hash): every request parameter is therefore bound, and any tampered field
+/// changes the single hash. The holder (here the test issuer) and the verifier MUST build the
+/// transcript identically, so this one function is the single authoritative source for both halves.
+///
+/// **Modelling note (offline suite).** The verifier currently models only the `client_id`
+/// (`audience`) and `nonce`; the SDK does not yet carry a separate `response_uri` nor the
+/// response-encryption key. Per OpenID4VP B.2.6.1 those map to:
+/// - `nonce` — the `nonce` request parameter is a text string; the SDK carries the nonce as bytes,
+///   so the conformant text value is its base64url-unpadded form (identical to the value an SD-JWT VC
+///   KB-JWT echoes), keeping the two formats' nonce-on-the-wire byte-identical.
+/// - `jwkThumbprint` — `null` (this SDK does not negotiate response encryption, so there is no
+///   verifier encryption key to thumbprint; the structure carries the conformant `null`).
+/// - `responseUri` — stubbed to the `client_id` (`audience`) until the SDK models a distinct
+///   `response_uri` request parameter. The external-conformance vector test (added separately) pins
+///   the exact wire bytes against a reference once the parameter is modelled.
 #[must_use]
 pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8]) -> Vec<u8> {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
     use sha2::{Digest as _, Sha256};
-    let client_id_hash = Sha256::digest(audience.as_bytes()).to_vec();
-    let nonce_hash = Sha256::digest(nonce).to_vec();
-    let handover = CborValue::Array(vec![
-        CborValue::Text("OID4VPHandover".to_owned()),
-        CborValue::Bytes(client_id_hash),
-        CborValue::Bytes(nonce_hash),
+
+    // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri].
+    // `nonce` is the text `nonce` request parameter; the SDK's bytes map to their base64url form.
+    let nonce_text = Base64UrlUnpadded::encode_string(nonce);
+    let handover_info = CborValue::Array(vec![
+        CborValue::Text(audience.to_owned()),
+        CborValue::Text(nonce_text),
+        // jwkThumbprint: null — no response encryption negotiated (see modelling note).
+        CborValue::Null,
+        // responseUri: stubbed to the client_id until a distinct response_uri is modelled.
+        CborValue::Text(audience.to_owned()),
     ]);
+    let handover_info_bytes = encode_cbor(&handover_info);
+    let handover_info_hash = Sha256::digest(&handover_info_bytes).to_vec();
+
+    // OpenID4VPHandover = ["OpenID4VPHandover", OpenID4VPHandoverInfoHash].
+    let handover = CborValue::Array(vec![
+        CborValue::Text("OpenID4VPHandover".to_owned()),
+        CborValue::Bytes(handover_info_hash),
+    ]);
+    // SessionTranscript = [null, null, OpenID4VPHandover].
     let transcript = CborValue::Array(vec![CborValue::Null, CborValue::Null, handover]);
+    encode_cbor(&transcript)
+}
+
+/// Encode a plain CBOR value into an in-memory `Vec` (infallible — a `Vec` writer never errors).
+fn encode_cbor(value: &CborValue) -> Vec<u8> {
     let mut buf = Vec::new();
-    // Infallible: encoding a plain CBOR value into an in-memory Vec cannot fail.
     #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
     {
-        ciborium::into_writer(&transcript, &mut buf)
-            .expect("CBOR encode of the handover transcript");
+        ciborium::into_writer(value, &mut buf).expect("CBOR encode into a Vec is infallible");
     }
     buf
 }

@@ -12,9 +12,12 @@ documentation = "https://docs.rs/cleverbase-attestation"
 description = "Sans-IO EUDI attestation core for the Cleverbase SDK: SD-JWT VC + ISO 18013-5 mdoc verification, EU trust-list anchoring, and OpenID4VP binding."
 
 [dependencies]
-# The signing core's redacting `Secret` newtype is reused for the OAuth bearer token (DRY — one
-# authoritative secret-redaction type; Constitution Principle IV: never leak secrets via Debug).
-cleverbase-core = { path = "../cleverbase-core" }
+# NOTE: this crate deliberately does NOT depend on `cleverbase-core`. It once did, solely to reuse
+# the ~20-line redacting `Secret` newtype for the OAuth bearer token — but that dragged the whole
+# signing stack (incl. `lopdf`, a PDF library, and `cms`) into this otherwise pure-Rust /
+# WASM-able / minimal verifier (`cargo tree -i lopdf -p cleverbase-attestation` flagged it),
+# contradicting the `lib.rs` posture. For a trivial leaf type the correct call is a local copy, not
+# a heavy cross-crate dependency, so `Secret` now lives in `src/secret.rs`.
 serde.workspace = true
 serde_json.workspace = true
 serde_bytes.workspace = true

@@ -43,11 +43,13 @@
     )
 )]
 
+pub mod datetime;
 pub mod issuance;
 pub mod mdoc;
 pub mod openid4vp;
 pub mod qualified;
 pub mod sdjwtvc;
+pub mod secret;
 pub mod status;
 #[cfg(feature = "test-vectors")]
 pub mod test_vectors;

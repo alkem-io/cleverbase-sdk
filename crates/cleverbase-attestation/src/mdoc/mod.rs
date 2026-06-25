@@ -220,11 +220,16 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     }
 
     // Verify EVERY document; the verdict is VALID only if all pass. Disclosed attributes are merged
-    // across documents (each document's identifiers are surfaced in the single result map).
+    // across documents into the single result map WITHOUT silent shadowing: a second authentic
+    // document (same trusted DS, or a holder presenting two credentials) MUST NOT be able to overwrite
+    // a claim a consumer reads with a conflicting value. A same-identifier clash with a different value
+    // is rejected (`DisclosureIntegrity`); an identical re-disclosure is harmless and merges cleanly.
     let mut disclosed = BTreeMap::new();
     for document in documents {
         let doc_disclosed = verify_one_document(document, anchors, params)?;
-        disclosed.extend(doc_disclosed);
+        for (identifier, value) in doc_disclosed {
+            insert_no_shadow(&mut disclosed, identifier, value)?;
+        }
     }
 
     Ok(VerificationResult {
@@ -392,10 +397,42 @@ fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
 pub fn issuer_signing_cert_der(device_response: &[u8]) -> Option<Vec<u8>> {
     let root: CborValue = ciborium::from_reader(device_response).ok()?;
     let document = first_document(&root).ok()?;
+    issuer_signing_cert_of_document(document)
+}
+
+/// Extract the claimed Document Signer leaf certificate (DER) from a single `Document`'s `IssuerAuth`
+/// `x5chain` (read-only, no verification — the shared body of [`issuer_signing_cert_der`] and
+/// [`issuer_signing_certs_der`]). Returns `None` when the document carries no resolvable leaf.
+fn issuer_signing_cert_of_document(document: &CborValue) -> Option<Vec<u8>> {
     let issuer_signed = get_map_entry(document, "issuerSigned")?;
     let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
     let issuer_auth = parse_cose_sign1(issuer_auth_value).ok()?;
     ds_cert_from_x5chain(&issuer_auth).ok()
+}
+
+/// Extract the claimed Document Signer leaf certificate (DER) of **every** document in a
+/// `DeviceResponse`, in document order — the per-document input the opt-in [`crate::qualified`] gate
+/// needs so a multi-document response is decided over ALL its issuers, not just `documents[0]`.
+///
+/// The always-on bar verifies + merges attributes from every document (possibly different issuers), so
+/// a qualified-status determination that read only `documents[0]` could report `Qualified` over a
+/// result that also carries a non-qualified second document's attributes. This returns one entry per
+/// document (`None` for a document whose leaf cannot be read), so the gate can fold a status across
+/// all of them and never report a single `Qualified` that under-covers.
+///
+/// Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
+/// [`issuer_signing_cert_der`], the certs are *claimed* (trust + signature are decided by the
+/// always-on bar in [`verify`]); this read is only the gate's cert-matching input, never an acceptance.
+#[must_use]
+pub fn issuer_signing_certs_der(device_response: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
+    let root: CborValue = ciborium::from_reader(device_response).ok()?;
+    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
+    Some(
+        documents
+            .iter()
+            .map(issuer_signing_cert_of_document)
+            .collect(),
+    )
 }
 
 /// Resolve the Document Signer certificate (DER) from a COSE_Sign1's `x5chain` header. The leaf is
@@ -419,6 +456,20 @@ fn ds_cert_from_x5chain(sign1: &CoseSign1) -> Result<Vec<u8>, VerifyFailure> {
     }
 }
 
+/// Whether a COSE_Sign1's protected-header `alg` names ES256 — the single authoritative
+/// algorithm-gate predicate the EUDI baseline pins. Both the `IssuerAuth` and `DeviceSignature`
+/// verifiers gate on this BEFORE any signature math runs, so a non-ES256 header is rejected on the
+/// algorithm alone (never via a failed ES256 verification of differently-signed bytes). Factored out
+/// (DRY) so the gate has one definition and can be probed in isolation.
+fn cose_alg_is_es256(sign1: &CoseSign1) -> bool {
+    matches!(
+        sign1.protected.header.alg,
+        Some(RegisteredLabelWithPrivate::Assigned(
+            coset::iana::Algorithm::ES256
+        ))
+    )
+}
+
 /// Verify a COSE_Sign1 ES256 signature against a P-256 public key extracted from `cert_der`.
 ///
 /// Builds the COSE `Sig_structure` (via `coset`, with no external AAD) and verifies the raw `r‖s`
@@ -428,14 +479,9 @@ fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), Ver
     use p256::ecdsa::signature::Verifier as _;
     use x509_cert::spki::DecodePublicKey as _;
 
-    // The protected header MUST name ES256 (the EUDI baseline). Anything else is rejected.
-    let is_es256 = matches!(
-        sign1.protected.header.alg,
-        Some(RegisteredLabelWithPrivate::Assigned(
-            coset::iana::Algorithm::ES256
-        ))
-    );
-    if !is_es256 {
+    // The protected header MUST name ES256 (the EUDI baseline). Anything else is rejected on the
+    // algorithm alone, before any signature math.
+    if !cose_alg_is_es256(sign1) {
         return Err(VerifyFailure::reason(ReasonCode::Tamper));
     }
 
@@ -511,63 +557,7 @@ fn tdate_field(info: &CborValue, key: &str) -> Result<i64, VerifyFailure> {
             .ok_or_else(VerifyFailure::malformed)?,
         _ => return Err(VerifyFailure::malformed()),
     };
-    parse_rfc3339_to_unix(&text).ok_or_else(VerifyFailure::malformed)
-}
-
-/// Parse an RFC 3339 / ISO 8601 UTC timestamp (`YYYY-MM-DDThh:mm:ssZ`, optional fractional seconds)
-/// to Unix seconds, without pulling a date crate. Only the `Z` (UTC) form is accepted — ISO/IEC
-/// 18013-5 mandates UTC for `tdate` fields.
-fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
-    // Expect at least "YYYY-MM-DDThh:mm:ss" then optional ".fff" then "Z".
-    let bytes = s.as_bytes();
-    if bytes.len() < 20 {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    if bytes.get(4) != Some(&b'-') {
-        return None;
-    }
-    let month: i64 = s.get(5..7)?.parse().ok()?;
-    if bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let day: i64 = s.get(8..10)?.parse().ok()?;
-    if bytes.get(10) != Some(&b'T') {
-        return None;
-    }
-    let hour: i64 = s.get(11..13)?.parse().ok()?;
-    if bytes.get(13) != Some(&b':') {
-        return None;
-    }
-    let min: i64 = s.get(14..16)?.parse().ok()?;
-    if bytes.get(16) != Some(&b':') {
-        return None;
-    }
-    let sec: i64 = s.get(17..19)?.parse().ok()?;
-    // Must end in 'Z' (after an optional fractional part); reject offsets/local time.
-    if !s.ends_with('Z') {
-        return None;
-    }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    if hour > 23 || min > 59 || sec > 60 {
-        return None;
-    }
-    Some(civil_to_unix(year, month, day, hour, min, sec))
-}
-
-/// Convert a UTC civil date-time to Unix seconds using Howard Hinnant's `days_from_civil` algorithm
-/// (public-domain; the same algorithm `chrono`/`time` use). Avoids a date dependency for the single
-/// `tdate` parse the verifier needs.
-fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    days * 86_400 + hour * 3_600 + min * 60 + sec
+    crate::datetime::parse_rfc3339_utc(&text).ok_or_else(VerifyFailure::malformed)
 }
 
 /// Enforce the validity window at `now_unix`: outside `[validFrom, validUntil]` → `Expired`.
@@ -644,10 +634,42 @@ fn verify_value_digests(
                 get_text(&item, "elementIdentifier").ok_or_else(VerifyFailure::malformed)?;
             let element_value =
                 get_map_entry(&item, "elementValue").ok_or_else(VerifyFailure::malformed)?;
-            disclosed.insert(identifier, cbor_to_attribute(element_value));
+            // The disclosed map is keyed by `elementIdentifier` alone (the format's flat claim view),
+            // but a credential MAY carry the same identifier in more than one namespace. Merging
+            // last-writer-wins would let one namespace silently SHADOW another's value, so insert
+            // without overwriting a conflicting value — a clash is a structurally untrustworthy
+            // disclosure set (a consumer cannot know which value is authoritative).
+            insert_no_shadow(&mut disclosed, identifier, cbor_to_attribute(element_value))?;
         }
     }
     Ok(disclosed)
+}
+
+/// Insert a disclosed attribute into `map` without ever silently shadowing an existing entry.
+///
+/// The disclosed map is keyed by `elementIdentifier` alone (the flat claim view consumers read). If
+/// the same identifier is disclosed more than once — across namespaces within a document, or across
+/// documents in a multi-credential response — a *conflicting* value MUST NOT silently overwrite an
+/// earlier one (a consumer reading `given_name` could otherwise be served a second, attacker-chosen
+/// document's value). An identical re-disclosure is harmless (no shadowing of a different value) and
+/// is accepted; a conflicting one is rejected as a structurally untrustworthy disclosure set.
+fn insert_no_shadow(
+    map: &mut BTreeMap<String, AttributeValue>,
+    identifier: String,
+    value: AttributeValue,
+) -> Result<(), VerifyFailure> {
+    match map.get(&identifier) {
+        // A genuine collision with a DIFFERENT value: one disclosure would shadow the other — reject.
+        Some(existing) if *existing != value => {
+            Err(VerifyFailure::reason(ReasonCode::DisclosureIntegrity))
+        }
+        // Same identifier, same value (or first sighting): no shadowing risk.
+        Some(_) => Ok(()),
+        None => {
+            map.insert(identifier, value);
+            Ok(())
+        }
+    }
 }
 
 /// Re-encode a byte string as a CBOR `#6.24(bstr)` tagged item — the canonical wire form whose digest
@@ -859,13 +881,9 @@ fn verify_cose_sign1_detached_es256(
 ) -> Result<(), ()> {
     use p256::ecdsa::signature::Verifier as _;
 
-    let is_es256 = matches!(
-        sign1.protected.header.alg,
-        Some(RegisteredLabelWithPrivate::Assigned(
-            coset::iana::Algorithm::ES256
-        ))
-    );
-    if !is_es256 {
+    // Gate on the algorithm BEFORE any signature math (the same single predicate the IssuerAuth path
+    // uses): a non-ES256 DeviceSignature is rejected on its header alone.
+    if !cose_alg_is_es256(sign1) {
         return Err(());
     }
     let verifying_key =
@@ -888,13 +906,93 @@ mod unit {
     //! Direct unit tests of the pure helpers whose error branches are awkward to reach end-to-end.
 
     use super::{
-        cbor_to_attribute, civil_to_unix, ds_cert_from_x5chain, integer_label,
-        parse_rfc3339_to_unix, tdate_field, unwrap_tagged_cbor_payload, DigestAlgorithm,
+        cbor_to_attribute, cose_alg_is_es256, ds_cert_from_x5chain, insert_no_shadow,
+        integer_label, tdate_field, unwrap_tagged_cbor_payload, DigestAlgorithm,
         COSE_HEADER_X5CHAIN, TAG_ENCODED_CBOR,
     };
     use crate::types::AttributeValue;
     use ciborium::Value as CborValue;
-    use coset::{CoseSign1Builder, HeaderBuilder};
+    use coset::{iana::Algorithm, CoseSign1Builder, HeaderBuilder};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn cose_alg_gate_accepts_only_es256() {
+        // Isolated probe of the algorithm gate (the single predicate both the IssuerAuth and
+        // DeviceSignature paths gate on BEFORE any signature math): ES256 passes, ES384 / absent fail.
+        // This proves the non-ES256 rejection in `issuer_auth_non_es256_alg_is_rejected_as_tamper` and
+        // `device_signature_with_non_es256_alg_fails_holder_binding` is the ALGORITHM gate, distinct
+        // from the signature-math failures that share the same ReasonCode.
+        let es256 = CoseSign1Builder::new()
+            .protected(HeaderBuilder::new().algorithm(Algorithm::ES256).build())
+            .signature(vec![0; 64])
+            .build();
+        assert!(cose_alg_is_es256(&es256), "ES256 header passes the gate");
+
+        let es384 = CoseSign1Builder::new()
+            .protected(HeaderBuilder::new().algorithm(Algorithm::ES384).build())
+            .signature(vec![0; 64])
+            .build();
+        assert!(
+            !cose_alg_is_es256(&es384),
+            "ES384 header is rejected by the gate, not by failed ES256 math"
+        );
+
+        // An absent `alg` header (no protected algorithm) also fails the gate.
+        let no_alg = CoseSign1Builder::new().signature(vec![0; 64]).build();
+        assert!(
+            !cose_alg_is_es256(&no_alg),
+            "an absent alg header fails the gate (never guessed as ES256)"
+        );
+    }
+
+    #[test]
+    fn insert_no_shadow_inserts_accepts_idempotent_rejects_conflict() {
+        let mut map = BTreeMap::new();
+        // First sighting inserts.
+        assert!(insert_no_shadow(
+            &mut map,
+            "given_name".to_owned(),
+            AttributeValue::Text("Ada".to_owned())
+        )
+        .is_ok());
+        assert_eq!(
+            map.get("given_name"),
+            Some(&AttributeValue::Text("Ada".to_owned()))
+        );
+        // Identical re-disclosure is accepted (no shadowing of a different value) and does not change
+        // the stored value.
+        assert!(insert_no_shadow(
+            &mut map,
+            "given_name".to_owned(),
+            AttributeValue::Text("Ada".to_owned())
+        )
+        .is_ok());
+        assert_eq!(
+            map.get("given_name"),
+            Some(&AttributeValue::Text("Ada".to_owned()))
+        );
+        // A conflicting value is rejected (DisclosureIntegrity) and the original is preserved.
+        let err = insert_no_shadow(
+            &mut map,
+            "given_name".to_owned(),
+            AttributeValue::Text("EVIL".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(err.reason, crate::types::ReasonCode::DisclosureIntegrity);
+        assert_eq!(
+            map.get("given_name"),
+            Some(&AttributeValue::Text("Ada".to_owned())),
+            "a rejected conflict never overwrites the existing value"
+        );
+        // A distinct identifier still inserts cleanly.
+        assert!(insert_no_shadow(
+            &mut map,
+            "nationality".to_owned(),
+            AttributeValue::Text("NL".to_owned())
+        )
+        .is_ok());
+        assert_eq!(map.len(), 2);
+    }
 
     #[test]
     fn digest_algorithm_parses_the_iso_names() {
@@ -921,50 +1019,85 @@ mod unit {
         assert_eq!(DigestAlgorithm::Sha512.digest(b"x").len(), 64);
     }
 
+    /// Build a `validityInfo`-shaped CBOR map carrying a single `key → tdate(text)` entry, so the
+    /// `tdate_field` reader (and the shared RFC 3339 parser it delegates to) can be exercised.
+    fn validity_info_with(key: &str, value: &str) -> CborValue {
+        CborValue::Map(vec![(
+            CborValue::Text(key.to_owned()),
+            CborValue::Text(value.to_owned()),
+        )])
+    }
+
     #[test]
-    fn rfc3339_parses_a_well_formed_utc_instant() {
-        // 1970-01-01T00:00:00Z is the Unix epoch.
-        assert_eq!(parse_rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
-        // A known instant: 2023-01-01T00:00:00Z.
+    fn tdate_field_parses_a_well_formed_utc_instant() {
+        // The mdoc `tdate` reader delegates to the shared RFC 3339 parser (`crate::datetime`).
         assert_eq!(
-            parse_rfc3339_to_unix("2023-01-01T00:00:00Z"),
+            tdate_field(
+                &validity_info_with("validFrom", "1970-01-01T00:00:00Z"),
+                "validFrom"
+            )
+            .ok(),
+            Some(0)
+        );
+        assert_eq!(
+            tdate_field(
+                &validity_info_with("validUntil", "2023-01-01T00:00:00Z"),
+                "validUntil"
+            )
+            .ok(),
             Some(1_672_531_200)
         );
-        // Fractional seconds are tolerated (still ends in Z).
+        // Fractional seconds are tolerated (still ends in Z); they are truncated.
         assert_eq!(
-            parse_rfc3339_to_unix("2023-01-01T00:00:00.123Z"),
+            tdate_field(
+                &validity_info_with("signed", "2023-01-01T00:00:00.123Z"),
+                "signed"
+            )
+            .ok(),
             Some(1_672_531_200)
         );
     }
 
     #[test]
-    fn rfc3339_rejects_malformed_or_non_utc_strings() {
-        // Too short.
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01"), None);
-        // Missing the trailing Z (an offset / local time is not accepted).
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T00:00:00+01:00"), None);
-        // Wrong separators.
-        assert_eq!(parse_rfc3339_to_unix("2023/01/01T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01/01T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01 00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T00-00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T00:00-00Z"), None);
-        // Out-of-range fields.
-        assert_eq!(parse_rfc3339_to_unix("2023-13-01T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-32T00:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T24:00:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T00:60:00Z"), None);
-        assert_eq!(parse_rfc3339_to_unix("2023-01-01T00:00:99Z"), None);
-        // Non-numeric components.
-        assert_eq!(parse_rfc3339_to_unix("yyyy-01-01T00:00:00Z"), None);
+    fn tdate_field_accepts_a_tag0_wrapped_text() {
+        // A `#6.0`-tagged text (a CBOR `tdate`) is read the same as a bare text.
+        let info = CborValue::Map(vec![(
+            CborValue::Text("validFrom".to_owned()),
+            CborValue::Tag(
+                0,
+                Box::new(CborValue::Text("2023-01-01T00:00:00Z".to_owned())),
+            ),
+        )]);
+        assert_eq!(tdate_field(&info, "validFrom").ok(), Some(1_672_531_200));
     }
 
     #[test]
-    fn civil_to_unix_handles_pre_epoch_and_leap_years() {
-        // 1969-12-31T00:00:00Z is one day before the epoch (negative-year branch via month<=2 path).
-        assert_eq!(civil_to_unix(1969, 12, 31, 0, 0, 0), -86_400);
-        // A leap day: 2020-02-29T00:00:00Z (month <= 2 branch).
-        assert_eq!(civil_to_unix(2020, 2, 29, 0, 0, 0), 1_582_934_400);
+    fn tdate_field_rejects_a_malformed_or_invalid_instant() {
+        // A malformed timestamp fails closed (Err), never a wrong instant.
+        assert!(tdate_field(&validity_info_with("validFrom", "2023-01-01"), "validFrom").is_err());
+        assert!(tdate_field(
+            &validity_info_with("validFrom", "2023-01-01T00:00:00+01:00"),
+            "validFrom"
+        )
+        .is_err());
+        // An out-of-range day-of-month (the old `1..=31` bug) is now rejected, not rolled forward.
+        assert!(tdate_field(
+            &validity_info_with("validFrom", "2023-02-31T00:00:00Z"),
+            "validFrom"
+        )
+        .is_err());
+        // A missing field is malformed.
+        assert!(tdate_field(
+            &validity_info_with("other", "2023-01-01T00:00:00Z"),
+            "validFrom"
+        )
+        .is_err());
+        // A non-text value is malformed.
+        let numeric = CborValue::Map(vec![(
+            CborValue::Text("validFrom".to_owned()),
+            CborValue::Integer(0.into()),
+        )]);
+        assert!(tdate_field(&numeric, "validFrom").is_err());
     }
 
     #[test]
