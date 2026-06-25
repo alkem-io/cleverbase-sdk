@@ -144,28 +144,14 @@ impl XmlTrustList {
                 }
                 Event::Text(t) => {
                     if let Some(tag) = pending.take() {
-                        let body = t
-                            .decode()
-                            .map_err(|e| XmlTrustListError::Xml(e.to_string()))?;
-                        match tag.as_str() {
-                            "x509certificate" => {
-                                let der = decode_b64_cert(body.as_ref())?;
-                                match section {
-                                    Section::Signature => signer_cert_der = Some(der),
-                                    Section::ServiceIdentity => service_anchors.push(der),
-                                    Section::Scheme => {}
-                                }
-                            }
-                            "nextupdate" => {
-                                // Take the first non-empty timestamp body seen inside NextUpdate
-                                // (a bare `<NextUpdate>ts</NextUpdate>` or a `<dateTime>` child).
-                                if next_update_unix.is_none() {
-                                    next_update_unix =
-                                        super::manifest::parse_rfc3339_utc_pub(body.trim());
-                                }
-                            }
-                            _ => {}
-                        }
+                        handle_text_event(
+                            &t,
+                            &tag,
+                            section,
+                            &mut signer_cert_der,
+                            &mut service_anchors,
+                            &mut next_update_unix,
+                        )?;
                     }
                 }
                 Event::Eof => break,
@@ -252,6 +238,47 @@ fn local_name(qname: &[u8]) -> String {
 fn decode_b64_cert(body: &str) -> Result<Vec<u8>, XmlTrustListError> {
     crate::crypto::decode_base64_cert_lenient(body)
         .map_err(|e| XmlTrustListError::Base64(e.to_string()))
+}
+
+/// Attribute one element's `Text` body (`text`, for the pending `tag` in `section`) to the right
+/// collection — extracted so the [`XmlTrustList::parse`] loop arm is a single call rather than a
+/// four-level-nested block (no parsing/authentication change; identical attribution):
+///
+/// - `<X509Certificate>` → the signer cert ([`Section::Signature`]) or a service anchor
+///   ([`Section::ServiceIdentity`]); a scheme-section cert is ignored.
+/// - `<NextUpdate>` → the first non-empty timestamp seen (a bare body or a `<dateTime>` child).
+///
+/// Any other pending tag is a no-op.
+fn handle_text_event(
+    text: &quick_xml::events::BytesText<'_>,
+    tag: &str,
+    section: Section,
+    signer_cert_der: &mut Option<Vec<u8>>,
+    service_anchors: &mut Vec<Vec<u8>>,
+    next_update_unix: &mut Option<i64>,
+) -> Result<(), XmlTrustListError> {
+    let body = text
+        .decode()
+        .map_err(|e| XmlTrustListError::Xml(e.to_string()))?;
+    match tag {
+        "x509certificate" => {
+            let der = decode_b64_cert(body.as_ref())?;
+            match section {
+                Section::Signature => *signer_cert_der = Some(der),
+                Section::ServiceIdentity => service_anchors.push(der),
+                Section::Scheme => {}
+            }
+        }
+        "nextupdate" => {
+            // Take the first non-empty timestamp body seen inside NextUpdate (a bare
+            // `<NextUpdate>ts</NextUpdate>` or a `<dateTime>` child).
+            if next_update_unix.is_none() {
+                *next_update_unix = super::manifest::parse_rfc3339_utc_pub(body.trim());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

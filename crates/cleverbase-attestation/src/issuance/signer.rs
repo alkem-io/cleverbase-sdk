@@ -375,7 +375,8 @@ pub fn build_kb_jwt(
     presentation_prefix: &str,
 ) -> Result<KbJwtBuild, SignerError> {
     let alg = SignatureAlgorithm::Es256;
-    let sd_hash = Base64UrlUnpadded::encode_string(&sha256(presentation_prefix.as_bytes()));
+    // The crate's single `sd_hash` formula (DRY — the SD-JWT VC verifier recomputes the same value).
+    let sd_hash = crate::crypto::sd_hash(presentation_prefix);
     let header = json!({
         "typ": "kb+jwt",
         "alg": alg.jose_alg(),
@@ -415,8 +416,6 @@ fn public_jwk_only(jwk: &Value) -> Value {
     }
     jwk
 }
-
-use crate::crypto::sha256;
 
 #[cfg(test)]
 mod tests;

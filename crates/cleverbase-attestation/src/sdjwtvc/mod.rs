@@ -216,7 +216,8 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
 /// decided separately in step 3 — a self-signed cert verifies its own signature but is rejected as
 /// untrusted unless it is on the configured anchor).
 fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, ReasonCode> {
-    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation.
+    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation. It is a
+    // compact JWS of EXACTLY three dot-segments; a non-3-segment framing is a malformed credential.
     let presentation = sd_jwt.presentation();
     let jws = presentation
         .split('~')
@@ -224,13 +225,13 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, Re
         .ok_or(ReasonCode::MalformedCredential)?;
     let mut parts = jws.split('.');
     let header_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
-    let payload_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
-    let sig_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
+    let _payload_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
+    let _sig_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
     if parts.next().is_some() {
         return Err(ReasonCode::MalformedCredential);
     }
 
-    // Header: require alg=ES256 and read the x5c leaf certificate.
+    // Issuer-specific header handling: require alg=ES256 and read the x5c leaf certificate.
     let header_json =
         Base64UrlUnpadded::decode_vec(header_b64).map_err(|_| ReasonCode::MalformedCredential)?;
     let header: Value =
@@ -240,17 +241,14 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, Re
     }
     let cert_der = issuer_cert_from_header(&header)?;
 
-    // Signing input is the ASCII bytes of `header.payload`; the signature is raw r||s (ES256).
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    let sig_bytes =
-        Base64UrlUnpadded::decode_vec(sig_b64).map_err(|_| ReasonCode::MalformedCredential)?;
-    let signature =
-        p256::ecdsa::Signature::from_slice(&sig_bytes).map_err(|_| ReasonCode::Tamper)?;
-
+    // The compact-JWS sig decode + `Signature::from_slice` + `header.payload` signing-input + verify is
+    // the SAME body the KB-JWT path uses — share the single [`verify_compact_es256`] (DRY — Principle
+    // III). The 3-segment guard above already established the framing (a malformed framing is
+    // `MalformedCredential`); a signature that does not verify under the credential's claimed signing
+    // cert is a `Tamper`. Trust is decided separately (step 3) — this only proves the credential signed
+    // its own bytes.
     let verifying_key = verifying_key_from_cert_der(&cert_der)?;
-    verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| ReasonCode::Tamper)?;
+    verify_compact_es256(jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
 
     Ok(cert_der)
 }
@@ -370,23 +368,23 @@ fn check_holder_binding(
 
     // `aud`/`nonce` bind the presentation to a verifier's request — checked ONLY when a challenge is
     // supplied (no challenge ⇒ no request to bind to, so no replay/audience check). The signature and
-    // `sd_hash` below run regardless: a PRESENT KB-JWT is always cryptographically verified.
+    // `sd_hash` below run regardless: a PRESENT KB-JWT is always cryptographically verified. Both the
+    // KB-JWT `aud` AND `nonce` must equal the challenge's (compared as a pair so the guard is one
+    // expression and `clippy::nursery`'s field-name heuristic doesn't misread the cross-struct compare).
     if let Some(challenge) = challenge {
-        let aud_ok = claims.aud == challenge.audience;
-        let nonce_ok = claims.nonce == challenge.nonce;
-        if !aud_ok || !nonce_ok {
+        if (claims.aud.as_str(), claims.nonce.as_str()) != (challenge.audience, challenge.nonce) {
             return Err(ReasonCode::HolderBinding);
         }
     }
 
     // `sd_hash` MUST be the SHA-256 (base64url) digest of the presentation prefix up to and including
     // the final `~` that precedes the KB-JWT (RFC 9901 §4.3). Always verified for a present KB-JWT.
+    // Recomputed via the crate's single `sd_hash` formula (DRY — the holder builder embeds the same).
     let kb_compact = kb.to_string();
     let prefix = presentation
         .strip_suffix(&kb_compact)
         .ok_or(ReasonCode::HolderBinding)?;
-    let expected_sd_hash = Base64UrlUnpadded::encode_string(&sha256(prefix.as_bytes()));
-    if claims.sd_hash != expected_sd_hash {
+    if claims.sd_hash != crate::crypto::sd_hash(prefix) {
         return Err(ReasonCode::HolderBinding);
     }
 

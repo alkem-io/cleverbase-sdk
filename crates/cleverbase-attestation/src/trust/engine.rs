@@ -85,6 +85,24 @@ struct Cache {
     earliest_next_update: Option<i64>,
 }
 
+impl Cache {
+    /// Append `anchors` (DER) to the cached set for `(role, format)`, creating the entry if absent.
+    /// The **one** anchor-insertion step shared by the JSON-manifest and XML refresh arms (DRY —
+    /// Principle III): both previously transcribed the identical
+    /// `entry((role, format)).or_default().extend(...)`.
+    fn add_anchors(
+        &mut self,
+        role: IssuerRole,
+        format: Format,
+        anchors: impl IntoIterator<Item = Vec<u8>>,
+    ) {
+        self.anchors
+            .entry((role, format))
+            .or_default()
+            .extend(anchors);
+    }
+}
+
 /// The native EU trust-list engine ([`TrustAnchorSource`]).
 ///
 /// Configure it with one or more trust lists, then [`refresh`](Self::refresh) (host-driven) to
@@ -179,11 +197,11 @@ impl NativeTrustEngine {
                     let manifest = TrustListManifest::parse(&bytes)
                         .map_err(|e| TrustError::Authentication(format!("{}: {e}", list.name)))?;
                     for (role, format) in manifest.keys() {
-                        cache
-                            .anchors
-                            .entry((role, format))
-                            .or_default()
-                            .extend(manifest.anchors_for(role, format).iter().cloned());
+                        cache.add_anchors(
+                            role,
+                            format,
+                            manifest.anchors_for(role, format).iter().cloned(),
+                        );
                     }
                     manifest.next_update_unix()
                 }
@@ -197,11 +215,11 @@ impl NativeTrustEngine {
                     parsed
                         .authenticate(&list.scheme_anchors_der, self.now_unix, *chain_only)
                         .map_err(|e| TrustError::Authentication(format!("{}: {e}", list.name)))?;
-                    cache
-                        .anchors
-                        .entry((*role, *format))
-                        .or_default()
-                        .extend(parsed.anchors_for(*role, *format).iter().cloned());
+                    cache.add_anchors(
+                        *role,
+                        *format,
+                        parsed.anchors_for(*role, *format).iter().cloned(),
+                    );
                     parsed.next_update_unix()
                 }
             };

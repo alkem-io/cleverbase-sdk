@@ -19,10 +19,6 @@ use coset::{
 
 use super::signer::{SignatureAlgorithm, SignerError, SigningInput};
 
-/// The CBOR `#6.24` "encoded CBOR data item" tag (RFC 8949 §3.4.5.1) — the wrapper ISO 18013-5 puts
-/// the `DeviceAuthentication` (and `DeviceNameSpaces`) payloads in, so the *exact bytes* are signed.
-const TAG_ENCODED_CBOR: u64 = 24;
-
 /// A built mdoc `DeviceSignature` input, plus the splice context (the protected header + payload) to
 /// reconstruct the detached COSE_Sign1 once the host has signed the `Sig_structure`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -108,7 +104,7 @@ pub fn build_device_signature(
         CborValue::Text(doc_type.to_owned()),
         device_ns_value,
     ]))?;
-    let device_auth_payload = encode(&tagged_cbor(device_auth_inner))?;
+    let device_auth_payload = crate::encode_tagged_cbor(&device_auth_inner);
 
     // The ES256 protected header is what the verifier reads the alg from; build the Sig_structure
     // (Signature1 context) over the detached DeviceAuthentication payload with no external aad.
@@ -153,12 +149,7 @@ pub fn build_device_signature(
 /// [`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value.
 pub fn empty_device_name_spaces_bytes() -> Result<Vec<u8>, SignerError> {
     let device_ns_inner = encode(&CborValue::Map(vec![]))?;
-    encode(&tagged_cbor(device_ns_inner))
-}
-
-/// Wrap inner CBOR bytes in a `#6.24` tag (the encoded-CBOR-data-item form).
-fn tagged_cbor(inner: Vec<u8>) -> CborValue {
-    CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner)))
+    Ok(crate::encode_tagged_cbor(&device_ns_inner))
 }
 
 /// Encode a `ciborium` value to CBOR bytes, surfacing the (impossible) failure as [`SignerError`].

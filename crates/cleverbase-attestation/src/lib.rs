@@ -78,3 +78,28 @@ pub(crate) fn cbor_to_vec<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
     ciborium::into_writer(value, &mut buf).expect("CBOR serialization into a Vec is infallible");
     buf
 }
+
+/// The CBOR `#6.24` "encoded CBOR data item" tag (RFC 8949 §3.4.5.1, value `24`) — the **one**
+/// authoritative definition for the crate (DRY — Principle III). ISO/IEC 18013-5 wraps each
+/// `IssuerSignedItem`, the MSO, the `DeviceNameSpaces`, and the `SessionTranscript` /
+/// `DeviceAuthentication` payloads in this tag so the *exact bytes* are what gets hashed/signed (a
+/// re-serialization with different map ordering must not change the digest); the SD-JWT VC / mdoc
+/// verifiers ([`mdoc`]) and the issuance holder ceremonies ([`issuance::device`],
+/// [`issuance::present`]) all reference this single const rather than a re-transcribed `24`.
+pub(crate) const TAG_ENCODED_CBOR: u64 = 24;
+
+/// Wrap `inner` bytes in a CBOR `#6.24(bstr)` "encoded CBOR data item" and serialize to a fresh
+/// `Vec` — the **one** authoritative `#6.24(bstr)` wrap-then-encode for the crate (DRY — Principle
+/// III), built on [`cbor_to_vec`]. The mdoc verifier (which rebuilds + re-signs over these bytes),
+/// the holder `DeviceSignature` ceremony ([`issuance::device`]), and the holder presentation splice
+/// ([`issuance::present`]) previously each transcribed an identical
+/// `Tag(24, Bytes(inner)) → into_writer` step; they now share this, so the byte output is identical
+/// across every site (critical — the verifier's digest/signature must reconstruct the same bytes the
+/// issuer/holder produced). Encoding a plain serde value into a `Vec` is infallible, so this has no
+/// error channel.
+pub(crate) fn encode_tagged_cbor(inner: &[u8]) -> Vec<u8> {
+    cbor_to_vec(&ciborium::value::Value::Tag(
+        TAG_ENCODED_CBOR,
+        Box::new(ciborium::value::Value::Bytes(inner.to_vec())),
+    ))
+}

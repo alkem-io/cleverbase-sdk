@@ -37,11 +37,10 @@ use crate::types::{
     AttributeValue, IssuerRole, ReasonCode, TrustStatus, Validity, VerificationResult,
 };
 
-/// The CBOR tag for an "encoded CBOR data item" (`#6.24`) — a byte string whose content is itself
-/// CBOR. ISO/IEC 18013-5 wraps each `IssuerSignedItem`, the MSO, the `DeviceNameSpaces`, and the
-/// `SessionTranscript`/`DeviceAuthentication` payloads in this tag so the *exact bytes* are what gets
-/// hashed/signed (a re-serialization with different map ordering must not change the digest).
-const TAG_ENCODED_CBOR: u64 = 24;
+/// The CBOR tag for an "encoded CBOR data item" (`#6.24`) — re-exported from the crate-level
+/// [`crate::TAG_ENCODED_CBOR`] (the one authoritative definition; DRY — Principle III) so this
+/// module's match arms and the test helper read it under the local name.
+use crate::TAG_ENCODED_CBOR;
 
 /// The COSE header label for an X.509 certificate chain (`x5chain`), RFC 9360 — carried in the
 /// `IssuerAuth` unprotected header as the DS certificate (or chain, leaf-first).
@@ -1075,8 +1074,6 @@ fn cose_alg_is_es256(sign1: &CoseSign1) -> bool {
 /// signature with the SDK's `p256`/`ecdsa` (no hand-rolled crypto). A non-ES256 algorithm header is
 /// rejected as a tamper (the EUDI baseline is ES256).
 fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), VerifyFailure> {
-    use p256::ecdsa::signature::Verifier as _;
-
     // The protected header MUST name ES256 (the EUDI baseline). Anything else is rejected on the
     // algorithm alone, before any signature math.
     if !cose_alg_is_es256(sign1) {
@@ -1090,12 +1087,28 @@ fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), Ver
         .ok_or_else(|| VerifyFailure::reason(ReasonCode::Tamper))?;
 
     let outcome = sign1.verify_signature(&[], |sig, tbs| {
-        let signature = p256::ecdsa::Signature::from_slice(sig)
-            .map_err(|_| ())
-            .or_else(|()| p256::ecdsa::Signature::from_der(sig).map_err(|_| ()))?;
-        verifying_key.verify(tbs, &signature).map_err(|_| ())
+        verify_p256_es256_sig(&verifying_key, sig, tbs)
     });
     outcome.map_err(|()| VerifyFailure::reason(ReasonCode::Tamper))
+}
+
+/// Verify a raw P-256 ES256 signature `sig_bytes` over `tbs` under `vk`, accepting the COSE/JOSE raw
+/// `r‖s` fixed-width form with a DER (`SEQUENCE`) fallback. The **one** ES256-signature-bytes check
+/// shared by both the attached (`IssuerAuth`) and detached (`DeviceSignature`) COSE_Sign1 verifiers
+/// (DRY — Principle III): both previously transcribed the identical
+/// `from_slice(sig).or_else(from_der)? → vk.verify(tbs, &sig)` body; the byte-level
+/// accepted-signature set is identical at both sites. Returns `Err(())` on a malformed signature
+/// encoding or a failed verification (no hand-rolled crypto — the SDK's `p256`/`ecdsa`).
+fn verify_p256_es256_sig(
+    vk: &p256::ecdsa::VerifyingKey,
+    sig_bytes: &[u8],
+    tbs: &[u8],
+) -> Result<(), ()> {
+    use p256::ecdsa::signature::Verifier as _;
+    let signature = p256::ecdsa::Signature::from_slice(sig_bytes)
+        .map_err(|_| ())
+        .or_else(|()| p256::ecdsa::Signature::from_der(sig_bytes).map_err(|_| ()))?;
+    vk.verify(tbs, &signature).map_err(|_| ())
 }
 
 /// Verify the `IssuerAuth` signature over the MSO with the DS certificate's key.
@@ -1323,12 +1336,11 @@ fn insert_no_shadow(
 ///
 /// This is used only for the holder-binding payload (which the verifier rebuilds and re-signs over);
 /// the `valueDigests` integrity check hashes the ORIGINAL on-wire `IssuerSignedItemBytes` instead
-/// (ISO/IEC 18013-5 §9.2.2.5), so it never re-encodes — see [`verify_value_digests`].
-fn encode_tagged_cbor(inner: &[u8]) -> Result<Vec<u8>, VerifyFailure> {
-    let tagged = CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner.to_vec())));
-    let mut buf = Vec::new();
-    ciborium::into_writer(&tagged, &mut buf).map_err(|_| VerifyFailure::malformed())?;
-    Ok(buf)
+/// (ISO/IEC 18013-5 §9.2.2.5), so it never re-encodes — see [`verify_value_digests`]. Delegates to
+/// the crate's single `#6.24(bstr)` wrap-then-encode [`crate::encode_tagged_cbor`] (DRY — Principle
+/// III; the holder issuance ceremonies share the same helper, so the bytes are identical).
+fn encode_tagged_cbor(inner: &[u8]) -> Vec<u8> {
+    crate::encode_tagged_cbor(inner)
 }
 
 /// Read an integer-valued, text-keyed field from a CBOR map.
@@ -1484,7 +1496,7 @@ fn verify_device_binding(
 /// Re-encode a `#6.24(bstr)` CBOR value to its canonical bytes (the `DeviceNameSpacesBytes` form).
 fn reencode_tagged(value: &CborValue) -> Result<Vec<u8>, VerifyFailure> {
     let inner = unwrap_tagged_cbor_payload(value)?;
-    encode_tagged_cbor(&inner)
+    Ok(encode_tagged_cbor(&inner))
 }
 
 /// Decode the supplied `SessionTranscript` bytes to a CBOR value. The transcript is REQUIRED to verify
@@ -1513,7 +1525,7 @@ fn build_device_authentication(
     ]);
     let mut inner = Vec::new();
     ciborium::into_writer(&device_auth, &mut inner).map_err(|_| VerifyFailure::malformed())?;
-    encode_tagged_cbor(&inner)
+    Ok(encode_tagged_cbor(&inner))
 }
 
 /// Verify a COSE_Sign1 ES256 signature over a **detached** payload against a SEC1 P-256 public key.
@@ -1522,8 +1534,6 @@ fn verify_cose_sign1_detached_es256(
     payload: &[u8],
     public_key_sec1: &[u8],
 ) -> Result<(), ()> {
-    use p256::ecdsa::signature::Verifier as _;
-
     // The DeviceSignature MUST be a DETACHED COSE_Sign1: a nil payload (third array element `null`),
     // with the signed `DeviceAuthentication` supplied externally (ISO/IEC 18013-5 §9.1.3). A
     // COSE_Sign1 carrying an ATTACHED payload (a `bstr` third element) is a malformed holder binding
@@ -1542,11 +1552,10 @@ fn verify_cose_sign1_detached_es256(
     }
     let verifying_key =
         p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| ())?;
+    // The detached coset call (`verify_detached_signature`) stays distinct from the attached path's
+    // `verify_signature`; only the inner raw-`r‖s`-with-DER-fallback ES256 check is shared (DRY).
     sign1.verify_detached_signature(payload, &[], |sig, tbs| {
-        let signature = p256::ecdsa::Signature::from_slice(sig)
-            .map_err(|_| ())
-            .or_else(|()| p256::ecdsa::Signature::from_der(sig).map_err(|_| ()))?;
-        verifying_key.verify(tbs, &signature).map_err(|_| ())
+        verify_p256_es256_sig(&verifying_key, sig, tbs)
     })
 }
 

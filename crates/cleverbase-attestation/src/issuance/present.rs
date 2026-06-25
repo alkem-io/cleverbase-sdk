@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::device::{build_device_signature, empty_device_name_spaces_bytes};
 use super::signer::{build_kb_jwt, HolderContext, Signer};
 use crate::openid4vp::{oid4vp_handover_transcript, MdocVpToken, PresentationRequest, VpToken};
+use crate::TAG_ENCODED_CBOR;
 
 /// An owned holder OpenID4VP `vp_token`, the output of [`present`]. The caller borrows it as a
 /// [`VpToken`] via [`HolderPresentation::as_vp_token`] to verify it under
@@ -522,7 +523,7 @@ fn first_device_name_spaces_bytes(response: &CborValue) -> Result<Vec<u8>, Prese
 /// `#6.24(bstr)` tag, matching the verifier's reconstruction byte-for-byte.
 fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentError> {
     let inner = match value {
-        CborValue::Tag(24, boxed) => match boxed.as_ref() {
+        CborValue::Tag(TAG_ENCODED_CBOR, boxed) => match boxed.as_ref() {
             CborValue::Bytes(bytes) => bytes.clone(),
             _ => {
                 return Err(PresentError::Malformed(
@@ -536,10 +537,10 @@ fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentErro
             ))
         }
     };
-    let tagged = CborValue::Tag(24, Box::new(CborValue::Bytes(inner)));
-    let mut buf = Vec::new();
-    ciborium::into_writer(&tagged, &mut buf).map_err(|e| PresentError::Build(e.to_string()))?;
-    Ok(buf)
+    // The crate's single `#6.24(bstr)` wrap-then-encode (DRY — Principle III): the verifier rebuilds
+    // `DeviceAuthentication` from these exact bytes, so they MUST match the mdoc verifier / device
+    // ceremony's encoding byte-for-byte.
+    Ok(crate::encode_tagged_cbor(&inner))
 }
 
 /// Replace the `deviceSigned.deviceAuth.deviceSignature` with `device_signature` (the fresh,
@@ -555,62 +556,55 @@ fn replace_device_signature(
 ) -> Result<CborValue, PresentError> {
     let device_signature_value: CborValue = ciborium::from_reader(device_signature_cbor)
         .map_err(|e| PresentError::Build(e.to_string()))?;
-    let map = response
-        .as_map()
-        .ok_or_else(|| PresentError::Malformed("DeviceResponse is not a map".to_owned()))?;
-    let mut out_entries = Vec::with_capacity(map.len());
-    for (k, v) in map {
-        if k.as_text() == Some("documents") {
-            let documents = v
-                .as_array()
-                .ok_or_else(|| PresentError::Malformed("documents is not an array".to_owned()))?;
-            let rebuilt_docs = documents
-                .iter()
-                .map(|doc| replace_in_document(doc, &device_signature_value))
-                .collect::<Result<Vec<_>, _>>()?;
-            out_entries.push((k.clone(), CborValue::Array(rebuilt_docs)));
-        } else {
-            out_entries.push((k.clone(), v.clone()));
-        }
-    }
-    Ok(CborValue::Map(out_entries))
+    // Walk DeviceResponse → documents[] → deviceSigned → deviceAuth, replacing each level's target key
+    // via the single map-key-replace helper (DRY — Principle III; three near-identical
+    // clone-or-transform walks collapse to one-line transforms).
+    replace_map_entry(response, "DeviceResponse", "documents", |documents| {
+        let documents = documents
+            .as_array()
+            .ok_or_else(|| PresentError::Malformed("documents is not an array".to_owned()))?;
+        let rebuilt_docs = documents
+            .iter()
+            .map(|doc| {
+                replace_map_entry(doc, "Document", "deviceSigned", |device_signed| {
+                    replace_map_entry(device_signed, "deviceSigned", "deviceAuth", |_| {
+                        Ok(CborValue::Map(vec![(
+                            CborValue::Text("deviceSignature".to_owned()),
+                            device_signature_value.clone(),
+                        )]))
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CborValue::Array(rebuilt_docs))
+    })
 }
 
-/// Replace the `deviceSignature` within a single `Document`'s `deviceSigned.deviceAuth`.
-fn replace_in_document(
-    document: &CborValue,
-    device_signature_value: &CborValue,
+/// Rebuild a CBOR map `value`, replacing the entry under `key` with `transform(old_value)` and leaving
+/// every other entry untouched (a clone-or-transform walk). The **one** map-key-replace primitive the
+/// holder-presentation splice uses at each `DeviceResponse` → `documents` → `deviceSigned` →
+/// `deviceAuth` level (DRY — Principle III). `map_label` names the map in the malformed-shape error.
+/// Pure CBOR re-serialization — no security logic (the signature it splices is validated elsewhere).
+///
+/// `transform` is applied to **every** entry whose key matches (matching the prior per-level walks,
+/// which carried no single-use guard); a well-formed `DeviceResponse` carries each key exactly once.
+///
+/// # Errors
+///
+/// [`PresentError::Malformed`] if `value` is not a CBOR map; propagates any error from `transform`.
+fn replace_map_entry(
+    value: &CborValue,
+    map_label: &str,
+    key: &str,
+    transform: impl Fn(&CborValue) -> Result<CborValue, PresentError>,
 ) -> Result<CborValue, PresentError> {
-    let map = document
+    let map = value
         .as_map()
-        .ok_or_else(|| PresentError::Malformed("Document is not a map".to_owned()))?;
+        .ok_or_else(|| PresentError::Malformed(format!("{map_label} is not a map")))?;
     let mut out = Vec::with_capacity(map.len());
     for (k, v) in map {
-        if k.as_text() == Some("deviceSigned") {
-            out.push((k.clone(), rebuild_device_signed(v, device_signature_value)?));
-        } else {
-            out.push((k.clone(), v.clone()));
-        }
-    }
-    Ok(CborValue::Map(out))
-}
-
-/// Rebuild a `DeviceSigned` map, replacing `deviceAuth.deviceSignature` with the fresh signature.
-fn rebuild_device_signed(
-    device_signed: &CborValue,
-    device_signature_value: &CborValue,
-) -> Result<CborValue, PresentError> {
-    let map = device_signed
-        .as_map()
-        .ok_or_else(|| PresentError::Malformed("deviceSigned is not a map".to_owned()))?;
-    let mut out = Vec::with_capacity(map.len());
-    for (k, v) in map {
-        if k.as_text() == Some("deviceAuth") {
-            let new_auth = CborValue::Map(vec![(
-                CborValue::Text("deviceSignature".to_owned()),
-                device_signature_value.clone(),
-            )]);
-            out.push((k.clone(), new_auth));
+        if k.as_text() == Some(key) {
+            out.push((k.clone(), transform(v)?));
         } else {
             out.push((k.clone(), v.clone()));
         }

@@ -125,6 +125,13 @@ pub(crate) struct MdocBuilder {
     /// the grant window (Qualified) and documents[1] is issued after the issuer's withdrawal
     /// (NotQualified), proving the gate reads EACH document at its OWN relevant time and folds.
     append_valid_document_issued_at: Option<(String, String)>,
+    /// When `Some`, append a SECOND fully-VALID document signed by the FOREIGN/untrusted `wrong-issuer`
+    /// DS (not the IACA-chained `mdoc-ds`), issued in `(signed = validFrom = signed_at, validUntil)` —
+    /// the multi-document qualified-status PROVENANCE probe. With the always-on bar configured to ALSO
+    /// trust `wrong-issuer` (so the whole response is VALID and the gate runs), this second document's
+    /// issuer is absent from the qualified national TL → its per-document status is `Indeterminate`, so
+    /// the fold MUST be `Indeterminate` (never a single `Qualified` read off documents[0]).
+    append_wrong_issuer_document_issued_at: Option<(String, String)>,
     /// When `Some`, set the top-level `DeviceResponse.status` to this value (non-zero drives the
     /// device-reported-error reject path).
     status_override: Option<i64>,
@@ -230,8 +237,10 @@ pub(crate) fn default_session_transcript() -> Vec<u8> {
     ]))
 }
 
-/// The wrong/untrusted issuer certificate DER.
-pub(super) fn wrong_issuer_cert_der() -> &'static [u8] {
+/// The wrong/untrusted issuer certificate DER. `pub(crate)` so the verify-layer multi-document
+/// qualified-status test can ALSO trust it on the always-on bar (making a `wrong-issuer`-signed
+/// second document VALID) while it stays absent from the qualified national TL → Indeterminate.
+pub(crate) fn wrong_issuer_cert_der() -> &'static [u8] {
     WRONG_ISSUER_CERT
 }
 
@@ -283,6 +292,7 @@ impl MdocBuilder {
             append_colliding_document: None,
             append_wrong_key_document: None,
             append_valid_document_issued_at: None,
+            append_wrong_issuer_document_issued_at: None,
             status_override: None,
             omit_status: false,
             empty_documents: false,
@@ -380,6 +390,23 @@ impl MdocBuilder {
         valid_until: &str,
     ) -> Self {
         self.append_valid_document_issued_at = Some((signed_at.to_owned(), valid_until.to_owned()));
+        self
+    }
+
+    /// Append a SECOND fully-VALID document signed by the FOREIGN/untrusted `wrong-issuer` DS (NOT the
+    /// IACA-chained `mdoc-ds`), issued in its own `(signed = validFrom = signed_at, validUntil)` window
+    /// and disclosing one DISTINCT (non-colliding) element. The always-on bar must be configured to
+    /// ALSO trust `wrong-issuer` for the whole response to verify; the qualified national TL does NOT
+    /// list `wrong-issuer`, so the gate reads its per-document status as `Indeterminate` and the fold
+    /// is `Indeterminate` — the multi-document provenance probe (a foreign issuer must not be folded
+    /// into a single `Qualified` read off documents[0]).
+    pub(crate) fn append_wrong_issuer_document_issued_at(
+        mut self,
+        signed_at: &str,
+        valid_until: &str,
+    ) -> Self {
+        self.append_wrong_issuer_document_issued_at =
+            Some((signed_at.to_owned(), valid_until.to_owned()));
         self
     }
 
@@ -551,6 +578,15 @@ impl MdocBuilder {
                 .map(|(signed_at, valid_until)| {
                     build_single_valid_document_issued_at(&signed_at, &valid_until)
                 });
+        // A second VALID document signed by the FOREIGN/untrusted `wrong-issuer` DS, issued in its own
+        // window — the multi-document qualified-status PROVENANCE probe (its issuer is absent from the
+        // qualified national TL → Indeterminate, never folded into a single Qualified).
+        let second_wrong_issuer_issued_at = self
+            .append_wrong_issuer_document_issued_at
+            .clone()
+            .map(|(signed_at, valid_until)| {
+                build_single_wrong_issuer_document_issued_at(&signed_at, &valid_until)
+            });
         // A second VALID document signed over the SAME transcript as the primary document but with a
         // WRONG-KEY `DeviceSignature` — the multi-document holder-binding-fault probe. Use the parent's
         // transcript (the one the primary document is bound to) so the only fault on `documents[1]` is
@@ -867,6 +903,9 @@ impl MdocBuilder {
         if let Some(second_valid_document) = second_valid_issued_at {
             documents.push(second_valid_document);
         }
+        if let Some(second_wrong_issuer_document) = second_wrong_issuer_issued_at {
+            documents.push(second_wrong_issuer_document);
+        }
         if let Some(wrong_key_doc) = wrong_key_document {
             documents.push(wrong_key_doc);
         }
@@ -949,6 +988,26 @@ fn build_single_valid_document_issued_at(signed_at: &str, valid_until: &str) -> 
             identifier: "document_number",
             value: CborValue::Text("D-2027".to_owned()),
         }])
+        .signed(signed_at)
+        .validity(signed_at, valid_until)
+        .build();
+    first_document_of_response(&response)
+}
+
+/// Mint a fresh, fully-VALID single document signed by the FOREIGN/untrusted `wrong-issuer` DS (via
+/// [`MdocBuilder::use_wrong_issuer`]) in its own `(signed = validFrom = signed_at, validUntil)` window,
+/// disclosing one DISTINCT (non-colliding) element. Used to append a second document whose issuer
+/// chains to a DIFFERENT (foreign) anchor — the multi-document qualified-status provenance probe. Its
+/// IssuerAuth verifies only when the always-on bar also trusts `wrong-issuer`; its issuer is absent
+/// from the qualified national TL → Indeterminate. Lifts out `documents[0]`.
+fn build_single_wrong_issuer_document_issued_at(signed_at: &str, valid_until: &str) -> CborValue {
+    let response = MdocBuilder::new()
+        .elements(vec![Element {
+            digest_id: 0,
+            identifier: "passport_number",
+            value: CborValue::Text("P-FOREIGN".to_owned()),
+        }])
+        .use_wrong_issuer()
         .signed(signed_at)
         .validity(signed_at, valid_until)
         .build();

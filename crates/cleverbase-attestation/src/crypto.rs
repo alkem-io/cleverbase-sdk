@@ -54,6 +54,17 @@ pub(crate) fn sha256(input: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The SD-JWT VC `sd_hash` (RFC 9901 §4.3): the base64url-unpadded SHA-256 digest of the presentation
+/// prefix bytes (the issuer-JWS-plus-selected-disclosures, up to and including the final `~` that
+/// precedes the KB-JWT). The **one** authoritative `sd_hash` formula for the crate (DRY — Principle
+/// III): the SD-JWT VC verifier ([`crate::sdjwtvc`]) recomputes it to check a presented KB-JWT and the
+/// holder KB-JWT builder ([`crate::issuance::signer`]) computes the same value to embed — both call
+/// this so the digest is identical on both sides (a verifier MUST recompute the byte-identical value
+/// the holder bound).
+pub(crate) fn sd_hash(prefix: &str) -> String {
+    Base64UrlUnpadded::encode_string(&sha256(prefix.as_bytes()))
+}
+
 /// Assemble the uncompressed SEC1 public point (`0x04 ‖ X ‖ Y`, 65 bytes) from raw P-256 affine
 /// coordinates, returning `None` unless each coordinate is exactly 32 bytes. This is the **byte-level**
 /// half shared by the JWK decode and the mdoc COSE-coordinate path (which reads `X`/`Y` from COSE

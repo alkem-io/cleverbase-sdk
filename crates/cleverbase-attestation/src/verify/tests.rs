@@ -5,7 +5,9 @@
 //! `verify` (bound VALID, replay/wrong-audience INVALID, both formats); and the policy format gate.
 
 use super::{detect_format, fold_qualified, verify, Presentation, VerifyContext};
-use crate::mdoc::test_issuer::{default_session_transcript, mdoc_ds_cert_der, MdocBuilder};
+use crate::mdoc::test_issuer::{
+    default_session_transcript, mdoc_ds_cert_der, wrong_issuer_cert_der, MdocBuilder,
+};
 use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
 use crate::qualified::QualifiedTrustList;
 use crate::sdjwtvc::test_issuer::{
@@ -64,6 +66,16 @@ fn sd_jwt_anchors() -> StaticTestAnchors {
 
 fn mdoc_anchors() -> StaticTestAnchors {
     StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der())
+}
+
+/// Always-on anchors that trust BOTH the IACA-chained `mdoc-ds` DS and the foreign, self-signed
+/// `wrong-issuer` DS — so a multi-document response with a `wrong-issuer`-signed second document
+/// passes the always-on bar (VALID) and the qualified gate runs. `wrong-issuer` is deliberately
+/// absent from the qualified national TL, so the gate reads its per-document status as Indeterminate.
+fn mdoc_anchors_with_wrong_issuer() -> StaticTestAnchors {
+    StaticTestAnchors::new()
+        .trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der())
+        .trust(IssuerRole::Pid, Format::Mdoc, wrong_issuer_cert_der())
 }
 
 fn request_with(audience: &str, nonce: &[u8]) -> PresentationRequest {
@@ -590,6 +602,75 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
         result.qualified_status,
         Some(QualifiedStatus::NotQualified),
         "documents[1] is NotQualified at its own (post-withdrawal) relevant time → the fold is NotQualified"
+    );
+}
+
+#[test]
+fn multi_document_mdoc_with_a_foreign_issuer_document_is_indeterminate_end_to_end() {
+    // PROVENANCE PROBE (end-to-end, the qualified-fold `Indeterminate`-via-foreign-issuer path): a
+    // VALID two-document response whose documents[0] is signed by the IACA-chained, qualified `mdoc-ds`
+    // (Qualified on its own at the credential's relevant time) and whose documents[1] is signed by a
+    // FOREIGN/untrusted `wrong-issuer` DS that is NOT on the qualified national TL. The always-on bar
+    // is configured to trust BOTH DS certs, so the whole response is VALID and the gate runs; but the
+    // foreign issuer is absent from the qualified TL → its per-document status is `Indeterminate`, and
+    // the fail-closed fold (Indeterminate dominates Qualified) MUST yield `Indeterminate` — NEVER a
+    // single `Qualified` read off documents[0] that under-covers documents[1]'s foreign provenance
+    // (SC-007). This exercises the fold end-to-end through `verify`, complementing the `fold_qualified`
+    // UNIT test below.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    let response = MdocBuilder::new()
+        // documents[0]: trusted `mdoc-ds`, issued in-grant, valid window covers `now` (RELEVANT_GRANTED).
+        .signed(MDOC_ISSUED_IN_GRANT)
+        .validity(MDOC_ISSUED_IN_GRANT, MDOC_VALID_UNTIL)
+        // documents[1]: FOREIGN `wrong-issuer` DS, issued in-window, valid window covers `now`.
+        .append_wrong_issuer_document_issued_at(MDOC_ISSUED_IN_GRANT, MDOC_VALID_UNTIL)
+        .build();
+    // Trust BOTH the IACA-chained `mdoc-ds` AND the foreign `wrong-issuer` on the always-on bar, so the
+    // whole response is VALID (otherwise documents[1] would fail the bar and the gate would never run).
+    let anchors = mdoc_anchors_with_wrong_issuer();
+    let scheme = [CA_IACA.to_vec()];
+    // Both documents are signed over the builder's default transcript; supply it so the request-less
+    // verify confirms each holder binding (§9.1.5 — the verifier no longer fabricates one).
+    let transcript = default_session_transcript();
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    // The response is VALID (both DS certs are trusted on the always-on bar), so the gate runs.
+    assert!(
+        result.valid,
+        "both documents are signed by always-on-trusted DS certs: {:?}",
+        result.reasons
+    );
+    // documents[1]'s foreign issuer is absent from the qualified TL → Indeterminate; the fold is
+    // Indeterminate (NOT a single Qualified that under-covers the foreign-issuer document).
+    assert_ne!(
+        result.qualified_status,
+        Some(QualifiedStatus::Qualified),
+        "a foreign-issuer second document must NOT report a Qualified that under-covers it"
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::Indeterminate),
+        "documents[1]'s issuer is on no qualified-TL service entry → its status is Indeterminate, and \
+         the fail-closed fold (Indeterminate dominates) yields Indeterminate"
     );
 }
 
