@@ -282,19 +282,26 @@ impl NativeTrustEngine {
 }
 
 impl TrustAnchorSource for NativeTrustEngine {
-    fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision {
+    fn resolve(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        issuer_cert_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
         // Fail-closed at resolve time too: if the cache is stale (past NextUpdate at the current
         // clock), do not serve it — an out-of-date list cannot anchor trust.
         if !self.cache_is_fresh() {
             return TrustDecision::untrusted();
         }
-        // Chain-validate the leaf against the cached anchors for its role/format (the shared,
-        // single-source resolve body — DRY).
+        // Validate the credential's signing path (leaf + supplied intermediates) against the cached
+        // anchors for its role/format (the shared, single-source resolve body — DRY).
         super::resolve_chain(
             self.cache.anchors.get(&(role, format)),
             role,
             format,
             issuer_cert_der,
+            supplied_intermediates,
             self.now_unix,
         )
     }
@@ -374,7 +381,7 @@ mod tests {
         engine.refresh_with(&mut fetcher).expect("refresh succeeds");
 
         // sdjwt-issuer chains to ca-iaca, which is the anchor for (Qeaa, SdJwtVc) + (Pid, SdJwtVc).
-        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER);
+        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[]);
         assert!(d.trusted, "sdjwt-issuer is trusted as QEAA SD-JWT VC");
         let entry = d.entry.expect("trusted carries an entry");
         assert_eq!(entry.role, IssuerRole::Qeaa);
@@ -383,13 +390,13 @@ mod tests {
         // mdoc-ds chains to ca-iaca, the anchor for (Pid, Mdoc).
         assert!(
             engine
-                .resolve(IssuerRole::Pid, Format::Mdoc, MDOC_DS)
+                .resolve(IssuerRole::Pid, Format::Mdoc, MDOC_DS, &[])
                 .trusted
         );
         // The IACA root itself is a direct pin too.
         assert!(
             engine
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, CA_IACA)
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, CA_IACA, &[])
                 .trusted
         );
     }
@@ -402,7 +409,7 @@ mod tests {
         let mut fetcher = MapFetcher::default().with("test-lotl", TRUST_LIST_JSON);
         engine.refresh_with(&mut fetcher).unwrap();
         // wrong-issuer is self-signed, does not chain to ca-iaca → untrusted, no entry.
-        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, WRONG_ISSUER);
+        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, WRONG_ISSUER, &[]);
         assert!(!d.trusted);
         assert!(d.entry.is_none());
     }
@@ -416,12 +423,12 @@ mod tests {
         // though the same leaf is trusted for its listed role/format.
         assert!(
             !engine
-                .resolve(IssuerRole::PubEaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::PubEaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::Mdoc, MDOC_DS)
+                .resolve(IssuerRole::Qeaa, Format::Mdoc, MDOC_DS, &[])
                 .trusted
         );
     }
@@ -440,7 +447,7 @@ mod tests {
         engine
             .refresh_with(&mut fetcher)
             .expect("list is still fresh at 2030");
-        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER);
+        let d = engine.resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[]);
         assert!(
             !d.trusted,
             "the issuer leaf is past its validity → untrusted entry"
@@ -460,7 +467,7 @@ mod tests {
         // And the cache is empty → resolve is untrusted (no silent trust).
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -473,7 +480,7 @@ mod tests {
         engine.refresh_with(&mut good).unwrap();
         assert!(
             engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
         // Then the list goes unreachable: best-effort surfaces the error but keeps the cache.
@@ -484,7 +491,7 @@ mod tests {
         ));
         assert!(
             engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted,
             "best-effort still serves the last-known-good anchors"
         );
@@ -504,7 +511,7 @@ mod tests {
         assert!(matches!(err, TrustError::Stale(_)), "got {err:?}");
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -529,7 +536,7 @@ mod tests {
         assert!(entry_engine.refresh_with(&mut fresh).is_ok());
         assert!(
             !entry_engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -544,7 +551,7 @@ mod tests {
         engine.refresh_with(&mut fetcher).unwrap();
         assert!(
             engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
         // Advance the clock past NextUpdate; a best-effort stale refresh keeps the cache...
@@ -557,7 +564,7 @@ mod tests {
         // ...but resolve refuses the stale cache.
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -602,7 +609,7 @@ mod tests {
         // The listed service anchor (sdjwt-issuer) now anchors its own leaf directly (direct pin).
         assert!(
             engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -626,7 +633,7 @@ mod tests {
         assert!(matches!(err, TrustError::Authentication(_)), "got {err:?}");
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }
@@ -680,7 +687,7 @@ mod tests {
         let engine = json_engine(NOW, Reachability::FailClosed);
         assert!(
             !engine
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }

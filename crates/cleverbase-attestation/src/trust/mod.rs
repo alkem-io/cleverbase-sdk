@@ -103,28 +103,38 @@ impl TrustDecision {
     }
 }
 
-/// Resolve an issuer leaf against a set of trusted anchors for one `(role, format)` by
-/// **chain-validation** — the single authoritative `resolve` body shared by every chain-validating
-/// [`TrustAnchorSource`] (the [`NativeTrustEngine`] and the C-ABI [`ChainValidatingAnchors`]), so the
-/// trust rule is defined once (DRY — Principle III).
+/// Resolve a credential's signing chain against a set of trusted anchors for one `(role, format)` by
+/// RFC 5280 **path validation** — the single authoritative `resolve` body shared by every
+/// chain-validating [`TrustAnchorSource`] (the [`NativeTrustEngine`] and the C-ABI
+/// [`ChainValidatingAnchors`]), so the trust rule is defined once (DRY — Principle III).
 ///
-/// The leaf is trusted iff it chains to one of `anchors_for_key` at `now_unix` via
-/// [`crate::trust::chain::verify_chain`] (issued-by-anchor name + signature, or a direct DER-equal
-/// pin — and in **both** cases the leaf must be within its own validity window at `now_unix`, so an
-/// expired pinned leaf is rejected). An empty/absent anchor set is untrusted (fail-closed). On
-/// success the matched [`TrustListEntry`] carries the leaf as its `anchor_cert_der` (matching the
-/// other sources; the entry is informational — the bar reads only `trusted`).
+/// `issuer_cert_der` is the credential's signing leaf and `supplied_intermediates` are the remaining
+/// `x5c` / `x5chain` certificates (leaf-first order overall). The chain is trusted iff the path
+/// `leaf → intermediate₁ → … → a configured anchor` validates at `now_unix` via
+/// [`crate::trust::chain::verify_chain`] (name chaining + signature + CA constraints + validity at
+/// every hop, or a direct DER-equal pin). The supplied intermediates are attacker-controlled
+/// path-building material — the path is trusted only if it reaches a configured anchor. An empty/absent
+/// anchor set is untrusted (fail-closed). On success the matched [`TrustListEntry`] carries the **leaf**
+/// as its `anchor_cert_der` (matching the other sources; the entry is informational — the bar reads
+/// only `trusted`).
 fn resolve_chain(
     anchors_for_key: Option<&Vec<Vec<u8>>>,
     role: IssuerRole,
     format: Format,
     issuer_cert_der: &[u8],
+    supplied_intermediates: &[Vec<u8>],
     now_unix: i64,
 ) -> TrustDecision {
     let Some(anchors) = anchors_for_key else {
         return TrustDecision::untrusted();
     };
-    if verify_chain(issuer_cert_der, anchors, now_unix).is_ok() {
+    // Assemble the leaf-first supplied path: [leaf, intermediate₁, …]. The intermediates come from the
+    // credential's own x5c/x5chain and are untrusted path-building material (verify_chain only trusts a
+    // path that terminates at a configured anchor).
+    let mut chain: Vec<&[u8]> = Vec::with_capacity(1 + supplied_intermediates.len());
+    chain.push(issuer_cert_der);
+    chain.extend(supplied_intermediates.iter().map(Vec::as_slice));
+    if verify_chain(&chain, anchors, now_unix).is_ok() {
         TrustDecision::trusted(TrustListEntry {
             role,
             format,
@@ -194,14 +204,21 @@ impl ChainValidatingAnchors {
 }
 
 impl TrustAnchorSource for ChainValidatingAnchors {
-    fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision {
-        // Chain-validate the credential's leaf against the host-supplied anchors for its role/format
-        // (the shared, single-source resolve body — DRY).
+    fn resolve(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        issuer_cert_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
+        // Validate the credential's signing path (leaf + supplied intermediates) against the
+        // host-supplied anchors for its role/format (the shared, single-source resolve body — DRY).
         resolve_chain(
             self.anchors.get(&(role, format)),
             role,
             format,
             issuer_cert_der,
+            supplied_intermediates,
             self.now_unix,
         )
     }
@@ -235,12 +252,23 @@ pub enum TrustError {
 /// Implementations range from the offline [`StaticTestAnchors`] to the native EU trust-list engine
 /// (task T013). `resolve` MUST be pure (sans-IO) — it works on cached, in-memory anchors only.
 pub trait TrustAnchorSource {
-    /// Resolve whether an issuer is trusted for a given role/format, matching its DER-encoded signing
-    /// certificate against the configured anchors. **Pure / sans-IO** — never performs I/O.
+    /// Resolve whether an issuer is trusted for a given role/format, validating the credential's
+    /// signing certification path against the configured anchors. **Pure / sans-IO** — never performs
+    /// I/O.
     ///
-    /// `issuer_cert_der` is the credential's signing certificate (the mdoc `IssuerAuth` x5chain leaf,
-    /// or the SD-JWT VC JWS `x5c` leaf).
-    fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision;
+    /// `issuer_cert_der` is the credential's signing leaf (the mdoc `IssuerAuth` x5chain leaf, or the
+    /// SD-JWT VC JWS `x5c` leaf) and `supplied_intermediates` are the remaining `x5c` / `x5chain`
+    /// certificates the credential carries (leaf-first order overall: leaf, then intermediate sub-CAs).
+    /// A chain-validating source builds the RFC 5280 §6.1 path `leaf → intermediate₁ → … → anchor`; the
+    /// supplied intermediates are untrusted path-building material, so the path is trusted only if it
+    /// reaches a configured anchor. An exact-match source ignores the intermediates (it pins the leaf).
+    fn resolve(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        issuer_cert_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision;
 
     /// Fetch and cache the signed trust lists (host-driven, **not** per-verification). The native
     /// engine applies the [`Reachability`] policy here; the offline anchors are infallible.
@@ -296,7 +324,15 @@ impl StaticTestAnchors {
 }
 
 impl TrustAnchorSource for StaticTestAnchors {
-    fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision {
+    fn resolve(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        issuer_cert_der: &[u8],
+        _supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
+        // Exact-DER-equality pinning of the leaf — the supplied intermediates are not consulted (an
+        // offline test seam that lists the leaf certificate itself, not a chain-to-root source).
         if self.is_trusted(role, format, issuer_cert_der) {
             TrustDecision::trusted(TrustListEntry {
                 role,
@@ -330,7 +366,7 @@ mod tests {
     #[test]
     fn configured_issuer_is_trusted_for_its_role_and_format() {
         let anchors = StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A);
-        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A);
+        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[]);
         assert!(decision.trusted);
         let entry = decision.entry.expect("trusted decision carries an entry");
         assert_eq!(entry.role, IssuerRole::Qeaa);
@@ -341,7 +377,7 @@ mod tests {
     #[test]
     fn unconfigured_issuer_is_untrusted() {
         let anchors = StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A);
-        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_B);
+        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_B, &[]);
         assert!(!decision.trusted);
         assert!(decision.entry.is_none());
     }
@@ -353,19 +389,19 @@ mod tests {
         // Same cert, different role → untrusted (per-role anchoring).
         assert!(
             !anchors
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[])
                 .trusted
         );
         // Same cert + role, different format → untrusted (per-format anchoring).
         assert!(
             !anchors
-                .resolve(IssuerRole::Pid, Format::Mdoc, ISSUER_A)
+                .resolve(IssuerRole::Pid, Format::Mdoc, ISSUER_A, &[])
                 .trusted
         );
         // Exact role+format → trusted.
         assert!(
             anchors
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, ISSUER_A)
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, ISSUER_A, &[])
                 .trusted
         );
     }
@@ -402,7 +438,7 @@ mod tests {
         // credential whose leaf chains to it (where exact-leaf-match would reject every real one).
         let anchors =
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
-        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER);
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[]);
         assert!(decision.trusted, "leaf chains to the passed CA root");
         let entry = decision.entry.expect("trusted decision carries an entry");
         assert_eq!(entry.role, IssuerRole::Pid);
@@ -419,7 +455,7 @@ mod tests {
             Format::SdJwtVc,
             SDJWT_ISSUER, // pin the leaf directly
         );
-        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER);
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[]);
         assert!(
             !decision.trusted,
             "an expired pinned leaf must be untrusted, not accepted"
@@ -435,7 +471,7 @@ mod tests {
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
         assert!(
             !anchors
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER)
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER, &[])
                 .trusted
         );
     }
@@ -448,19 +484,19 @@ mod tests {
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
         assert!(
             !anchors
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
         assert!(
             !anchors
-                .resolve(IssuerRole::Pid, Format::Mdoc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Pid, Format::Mdoc, SDJWT_ISSUER, &[])
                 .trusted
         );
         // No anchor configured at all → untrusted (fail-closed).
         let empty = ChainValidatingAnchors::new(IN_WINDOW);
         assert!(
             !empty
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER)
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[])
                 .trusted
         );
     }

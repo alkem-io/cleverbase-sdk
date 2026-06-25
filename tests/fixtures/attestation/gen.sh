@@ -209,6 +209,118 @@ openssl x509 -req -in non-ca-leaf.csr -CA non-ca.cert.pem -CAkey non-ca.key.pem 
   -out non-ca-leaf.cert.pem
 der_and_pk8 non-ca-leaf
 
+# --- Multi-tier (sub-CA) path-validation fixtures (RFC 5280 §6.1 path length > 1) -------------------
+# eIDAS QTSP / EUDI issuer PKIs commonly present x5c/x5chain = [leaf, intermediate, …] where the leaf
+# is issued by an intermediate sub-CA that itself chains to the trust-list-pinned root. RFC 5280 §6.1
+# permits a certification path of length > 1, so the trust engine MUST build/validate the full path
+# leaf → intermediate → … → a CONFIGURED ANCHOR over the SUPPLIED chain rather than only checking a
+# one-hop chain, while rejecting attacker-supplied intermediates that never reach a trusted anchor.
+#
+# These live under a SEPARATE root (`mt-root`) ON PURPOSE: the always-on `ca-iaca` root is minted
+# `pathlen:0` (it issues only end-entity leaves — the direct IACA shape every existing test depends
+# on, byte-for-byte), so it cannot anchor a sub-CA. A dedicated `mt-root` with `pathlen:1` (one
+# intermediate permitted, §4.2.1.9 / §6.1.4 (m)) anchors the multi-tier set additively, leaving the
+# `ca-iaca` PKI and every fixture that chains to it completely unchanged.
+#
+#   mt-root                 self-signed root, basicConstraints critical CA:TRUE,pathlen:1 + keyCertSign.
+#   mt-intermediate / mt-leaf
+#       The conformant 2-tier happy path: `mt-intermediate` is a real sub-CA (critical CA:TRUE,
+#       pathlen:0 + keyCertSign) ISSUED BY mt-root; `mt-leaf` is an end-entity ISSUED BY
+#       mt-intermediate. The supplied chain [mt-leaf, mt-intermediate] MUST be TRUSTED against the
+#       configured mt-root anchor (leaf → sub-CA → root).
+#   mt-noca-intermediate / mt-noca-leaf
+#       Broken hop — the intermediate is NOT a CA. `mt-noca-intermediate` is CA:FALSE (critical) yet
+#       ISSUED BY mt-root; it "issues" `mt-noca-leaf`. The chain reaches the anchor by name+signature
+#       but the §6.1.4 CA-constraint gate must REJECT it — guards `ChainError::NotACa` on a path.
+#   mt-expired-intermediate / mt-expired-leaf
+#       Broken hop — the intermediate is EXPIRED. A valid CA:TRUE sub-CA ISSUED BY mt-root but with a
+#       PAST window (2018..2019); its leaf's OWN window is current. Per §6.1.3 (a)(2) every cert in
+#       the path must be valid at the time of interest → REJECTED (`ChainError::AnchorExpired`).
+#   attacker-ca / attacker-leaf
+#       An attacker chain that does NOT reach any configured anchor. `attacker-ca` is a SELF-SIGNED CA
+#       under a rogue name (it chains to neither mt-root nor ca-iaca); `attacker-leaf` is issued by
+#       it. The supplied chain [attacker-leaf, attacker-ca] is internally well-formed (each hop
+#       name-matches + verifies, attacker-ca is a CA) but TERMINATES at a NON-anchor, so it MUST be
+#       REJECTED as untrusted — an attacker cannot manufacture trust by supplying their own
+#       intermediates.
+DAYS_INT=1825 # ~5y sub-CA (well inside the root window)
+
+# Multi-tier root: pathlen:1 permits exactly ONE intermediate sub-CA beneath it.
+genec mt-root.key.pem
+openssl req -x509 -new -key mt-root.key.pem -sha256 -days "${DAYS_CA}" \
+  -subj "/CN=Cleverbase SDK Test Multi-Tier Root/O=Alkemio Test/C=NL" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out mt-root.cert.pem
+der_and_pk8 mt-root
+
+# issue_under <stem> <subject> <ca-stem> <ext-lines> [<not_before> <not_after>]: CSR + CA-signed cert
+# + DER/PKCS#8, signed by an ARBITRARY parent CA (so an intermediate can sign a leaf). With the two
+# optional time args it pins a fixed validity window; otherwise it uses -days (DAYS_LEAF).
+issue_under() {
+  local stem="$1" subject="$2" castem="$3" exts="$4" nb="${5:-}" na="${6:-}"
+  genec "${stem}.key.pem"
+  openssl req -new -key "${stem}.key.pem" -subj "${subject}" -out "${stem}.csr"
+  if [ -n "${nb}" ]; then
+    openssl x509 -req -in "${stem}.csr" -CA "${castem}.cert.pem" -CAkey "${castem}.key.pem" \
+      -CAcreateserial -sha256 -not_before "${nb}" -not_after "${na}" \
+      -extfile <(printf '%b' "${exts}") -out "${stem}.cert.pem"
+  else
+    openssl x509 -req -in "${stem}.csr" -CA "${castem}.cert.pem" -CAkey "${castem}.key.pem" \
+      -CAcreateserial -sha256 -days "${DAYS_LEAF}" \
+      -extfile <(printf '%b' "${exts}") -out "${stem}.cert.pem"
+  fi
+  der_and_pk8 "${stem}"
+}
+
+CA_EXTS='basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n'
+EE_EXTS='basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+
+# Happy 2-tier path: mt-root → mt-intermediate (sub-CA) → mt-leaf (end-entity).
+issue_under mt-intermediate "/CN=Cleverbase SDK Test Multi-Tier Intermediate Sub-CA/O=Alkemio Test/C=NL" \
+  mt-root "${CA_EXTS}"
+issue_under mt-leaf "/CN=Cleverbase SDK Test Multi-Tier Leaf/O=Alkemio Test/C=NL" \
+  mt-intermediate "${EE_EXTS}"
+
+# Broken hop — non-CA intermediate (CA:FALSE) issued by mt-root, that "issues" a leaf.
+issue_under mt-noca-intermediate "/CN=Cleverbase SDK Test Multi-Tier Non-CA Intermediate/O=Alkemio Test/C=NL" \
+  mt-root 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+issue_under mt-noca-leaf "/CN=Cleverbase SDK Test Multi-Tier Leaf Of Non-CA Intermediate/O=Alkemio Test/C=NL" \
+  mt-noca-intermediate "${EE_EXTS}"
+
+# Broken hop — EXPIRED intermediate sub-CA (valid CA, past window) issued by mt-root; in-window leaf.
+issue_under mt-expired-intermediate "/CN=Cleverbase SDK Test Multi-Tier Expired Intermediate/O=Alkemio Test/C=NL" \
+  mt-root "${CA_EXTS}" "${EXPIRED_NB}" "${EXPIRED_NA}"
+issue_under mt-expired-leaf "/CN=Cleverbase SDK Test Multi-Tier Leaf Of Expired Intermediate/O=Alkemio Test/C=NL" \
+  mt-expired-intermediate "${EE_EXTS}" "${LEAF_NB}" "${LEAF_NA}"
+
+# Attacker chain: a SELF-SIGNED rogue CA (chains to no configured anchor) that issues its own leaf.
+genec attacker-ca.key.pem
+openssl req -x509 -new -key attacker-ca.key.pem -sha256 -days "${DAYS_INT}" \
+  -subj "/CN=Attacker Rogue Intermediate CA (NOT chained)/O=Rogue Test/C=XX" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out attacker-ca.cert.pem
+der_and_pk8 attacker-ca
+issue_under attacker-leaf "/CN=Attacker Leaf (issued by rogue CA)/O=Rogue Test/C=XX" \
+  attacker-ca "${EE_EXTS}"
+
+# Path-length DoS-cap fixture: a SELF-SIGNED CA with NO pathLenConstraint (CA:TRUE + keyCertSign, no
+# pathlen), so it can act as the issuer of an arbitrarily long synthetic chain. Reusing this single
+# self-signed CA as the issuer at every hop (subject == issuer; it signed itself) lets a test build a
+# supplied chain longer than the validator's MAX_PATH_LEN that the §6.1.4 pathLenConstraint gate does
+# NOT short-circuit — so the length-cap (ChainError::PathTooLong) is the gate that fires. (The bounded
+# `attacker-ca` above carries pathlen:0 and would trip NotACa at depth 1, never reaching the cap.)
+genec nolen-ca.key.pem
+openssl req -x509 -new -key nolen-ca.key.pem -sha256 -days "${DAYS_INT}" \
+  -subj "/CN=Cleverbase SDK Test Unbounded Self-Signed CA (no pathlen)/O=Rogue Test/C=XX" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out nolen-ca.cert.pem
+der_and_pk8 nolen-ca
+issue_under nolen-leaf "/CN=Cleverbase SDK Test Leaf Of Unbounded CA/O=Rogue Test/C=XX" \
+  nolen-ca "${EE_EXTS}"
+
 # --- Minimal test trust-list anchor (JSON manifest for T009/T013) ----------------------------------
 # The native EU trust-list engine (T013) fetches/authenticates signed TS 119 612 XML in production;
 # for the OFFLINE suite the configured test anchor (StaticTestAnchors) is seeded from this manifest:
@@ -321,6 +433,17 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   expired-ca-leaf.*  leaf issued by expired-ca whose OWN window is current (anchor-validity reject path)
   non-ca.*         NON-CA issuer (CA:FALSE, no keyCertSign) for the "any cert is a CA" reject path
   non-ca-leaf.*    leaf issued by non-ca (CA-constraint reject path)
+  mt-root.*        independent multi-tier root (CA:TRUE,pathlen:1) anchoring the sub-CA path fixtures
+  mt-intermediate.*  sub-CA issued by mt-root (critical CA:TRUE + keyCertSign) — multi-tier path
+  mt-leaf.*        end-entity issued by mt-intermediate (2-tier happy path: leaf→sub-CA→root)
+  mt-noca-intermediate.*  CA:FALSE "intermediate" issued by mt-root (multi-tier NotACa reject path)
+  mt-noca-leaf.*   leaf issued by the non-CA intermediate
+  mt-expired-intermediate.*  EXPIRED sub-CA issued by mt-root (multi-tier AnchorExpired reject path)
+  mt-expired-leaf.*  leaf (in-window) issued by the expired intermediate
+  attacker-ca.*    self-signed rogue CA that chains to no configured anchor (attacker-intermediate)
+  attacker-leaf.*  leaf issued by attacker-ca (supplied chain terminates at a non-anchor → untrusted)
+  nolen-ca.*       self-signed CA with NO pathLenConstraint (path-length DoS-cap / PathTooLong fixture)
+  nolen-leaf.*     leaf issued by nolen-ca
   trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
   qualified-trust-list.json
                    minimal national Trusted List with EAA/Q services + per-service status history
@@ -361,6 +484,18 @@ echo "wrong-issuer.cert.der: correctly REJECTED against ca-iaca.cert.der (expect
 # signature linkage with `-no_check_time -partial_chain` to assert the chain is otherwise structurally sound.
 openssl verify -no_check_time -partial_chain -CAfile expired-ca.cert.der expired-ca-leaf.cert.der
 echo "non-ca / non-ca-leaf: signature linkage minted (rejected by the SDK's CA-constraint gate, by design)"
+
+# Multi-tier (sub-CA) path: the conformant 2-tier chain MUST verify with the intermediate supplied as
+# an untrusted path-building cert (-untrusted) against the mt-root — leaf → intermediate → root.
+openssl verify -CAfile mt-root.cert.der -untrusted mt-intermediate.cert.der mt-leaf.cert.der
+# The attacker chain MUST NOT verify against mt-root even with its own intermediate supplied (it
+# terminates at a self-signed rogue CA that is not the configured anchor).
+if openssl verify -CAfile mt-root.cert.der -untrusted attacker-ca.cert.der attacker-leaf.cert.der >/dev/null 2>&1; then
+  echo "ERROR: attacker chain unexpectedly verified against mt-root — fixture is broken." >&2
+  exit 1
+fi
+echo "attacker-leaf [+ attacker-ca]: correctly REJECTED against mt-root.cert.der (expected)"
+echo "mt-{noca,expired}-intermediate: multi-tier broken-hop linkage minted (rejected by the SDK gates, by design)"
 
 # --- drop transient working files ------------------------------------------------------------------
 # The tests load only the DER certs + PKCS#8 keys (+ the JSON/JWK/YAML/Kotlin material); the CSRs and

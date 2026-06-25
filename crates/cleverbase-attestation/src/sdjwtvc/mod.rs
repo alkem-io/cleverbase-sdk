@@ -175,13 +175,22 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let sd_jwt = sd_jwt_payload::SdJwt::parse(input.presentation)
         .map_err(|_| ReasonCode::MalformedCredential)?;
 
-    // 2. Issuer signature (in-house ES256 over the compact JWS) + the signing certificate.
-    let issuer_cert_der = verify_issuer_signature(&sd_jwt)?;
+    // 2. Issuer signature (in-house ES256 over the compact JWS) + the full signing chain (leaf-first).
+    let issuer_chain = verify_issuer_signature(&sd_jwt)?;
+    let (issuer_cert_der, supplied_intermediates) = issuer_chain
+        .split_first()
+        .ok_or(ReasonCode::MalformedCredential)?;
 
-    // 3. Issuer trust — the signing cert must be on the configured anchor for its role/format.
+    // 3. Issuer trust — the signing leaf's certification path (leaf + the supplied x5c intermediates)
+    //    must validate to the configured anchor for its role/format (RFC 5280 §6.1 path validation).
     if !input
         .anchors
-        .resolve(input.role, crate::types::Format::SdJwtVc, &issuer_cert_der)
+        .resolve(
+            input.role,
+            crate::types::Format::SdJwtVc,
+            issuer_cert_der,
+            supplied_intermediates,
+        )
         .trusted
     {
         return Err(ReasonCode::UntrustedIssuer);
@@ -207,15 +216,17 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     Ok(accept(disclosed))
 }
 
-/// Verify the issuer compact-JWS signature in-house and return the DER of the signing certificate.
+/// Verify the issuer compact-JWS signature in-house and return the full signing chain (DER,
+/// leaf-first).
 ///
 /// Framing: `header.payload.signature` (each base64url). The header MUST be `alg=ES256` and carry an
 /// `x5c` whose leaf is the signing certificate; the ES256 signature (raw `r||s`) is verified over the
-/// ASCII `header.payload` signing input with the certificate's P-256 public key. The cert DER is
-/// returned for the trust-anchor resolution step (it is the credential's own claimed signer; trust is
-/// decided separately in step 3 — a self-signed cert verifies its own signature but is rejected as
-/// untrusted unless it is on the configured anchor).
-fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, ReasonCode> {
+/// ASCII `header.payload` signing input with the leaf certificate's P-256 public key. The full chain
+/// (`[leaf, intermediate, …]`) is returned for the trust-anchor resolution step (it is the credential's
+/// own claimed signer + path-building intermediates; trust is decided separately in step 3 — a
+/// self-signed cert verifies its own signature but is rejected as untrusted unless its path reaches the
+/// configured anchor).
+fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>>, ReasonCode> {
     // The issuer JWS is the first `~`-separated segment of the re-serialized presentation. It is a
     // compact JWS of EXACTLY three dot-segments; a non-3-segment framing is a malformed credential.
     let presentation = sd_jwt.presentation();
@@ -239,7 +250,13 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, Re
     if header.get("alg").and_then(Value::as_str) != Some(ES256) {
         return Err(ReasonCode::UnsupportedFormat);
     }
-    let cert_der = issuer_cert_from_header(&header)?;
+    // Read the FULL x5c chain (leaf-first), not just the leaf: eIDAS/EUDI issuers commonly present
+    // [leaf, intermediate, …] where the leaf chains to the trusted root via an intermediate sub-CA, so
+    // the supplied intermediates are path-building material the trust step (step 3) needs.
+    let chain = issuer_chain_from_header(&header)?;
+    // x5c is non-empty (issuer_chain_from_header rejects an empty array), so the leaf is present; use
+    // `.first()` rather than `[0]` (the crate forbids `clippy::indexing_slicing`).
+    let cert_der = chain.first().ok_or(ReasonCode::MalformedCredential)?;
 
     // The compact-JWS sig decode + `Signature::from_slice` + `header.payload` signing-input + verify is
     // the SAME body the KB-JWT path uses — share the single [`verify_compact_es256`] (DRY — Principle
@@ -247,22 +264,37 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<u8>, Re
     // `MalformedCredential`); a signature that does not verify under the credential's claimed signing
     // cert is a `Tamper`. Trust is decided separately (step 3) — this only proves the credential signed
     // its own bytes.
-    let verifying_key = verifying_key_from_cert_der(&cert_der)?;
+    let verifying_key = verifying_key_from_cert_der(cert_der)?;
     verify_compact_es256(jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
 
-    Ok(cert_der)
+    Ok(chain)
 }
 
-/// Extract the leaf signing certificate (DER) from a JWS header's `x5c` (RFC 7515 §4.1.6): a JSON
-/// array of base64 (standard, **not** url) DER certificates, leaf first.
-fn issuer_cert_from_header(header: &Value) -> Result<Vec<u8>, ReasonCode> {
-    let leaf_b64 = header
+/// Extract the FULL signing certificate chain (DER, leaf-first) from a JWS header's `x5c` (RFC 7515
+/// §4.1.6): a JSON array of base64 (standard, **not** url) DER certificates, leaf first. The leaf is
+/// the signing certificate; any further entries are the intermediate sub-CAs the leaf chains through.
+/// An absent or empty `x5c`, or an entry that is not base64 DER, is a malformed credential.
+fn issuer_chain_from_header(header: &Value) -> Result<Vec<Vec<u8>>, ReasonCode> {
+    let entries = header
         .get("x5c")
         .and_then(Value::as_array)
-        .and_then(|chain| chain.first())
-        .and_then(Value::as_str)
+        .filter(|chain| !chain.is_empty())
         .ok_or(ReasonCode::MalformedCredential)?;
-    base64ct::Base64::decode_vec(leaf_b64).map_err(|_| ReasonCode::MalformedCredential)
+    entries
+        .iter()
+        .map(|entry| {
+            let b64 = entry.as_str().ok_or(ReasonCode::MalformedCredential)?;
+            base64ct::Base64::decode_vec(b64).map_err(|_| ReasonCode::MalformedCredential)
+        })
+        .collect()
+}
+
+/// Extract just the leaf signing certificate (DER) from a JWS header's `x5c` — the first entry of
+/// [`issuer_chain_from_header`] (DRY — one x5c parser). Used by the opt-in qualified gate, which keys
+/// on the leaf only.
+fn issuer_cert_from_header(header: &Value) -> Result<Vec<u8>, ReasonCode> {
+    let mut chain = issuer_chain_from_header(header)?;
+    Ok(chain.swap_remove(0))
 }
 
 /// Parse a DER certificate and extract its P-256 ECDSA verifying key via the crate's single cert-DER →

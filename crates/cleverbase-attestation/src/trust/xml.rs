@@ -197,7 +197,9 @@ impl XmlTrustList {
             .signer_cert_der
             .as_deref()
             .ok_or(XmlTrustListError::Unsigned)?;
-        verify_chain(signer, scheme_anchors_der, now_unix)
+        // The list carries a single signer certificate (no supplied intermediate chain), so the
+        // supplied path is the one-element `[signer]` validated against the scheme anchors.
+        verify_chain(&[signer], scheme_anchors_der, now_unix)
             .map_err(XmlTrustListError::SignerUntrusted)?;
         if chain_only {
             Ok(())

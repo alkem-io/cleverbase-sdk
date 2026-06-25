@@ -506,12 +506,24 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     let mso: CborValue =
         ciborium::from_reader(mso_inner.as_slice()).map_err(|_| VerifyFailure::malformed())?;
 
-    // --- Resolve the DS certificate from the x5chain and verify the IssuerAuth signature. ----------
-    let ds_cert_der = ds_cert_from_x5chain(&issuer_auth)?;
-    verify_issuer_auth_signature(&issuer_auth, &ds_cert_der)?;
+    // --- Resolve the DS chain from the x5chain and verify the IssuerAuth signature under the leaf. ---
+    // The full x5chain (leaf-first) is read, not just the leaf: an mdoc DS leaf may chain to the
+    // trusted IACA root through an intermediate sub-CA, so the supplied intermediates are needed as
+    // path-building material for the trust step (RFC 5280 §6.1 path validation).
+    let ds_chain = ds_chain_from_x5chain(&issuer_auth)?;
+    let (ds_cert_der, supplied_intermediates) = ds_chain
+        .split_first()
+        .ok_or_else(VerifyFailure::malformed)?;
+    verify_issuer_auth_signature(&issuer_auth, ds_cert_der)?;
 
-    // --- IssuerAuth trust: the DS cert must be on the configured anchor for the role/format. --------
-    let decision = anchors.resolve(params.role, crate::types::Format::Mdoc, &ds_cert_der);
+    // --- IssuerAuth trust: the DS leaf's certification path (leaf + supplied x5chain intermediates)
+    //     must validate to the configured anchor for the role/format. -------------------------------
+    let decision = anchors.resolve(
+        params.role,
+        crate::types::Format::Mdoc,
+        ds_cert_der,
+        supplied_intermediates,
+    );
     if !decision.trusted {
         return Err(VerifyFailure::reason(ReasonCode::UntrustedIssuer));
     }
@@ -1033,10 +1045,11 @@ pub fn issuer_signing_certs_with_issuance_der(
     )
 }
 
-/// Resolve the Document Signer certificate (DER) from a COSE_Sign1's `x5chain` header. The leaf is
-/// the first certificate (RFC 9360); a single-cert chain may be carried as a bare `bstr` rather than
-/// an array of `bstr`.
-fn ds_cert_from_x5chain(sign1: &CoseSign1) -> Result<Vec<u8>, VerifyFailure> {
+/// Resolve the full Document Signer certificate chain (DER, leaf-first) from a COSE_Sign1's `x5chain`
+/// header (RFC 9360). The leaf is the first certificate; any further entries are the intermediate
+/// sub-CAs the leaf chains through. A single-cert chain may be carried as a bare `bstr` rather than an
+/// array of `bstr`; an empty array, or any non-`bstr` entry, is malformed.
+fn ds_chain_from_x5chain(sign1: &CoseSign1) -> Result<Vec<Vec<u8>>, VerifyFailure> {
     let label = Label::Int(COSE_HEADER_X5CHAIN);
     let value = sign1
         .unprotected
@@ -1045,13 +1058,23 @@ fn ds_cert_from_x5chain(sign1: &CoseSign1) -> Result<Vec<u8>, VerifyFailure> {
         .find_map(|(l, v)| (*l == label).then_some(v))
         .ok_or_else(VerifyFailure::malformed)?;
     match value {
-        Value::Bytes(b) => Ok(b.clone()),
-        Value::Array(certs) => match certs.first() {
-            Some(Value::Bytes(b)) => Ok(b.clone()),
-            _ => Err(VerifyFailure::malformed()),
-        },
+        Value::Bytes(b) => Ok(vec![b.clone()]),
+        Value::Array(certs) if !certs.is_empty() => certs
+            .iter()
+            .map(|c| match c {
+                Value::Bytes(b) => Ok(b.clone()),
+                _ => Err(VerifyFailure::malformed()),
+            })
+            .collect(),
         _ => Err(VerifyFailure::malformed()),
     }
+}
+
+/// Resolve just the Document Signer leaf certificate (DER) from a COSE_Sign1's `x5chain` — the first
+/// entry of [`ds_chain_from_x5chain`] (DRY — one x5chain parser). Used where only the leaf is needed.
+fn ds_cert_from_x5chain(sign1: &CoseSign1) -> Result<Vec<u8>, VerifyFailure> {
+    let mut chain = ds_chain_from_x5chain(sign1)?;
+    Ok(chain.swap_remove(0))
 }
 
 /// Whether a COSE_Sign1's protected-header `alg` names ES256 — the single authoritative
