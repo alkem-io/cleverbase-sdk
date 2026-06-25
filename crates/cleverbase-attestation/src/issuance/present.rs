@@ -120,8 +120,9 @@ struct Sha2Hasher;
 
 impl sd_jwt_payload::Hasher for Sha2Hasher {
     fn digest(&self, input: &[u8]) -> Vec<u8> {
-        use sha2::Digest as _;
-        sha2::Sha256::digest(input).to_vec()
+        // Route through the crate's single authoritative SHA-256 (DRY — `crate::crypto` is the one
+        // digest helper), adapting its fixed `[u8; 32]` to the `Vec<u8>` the `Hasher` trait returns.
+        crate::crypto::sha256(input).to_vec()
     }
     fn alg_name(&self) -> &'static str {
         crate::crypto::SHA_256
@@ -139,7 +140,6 @@ impl sd_jwt_payload::Hasher for Sha2Hasher {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedPresentation {
     kind: PreparedKind,
-    audience: String,
 }
 
 /// The format-specific splice context held by a [`PreparedPresentation`].
@@ -201,7 +201,10 @@ impl PreparedPresentation {
                 ciborium::into_writer(&rebuilt, &mut buf)
                     .map_err(|e| PresentError::Build(e.to_string()))?;
                 Ok(HolderPresentation::Mdoc {
-                    audience: self.audience.clone(),
+                    // The addressed audience is the verifier `aud` the prepared signing input already
+                    // carries (the `DeviceSignature` ceremony binds it) — derive it there rather than
+                    // duplicate it as a struct field (DRY).
+                    audience: build.input.audience().to_owned(),
                     device_response: buf,
                 })
             }
@@ -335,7 +338,6 @@ fn prepare_sd_jwt_vc(
     )
     .map_err(|e| PresentError::Build(e.to_string()))?;
     Ok(PreparedPresentation {
-        audience: request.audience.clone(),
         kind: PreparedKind::SdJwtVc {
             presentation_prefix,
             kb,
@@ -479,7 +481,6 @@ fn prepare_mdoc(
     )
     .map_err(|e| PresentError::Build(e.to_string()))?;
     Ok(PreparedPresentation {
-        audience: request.audience.clone(),
         kind: PreparedKind::Mdoc {
             device_response: device_response.to_vec(),
             build,

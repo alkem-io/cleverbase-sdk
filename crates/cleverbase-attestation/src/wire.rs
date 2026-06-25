@@ -52,8 +52,10 @@ use crate::types::{Format, IssuerRole, VerificationPolicy, VerificationResult};
 use crate::verify::{verify, Presentation, VerifyContext};
 
 /// Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
-/// SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
-/// verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
+/// SemVer major (independent of the signing core's `SCHEMA_VERSION`). The current version (5) carries
+/// the full verifier inputs — the always-on bar + the OpenID4VP binding + the opt-in qualified-status
+/// gate's national Trusted List / scheme anchors + the mdoc handover `response_uri`. See the
+/// `## Schema version 5` module section for the per-version history (v1 was the foundation seam).
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 5;
 
 /// A single configured trust anchor passed across the wire: a trusted issuer/anchor certificate for
@@ -203,15 +205,9 @@ pub fn encode_verify_response(outcome: VerifyOutcome) -> Vec<u8> {
         schema_version: ATTESTATION_SCHEMA_VERSION,
         outcome,
     };
-    let mut buf = Vec::new();
-    // Infallible: writing CBOR into an in-memory Vec cannot fail, and VerifyResponse is a plain serde
-    // type. There is no error channel on this helper, so an impossible failure should surface.
-    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
-    {
-        ciborium::into_writer(&resp, &mut buf)
-            .expect("CBOR serialization of VerifyResponse is infallible");
-    }
-    buf
+    // Infallible (no error channel on this helper): the shared `cbor_to_vec` encodes a plain serde
+    // value into an in-memory Vec, which cannot fail (DRY — one authoritative CBOR-into-Vec helper).
+    crate::cbor_to_vec(&resp)
 }
 
 /// Build a [`ChainValidatingAnchors`] trust source from the wire anchor entries (the host's resolved,

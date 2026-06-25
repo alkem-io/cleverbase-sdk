@@ -939,6 +939,50 @@ fn the_same_digest_referenced_twice_in_an_array_is_rejected() {
 }
 
 #[test]
+fn a_non_string_sd_entry_inside_a_disclosed_value_is_rejected() {
+    // RFC 9901 §7.1: `_sd` MUST be "an array of strings". A non-string `_sd` entry must reject the
+    // SD-JWT rather than be silently `filter_map`-skipped (which would process a structure the spec
+    // forbids). The TOP-LEVEL `_sd` is typed `Vec<String>` by `sd_jwt_payload`'s parser, so a non-
+    // string there fails at parse time; the place a non-string `_sd` entry survives parsing is INSIDE
+    // a disclosed object *value* (free-form issuer JSON reconstructed by `substitute_sd_array`). Here
+    // the disclosed `address` value is `{"_sd": [<inner-digest>, 123]}`: reconstructing it hits the
+    // non-string `123` and rejects. (Issuer-signed, so a conformance gap, not a forgery vector.)
+    let inner = object_disclosure("BBBBBBBBBBBBBBBBBBBBBB", "locality", json!("London"));
+    let inner_digest = disclosure_digest(&inner);
+    let outer = object_disclosure(
+        "AAAAAAAAAAAAAAAAAAAAAA",
+        "address",
+        json!({ "_sd": [inner_digest, 123] }),
+    );
+    let outer_digest = disclosure_digest(&outer);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [outer_digest],
+    });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&outer, &inner]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
+fn an_array_redaction_object_with_an_extra_key_is_rejected() {
+    // RFC 9901 §4.2.4.2: an array-element redaction object MUST have EXACTLY ONE key, the `...` key
+    // ("There MUST NOT be any other keys in the object"). A `{"...": digest, "extra": 1}` object is a
+    // malformed redaction → reject the SD-JWT, never silently process it (nor reinterpret it as a clear
+    // array element). The disclosure IS presented, so only the extra key can fail the reconstruction.
+    let disclosure = array_disclosure("AAAAAAAAAAAAAAAAAAAAAA", json!("DE"));
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256",
+        "nationalities": [ { "...": digest, "extra": 1 } ],
+    });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::DisclosureIntegrity)
+    );
+}
+
+#[test]
 fn a_disclosed_array_claim_value_is_reconstructed_in_full() {
     use super::collect_disclosed_attributes;
     // A WHOLE array claim `tags` is concealable; its disclosed value carries a clear scalar element AND

@@ -367,32 +367,26 @@ fn qualified_status_for(
 /// undecidable; otherwise `NotQualified`. An empty iterator yields `Indeterminate` (nothing to
 /// decide). This guarantees a `Qualified` verdict never under-covers a response whose merged
 /// attributes include a non-qualified document (SC-007).
+///
+/// The fold keeps the **most severe** status seen, by the precedence `Indeterminate` (undecidable —
+/// most severe) > `NotQualified` > `Qualified` (every document must clear to land here). The empty
+/// case has no status to start from, so it defaults — explicitly and fail-closed — to `Indeterminate`.
 fn fold_qualified<I>(statuses: I) -> crate::types::QualifiedStatus
 where
     I: IntoIterator<Item = crate::types::QualifiedStatus>,
 {
     use crate::types::QualifiedStatus;
-    let mut saw_any = false;
-    let mut saw_indeterminate = false;
-    let mut saw_not_qualified = false;
-    for status in statuses {
-        saw_any = true;
-        match status {
-            QualifiedStatus::Qualified => {}
-            QualifiedStatus::Indeterminate => saw_indeterminate = true,
-            QualifiedStatus::NotQualified => saw_not_qualified = true,
-        }
-    }
-    if !saw_any || saw_indeterminate {
-        // Nothing to decide, or at least one document is undecidable → cannot assert all-qualified.
-        QualifiedStatus::Indeterminate
-    } else if saw_not_qualified {
-        // No undecidable document, but at least one is definitively not qualified.
-        QualifiedStatus::NotQualified
-    } else {
-        // Every document qualified.
-        QualifiedStatus::Qualified
-    }
+    // Most-severe-wins: `max_by_key` over the severity rank folds the per-document statuses to the
+    // single dominating one. Empty (no documents) → fail-closed `Indeterminate` (nothing to assert).
+    let severity = |status: &QualifiedStatus| match status {
+        QualifiedStatus::Qualified => 0u8,
+        QualifiedStatus::NotQualified => 1,
+        QualifiedStatus::Indeterminate => 2,
+    };
+    statuses
+        .into_iter()
+        .max_by_key(|status| severity(status))
+        .unwrap_or(QualifiedStatus::Indeterminate)
 }
 
 /// For a request-less SD-JWT VC, do not impose a holder-binding challenge: a presentation that omits

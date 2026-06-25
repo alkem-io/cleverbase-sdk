@@ -68,9 +68,6 @@ pub struct TrustListEntry {
     pub format: Format,
     /// The DER-encoded issuer/anchor certificate that the credential's signer chained to.
     pub anchor_cert_der: Vec<u8>,
-    /// A human-readable label for the trust-list service (e.g. a national TL service name), if
-    /// known. The test anchor leaves this empty.
-    pub service_name: Option<String>,
 }
 
 /// The outcome of resolving an issuer against the configured anchors
@@ -132,7 +129,6 @@ fn resolve_chain(
             role,
             format,
             anchor_cert_der: issuer_cert_der.to_vec(),
-            service_name: None,
         })
     } else {
         TrustDecision::untrusted()
@@ -306,7 +302,6 @@ impl TrustAnchorSource for StaticTestAnchors {
                 role,
                 format,
                 anchor_cert_der: issuer_cert_der.to_vec(),
-                service_name: None,
             })
         } else {
             TrustDecision::untrusted()

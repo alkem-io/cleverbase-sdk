@@ -208,14 +208,9 @@ pub fn encode_issuance_response(outcome: IssuanceOutcome) -> Vec<u8> {
         schema_version: ISSUANCE_SCHEMA_VERSION,
         outcome,
     };
-    let mut buf = Vec::new();
-    // Infallible: writing CBOR into an in-memory Vec cannot fail; surface an impossible failure.
-    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
-    {
-        ciborium::into_writer(&resp, &mut buf)
-            .expect("CBOR serialization of IssuanceResponse is infallible");
-    }
-    buf
+    // Infallible (no error channel on this helper): the shared `cbor_to_vec` encodes a plain serde
+    // value into an in-memory Vec, which cannot fail (DRY — one authoritative CBOR-into-Vec helper).
+    crate::cbor_to_vec(&resp)
 }
 
 /// Map a wire resume input to the typed [`ResumeObtain`].

@@ -69,9 +69,6 @@ struct RawAnchor {
     format: String,
     #[serde(rename = "anchorCertDerB64")]
     anchor_cert_der_b64: String,
-    #[serde(rename = "serviceName")]
-    #[allow(dead_code)] // carried for parity with the engine entry; not used by the matcher.
-    service_name: Option<String>,
 }
 
 /// Map the manifest's PascalCase role spelling to [`IssuerRole`].

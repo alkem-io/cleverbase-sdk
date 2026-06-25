@@ -317,7 +317,7 @@ pub fn resume_obtain(
                 .expose()
                 .to_owned();
             let effect =
-                credential_request(&session.backend, &session.offer, &access_token, &proof_jwt);
+                credential_request(&session.backend, &session.offer, &access_token, &proof_jwt)?;
             Ok((session, ObtainStep::PerformHttp(effect)))
         }
         ObtainPhase::CredentialPending => {
@@ -380,18 +380,29 @@ fn token_request(backend: &IssuerBackend, offer: &CredentialOffer) -> HttpEffect
 
 /// Build the OpenID4VCI credential-endpoint request: the credential configuration id + the holder
 /// `jwt` proof, as JSON, with the access token as the Bearer.
+///
+/// # Errors
+///
+/// [`ObtainError::CredentialRequest`] on the (impossible) JSON-serialization failure of the in-memory
+/// request body. Serializing a plain `serde_json::Value` of owned strings cannot fail in practice, but
+/// the failure is **propagated** rather than swallowed with `unwrap_or_default()` (which would POST an
+/// EMPTY body the issuer rejects with an opaque error far from the cause — Constitution VIII RCA). This
+/// mirrors [`super::signer`]'s `to_json_bytes`, which surfaces the same impossible failure on the
+/// error channel.
 fn credential_request(
     backend: &IssuerBackend,
     offer: &CredentialOffer,
     access_token: &str,
     proof_jwt: &str,
-) -> HttpEffect {
+) -> Result<HttpEffect, ObtainError> {
     let body = serde_json::json!({
         "credential_configuration_id": offer.credential_configuration_id,
         "proof": { "proof_type": "jwt", "jwt": proof_jwt },
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
-    HttpEffect {
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| {
+        ObtainError::CredentialRequest(format!("failed to serialize request body: {e}"))
+    })?;
+    Ok(HttpEffect {
         method: HttpMethod::Post,
         url: backend.credential_endpoint.clone(),
         headers: vec![
@@ -399,7 +410,7 @@ fn credential_request(
             ("Content-Type".to_owned(), "application/json".to_owned()),
         ],
         body: body_bytes,
-    }
+    })
 }
 
 /// The parsed OpenID4VCI token response (`access_token` + the `c_nonce` the PoP-JWT must echo).

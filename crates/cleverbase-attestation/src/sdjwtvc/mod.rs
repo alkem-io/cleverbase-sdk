@@ -40,7 +40,12 @@ use crate::types::{
 
 /// The JOSE `alg` the EUDI baseline mandates for SD-JWT VC issuer and KB-JWT signatures (ES256 =
 /// ECDSA / P-256 / SHA-256 — HAIP 1.0 §7; research D1). Any other `alg` is rejected as unsupported.
-const ES256: &str = "ES256";
+///
+/// The RFC 7518 algorithm name has **one** authoritative source —
+/// [`SignatureAlgorithm::Es256.jose_alg()`](crate::issuance::signer::SignatureAlgorithm::jose_alg) —
+/// so the verifier's accepted-`alg` literal cannot drift from the one the holder signer-hook stamps
+/// into the JOSE header it builds (DRY — Principle III).
+const ES256: &str = crate::issuance::signer::SignatureAlgorithm::Es256.jose_alg();
 
 use crate::crypto::{sha256, SHA_256};
 
@@ -291,6 +296,16 @@ fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::Verifying
 /// A relying party that requires an upper bound MUST reject a no-`exp` credential at the
 /// [`crate::status`] / policy layer (the seam where reachability/qualified policy already lives); the
 /// always-on bar does not fabricate a bound the issuer did not assert.
+///
+/// ## Boundary convention (per-spec, intentionally asymmetric with mdoc — DO NOT unify blindly)
+///
+/// The upper bound here is **exclusive**: `now >= exp` rejects (a credential is invalid *at and after*
+/// its `exp` instant), per RFC 7519 §4.1.4 ("the current date/time MUST be **before** the expiration
+/// time"). The mdoc verifier's [`crate::mdoc::enforce_validity`] uses an **inclusive** upper bound
+/// (`now > validUntil`), per ISO/IEC 18013-5 (the credential is valid up to and **including**
+/// `validUntil`). This one-second divergence at the boundary is each format's own spec rule, NOT a
+/// bug — a future refactor that "unifies" the two windows would silently change one format's accepted
+/// range, so the two sites cross-reference each other deliberately.
 fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Validity, ReasonCode> {
     let not_before = numeric_date(claims.get("nbf"))?;
     let not_after = numeric_date(claims.get("exp"))?;
@@ -300,6 +315,8 @@ fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Vali
         }
     }
     if let Some(exp) = not_after {
+        // EXCLUSIVE upper bound (RFC 7519 §4.1.4: now MUST be *before* `exp`). Intentionally differs
+        // from mdoc's INCLUSIVE `now > validUntil` (ISO/IEC 18013-5) — see this fn's doc comment.
         if now >= exp {
             return Err(ReasonCode::Expired);
         }
@@ -522,7 +539,12 @@ fn substitute_sd_array(
     let Some(Value::Array(sd)) = object.get("_sd") else {
         return Ok(out);
     };
-    for digest in sd.iter().filter_map(Value::as_str) {
+    for entry in sd {
+        // RFC 9901 §7.1: `_sd` MUST be "an array of strings". A non-string entry is a malformed
+        // digest array — reject the SD-JWT (fail-closed) rather than `filter_map`-skip it, which
+        // would silently process a structure the spec forbids. (Issuer-signed, so a conformance gap,
+        // not a forgery vector — but an unreadable `_sd` entry must not be ignored.)
+        let digest = entry.as_str().ok_or(ReasonCode::DisclosureIntegrity)?;
         let Some(disclosure) = disclosures_by_digest.get(digest) else {
             // The digest is signed but not disclosed — a withheld claim; nothing to surface.
             continue;
@@ -645,25 +667,47 @@ fn reconstruct_array(
     Ok(out)
 }
 
-/// Whether an array element is a selective-disclosure redaction object `{"...": "<digest>"}`.
+/// Whether an array element is a **well-formed** selective-disclosure redaction object
+/// `{"...": "<digest>"}` (RFC 9901 §4.2.4.2: an object with the single key `...`, that value a string).
+///
+/// An object that carries a `...` key **alongside** other keys is NOT a well-formed redaction — RFC
+/// 9901 §4.2.4.2 mandates "There MUST NOT be any other keys in the object" — so this returns `false`
+/// for it. That malformed shape is rejected as [`ReasonCode::DisclosureIntegrity`] in
+/// [`disclosed_array_redaction`] (the fallible path the array walkers call first), never silently
+/// reinterpreted as a clear array element (which this `false` would otherwise allow).
 fn is_array_redaction(item: &Value) -> bool {
     item.as_object()
-        .and_then(|map| map.get("..."))
-        .is_some_and(Value::is_string)
+        .is_some_and(|map| map.len() == 1 && map.get("...").is_some_and(Value::is_string))
 }
 
 /// Resolve an array-element redaction `{"...": "<digest>"}`: `Ok(Some(value))` when the disclosure is
 /// presented (the revealed element value), `Ok(None)` when the element is not a redaction or the
 /// redaction was not disclosed. Enforces the repeated-digest rule and that an array-element disclosure
 /// carries no claim name (`[salt, value]`); both violations reject as [`ReasonCode::DisclosureIntegrity`].
+///
+/// RFC 9901 §4.2.4.2 conformance: an object that has the `...` key but **also** other keys is a
+/// malformed redaction ("There MUST NOT be any other keys in the object") — it is rejected as
+/// [`ReasonCode::DisclosureIntegrity`] here (fail-closed), never silently treated as a clear element.
+/// The check runs whether or not the disclosure is presented, so a withheld malformed redaction is
+/// caught too. (The redaction is issuer-signed, so this is a conformance-strictness gap, not a forgery
+/// vector — but the SD-JWT is rejected rather than processed under an unreadable structure.)
 fn disclosed_array_redaction(
     item: &Value,
     disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
     used_digests: &mut std::collections::BTreeSet<String>,
 ) -> Result<Option<AttributeValue>, ReasonCode> {
-    let Some(Value::String(digest)) = item.as_object().and_then(|map| map.get("...")) else {
+    let Some(object) = item.as_object() else {
         return Ok(None);
     };
+    let Some(Value::String(digest)) = object.get("...") else {
+        return Ok(None);
+    };
+    // RFC 9901 §4.2.4.2: a `{"...": digest}` redaction MUST have EXACTLY ONE key. Any extra key
+    // makes the object an invalid redaction → reject the SD-JWT (do not fall through to "clear
+    // element", which would silently process a structure the spec forbids).
+    if object.len() != 1 {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
     let Some(disclosure) = disclosures_by_digest.get(digest.as_str()) else {
         // Undisclosed array element — not revealed in this presentation.
         return Ok(None);

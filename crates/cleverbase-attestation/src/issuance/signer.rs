@@ -263,7 +263,10 @@ fn jws_signing_input(header: &Value, payload: &Value) -> Result<(Vec<u8>, String
     let header_b64 = Base64UrlUnpadded::encode_string(&to_json_bytes(header)?);
     let payload_b64 = Base64UrlUnpadded::encode_string(&to_json_bytes(payload)?);
     let signing_input = format!("{header_b64}.{payload_b64}");
-    Ok((signing_input.clone().into_bytes(), signing_input))
+    // Copy the to-be-signed bytes from the borrow, then move the String out (no `.clone()` of the
+    // whole String just to `into_bytes()` it).
+    let to_be_signed = signing_input.as_bytes().to_vec();
+    Ok((to_be_signed, signing_input))
 }
 
 /// Splice a raw `r‖s` ES256 signature onto a compact-JWS `header.payload` prefix, yielding the full

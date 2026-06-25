@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use ciborium::value::Value;
 use ciborium::Value as CborValue;
 use coset::{CborSerializable, CoseKey, CoseSign1, Label, RegisteredLabelWithPrivate};
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha384, Sha512};
 use x509_cert::der::{Decode as _, Encode as _};
 use x509_cert::Certificate;
 
@@ -89,7 +89,10 @@ impl DigestAlgorithm {
     /// Compute the digest of `data` under this algorithm.
     fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
-            Self::Sha256 => Sha256::digest(data).to_vec(),
+            // SHA-256 routes through the crate's single authoritative digest (DRY — `crate::crypto`
+            // is the one SHA-256 helper); SHA-384/512 are mdoc-only (no SD-JWT VC use), so they stay
+            // on `sha2` here.
+            Self::Sha256 => crate::crypto::sha256(data).to_vec(),
             Self::Sha384 => Sha384::digest(data).to_vec(),
             Self::Sha512 => Sha512::digest(data).to_vec(),
         }
@@ -1091,6 +1094,16 @@ fn tdate_field(info: &CborValue, key: &str) -> Result<i64, VerifyFailure> {
 }
 
 /// Enforce the validity window at `now_unix`: outside `[validFrom, validUntil]` → `Expired`.
+///
+/// ## Boundary convention (per-spec, intentionally asymmetric with SD-JWT VC — DO NOT unify blindly)
+///
+/// The upper bound here is **inclusive**: `now > validUntil` rejects, so the credential is valid up to
+/// and **including** the `validUntil` instant (ISO/IEC 18013-5 — the window is the closed interval
+/// `[validFrom, validUntil]`). The SD-JWT VC verifier's [`crate::sdjwtvc`] `check_validity` uses an
+/// **exclusive** upper bound (`now >= exp`), per RFC 7519 §4.1.4 ("now MUST be *before* `exp`"). This
+/// one-second divergence at the boundary is each format's own spec rule, NOT a bug — a future refactor
+/// that "unifies" the two windows would silently change one format's accepted range, so the two sites
+/// cross-reference each other deliberately.
 fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFailure> {
     if let Some(not_before) = validity.not_before {
         if now_unix < not_before {
@@ -1098,6 +1111,8 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
         }
     }
     if let Some(not_after) = validity.not_after {
+        // INCLUSIVE upper bound (ISO/IEC 18013-5: valid up to and including `validUntil`).
+        // Intentionally differs from SD-JWT VC's EXCLUSIVE `now >= exp` (RFC 7519) — see doc comment.
         if now_unix > not_after {
             return Err(VerifyFailure::reason(ReasonCode::Expired));
         }

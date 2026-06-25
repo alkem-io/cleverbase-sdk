@@ -24,9 +24,10 @@
 //! the always-on bar over both format verifiers ([`sdjwtvc`], [`mdoc`]), the native EU trust-list
 //! engine ([`trust`]), the revocation/[`status`] check (fail-closed by default), and the
 //! [`openid4vp`] request binding (nonce + audience), surfaced over the `cleverbase-ffi` C-ABI via
-//! [`wire`]. The opt-in [`qualified`]-status gate (T019) and the gated [`issuance`] path (US2)
-//! remain stubs filled in by later tasks; [`verify::VerifyContext::qualified_gate`] is the off-by-
-//! default seam for the former.
+//! [`wire`]. The opt-in [`qualified`]-status gate (eIDAS qualified-status determination) is
+//! implemented and off by default ([`verify::VerifyContext::qualified_gate`] is the seam); the gated
+//! [`issuance`] path (US2 — OpenID4VCI `obtain` + OpenID4VP holder `present` via the signer-hook) is
+//! implemented and skips when no issuer backend is configured.
 
 // The workspace pins a strict `restriction` lint set (unwrap/expect/panic/indexing/…) that targets
 // library code. Test modules use those same constructs as assertions, where a panic IS the intended
@@ -62,3 +63,18 @@ pub mod verify;
 pub mod wire;
 
 pub use verify::{detect_format, verify, Presentation, VerifyContext};
+
+/// Serialize a value to CBOR in a fresh in-memory `Vec` — the one authoritative "encode CBOR into a
+/// Vec" helper for the crate (DRY — Principle III). Writing CBOR into an in-memory `Vec` writer is
+/// **infallible** (a `Vec` never fails a write and the serialized types are plain serde types), so
+/// the only possible `into_writer` error is impossible here; this surfaces it via `expect` rather
+/// than threading an error channel that can never fire. The three response/transcript encoders that
+/// have no error channel (`wire::encode_verify_response`, `issuance::wire::encode_issuance_response`,
+/// `openid4vp::oid4vp_handover_transcript`) previously each carried an identical
+/// `#[allow(clippy::expect_used)] into_writer(...).expect("infallible")` block; they now share this.
+#[allow(clippy::expect_used)] // infallible: serializing a plain serde value into a Vec writer
+pub(crate) fn cbor_to_vec<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(value, &mut buf).expect("CBOR serialization into a Vec is infallible");
+    buf
+}

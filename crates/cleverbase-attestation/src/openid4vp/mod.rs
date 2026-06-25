@@ -333,7 +333,6 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
 #[must_use]
 pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &str) -> Vec<u8> {
     use base64ct::{Base64UrlUnpadded, Encoding as _};
-    use sha2::{Digest as _, Sha256};
 
     // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri] (OpenID4VP 1.0 §B.2.6).
     // `nonce` is the text `nonce` request parameter; the SDK's bytes map to their base64url form.
@@ -348,7 +347,9 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
         CborValue::Text(response_uri.to_owned()),
     ]);
     let handover_info_bytes = encode_cbor(&handover_info);
-    let handover_info_hash = Sha256::digest(&handover_info_bytes).to_vec();
+    // The crate's single authoritative SHA-256 (DRY — `crate::crypto` is the one digest helper),
+    // adapting its fixed `[u8; 32]` to the `Vec<u8>` the CBOR `bstr` carries.
+    let handover_info_hash = crate::crypto::sha256(&handover_info_bytes).to_vec();
 
     // OpenID4VPHandover = ["OpenID4VPHandover", OpenID4VPHandoverInfoHash].
     let handover = CborValue::Array(vec![
@@ -360,14 +361,10 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
     encode_cbor(&transcript)
 }
 
-/// Encode a plain CBOR value into an in-memory `Vec` (infallible — a `Vec` writer never errors).
+/// Encode a plain CBOR value into an in-memory `Vec` (infallible — a `Vec` writer never errors). The
+/// one authoritative CBOR-into-Vec helper [`crate::cbor_to_vec`] (DRY — Principle III).
 fn encode_cbor(value: &CborValue) -> Vec<u8> {
-    let mut buf = Vec::new();
-    #[allow(clippy::expect_used)] // infallible: CBOR into a Vec writer
-    {
-        ciborium::into_writer(value, &mut buf).expect("CBOR encode into a Vec is infallible");
-    }
-    buf
+    crate::cbor_to_vec(value)
 }
 
 #[cfg(test)]

@@ -63,6 +63,56 @@ pub fn process_bytes(input: &[u8]) -> Vec<u8> {
     encode_response(result)
 }
 
+/// The shared C-ABI pointer/null/`catch_unwind`/hand-off dance for a CBOR-in / CBOR-out function
+/// (single source of truth for all `cleverbase_*` entry points — Constitution Principle III).
+///
+/// Reads `in_len` bytes from `in_ptr`, runs `process` (a pure CBOR-in / CBOR-out core function)
+/// inside a `catch_unwind`, and hands the result to the caller as an exact-capacity boxed slice via
+/// `*out_ptr`/`*out_len` (freed by [`cleverbase_free`]). Returns `0` on success, `1` for a null
+/// argument, `2` for a contained panic — the identical status contract every entry point documents.
+/// Protocol/usage errors are carried *inside* the returned CBOR (never via the status code).
+///
+/// # Safety
+/// `in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
+unsafe fn run_cbor_abi(
+    in_ptr: *const u8,
+    in_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    process: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> i32 {
+    unsafe {
+        if out_ptr.is_null() || out_len.is_null() {
+            return 1;
+        }
+        // Initialize the outputs FIRST so every non-zero return below (null input or the panic path)
+        // leaves a null/empty buffer for a consumer that inspects them, never uninitialized memory.
+        *out_ptr = std::ptr::null_mut();
+        *out_len = 0;
+        if in_ptr.is_null() {
+            return 1;
+        }
+        let input = std::slice::from_raw_parts(in_ptr, in_len);
+        // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
+        // `process` borrows nothing observable across the boundary, so asserting unwind-safety is
+        // sound (the only state is the local input slice + the returned Vec).
+        let bytes = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(input)))
+        {
+            Ok(bytes) => bytes,
+            Err(_) => return 2,
+        };
+
+        // Hand ownership to the caller as an exact-capacity boxed slice (cap == len), freed by
+        // [`cleverbase_free`].
+        let boxed = bytes.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed).cast::<u8>();
+        *out_ptr = ptr;
+        *out_len = len;
+        0
+    }
+}
+
 /// Process one CBOR request envelope.
 ///
 /// On success writes a heap buffer to `*out_ptr`/`*out_len` (free it with [`cleverbase_free`]) and
@@ -78,33 +128,9 @@ pub unsafe extern "C" fn cleverbase_process(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    unsafe {
-        if out_ptr.is_null() || out_len.is_null() {
-            return 1;
-        }
-        // Initialize the outputs FIRST so every non-zero return below (null input or the panic
-        // path) leaves a null/empty buffer for a consumer that inspects them, never uninitialized
-        // memory.
-        *out_ptr = std::ptr::null_mut();
-        *out_len = 0;
-        if in_ptr.is_null() {
-            return 1;
-        }
-        let input = std::slice::from_raw_parts(in_ptr, in_len);
-        // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
-        let bytes = match std::panic::catch_unwind(|| process_bytes(input)) {
-            Ok(bytes) => bytes,
-            Err(_) => return 2,
-        };
-
-        // Hand ownership to the caller as an exact-capacity boxed slice (cap == len).
-        let boxed = bytes.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = Box::into_raw(boxed).cast::<u8>();
-        *out_ptr = ptr;
-        *out_len = len;
-        0
-    }
+    // The pointer/null/catch_unwind/free dance is the shared `run_cbor_abi`; this entry only names the
+    // signing-core `process_bytes` as the CBOR-in / CBOR-out body (DRY — Principle III).
+    unsafe { run_cbor_abi(in_ptr, in_len, out_ptr, out_len, process_bytes) }
 }
 
 /// Verify a presented EUDI attestation (the always-on bar — contracts/verifier.md).
@@ -127,34 +153,16 @@ pub unsafe extern "C" fn cleverbase_attestation_verify(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
+    // The pointer/null/catch_unwind/free dance is the shared `run_cbor_abi`; this entry only names the
+    // attestation verifier core as the CBOR-in / CBOR-out body (DRY — Principle III).
     unsafe {
-        if out_ptr.is_null() || out_len.is_null() {
-            return 1;
-        }
-        // Initialize the outputs FIRST so every non-zero return below (null input or the panic path)
-        // leaves a null/empty buffer for a consumer that inspects them, never uninitialized memory.
-        *out_ptr = std::ptr::null_mut();
-        *out_len = 0;
-        if in_ptr.is_null() {
-            return 1;
-        }
-        let input = std::slice::from_raw_parts(in_ptr, in_len);
-        // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
-        let bytes = match std::panic::catch_unwind(|| {
-            cleverbase_attestation::wire::process_verify_bytes(input)
-        }) {
-            Ok(bytes) => bytes,
-            Err(_) => return 2,
-        };
-
-        // Hand ownership to the caller as an exact-capacity boxed slice (cap == len), freed by
-        // [`cleverbase_free`] exactly like a `cleverbase_process` buffer.
-        let boxed = bytes.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = Box::into_raw(boxed).cast::<u8>();
-        *out_ptr = ptr;
-        *out_len = len;
-        0
+        run_cbor_abi(
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_len,
+            cleverbase_attestation::wire::process_verify_bytes,
+        )
     }
 }
 
@@ -183,34 +191,16 @@ pub unsafe extern "C" fn cleverbase_attestation_issuance(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
+    // The pointer/null/catch_unwind/free dance is the shared `run_cbor_abi`; this entry only names the
+    // attestation issuance core as the CBOR-in / CBOR-out body (DRY — Principle III).
     unsafe {
-        if out_ptr.is_null() || out_len.is_null() {
-            return 1;
-        }
-        // Initialize the outputs FIRST so every non-zero return below (null input or the panic path)
-        // leaves a null/empty buffer for a consumer that inspects them, never uninitialized memory.
-        *out_ptr = std::ptr::null_mut();
-        *out_len = 0;
-        if in_ptr.is_null() {
-            return 1;
-        }
-        let input = std::slice::from_raw_parts(in_ptr, in_len);
-        // A panic unwinding across the C ABI is undefined behavior; contain it and report status 2.
-        let bytes = match std::panic::catch_unwind(|| {
-            cleverbase_attestation::issuance::wire::process_issuance_bytes(input)
-        }) {
-            Ok(bytes) => bytes,
-            Err(_) => return 2,
-        };
-
-        // Hand ownership to the caller as an exact-capacity boxed slice (cap == len), freed by
-        // [`cleverbase_free`] exactly like a `cleverbase_process` buffer.
-        let boxed = bytes.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = Box::into_raw(boxed).cast::<u8>();
-        *out_ptr = ptr;
-        *out_len = len;
-        0
+        run_cbor_abi(
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_len,
+            cleverbase_attestation::issuance::wire::process_issuance_bytes,
+        )
     }
 }
 
