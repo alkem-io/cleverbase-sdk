@@ -51,17 +51,28 @@ const WRONG_ISSUER: &[u8] =
 const QUALIFIED_TRUST_LIST_JSON: &[u8] =
     include_bytes!("../../../../tests/fixtures/attestation/qualified-trust-list.json");
 
-// RCA — the qualified gate authenticates the national TL's signer (`ca-iaca`, valid
-// 2026-06-25..2036) by chain-validating it at the SAME instant it reads the status (the relevant
-// time). After the chain-validity fix (trust/chain.rs now enforces the leaf validity window on the
-// direct-pin path too — previously skipped), the relevant-time constants MUST fall inside the
-// signer cert's validity window, or authentication fails (Indeterminate). The earlier 2017/2025
-// constants only ever "worked" because the direct-pin path skipped the validity check — the very
-// false-trust bug now fixed. So every relevant time below sits inside `[2026-06-25, 2027-09-23]`
-// (the IACA signer + the leaf issuer windows), and the fixture's granted/withdrawn `startingTime`s
-// were moved into the same window (grant 2026-07-01, withdrawal 2027-03-01) to preserve the
-// granted→withdrawn ordering the determination tests exercise.
+// RCA — the gate evaluates TWO distinct times. It AUTHENTICATES the national TL (freshness `now >=
+// NextUpdate` + the TL-signer's chain validity) at the verification instant `now`, and only READS the
+// issuer's granted/withdrawn status at the credential's relevant (issuance) time. A prior fix
+// correctly derived the relevant time from the credential for the *status read*, but passed that same
+// old time into `authenticate`, so a TL that is STALE at real `now` but fresh relative to an old
+// credential's issuance time authenticated as fresh → false `Qualified`. The fix passes `now` to
+// `authenticate` and the relevant time only to the status read; these tests therefore supply BOTH a
+// verification instant ([`NOW_VERIFY`]) and a relevant time, and the dedicated now-vs-relevant probes
+// below (`*_stale_at_now_but_fresh_at_issuance*`, `*_expired_signer_at_now*`) keep the two apart.
+//
+// Authentication also enforces the signer cert's validity window: `ca-iaca` (the committed fixture's
+// signer) is valid 2026-06-25..2036 and the leaf issuer certs 2026-06-25..2027-09-23, so the
+// verification instant must sit inside the relevant signer's window or authentication fails
+// (Indeterminate). The fixture's granted/withdrawn `startingTime`s (grant 2026-07-01, withdrawal
+// 2027-03-01) sit inside that window to preserve the granted→withdrawn ordering the determination
+// tests exercise.
 
+/// The verification instant ("now") the determination tests AUTHENTICATE the committed fixture at:
+/// inside the `ca-iaca` signer window (2026-06-25..2036) and before the fixture's 2036 `NextUpdate`,
+/// so the TL authenticates and the status read (at the per-test relevant time) is reached. Kept
+/// distinct from the `RELEVANT_*` (issuance/relevant) times so the now-vs-relevant split is explicit.
+const NOW_VERIFY: i64 = 1_788_220_800; // 2026-09-01 — TL-signer valid + list fresh at this instant.
 /// Relevant time INSIDE the `granted` window (after the 2026-07-01 grant) and BEFORE the mdoc-ds
 /// withdrawal (2027-03-01T00:00:00Z). Inside the signer + leaf cert validity windows so the TL
 /// authenticates and the status is read as granted.
@@ -116,9 +127,15 @@ fn qualified_issuer_granted_at_the_relevant_time_is_qualified() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return; // self-skip: the qualified TL fixture is absent
     };
-    // sdjwt-issuer is an EAA/Q service, granted from 2020-01-01 onward (so granted at NOW). The TL
-    // authenticates (its signer chains to the scheme anchor + it is fresh) so the status is read.
-    let status = qualified_status(ISSUER_CERT_DER, RELEVANT_GRANTED, &tl, &scheme_anchors());
+    // sdjwt-issuer is a granted EAA/Q service at RELEVANT_GRANTED. The TL authenticates at NOW_VERIFY
+    // (its signer chains to the scheme anchor + it is fresh there) so the status is then read.
+    let status = qualified_status(
+        ISSUER_CERT_DER,
+        NOW_VERIFY,
+        RELEVANT_GRANTED,
+        &tl,
+        &scheme_anchors(),
+    );
     assert_eq!(status, QualifiedStatus::Qualified);
 }
 
@@ -128,7 +145,13 @@ fn trusted_but_non_qualified_issuer_is_not_qualified() {
         return;
     };
     // ca-iaca is on the TL but only as a plain EAA (non-qualified) service — found, not EAA/Q-granted.
-    let status = qualified_status(CA_IACA, RELEVANT_GRANTED, &tl, &scheme_anchors());
+    let status = qualified_status(
+        CA_IACA,
+        NOW_VERIFY,
+        RELEVANT_GRANTED,
+        &tl,
+        &scheme_anchors(),
+    );
     assert_eq!(
         status,
         QualifiedStatus::NotQualified,
@@ -141,14 +164,27 @@ fn withdrawn_eaa_q_is_qualified_before_and_not_qualified_after_the_withdrawal() 
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    // mdoc-ds: granted 2020-01-01, withdrawn 2025-09-01 — status is read AT the relevant time.
+    // mdoc-ds: granted 2026-07-01, withdrawn 2027-03-01 — status is read AT the relevant time, while
+    // the TL is authenticated at the (fixed) NOW_VERIFY instant in both calls.
     assert_eq!(
-        qualified_status(MDOC_DS, RELEVANT_GRANTED, &tl, &scheme_anchors()),
+        qualified_status(
+            MDOC_DS,
+            NOW_VERIFY,
+            RELEVANT_GRANTED,
+            &tl,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Qualified,
-        "granted at a time before the withdrawal → Qualified"
+        "granted at a relevant time before the withdrawal → Qualified"
     );
     assert_eq!(
-        qualified_status(MDOC_DS, RELEVANT_AFTER_WITHDRAWN, &tl, &scheme_anchors()),
+        qualified_status(
+            MDOC_DS,
+            NOW_VERIFY,
+            RELEVANT_AFTER_WITHDRAWN,
+            &tl,
+            &scheme_anchors()
+        ),
         QualifiedStatus::NotQualified,
         "withdrawn at the relevant time → NotQualified (status-at-time, not 'now')"
     );
@@ -159,11 +195,13 @@ fn before_any_granted_entry_the_eaa_q_service_is_not_qualified() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    // sdjwt-issuer's EAA/Q grant starts 2020-01-01; a relevant time before that is "found but not
-    // granted at the relevant time" → NotQualified (the entry exists, the grant had not begun).
+    // sdjwt-issuer's EAA/Q grant starts 2026-07-01; a relevant time before that is "found but not
+    // granted at the relevant time" → NotQualified (the entry exists, the grant had not begun). The TL
+    // still authenticates at NOW_VERIFY (signer valid + fresh there).
     assert_eq!(
         qualified_status(
             ISSUER_CERT_DER,
+            NOW_VERIFY,
             RELEVANT_BEFORE_GRANTED,
             &tl,
             &scheme_anchors()
@@ -180,7 +218,13 @@ fn issuer_absent_from_the_trust_list_is_indeterminate() {
     // wrong-issuer is on no service entry at all → the trust-list data needed to decide is absent →
     // honest Indeterminate (NEVER assume qualified).
     assert_eq!(
-        qualified_status(WRONG_ISSUER, RELEVANT_GRANTED, &tl, &scheme_anchors()),
+        qualified_status(
+            WRONG_ISSUER,
+            NOW_VERIFY,
+            RELEVANT_GRANTED,
+            &tl,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Indeterminate
     );
 }
@@ -191,7 +235,13 @@ fn an_empty_or_unreachable_trust_list_is_indeterminate() {
     // authenticate → Indeterminate, never qualified.
     let empty = QualifiedTrustList::empty();
     assert_eq!(
-        qualified_status(ISSUER_CERT_DER, RELEVANT_GRANTED, &empty, &scheme_anchors()),
+        qualified_status(
+            ISSUER_CERT_DER,
+            NOW_VERIFY,
+            RELEVANT_GRANTED,
+            &empty,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Indeterminate
     );
 }
@@ -233,7 +283,13 @@ fn a_list_without_a_signer_cert_parses_with_none() {
     let tl = QualifiedTrustList::parse(json).expect("parses");
     assert!(tl.signer_cert_der().is_none());
     assert_eq!(
-        qualified_status(ISSUER_CERT_DER, RELEVANT_GRANTED, &tl, &scheme_anchors()),
+        qualified_status(
+            ISSUER_CERT_DER,
+            NOW_VERIFY,
+            RELEVANT_GRANTED,
+            &tl,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Indeterminate
     );
 }
@@ -479,6 +535,29 @@ const STALE_NEXT_UPDATE: &str = "2021-01-01T00:00:00Z";
 /// signer that is a *leaf* (not the root) chain-validates by SIGNATURE — mirrors chain.rs's NOW.
 const NOW_LEAF_VALID: i64 = 1_788_220_800; // 2026-09-01.
 
+// --- now-vs-relevant split probes (the exact false-`Qualified` bug) ------------------------------
+// A TL must be AUTHENTICATED at the verification instant `now`, not at the credential's (older)
+// relevant time. These constants keep a `NextUpdate` / signer-validity window that is satisfied at the
+// credential's issuance/relevant time but NOT at real `now`, so a gate that (incorrectly) authenticated
+// at the relevant time would read `Qualified`, while authenticating at `now` correctly fails closed.
+
+/// A `nextUpdate` that is AFTER the credential's issuance/relevant time ([`ISSUANCE_BEFORE_STALE`])
+/// but BEFORE the verification instant ([`NOW_STALE`]): the list is fresh relative to the old
+/// credential yet STALE at real `now`. (2026-08-01.)
+const STALE_AT_NOW_NEXT_UPDATE: &str = "2026-08-01T00:00:00Z";
+/// The verification instant for the stale-at-now probe: PAST `STALE_AT_NOW_NEXT_UPDATE` (so the list
+/// is stale now) yet still inside the `ca-iaca` signer window (valid ..2036), so the failure is
+/// specifically staleness, not signer expiry. (2030-01-01.)
+const NOW_STALE: i64 = 1_893_456_000; // 2030-01-01.
+/// The credential's issuance/relevant time for the stale-at-now probe: AFTER the 2026-07-01 grant (so
+/// the issuer IS granted at the relevant time) and BEFORE `STALE_AT_NOW_NEXT_UPDATE` (so a gate that
+/// wrongly authenticated at this time would see the list as fresh → false `Qualified`). (2026-07-15.)
+const ISSUANCE_BEFORE_STALE: i64 = 1_784_073_600; // 2026-07-15 — granted, list "fresh" at issuance.
+/// The verification instant for the expired-signer probe: PAST the leaf TL-signer's notAfter
+/// (2027-09-23), so the TL-signer cert is EXPIRED now and its chain validity fails — even though the
+/// list's `NextUpdate` is fresh. (2028-01-01.)
+const NOW_SIGNER_EXPIRED: i64 = 1_830_297_600; // 2028-01-01 — leaf TL-signer expired by now.
+
 #[test]
 fn a_forged_unchained_signer_is_indeterminate_not_qualified() {
     // THE PROBE: an attacker-supplied national TL signed by wrong-issuer (a self-signed cert that does
@@ -493,6 +572,7 @@ fn a_forged_unchained_signer_is_indeterminate_not_qualified() {
     assert_eq!(
         qualified_status(
             ISSUER_CERT_DER,
+            NOW_VERIFY,
             RELEVANT_GRANTED,
             &forged,
             &scheme_anchors()
@@ -500,9 +580,9 @@ fn a_forged_unchained_signer_is_indeterminate_not_qualified() {
         QualifiedStatus::Indeterminate,
         "a forged TL whose signer does not chain to the scheme anchor must NEVER be Qualified"
     );
-    // And the authenticate() primitive itself surfaces the specific reason.
+    // And the authenticate() primitive itself surfaces the specific reason (at the verification now).
     assert!(matches!(
-        forged.authenticate(&scheme_anchors(), RELEVANT_GRANTED),
+        forged.authenticate(&scheme_anchors(), NOW_VERIFY),
         Err(QualifiedTrustError::SignerNotTrusted(_))
     ));
 }
@@ -517,6 +597,7 @@ fn an_unsigned_list_listing_a_granted_service_is_indeterminate_not_qualified() {
     assert_eq!(
         qualified_status(
             ISSUER_CERT_DER,
+            NOW_VERIFY,
             RELEVANT_GRANTED,
             &unsigned,
             &scheme_anchors()
@@ -524,27 +605,122 @@ fn an_unsigned_list_listing_a_granted_service_is_indeterminate_not_qualified() {
         QualifiedStatus::Indeterminate
     );
     assert_eq!(
-        unsigned.authenticate(&scheme_anchors(), RELEVANT_GRANTED),
+        unsigned.authenticate(&scheme_anchors(), NOW_VERIFY),
         Err(QualifiedTrustError::Unsigned)
     );
 }
 
 #[test]
 fn a_stale_list_past_next_update_is_indeterminate_not_qualified() {
-    // A properly-SIGNED list (signer = ca-iaca, chains to the scheme anchor) listing sdjwt-issuer as
-    // granted EAA/Q, but PAST its NextUpdate at the relevant time → stale → Indeterminate, never
-    // Qualified (a stale list is not authoritative forever).
+    // A properly-SIGNED list (signer = ca-iaca, chains to the scheme anchor) listing the issuer as
+    // granted EAA/Q, but PAST its NextUpdate at the verification instant → stale → Indeterminate,
+    // never Qualified (a stale list is not authoritative forever).
     let stale =
         QualifiedTrustList::parse(&tl_json(Some(CA_IACA), STALE_NEXT_UPDATE, ISSUER_CERT_DER))
             .expect("parses");
     assert_eq!(
-        qualified_status(ISSUER_CERT_DER, RELEVANT_GRANTED, &stale, &scheme_anchors()),
+        qualified_status(
+            ISSUER_CERT_DER,
+            NOW_VERIFY,
+            RELEVANT_GRANTED,
+            &stale,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Indeterminate,
         "a stale TL (now past NextUpdate) must NEVER be Qualified"
     );
     assert_eq!(
-        stale.authenticate(&scheme_anchors(), RELEVANT_GRANTED),
+        stale.authenticate(&scheme_anchors(), NOW_VERIFY),
         Err(QualifiedTrustError::Stale)
+    );
+}
+
+#[test]
+fn a_list_stale_at_now_but_fresh_at_issuance_is_indeterminate_not_qualified() {
+    // THE now-vs-relevant PROBE (the exact false-`Qualified` bug). A properly-signed list (signer =
+    // ca-iaca) listing sdjwt-issuer as a GRANTED EAA/Q service, whose NextUpdate (2026-08-01) is AFTER
+    // the credential's issuance/relevant time (2026-07-15) but BEFORE real now (2030). The issuer IS
+    // granted at the relevant time, so the only thing standing between this list and a `Qualified`
+    // verdict is whether the staleness check uses `now` (correct → stale → Indeterminate) or the
+    // credential's relevant time (the bug → "fresh" → false Qualified).
+    let stale_at_now = QualifiedTrustList::parse(&tl_json(
+        Some(CA_IACA),
+        STALE_AT_NOW_NEXT_UPDATE,
+        ISSUER_CERT_DER,
+    ))
+    .expect("parses");
+
+    // Authenticate is a NOW property: stale at `now`, but (if the bug were present) "fresh" at issuance.
+    assert_eq!(
+        stale_at_now.authenticate(&scheme_anchors(), NOW_STALE),
+        Err(QualifiedTrustError::Stale),
+        "the list is stale at the verification instant"
+    );
+    assert!(
+        stale_at_now
+            .authenticate(&scheme_anchors(), ISSUANCE_BEFORE_STALE)
+            .is_ok(),
+        "the list WOULD authenticate at the (older) issuance time — which is exactly why \
+         authentication must use `now`, not the relevant time"
+    );
+
+    // The determination authenticates at `now` (stale) → Indeterminate, even though the issuer is
+    // granted at the relevant time. With the pre-fix code (authenticate at the relevant time) this
+    // would have read a false `Qualified`.
+    assert_eq!(
+        qualified_status(
+            ISSUER_CERT_DER,
+            NOW_STALE,
+            ISSUANCE_BEFORE_STALE,
+            &stale_at_now,
+            &scheme_anchors(),
+        ),
+        QualifiedStatus::Indeterminate,
+        "a TL stale at `now` (even if fresh relative to an older credential) must NEVER be Qualified"
+    );
+}
+
+#[test]
+fn a_tl_signer_expired_at_now_but_valid_at_issuance_is_indeterminate_not_qualified() {
+    // The TL-signer chain validity is also a NOW property. The list is signed by sdjwt-issuer (a leaf
+    // ISSUED BY ca-iaca, valid 2026-06-25..2027-09-23) and lists mdoc-ds as granted EAA/Q with a FRESH
+    // NextUpdate. At the credential's issuance/relevant time (2026-09-01) the signer cert is valid; at
+    // real now (2028-01-01) it has EXPIRED, so its chain validity fails → the list cannot authenticate.
+    let signer_expired =
+        QualifiedTrustList::parse(&tl_json(Some(SDJWT_ISSUER), FRESH_NEXT_UPDATE, MDOC_DS))
+            .expect("parses");
+
+    // Valid at the issuance time, expired at now — the very contrast the split protects against.
+    assert!(
+        signer_expired
+            .authenticate(&scheme_anchors(), NOW_LEAF_VALID)
+            .is_ok(),
+        "the TL-signer cert is valid at the issuance-era instant"
+    );
+    assert!(
+        matches!(
+            signer_expired.authenticate(&scheme_anchors(), NOW_SIGNER_EXPIRED),
+            Err(QualifiedTrustError::SignerNotTrusted(
+                ChainError::LeafExpired
+            ))
+        ),
+        "the TL-signer cert has expired by the verification instant → chain validity fails"
+    );
+
+    // The determination authenticates at `now` (signer expired) → Indeterminate, even though mdoc-ds is
+    // granted EAA/Q at the relevant time and the signer was valid then. Pre-fix (authenticate at the
+    // relevant time) this would have read a false `Qualified`.
+    assert_eq!(
+        qualified_status(
+            MDOC_DS,
+            NOW_SIGNER_EXPIRED,
+            NOW_LEAF_VALID,
+            &signer_expired,
+            &scheme_anchors(),
+        ),
+        QualifiedStatus::Indeterminate,
+        "a TL whose signer cert has expired by `now` must NEVER be Qualified, even for a credential \
+         issued while that signer was still valid"
     );
 }
 
@@ -557,11 +733,11 @@ fn no_scheme_anchor_configured_is_indeterminate_not_qualified() {
         return;
     };
     assert_eq!(
-        qualified_status(ISSUER_CERT_DER, RELEVANT_GRANTED, &tl, &[]),
+        qualified_status(ISSUER_CERT_DER, NOW_VERIFY, RELEVANT_GRANTED, &tl, &[]),
         QualifiedStatus::Indeterminate
     );
     assert_eq!(
-        tl.authenticate(&[], RELEVANT_GRANTED),
+        tl.authenticate(&[], NOW_VERIFY),
         Err(QualifiedTrustError::NoSchemeAnchor)
     );
 }
@@ -584,7 +760,13 @@ fn a_signer_that_chains_to_the_scheme_anchor_by_signature_authenticates_and_read
         "a leaf signer issued by the scheme anchor must authenticate by signature"
     );
     assert_eq!(
-        qualified_status(MDOC_DS, NOW_LEAF_VALID, &signed, &scheme_anchors()),
+        qualified_status(
+            MDOC_DS,
+            NOW_LEAF_VALID,
+            NOW_LEAF_VALID,
+            &signed,
+            &scheme_anchors()
+        ),
         QualifiedStatus::Qualified
     );
 }
@@ -597,10 +779,10 @@ fn the_committed_fixture_signer_authenticates_against_the_scheme_anchor() {
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    assert!(tl.authenticate(&scheme_anchors(), RELEVANT_GRANTED).is_ok());
+    assert!(tl.authenticate(&scheme_anchors(), NOW_VERIFY).is_ok());
     // A signer that is NOT the scheme anchor (and not chained to it) fails authentication.
     assert!(matches!(
-        tl.authenticate(&[WRONG_ISSUER.to_vec()], RELEVANT_GRANTED),
+        tl.authenticate(&[WRONG_ISSUER.to_vec()], NOW_VERIFY),
         Err(QualifiedTrustError::SignerNotTrusted(
             ChainError::IssuerMismatch
         ))

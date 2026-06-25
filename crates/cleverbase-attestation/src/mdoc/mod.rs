@@ -302,7 +302,7 @@ pub type IssuerVerifiedAttributes = BTreeMap<String, AttributeValue>;
 /// on the first failure.
 ///
 /// This is the entry the **external-vector conformance** test drives (the ISO Annex-D worked example),
-/// exercising the exact production [`verify_issuer_signed`] path — NOT a parallel re-implementation
+/// exercising the exact production `verify_issuer_signed` path — NOT a parallel re-implementation
 /// (Principle III/VIII). It deliberately omits the holder `DeviceAuth` binding: the Annex-D vector's
 /// `DeviceAuth` is the device-retrieval `DeviceMac` (an ECDH-derived HMAC over the ISO
 /// `SessionTranscript`), which is a documented follow-on to this SDK's `DeviceSignature` path

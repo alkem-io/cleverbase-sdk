@@ -309,10 +309,14 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 /// else `Indeterminate` if any document is undecidable; else `NotQualified`.
 ///
 /// Each per-document/credential delegate authenticates the TL (signer chains to a scheme anchor + not
-/// stale) at the relevant time BEFORE reading status. When a signing cert OR the issuance time cannot
-/// be read, no trust list was supplied, or the list fails to authenticate, it yields
-/// [`QualifiedStatus::Indeterminate`] — the data needed to decide is absent or untrustworthy (never a
-/// false "qualified", SC-007).
+/// stale) **at `ctx.now_unix`** (the verification instant) BEFORE reading status, then reads the
+/// issuer's granted/withdrawn status **at that credential's/document's own relevant time**. The two
+/// times are deliberately distinct: TL freshness and the TL-signer's chain validity are "now"
+/// properties — a stale or expired-signer trust snapshot must never be trusted just because the
+/// credential being checked is old — whereas the status read is "status at the relevant time". When a
+/// signing cert OR the issuance time cannot be read, no trust list was supplied, or the list fails to
+/// authenticate, it yields [`QualifiedStatus::Indeterminate`] — the data needed to decide is absent or
+/// untrustworthy (never a false "qualified", SC-007).
 ///
 /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 fn qualified_status_for(
@@ -324,12 +328,16 @@ fn qualified_status_for(
         // The gate is enabled but the host supplied no national TL → the data is unreachable.
         return QualifiedStatus::Indeterminate;
     };
-    // Resolve the status of one claimed signing cert at the credential's OWN relevant time. A missing
-    // cert OR a missing issuance time fails closed (Indeterminate) — never read the status at "now".
+    // Resolve the status of one claimed signing cert. TWO distinct times are threaded (the load-
+    // bearing split): the TL is AUTHENTICATED at `ctx.now_unix` (the verification instant — TL
+    // freshness `now >= NextUpdate` and the TL-signer's chain validity are "now" properties), while the
+    // issuer's granted/withdrawn status is READ at the credential's OWN relevant time. A missing cert OR
+    // a missing issuance time fails closed (Indeterminate) — the status is never read at "now".
     let status_of = |cert: Option<Vec<u8>>, relevant_time: Option<i64>| -> QualifiedStatus {
         match (cert, relevant_time) {
             (Some(cert_der), Some(relevant_time_unix)) => crate::qualified::qualified_status(
                 &cert_der,
+                ctx.now_unix,
                 relevant_time_unix,
                 trust_list,
                 ctx.qualified_scheme_anchors,

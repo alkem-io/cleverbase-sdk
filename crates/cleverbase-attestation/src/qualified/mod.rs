@@ -325,11 +325,35 @@ impl QualifiedTrustList {
 /// Determine the eIDAS qualified status of an attestation issuer at a relevant time (TS 119 615
 /// v1.4.1 cl. 4.12 — the opt-in gate, research D6).
 ///
+/// ## Two distinct times — authenticate at `now`, read status at the relevant time
+///
+/// Trust-list **authentication** and the issuer **status read** are evaluated at *different* instants
+/// (the load-bearing split — RCA below):
+///
+/// - **`now_unix`** — the verification instant ("real now"). Used to **authenticate the TL**
+///   ([`QualifiedTrustList::authenticate`]): the freshness check (`now >= NextUpdate ⇒ stale`) AND the
+///   TL-signer certificate's chain validity ([`crate::trust::chain::verify_chain`] `notBefore`/
+///   `notAfter`). Whether the LOTL/national-TL snapshot in hand is itself **currently** fresh and
+///   signed by a **currently** valid scheme operator is a *now* property — a stale or expired-signer TL
+///   must never be trusted just because the credential being checked is old.
+/// - **`relevant_time_unix`** — the credential's issuance/relevant time. Used only to **read the
+///   issuer's granted/withdrawn `EAA/Q` status** (the effective status at that instant); per eIDAS the
+///   status read is "status at the relevant time" (an issuer not yet granted when it signed a
+///   credential, but granted later, is NOT `Qualified` for that earlier credential).
+///
+/// **RCA — why the split matters (the false-`Qualified` bug this fixes):** a prior fix correctly
+/// derived the relevant time for the *status read* from the credential's issuance time, but then passed
+/// that SAME old time into `authenticate`, so the TL freshness/signer-validity checks were evaluated at
+/// the credential's issuance time instead of `now`. A TL whose `NextUpdate` is in the past relative to
+/// real `now` (stale) but in the future relative to an old credential's issuance time was treated as
+/// fresh, yielding a false `Qualified` from a stale/withdrawn-since trust snapshot. Authentication MUST
+/// use `now_unix`; only the status read uses `relevant_time_unix`.
+///
 /// **Authenticates the national TL first** ([`QualifiedTrustList::authenticate`] against the
-/// host-configured scheme-operator `scheme_anchors`, at `relevant_time_unix`): an unsigned / forged /
-/// unchained / stale list yields [`QualifiedStatus::Indeterminate`] before any status is read
-/// (fail-closed — a forged TL can never make an unchained issuer report `Qualified`, SC-007). Only an
-/// authenticated list is consulted.
+/// host-configured scheme-operator `scheme_anchors`, at `now_unix`): an unsigned / forged / unchained /
+/// stale list yields [`QualifiedStatus::Indeterminate`] before any status is read (fail-closed — a
+/// forged TL can never make an unchained issuer report `Qualified`, SC-007). Only an authenticated list
+/// is consulted.
 ///
 /// On an authenticated list it then matches `issuer_cert_der` (the credential's signing certificate)
 /// against the trust-service entries and reads the effective service status **at
@@ -346,16 +370,16 @@ impl QualifiedTrustList {
 #[must_use]
 pub fn qualified_status(
     issuer_cert_der: &[u8],
+    now_unix: i64,
     relevant_time_unix: i64,
     trust_list: &QualifiedTrustList,
     scheme_anchors: &[Vec<u8>],
 ) -> QualifiedStatus {
-    // Authenticate the list against the scheme-operator anchor BEFORE reading any status. A forged /
-    // unsigned / unchained / stale list cannot be authoritative → Indeterminate, never Qualified.
-    if trust_list
-        .authenticate(scheme_anchors, relevant_time_unix)
-        .is_err()
-    {
+    // Authenticate the list against the scheme-operator anchor BEFORE reading any status, at `now_unix`
+    // (the verification instant) — NOT the credential's relevant time: TL freshness (`now >=
+    // NextUpdate`) and the TL-signer's chain validity are "now" properties. A forged / unsigned /
+    // unchained / stale-at-now list cannot be authoritative → Indeterminate, never Qualified.
+    if trust_list.authenticate(scheme_anchors, now_unix).is_err() {
         return QualifiedStatus::Indeterminate;
     }
 
