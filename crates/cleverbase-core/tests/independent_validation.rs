@@ -21,14 +21,100 @@ use std::process::Command;
 
 use cleverbase_core::util::{base64_decode, base64_std};
 use cleverbase_core::{
-    begin, resume, ConformanceLevel, CscApi, Environment, HostContext, ResumeInput, Secret,
-    SignedDocument, SigningRequest, Step, TrustServiceConfiguration, TsaConfiguration,
+    begin, resume, ConformanceLevel, CscApi, Environment, HostContext, HttpEffect, ResumeInput,
+    Secret, SignedDocument, SigningRequest, Step, TrustServiceConfiguration, TsaConfiguration,
 };
 use lopdf::{Dictionary, Document, Object};
 use pkcs8::DecodePrivateKey;
 
 const RSA_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.cert.der");
 const RSA_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.key.pk8");
+const EC_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-ec.cert.der");
+const EC_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-ec.key.pk8");
+
+/// Signature algorithm the harness drives end-to-end. ONE parametrized producer path covers both
+/// arms (FR-004) — no RSA/ECDSA copy-paste. Each arm pins the matching CSC API base, the
+/// `credentials/info` substitution values (cert + key.algo OID + subject), and the `signHash`
+/// simulator's signing routine.
+#[derive(Clone, Copy)]
+enum KeyAlgo {
+    Rsa,
+    EcdsaP256,
+}
+
+impl KeyAlgo {
+    fn csc_api(self) -> CscApi {
+        match self {
+            Self::Rsa => CscApi::V1Rsa,
+            Self::EcdsaP256 => CscApi::V2Ecdsa,
+        }
+    }
+
+    /// The signer certificate (DER) the matching `credentials/info` advertises — the same key whose
+    /// private half the `signHash` simulator signs with (no drift).
+    fn cert_der(self) -> &'static [u8] {
+        match self {
+            Self::Rsa => RSA_CERT,
+            Self::EcdsaP256 => EC_CERT,
+        }
+    }
+
+    /// The `key.algo` OID the `credentials/info` advertises so the core detects this `KeyAlgo`.
+    fn algo_oid(self) -> &'static str {
+        match self {
+            Self::Rsa => "1.2.840.113549.1.1.1",    // rsaEncryption
+            Self::EcdsaP256 => "1.2.840.10045.2.1", // id-ecPublicKey
+        }
+    }
+
+    /// The subject DN + serial the real fixture cert carries (kept honest with the cert above).
+    fn subject_dn(self) -> &'static str {
+        match self {
+            Self::Rsa => "CN=Jane Doe,serialNumber=PNONL-123",
+            Self::EcdsaP256 => "CN=John Roe,serialNumber=PNONL-456",
+        }
+    }
+
+    fn serial(self) -> &'static str {
+        match self {
+            Self::Rsa => "PNONL-123",
+            Self::EcdsaP256 => "PNONL-456",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rsa => "RSA",
+            Self::EcdsaP256 => "ECDSA P-256",
+        }
+    }
+
+    /// Simulate Cleverbase's `signHash`: sign the 32-byte to-be-signed digest of the signedAttrs
+    /// with the fixture private key. RSA → PKCS#1 v1.5(SHA-256); ECDSA P-256 → the raw 64-byte
+    /// `r‖s` wire form CSC v2 returns (the core's `ecdsa_signature_to_der` normalizes it).
+    fn sign_hash(self, tbs: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Rsa => {
+                let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
+                key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), tbs)
+                    .unwrap()
+            }
+            Self::EcdsaP256 => ec_sign_raw(tbs),
+        }
+    }
+}
+
+/// Sign a prehashed 32-byte digest with the EC fixture key, returning the raw fixed-width 64-byte
+/// `r‖s` (the CSC v2 wire form). Uses `sign_prehash` because the core feeds the SHA-256 of the
+/// signedAttrs (already a digest), not the message.
+fn ec_sign_raw(tbs: &[u8]) -> Vec<u8> {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::DecodePrivateKey;
+    let key = SigningKey::from_pkcs8_der(EC_KEY).unwrap();
+    let sig: Signature = key.sign_prehash(tbs).unwrap();
+    sig.to_bytes().to_vec()
+}
 
 fn openssl_available() -> bool {
     Command::new("openssl")
@@ -84,25 +170,44 @@ fn http_ok(json: serde_json::Value) -> ResumeInput {
     }
 }
 
-fn produce_signed_pdf() -> SignedDocument {
-    let cfg = TrustServiceConfiguration {
+/// Build the trust-service configuration for the requested algorithm and conformance level. B-T
+/// pins a TSA (so the flow requests a timestamp); B-B leaves `tsa: None`. Single source for the
+/// otherwise-identical config block every flow driver needs.
+fn trust_service_config(algo: KeyAlgo, conformance: ConformanceLevel) -> TrustServiceConfiguration {
+    TrustServiceConfiguration {
         environment: Environment::Acceptance,
-        csc_api: CscApi::V1Rsa,
+        csc_api: algo.csc_api(),
         client_id: "client-123".into(),
         client_secret: Secret::new("shh"),
         redirect_uri: "https://app.example/cb".into(),
-        tsa: None,
-    };
+        tsa: match conformance {
+            ConformanceLevel::BB => None,
+            ConformanceLevel::BT => Some(TsaConfiguration {
+                url: "https://tsa.example/tsr".into(),
+                auth: None,
+                policy_oid: None,
+            }),
+        },
+    }
+}
+
+/// Drive the shared protocol prefix: `begin` → redirect return → `service_token` →
+/// `credentials_list`, leaving the handle ready to receive the `credentials/info` (signer_info)
+/// response. This is the single point through which every flow driver (and the unsupported-OID
+/// test, which then feeds a DIFFERENT `credentials/info`) routes — parametrized by algorithm AND
+/// conformance so RSA/ECDSA and B-B/B-T share one path (no twins).
+fn drive_to_credentials_info(
+    algo: KeyAlgo,
+    conformance: ConformanceLevel,
+) -> cleverbase_core::SigningSessionHandle {
     let request = SigningRequest {
         document: minimal_pdf(),
-        conformance_level: ConformanceLevel::BB,
+        conformance_level: conformance,
         expected_signer: None,
         appearance: None,
         signature_meta: None,
     };
-    let info = signer_info();
-
-    let (h, s) = begin(request, cfg, ctx()).unwrap();
+    let (h, s) = begin(request, trust_service_config(algo, conformance), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
         _ => panic!(),
@@ -116,8 +221,26 @@ fn produce_signed_pdf() -> SignedDocument {
         ctx(),
     )
     .unwrap();
-    let (h, _) = resume(h, http_ok(upstream_fixture("service_token")), ctx()).unwrap();
-    let (h, _) = resume(h, http_ok(upstream_fixture("credentials_list")), ctx()).unwrap();
+    let (h, _) = resume(h, http_ok(upstream_fixture("service_token", algo)), ctx()).unwrap();
+    let (h, _) = resume(
+        h,
+        http_ok(upstream_fixture("credentials_list", algo)),
+        ctx(),
+    )
+    .unwrap();
+    h
+}
+
+/// Continue from `credentials/info` through the credential-scope redirect return + `credential_token`
+/// to the point where the `signHash` REQUEST is emitted: feed the supplied `info` (the producers pass
+/// the normal signer_info), then return the handle together with the to-be-signed `signHash` request
+/// so the caller can inject its own `signHash` RESPONSE (a real signature, or a bad-length one).
+fn drive_to_sign_request(
+    algo: KeyAlgo,
+    conformance: ConformanceLevel,
+    info: serde_json::Value,
+) -> (cleverbase_core::SigningSessionHandle, HttpEffect) {
+    let h = drive_to_credentials_info(algo, conformance);
     let (h, s) = resume(h, http_ok(info), ctx()).unwrap();
     let state = match &s {
         Step::Redirect(r) => r.state.clone(),
@@ -132,17 +255,29 @@ fn produce_signed_pdf() -> SignedDocument {
         ctx(),
     )
     .unwrap();
-    let (h, s) = resume(h, http_ok(upstream_fixture("credential_token")), ctx()).unwrap();
+    let (h, s) = resume(
+        h,
+        http_ok(upstream_fixture("credential_token", algo)),
+        ctx(),
+    )
+    .unwrap();
     let sign_req = match &s {
         Step::PerformHttp(e) => e.clone(),
-        _ => panic!(),
+        _ => panic!("expected signHash"),
     };
+    (h, sign_req)
+}
+
+/// The to-be-signed digest the core asks `signHash` to sign (the SHA-256 of the signedAttrs),
+/// extracted from the emitted `signHash` request — the input every `signHash` simulator signs.
+fn tbs_from_sign_request(sign_req: &HttpEffect) -> Vec<u8> {
     let body: serde_json::Value = serde_json::from_slice(sign_req.body.as_ref().unwrap()).unwrap();
-    let tbs = base64_decode(body["hash"][0].as_str().unwrap()).unwrap();
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
-    let sig = key
-        .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &tbs)
-        .unwrap();
+    base64_decode(body["hash"][0].as_str().unwrap()).unwrap()
+}
+
+fn produce_signed_pdf(algo: KeyAlgo) -> SignedDocument {
+    let (h, sign_req) = drive_to_sign_request(algo, ConformanceLevel::BB, signer_info(algo));
+    let sig = algo.sign_hash(&tbs_from_sign_request(&sign_req));
     let (_h, step) = resume(
         h,
         http_ok(serde_json::json!({"signatures": [base64_std(&sig)]})),
@@ -202,20 +337,15 @@ fn der_total_len(b: &[u8]) -> usize {
     }
 }
 
-#[test]
-fn produced_b_b_signature_verifies_with_openssl() {
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping independent validation");
-        return;
-    }
-    let signed = produce_signed_pdf();
-    let (content, cms_der) = extract(&signed.pdf);
-
+/// Run `openssl cms -verify` on a detached CMS over its ByteRange content against the test CA.
+/// Returns whether OpenSSL accepted the signature (an entirely independent implementation).
+fn openssl_cms_verify(content: &[u8], cms_der: &[u8]) -> bool {
     let dir = std::env::temp_dir();
-    let cms_path = dir.join("cleverbase_it_cms.der");
-    let content_path = dir.join("cleverbase_it_content.bin");
-    std::fs::write(&cms_path, &cms_der).unwrap();
-    std::fs::write(&content_path, &content).unwrap();
+    let cms_path = dir.join(format!("{}.der", unique_tag("cb_it_cms")));
+    let content_path = dir.join(format!("{}.bin", unique_tag("cb_it_content")));
+    let out_path = dir.join(format!("{}.bin", unique_tag("cb_it_out")));
+    std::fs::write(&cms_path, cms_der).unwrap();
+    std::fs::write(&content_path, content).unwrap();
     let ca = materialize_ca_pem();
 
     let out = Command::new("openssl")
@@ -229,20 +359,89 @@ fn produced_b_b_signature_verifies_with_openssl() {
         .arg("-CAfile")
         .arg(&ca)
         .arg("-out")
-        .arg(dir.join("cleverbase_it_out.bin"))
+        .arg(&out_path)
         .output()
         .expect("run openssl");
 
     let _ = std::fs::remove_file(&cms_path);
     let _ = std::fs::remove_file(&content_path);
+    let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&ca);
+    out.status.success()
+}
 
+#[test]
+fn produced_b_b_signature_verifies_with_openssl() {
+    if !openssl_available() {
+        eprintln!("openssl not available; skipping independent validation");
+        return;
+    }
+    // One parametrized path, both algorithms (FR-004): each produced B-B CMS is accepted by the
+    // independent OpenSSL validator.
+    for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
+        let signed = produce_signed_pdf(algo);
+        let (content, cms_der) = extract(&signed.pdf);
+        assert!(
+            openssl_cms_verify(&content, &cms_der),
+            "openssl cms -verify rejected a valid {} B-B signature",
+            algo.name(),
+        );
+    }
+}
+
+/// A produced ECDSA B-B CMS whose embedded signature has been corrupted MUST be rejected by the
+/// always-on OpenSSL bar — no false-accept (F1 / FR-012 / SC-006). We produce a real signature, then
+/// locate the `SignerInfo.signature` OCTET STRING in the assembled CMS and flip a bit inside it, so
+/// the surrounding DER still parses but the signature no longer matches the signed attributes.
+#[test]
+fn tampered_ecdsa_signature_is_rejected_by_openssl() {
+    if !openssl_available() {
+        eprintln!("openssl not available; skipping tamper test");
+        return;
+    }
+    let signed = produce_signed_pdf(KeyAlgo::EcdsaP256);
+    let (content, cms_der) = extract(&signed.pdf);
+    // Sanity: the untampered signature verifies, so a later rejection is due to the tamper.
     assert!(
-        out.status.success(),
-        "openssl cms -verify failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        openssl_cms_verify(&content, &cms_der),
+        "baseline ECDSA signature should verify before tampering",
     );
+    let tampered = flip_signature_byte(&cms_der);
+    assert_ne!(tampered, cms_der, "tamper must change the CMS bytes");
+    assert!(
+        !openssl_cms_verify(&content, &tampered),
+        "openssl cms -verify MUST reject a tampered ECDSA signature (no false-accept)",
+    );
+}
+
+/// Locate the `SignerInfo.signature` OCTET STRING in a detached CMS `SignedData` and flip a bit in
+/// its last content byte. Parses the CMS with the `cms`/`der` crates (test-only) to find the exact
+/// span — no `src/` change, no brittle byte scanning.
+fn flip_signature_byte(cms_der: &[u8]) -> Vec<u8> {
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::SignedData;
+    use der::{Decode, Encode};
+
+    let ci = ContentInfo::from_der(cms_der).expect("parse ContentInfo");
+    let sd = ci
+        .content
+        .decode_as::<SignedData>()
+        .expect("decode SignedData");
+    let signer = sd.signer_infos.0.as_slice().first().expect("a SignerInfo");
+    let sig = signer.signature.as_bytes();
+    // The OCTET STRING content is a unique byte run in the CMS DER (it is the raw signature value);
+    // find it and flip the last byte in place. Using the exact decoded bytes as the needle keeps
+    // this robust against any incidental repetition elsewhere in the structure.
+    let needle = sig.to_vec();
+    let _ = signer.to_der().expect("re-encode SignerInfo"); // sanity: structure is well-formed
+    let pos = cms_der
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("signature bytes present in CMS DER");
+    let mut t = cms_der.to_vec();
+    let last = pos + needle.len() - 1;
+    t[last] ^= 0x01;
+    t
 }
 
 fn upstream_dir() -> PathBuf {
@@ -253,16 +452,38 @@ fn upstream_dir() -> PathBuf {
 }
 
 /// Load a shared upstream-response fixture (the single source the Go mock also reads — FR-015),
-/// substituting the synthetic signer certificate for the `{{signer_rsa_cert_b64}}` placeholder.
-fn upstream_fixture(name: &str) -> serde_json::Value {
+/// substituting the selected algorithm's signer cert + `key.algo` OID + subject into the one
+/// `credentials/info` template (per-algorithm substitution, no second committed copy — N1). The
+/// cert and OID come from the SAME `algo` the `signHash` simulator signs with, so they never drift.
+fn upstream_fixture(name: &str, algo: KeyAlgo) -> serde_json::Value {
     let raw = std::fs::read_to_string(upstream_dir().join(format!("{name}.json")))
         .unwrap_or_else(|e| panic!("read upstream fixture {name}: {e}"));
-    let substituted = raw.replace("{{signer_rsa_cert_b64}}", &base64_std(RSA_CERT));
+    let substituted = raw
+        .replace("{{signer_cert_b64}}", &base64_std(algo.cert_der()))
+        .replace("{{key_algo_oid}}", algo.algo_oid())
+        .replace("{{signer_subject_dn}}", algo.subject_dn())
+        .replace("{{signer_serial}}", algo.serial());
     serde_json::from_str(&substituted).unwrap()
 }
 
-fn signer_info() -> serde_json::Value {
-    upstream_fixture("credentials_info")
+fn signer_info(algo: KeyAlgo) -> serde_json::Value {
+    upstream_fixture("credentials_info", algo)
+}
+
+/// Build a `credentials/info` value advertising an arbitrary `key.algo` OID + cert — for the
+/// unsupported-OID rejection test (T008). Reuses the one template so there is no second copy.
+fn signer_info_with_oid(oid: &str, cert_der: &[u8]) -> serde_json::Value {
+    let raw = std::fs::read_to_string(upstream_dir().join("credentials_info.json"))
+        .expect("read credentials_info template");
+    let substituted = raw
+        .replace("{{signer_cert_b64}}", &base64_std(cert_der))
+        .replace("{{key_algo_oid}}", oid)
+        .replace(
+            "{{signer_subject_dn}}",
+            "CN=Ed Wards,serialNumber=PNONL-789",
+        )
+        .replace("{{signer_serial}}", "PNONL-789");
+    serde_json::from_str(&substituted).unwrap()
 }
 
 fn http_ok_bytes(body: Vec<u8>) -> ResumeInput {
@@ -401,67 +622,9 @@ fn tsa_token_gen_time_is_parsed() {
 }
 
 /// Drive a B-T flow up to the TSA request; return the handle (at TimestampPending) + the TSA query.
-fn drive_bt_to_timestamp() -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
-    let cfg = TrustServiceConfiguration {
-        environment: Environment::Acceptance,
-        csc_api: CscApi::V1Rsa,
-        client_id: "client-123".into(),
-        client_secret: Secret::new("shh"),
-        redirect_uri: "https://app.example/cb".into(),
-        tsa: Some(TsaConfiguration {
-            url: "https://tsa.example/tsr".into(),
-            auth: None,
-            policy_oid: None,
-        }),
-    };
-    let request = SigningRequest {
-        document: minimal_pdf(),
-        conformance_level: ConformanceLevel::BT,
-        expected_signer: None,
-        appearance: None,
-        signature_meta: None,
-    };
-    let (h, s) = begin(request, cfg, ctx()).unwrap();
-    let state = match &s {
-        Step::Redirect(r) => r.state.clone(),
-        _ => panic!(),
-    };
-    let (h, _) = resume(
-        h,
-        ResumeInput::RedirectReturn {
-            code: "c".into(),
-            state,
-        },
-        ctx(),
-    )
-    .unwrap();
-    let (h, _) = resume(h, http_ok(upstream_fixture("service_token")), ctx()).unwrap();
-    let (h, _) = resume(h, http_ok(upstream_fixture("credentials_list")), ctx()).unwrap();
-    let (h, s) = resume(h, http_ok(signer_info()), ctx()).unwrap();
-    let state = match &s {
-        Step::Redirect(r) => r.state.clone(),
-        _ => panic!(),
-    };
-    let (h, _) = resume(
-        h,
-        ResumeInput::RedirectReturn {
-            code: "c2".into(),
-            state,
-        },
-        ctx(),
-    )
-    .unwrap();
-    let (h, s) = resume(h, http_ok(upstream_fixture("credential_token")), ctx()).unwrap();
-    let sign_req = match &s {
-        Step::PerformHttp(e) => e.clone(),
-        _ => panic!("expected signHash"),
-    };
-    let body: serde_json::Value = serde_json::from_slice(sign_req.body.as_ref().unwrap()).unwrap();
-    let tbs = base64_decode(body["hash"][0].as_str().unwrap()).unwrap();
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
-    let sig = key
-        .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &tbs)
-        .unwrap();
+fn drive_bt_to_timestamp(algo: KeyAlgo) -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
+    let (h, sign_req) = drive_to_sign_request(algo, ConformanceLevel::BT, signer_info(algo));
+    let sig = algo.sign_hash(&tbs_from_sign_request(&sign_req));
     let (h, s) = resume(
         h,
         http_ok(serde_json::json!({"signatures": [base64_std(&sig)]})),
@@ -479,8 +642,8 @@ fn drive_bt_to_timestamp() -> (cleverbase_core::SigningSessionHandle, Vec<u8>) {
     (h, tsa_req)
 }
 
-fn produce_signed_pdf_bt() -> SignedDocument {
-    let (h, tsa_req) = drive_bt_to_timestamp();
+fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
+    let (h, tsa_req) = drive_bt_to_timestamp(algo);
     // Play the TSA with OpenSSL over the real request.
     let resp = openssl_timestamp(&tsa_req);
     match resume(h, http_ok_bytes(resp), ctx()).unwrap().1 {
@@ -495,7 +658,7 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
         eprintln!("openssl not available; skipping");
         return;
     }
-    let (h, _tsa_req) = drive_bt_to_timestamp();
+    let (h, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
     // Feed a token bound to an UNRELATED imprint (as a MITM'd/replayed TSA would) — it must be
     // rejected, not embedded, because it does not cover our signature value.
     let bogus_req = cleverbase_core::timestamp::build_request(
@@ -523,43 +686,125 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         eprintln!("openssl not available; skipping B-T validation");
         return;
     }
-    let signed = produce_signed_pdf_bt();
-    assert_eq!(signed.conformance_level, ConformanceLevel::BT);
-    Document::load_mem(&signed.pdf).unwrap();
+    // Both algorithms, one path (FR-004): each B-T signature carries a timestamp token AND the base
+    // signature still verifies independently after timestamp embedding.
+    for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
+        let signed = produce_signed_pdf_bt(algo);
+        assert_eq!(signed.conformance_level, ConformanceLevel::BT);
+        Document::load_mem(&signed.pdf).unwrap();
 
+        let (content, cms_der) = extract(&signed.pdf);
+        assert!(
+            cleverbase_core::crypto::cms::has_signature_timestamp(&cms_der).unwrap(),
+            "{} B-T signature must carry a signature-time-stamp unsigned attribute",
+            algo.name(),
+        );
+        assert!(
+            openssl_cms_verify(&content, &cms_der),
+            "{} B-T base signature failed independent verification",
+            algo.name(),
+        );
+    }
+}
+
+/// T007 (core arm) / F1: a tampered ECDSA B-T CMS is ALSO rejected by the always-on bar — the
+/// timestamp embedding must not create a false-accept window.
+#[test]
+fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
+    if !openssl_available() {
+        eprintln!("openssl not available; skipping B-T tamper test");
+        return;
+    }
+    let signed = produce_signed_pdf_bt(KeyAlgo::EcdsaP256);
     let (content, cms_der) = extract(&signed.pdf);
     assert!(
-        cleverbase_core::crypto::cms::has_signature_timestamp(&cms_der).unwrap(),
-        "B-T signature must carry a signature-time-stamp unsigned attribute"
+        openssl_cms_verify(&content, &cms_der),
+        "baseline ECDSA B-T signature should verify before tampering",
     );
-
-    // The base signature still verifies independently after timestamp embedding.
-    let dir = std::env::temp_dir();
-    let cms_path = dir.join("cb_it_bt_cms.der");
-    let content_path = dir.join("cb_it_bt_content.bin");
-    std::fs::write(&cms_path, &cms_der).unwrap();
-    std::fs::write(&content_path, &content).unwrap();
-    let ca = materialize_ca_pem();
-    let out = Command::new("openssl")
-        .args([
-            "cms", "-verify", "-inform", "DER", "-binary", "-purpose", "any",
-        ])
-        .arg("-in")
-        .arg(&cms_path)
-        .arg("-content")
-        .arg(&content_path)
-        .arg("-CAfile")
-        .arg(&ca)
-        .arg("-out")
-        .arg(dir.join("cb_it_bt_out.bin"))
-        .output()
-        .expect("run openssl");
-    let _ = std::fs::remove_file(&cms_path);
-    let _ = std::fs::remove_file(&content_path);
-    let _ = std::fs::remove_file(&ca);
+    let tampered = flip_signature_byte(&cms_der);
+    assert_ne!(tampered, cms_der, "tamper must change the CMS bytes");
     assert!(
-        out.status.success(),
-        "B-T base signature verify failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !openssl_cms_verify(&content, &tampered),
+        "openssl cms -verify MUST reject a tampered ECDSA B-T signature",
     );
+}
+
+/// T008 / F2: a `credentials/info` advertising an unsupported key OID (Ed25519, `1.3.101.112`) —
+/// neither RSA nor P-256 — MUST terminate the flow with a specific credential-unavailable error and
+/// produce NO signature (the core never guesses an algorithm). Exercises the core's existing
+/// `KeyAlgo::Other` rejection end-to-end; no `src/` change.
+#[test]
+fn unsupported_key_oid_fails_with_no_signature() {
+    // Ed25519 (id-Ed25519, 1.3.101.112) is a valid key OID the SDK does not support in this phase.
+    let info = signer_info_with_oid("1.3.101.112", EC_CERT);
+
+    // Share the begin → … → credentials_list prefix; this test diverges by feeding a DIFFERENT
+    // credentials/info (the bad OID) at the signer_info step, where it must fail before any signHash.
+    let h = drive_to_credentials_info(KeyAlgo::EcdsaP256, ConformanceLevel::BB);
+    // The credentials/info advertising the unsupported OID must terminate the flow immediately.
+    let (handle, step) = resume(h, http_ok(info), ctx()).unwrap();
+    assert_eq!(
+        handle.phase,
+        cleverbase_core::SigningPhase::Failed,
+        "an unsupported key OID must fail the flow, not proceed",
+    );
+    // Reaching `Step::Failed` (never `Step::Done { signed, .. }`) is itself the "no signature
+    // produced" guarantee — the evidence record carries no signed document on failure.
+    match step {
+        Step::Failed { evidence } => {
+            assert_eq!(
+                evidence.outcome,
+                cleverbase_core::SigningOutcome::CredentialUnavailable,
+                "unsupported key OID must be a specific credential-unavailable outcome",
+            );
+            assert!(
+                evidence.failure_reason.is_some(),
+                "the failure must carry a specific human-readable reason",
+            );
+        }
+        other => panic!("expected Failed (no signature), got {other:?}"),
+    }
+}
+
+/// T009 / F3 (A1 — injection point is THIS Rust simulator): when the `signHash` simulator returns a
+/// bad ECDSA signature, the core MUST reject it rather than mis-encode a malformed CMS. Covers two
+/// realistic shapes: a WRONG RAW LENGTH (63/65 bytes — not 64, not valid DER, cannot be normalized) and
+/// a CORRECT-LENGTH-BUT-CRYPTOGRAPHICALLY-WRONG 64-byte r‖s (the realistic value a buggy/hostile CSC
+/// could return — it normalizes to a DER ECDSA-Sig-Value but fails the post-assembly self-verify). Both
+/// reach Failed/SignatureInvalid (no malformed CMS), end-to-end; no `src/` change.
+#[test]
+fn malformed_raw_ecdsa_length_is_rejected_by_core() {
+    for bad_len in [63usize, 64, 65] {
+        let algo = KeyAlgo::EcdsaP256;
+        // Share the full begin → … → signHash-request drive; this test diverges only by injecting a
+        // bad-length signHash RESPONSE below (instead of a real signature).
+        let (h, _sign_req) = drive_to_sign_request(algo, ConformanceLevel::BB, signer_info(algo));
+        // Return a bad raw signature. 63/65 bytes: wrong length — not 64, not valid DER — cannot be
+        // normalized. 64 bytes of garbage: correct length but a cryptographically wrong r‖s that DOES
+        // normalize to a DER ECDSA-Sig-Value yet fails the post-assembly self-verify. Either way the
+        // core must reject (Failed/SignatureInvalid), never embed a bad/malformed signature.
+        let bad_sig = vec![0x7Au8; bad_len];
+        let (handle, step) = resume(
+            h,
+            http_ok(serde_json::json!({"signatures": [base64_std(&bad_sig)]})),
+            ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle.phase,
+            cleverbase_core::SigningPhase::Failed,
+            "a {bad_len}-byte raw ECDSA signature must be rejected, not embedded",
+        );
+        // Reaching `Step::Failed` (not `Step::Done`) proves no malformed CMS was produced.
+        match step {
+            Step::Failed { evidence } => {
+                assert_eq!(
+                    evidence.outcome,
+                    cleverbase_core::SigningOutcome::SignatureInvalid,
+                    "a malformed ({bad_len}-byte) signature must fail self-verification",
+                );
+            }
+            other => panic!("expected Failed for {bad_len}-byte sig, got {other:?}"),
+        }
+    }
 }

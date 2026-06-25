@@ -1,0 +1,199 @@
+// Package e2e drives the reference signing service end-to-end. This file holds the pluggable
+// Authorizer seam used by both the credential-free flow (mockAutoApprove) and the gated live flow
+// (Interactive / Headless) — the only thing that differs between those runs (contracts/authorizer.md).
+package e2e
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// Authorizer completes one Cleverbase redirect (service-scope, then credential-scope/SCAL2) and
+// returns the OIDC callback parameters. It is the only thing that differs between credential-free and
+// live runs, and between human-in-the-loop and headless live runs: the driving loop only needs
+// (code, state) to call POST /v1/sign/complete, so swapping authorizers changes nothing in the
+// core/flow (FR-013, contracts/authorizer.md).
+type Authorizer interface {
+	// Authorize is given the authorize URL the flow produced and the CSRF state it expects back. It
+	// returns the (code, state) to feed into POST /v1/sign/complete, or an error.
+	Authorize(ctx context.Context, authorizeURL, expectState string) (code, state string, err error)
+}
+
+// errAuthNotCompleted is the sentinel for "the human/automation did not finish authorization within
+// the window" — the live path maps it to a clear, non-defect outcome (FR-011, Edge Cases).
+var errAuthNotCompleted = errors.New("authorization not completed")
+
+// errAuthDeclined is the sentinel for a signer decline / OIDC access_denied.
+var errAuthDeclined = errors.New("authorization declined")
+
+// errHeadlessNotConfigured is returned by Headless until an automatable Cleverbase test-credential
+// approval exists (a pending external dependency — see spec Dependencies / U1). The drop-in type
+// ships now; it fails fast with this specific error rather than hanging or panicking.
+var errHeadlessNotConfigured = errors.New("headless approval not configured: no automatable Cleverbase test-credential approval is wired (set REFSVC_LIVE_AUTHORIZER=interactive)")
+
+// mockAutoApprove is the credential-free Authorizer: it GETs the mock upstream's auto-approving
+// authorize endpoint (without following the redirect) and returns the code+state from the Location.
+// This is the refactored former followRedirect, now satisfying the Authorizer seam so the
+// credential-free loop is authorizer-agnostic.
+type mockAutoApprove struct{}
+
+func (mockAutoApprove) Authorize(ctx context.Context, authorizeURL, _ string) (code, state string, err error) {
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizeURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("build authorize request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("authorize GET: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return codeStateFromLocation(resp.Header.Get("Location"))
+}
+
+// codeStateFromLocation parses an OIDC redirect Location, returning (code, state) — or a declined
+// error when the callback carries error=access_denied (mapped distinctly from an SDK defect, FR-011).
+//
+// FR-010: the callback URL carries the live OIDC `code` (a secret). Errors here MUST NOT interpolate
+// the raw Location — only the structural parse failure is reported (no code/state values leak to logs).
+func codeStateFromLocation(loc string) (code, state string, err error) {
+	if loc == "" {
+		return "", "", errors.New("authorize response carried no Location redirect")
+	}
+	// FR-010: url.Parse's *url.Error embeds the FULL raw URL (including code=<secret>) in its message,
+	// so it MUST NOT be wrapped/propagated. Report a structural-only failure with no raw URL/code/state.
+	u, err := url.Parse(loc)
+	if err != nil {
+		return "", "", errors.New("parse redirect callback: malformed URL")
+	}
+	q := u.Query()
+	if e := q.Get("error"); e != "" {
+		if e == "access_denied" {
+			return "", "", fmt.Errorf("%w: %s", errAuthDeclined, e)
+		}
+		return "", "", fmt.Errorf("authorization error: %s", e)
+	}
+	return q.Get("code"), q.Get("state"), nil
+}
+
+// Interactive is the default live Authorizer: it surfaces the authorize URL to a human and captures
+// the redirect callback. Capture is via a state-matched waiter (WaitForCallback) or — as a simpler
+// fallback — a raw callback channel (CaptureCallback) fed by a redirect-capture listener or a stdin
+// paste; Timeout bounds the wait so an unapproved authorization fails fast with a clear "authorization
+// not completed" error instead of hanging (FR-011, Edge Cases).
+type Interactive struct {
+	// Surface is called with the authorize URL the human must open (e.g. print it / open a browser).
+	// If nil, the URL is not surfaced (the caller is expected to have arranged capture out of band).
+	Surface func(authorizeURL string)
+	// WaitForCallback, when set, is the state-matched capture seam: it blocks (bounded by ctx) until a
+	// redirect callback whose state EQUALS expectState is observed, returning that callback's raw URL.
+	// Callbacks for any OTHER state are ignored by the waiter, so a duplicate/stale leg's callback can
+	// never be delivered to this leg (no cross-leg CSRF poisoning). When set it takes precedence over
+	// CaptureCallback. The redirect-capture listener supplies this in the live harness.
+	WaitForCallback func(ctx context.Context, expectState string) (callbackURL string, err error)
+	// CaptureCallback is the simpler fallback capture seam: it yields the raw redirect callback URL (or
+	// query string) once the human completes the journey. It is used only when WaitForCallback is nil.
+	// Without either seam Authorize cannot complete and times out.
+	CaptureCallback <-chan string
+	// Timeout bounds the wait for the callback. Zero means "use the caller's context deadline only".
+	Timeout time.Duration
+}
+
+// Authorize surfaces the authorize URL (if a Surface hook is set), then waits — bounded by Timeout
+// and the caller's context — for the captured redirect callback, returning its (code, state). A
+// timeout/cancel yields errAuthNotCompleted (never a hang); access_denied yields errAuthDeclined; a
+// state that does not match expectState is rejected as a possible CSRF.
+func (i Interactive) Authorize(ctx context.Context, authorizeURL, expectState string) (code, state string, err error) {
+	if i.Surface != nil {
+		i.Surface(authorizeURL)
+	}
+	// Bound the wait: the context deadline AND (when set) the per-call Timeout, whichever is sooner.
+	if i.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.Timeout)
+		defer cancel()
+	}
+	// Prefer the state-matched waiter: it only returns a callback whose state == expectState, so a
+	// stale/duplicate callback from another leg is dropped at the source (no cross-leg CSRF poisoning).
+	if i.WaitForCallback != nil {
+		raw, werr := i.WaitForCallback(ctx, expectState)
+		if werr != nil {
+			return "", "", werr
+		}
+		return i.parseAndCheck(raw, expectState)
+	}
+	if i.CaptureCallback == nil {
+		// No capture mechanism: wait out the deadline rather than block forever, then fail clearly.
+		<-ctx.Done()
+		return "", "", fmt.Errorf("%w: no redirect-capture mechanism configured", errAuthNotCompleted)
+	}
+	select {
+	case <-ctx.Done():
+		return "", "", fmt.Errorf("%w: %w (signer did not approve within the window)", errAuthNotCompleted, ctx.Err())
+	case raw, ok := <-i.CaptureCallback:
+		if !ok {
+			return "", "", fmt.Errorf("%w: capture channel closed before a callback arrived", errAuthNotCompleted)
+		}
+		return i.parseAndCheck(raw, expectState)
+	}
+}
+
+// parseAndCheck extracts (code, state) from a captured callback and enforces the CSRF state echo.
+func (Interactive) parseAndCheck(raw, expectState string) (code, state string, err error) {
+	code, state, err = parseCapturedCallback(raw)
+	if err != nil {
+		return "", "", err
+	}
+	// CSRF: Cleverbase must echo back the state the flow issued. A mismatch is surfaced loudly,
+	// never silently accepted (contracts/authorizer.md). The state is a per-session secret echoed
+	// alongside the code, so the error MUST NOT interpolate the raw got/expected values (FR-010) —
+	// report only the lengths so a live state token can never reach a log via t.Fatalf.
+	if expectState != "" && state != expectState {
+		return "", "", fmt.Errorf("authorize state mismatch (possible CSRF): got state of length %d, expected length %d", len(state), len(expectState))
+	}
+	return code, state, nil
+}
+
+// parseCapturedCallback accepts either a full redirect URL or a bare query string and extracts
+// (code, state), surfacing access_denied as a decline.
+func parseCapturedCallback(raw string) (code, state string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("%w: empty callback", errAuthNotCompleted)
+	}
+	if strings.Contains(raw, "://") || strings.HasPrefix(raw, "/") {
+		return codeStateFromLocation(raw)
+	}
+	// FR-010: the raw query carries the live `code`/`state` (secrets). url.ParseQuery's error can echo
+	// the offending fragment of the query (e.g. a bad %-escape), so it MUST NOT be wrapped/propagated —
+	// report a structural-only failure with no raw query/code/state.
+	q, perr := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+	if perr != nil {
+		return "", "", errors.New("parse callback query: malformed query string")
+	}
+	if e := q.Get("error"); e != "" {
+		if e == "access_denied" {
+			return "", "", fmt.Errorf("%w: %s", errAuthDeclined, e)
+		}
+		return "", "", fmt.Errorf("authorization error: %s", e)
+	}
+	return q.Get("code"), q.Get("state"), nil
+}
+
+// Headless is the opt-in live Authorizer selected by REFSVC_LIVE_AUTHORIZER=headless. It is the
+// interface drop-in for an automatable Cleverbase test-credential approval (U1). The approval
+// mechanism is a pending external dependency; until it is wired, Authorize fails fast with the
+// specific errHeadlessNotConfigured error (never a hang/panic), keeping the shipped branch covered
+// and the interactive path unaffected.
+type Headless struct{}
+
+// Authorize fails fast with errHeadlessNotConfigured until an automatable Cleverbase test-credential
+// approval is wired (a pending external dependency).
+func (Headless) Authorize(context.Context, string, string) (code, state string, err error) {
+	return "", "", errHeadlessNotConfigured
+}

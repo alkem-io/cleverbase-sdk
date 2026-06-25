@@ -26,6 +26,13 @@ const (
 	ConformanceBT = "B-T"
 )
 
+// Supported live authorizer modes (REFSVC_LIVE_AUTHORIZER): the human-in-the-loop default and the
+// opt-in automatable test-credential approval (see e2e/authorizer.go).
+const (
+	AuthorizerInteractive = "interactive"
+	AuthorizerHeadless    = "headless"
+)
+
 // Harmless placeholders so a fixtures run needs no Cleverbase credentials: the SDK requires a
 // non-empty client_id/secret/redirect_uri even though the mock upstream ignores them.
 const (
@@ -41,6 +48,12 @@ const (
 	envPublicBaseURL = "REFSVC_PUBLIC_BASE_URL"
 	envRedirectURI   = "REFSVC_REDIRECT_URI"
 	envTsaURL        = "REFSVC_TSA_URL"
+)
+
+// Live-only knob names (the gated e2e/live_test.go path), named once for DRY.
+const (
+	envLiveAuthorizer = "REFSVC_LIVE_AUTHORIZER"
+	envLiveCABundle   = "REFSVC_LIVE_CA_BUNDLE"
 )
 
 // Profile is the validated run configuration (data-model: RunProfile).
@@ -70,6 +83,13 @@ type Profile struct {
 	DefaultConformance string // "B-B" | "B-T" when a request omits conformanceLevel
 	SessionTTL         time.Duration
 	Listen             string
+
+	// LiveAuthorizer selects the e2e live-path authorizer: "interactive" (default, human-in-the-loop)
+	// or "headless" (opt-in automatable approval). Only consulted by the gated live test.
+	LiveAuthorizer string
+	// LiveCABundle is the path to the real Cleverbase issuer-chain PEM used to independently verify a
+	// live-produced signature. Only consulted by the gated live test.
+	LiveCABundle string
 }
 
 func env(k, def string) string {
@@ -96,6 +116,8 @@ func Load() (*Profile, error) {
 		APIKey:                os.Getenv("REFSVC_API_KEY"),
 		DefaultConformance:    env("REFSVC_DEFAULT_CONFORMANCE", ConformanceBB),
 		Listen:                env("REFSVC_LISTEN", ":8080"),
+		LiveAuthorizer:        env(envLiveAuthorizer, AuthorizerInteractive),
+		LiveCABundle:          os.Getenv(envLiveCABundle),
 	}
 
 	ttlStr := env("REFSVC_SESSION_TTL", "15m")
@@ -226,6 +248,19 @@ func (p *Profile) validateLive() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("live mode requires: %s", strings.Join(missing, ", "))
+	}
+	// The live authorizer must be one of the two known modes; an unknown value would otherwise be
+	// silently ignored by the live test and pick the default.
+	if p.LiveAuthorizer != AuthorizerInteractive && p.LiveAuthorizer != AuthorizerHeadless {
+		return fmt.Errorf("invalid %s %q (%s|%s)", envLiveAuthorizer, p.LiveAuthorizer, AuthorizerInteractive, AuthorizerHeadless)
+	}
+	// REFSVC_LIVE_CA_BUNDLE is optional in the profile (the live test self-skips if it is absent), but
+	// when set it MUST point at an existing readable file: a typo'd path would otherwise surface only
+	// late, as a confusing verification failure rather than a clear config error.
+	if p.LiveCABundle != "" {
+		if _, err := os.Stat(p.LiveCABundle); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", envLiveCABundle, p.LiveCABundle, err)
+		}
 	}
 	return nil
 }

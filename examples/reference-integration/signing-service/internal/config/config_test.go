@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,8 +12,9 @@ import (
 var knownEnvKeys = []string{
 	"REFSVC_API_KEY", "REFSVC_AUTH_DISABLED", "REFSVC_BASE_URL", "REFSVC_CLIENT_ID",
 	"REFSVC_CLIENT_SECRET", "REFSVC_CSC_API", "REFSVC_DEFAULT_CONFORMANCE", "REFSVC_ENV",
-	"REFSVC_LISTEN", "REFSVC_MODE", "REFSVC_PUBLIC_BASE_URL", "REFSVC_REDIRECT_URI",
-	"REFSVC_SESSION_TTL", "REFSVC_TSA_AUTH", "REFSVC_TSA_POLICY", "REFSVC_TSA_URL",
+	"REFSVC_LISTEN", "REFSVC_LIVE_AUTHORIZER", "REFSVC_LIVE_CA_BUNDLE", "REFSVC_MODE",
+	"REFSVC_PUBLIC_BASE_URL", "REFSVC_REDIRECT_URI", "REFSVC_SESSION_TTL", "REFSVC_TSA_AUTH",
+	"REFSVC_TSA_POLICY", "REFSVC_TSA_URL",
 }
 
 // setEnv sets env vars for a test (restored afterward by t.Setenv), clearing every known REFSVC_* key
@@ -159,6 +162,81 @@ func TestMalformedURLsFailFast(t *testing.T) {
 	})
 	if _, err := Load(); err != nil {
 		t.Fatalf("well-formed URLs should load: %v", err)
+	}
+}
+
+// validLiveEnv is a fully-configured live profile (loads OK). Cases mutate a copy.
+func validLiveEnv() map[string]string {
+	return map[string]string{
+		"REFSVC_MODE": "live", "REFSVC_API_KEY": "k", "REFSVC_DEFAULT_CONFORMANCE": "B-B",
+		"REFSVC_CLIENT_ID": "c", "REFSVC_CLIENT_SECRET": "s", "REFSVC_REDIRECT_URI": "https://a/cb",
+		"REFSVC_TSA_URL": "https://tsa.example/tsr",
+	}
+}
+
+func TestLiveAuthorizerDefaultAndValidation(t *testing.T) {
+	// Default: an unset REFSVC_LIVE_AUTHORIZER resolves to "interactive".
+	setEnv(t, validLiveEnv())
+	p, err := Load()
+	if err != nil {
+		t.Fatalf("valid live profile should load: %v", err)
+	}
+	if p.LiveAuthorizer != AuthorizerInteractive {
+		t.Fatalf("default LiveAuthorizer = %q, want %q", p.LiveAuthorizer, AuthorizerInteractive)
+	}
+	if p.LiveCABundle != "" {
+		t.Fatalf("LiveCABundle should default empty, got %q", p.LiveCABundle)
+	}
+	// "headless" is an accepted value.
+	e := validLiveEnv()
+	e["REFSVC_LIVE_AUTHORIZER"] = "headless"
+	setEnv(t, e)
+	p, err = Load()
+	if err != nil {
+		t.Fatalf("headless authorizer should load: %v", err)
+	}
+	if p.LiveAuthorizer != AuthorizerHeadless {
+		t.Fatalf("LiveAuthorizer = %q, want %q", p.LiveAuthorizer, AuthorizerHeadless)
+	}
+	// An unknown authorizer mode must fail fast.
+	e = validLiveEnv()
+	e["REFSVC_LIVE_AUTHORIZER"] = "robot"
+	setEnv(t, e)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid REFSVC_LIVE_AUTHORIZER to fail Load()")
+	}
+}
+
+func TestLiveCABundleValidation(t *testing.T) {
+	// A REFSVC_LIVE_CA_BUNDLE pointing at a missing file must fail fast.
+	e := validLiveEnv()
+	e["REFSVC_LIVE_CA_BUNDLE"] = filepath.Join(t.TempDir(), "does-not-exist.pem")
+	setEnv(t, e)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected a missing REFSVC_LIVE_CA_BUNDLE file to fail Load()")
+	}
+	// An existing file loads and is recorded on the profile.
+	bundle := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(bundle, []byte("-----BEGIN CERTIFICATE-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e = validLiveEnv()
+	e["REFSVC_LIVE_CA_BUNDLE"] = bundle
+	setEnv(t, e)
+	p, err := Load()
+	if err != nil {
+		t.Fatalf("existing CA bundle should load: %v", err)
+	}
+	if p.LiveCABundle != bundle {
+		t.Fatalf("LiveCABundle = %q, want %q", p.LiveCABundle, bundle)
+	}
+	// The live-only knobs are not validated in fixtures mode (an unknown value is irrelevant there).
+	fe := fixturesEnv()
+	fe["REFSVC_LIVE_AUTHORIZER"] = "robot"
+	fe["REFSVC_LIVE_CA_BUNDLE"] = filepath.Join(t.TempDir(), "nope.pem")
+	setEnv(t, fe)
+	if _, err := Load(); err != nil {
+		t.Fatalf("fixtures mode must ignore live-only knobs, got: %v", err)
 	}
 }
 

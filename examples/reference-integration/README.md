@@ -141,13 +141,15 @@ the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `cre
 | `REFSVC_MODE` | `fixtures` | `fixtures` (mock upstream) or `live` (Cleverbase). |
 | `REFSVC_BASE_URL` | — | Mock upstream base URL; **required in fixtures mode**. |
 | `REFSVC_ENV` | `acceptance` | `acceptance` or `production`. |
-| `REFSVC_CSC_API` | `v1_rsa` | `v1_rsa` or `v2_ecdsa`. |
+| `REFSVC_CSC_API` | `v1_rsa` | `v1_rsa` or `v2_ecdsa`. Both algorithms (RSA and ECDSA P-256) are signed and independently validated end-to-end at parity — see the credential-free E2E table and the core's `independent_validation` test. |
 | `REFSVC_CLIENT_ID` | — | OAuth client id (**required in live**). |
 | `REFSVC_CLIENT_SECRET` | — | OAuth client secret (**required in live**). |
 | `REFSVC_REDIRECT_URI` | — | Registered redirect URI (**required in live**). |
 | `REFSVC_TSA_URL` | — | RFC 3161 TSA endpoint (**required in live** — conformance is per-request, so a live deployment must always be able to serve B-T). |
 | `REFSVC_TSA_AUTH` | — | Optional TSA authorization header value. |
 | `REFSVC_TSA_POLICY` | — | Optional TSA policy OID. |
+| `REFSVC_LIVE_AUTHORIZER` | `interactive` | Live contract path only: `interactive` (a human completes the Cleverbase approval) or `headless` (opt-in automatable test-credential approval). |
+| `REFSVC_LIVE_CA_BUNDLE` | — | Live contract path only: PEM of the real Cleverbase issuer chain, used to independently verify a live-produced signature. |
 | `REFSVC_API_KEY` | — | Bearer key for the service's REST API; auth is on by default. |
 | `REFSVC_AUTH_DISABLED` | `false` | Set `true` to run without a key in local fixtures only. |
 | `REFSVC_DEFAULT_CONFORMANCE` | `B-B` | `B-B` or `B-T` when a request omits `conformanceLevel`. |
@@ -155,6 +157,14 @@ the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `cre
 | `REFSVC_LISTEN` | `:8080` | Listen address. |
 
 In fixtures mode the service supplies harmless default credentials (the mock ignores them) and defaults `REFSVC_TSA_URL` to `<REFSVC_BASE_URL>/tsr`, so a fixtures run needs no Cleverbase credentials.
+
+**Signature validation.** Every produced B-B/B-T signature — RSA and ECDSA P-256 — is independently
+verified with OpenSSL (the always-on bar). An **opt-in** PAdES/eIDAS baseline-profile conformance gate
+(`scripts/validate-pades.sh`, pyHanko + EU DSS; CI: `profile-conformance.yml`, off by default) can
+additionally assert the ETSI EN 319 142 `PAdES-BASELINE-B/-T` level. A **live contract path**
+(`e2e/live_test.go`, opt-in, gated on real Cleverbase credentials via `REFSVC_LIVE_*`; CI: `live.yml`) signs
+against the real service and verifies the result against the real issuer chain; it is skipped cleanly when
+credentials are absent.
 
 ### mock-upstream (`REFMOCK_*`)
 

@@ -1,0 +1,127 @@
+name: Live contract path (opt-in)
+
+# Opt-in only: the live Cleverbase contract test (US2) signs against the REAL acceptance service and
+# verifies the result against the REAL issuer chain. It is never part of the default pipeline — it is
+# triggered manually and is gated on real-credential secrets that only exist in the protected
+# environment. Each algorithm leg SKIPS cleanly when that algorithm's credential is absent; the suite
+# passes when at least one leg verified (FR-007/008). Secrets are referenced only as env vars consumed
+# by the test process and are NEVER echoed (FR-010).
+
+on:
+  # No inputs: B-B is always driven; B-T is additionally exercised when a TSA URL secret
+  # (LIVE_TSA_URL → REFSVC_TSA_URL) is provided to the protected environment. A missing TSA must not
+  # block B-B (FR-015), so conformance is driven by secret presence, not a manual input.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: Live signing (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    # The real credentials live in a protected GitHub Environment; manual approval gates the run.
+    environment: live-acceptance
+    strategy:
+      fail-fast: false
+      # Matrix over both algorithms (F6): v1_rsa and v2_ecdsa. Each leg is independently gated on its
+      # own credential secret and skips when that secret is absent — a single available credential is
+      # sufficient for the suite to pass.
+      matrix:
+        include:
+          - leg: v1_rsa
+            csc_api: v1_rsa
+          - leg: v2_ecdsa
+            csc_api: v2_ecdsa
+    # SINGLE SOURCE OF TRUTH for the per-leg credential selection, consumed by BOTH the gate step and
+    # the test-run step below (DRY — they previously duplicated this 4x). Per-leg gating uses ONLY this
+    # leg's own credential: two single-arm `&&` conditions OR'd together yield exactly this leg's secret
+    # and an empty string for the other leg — never cross-wired, so a leg with no credential is skipped
+    # rather than running with the wrong algorithm's credential.
+    # The trailing `|| ''` is REQUIRED: GHA `&&`/`||` return the operand JS-style, so when this leg's
+    # own secret is empty the expression collapses to the boolean `false`
+    # (`(true && '') || (false && Y)` → `'' || false` → `false`), which GHA renders as the literal
+    # string "false" — non-empty, so the `[ -n ... ]` gate would mis-detect an ABSENT credential as
+    # present and RUN the leg with CLIENT_ID="false". `|| ''` forces the all-falsy case back to a
+    # genuine empty string so the leg skips cleanly.
+    env:
+      LEG_CLIENT_ID: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA) || '' }}
+      LEG_CLIENT_SECRET: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA) || '' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Per-leg skip gate: decide whether this algorithm's credential exists WITHOUT printing it. We
+      # only emit a boolean ("present"), never the secret value.
+      - name: Gate — is this algorithm's credential configured?
+        id: gate
+        env:
+          # Per-leg credential from the job-level `env` above (single source of truth). It is already
+          # this leg's own secret (or a genuine empty string when absent — never the literal "false"),
+          # so the `[ -n ... ]` gate below correctly detects present vs absent.
+          CLIENT_ID: ${{ env.LEG_CLIENT_ID }}
+          CLIENT_SECRET: ${{ env.LEG_CLIENT_SECRET }}
+          REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
+          CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
+        run: |
+          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ] && [ -n "$REDIRECT_URI" ] && [ -n "$CA_BUNDLE_B64" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping ${{ matrix.leg }}: its live credential / trust bundle is not configured."
+          fi
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        if: steps.gate.outputs.present == 'true'
+        run: rustup show
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: steps.gate.outputs.present == 'true'
+        with:
+          go-version: "1.22"
+
+      - name: Build the cleverbase-ffi library
+        if: steps.gate.outputs.present == 'true'
+        run: cargo build -p cleverbase-ffi
+
+      # Materialize the real issuer-chain PEM from a base64 secret into a workspace file the test reads
+      # via REFSVC_LIVE_CA_BUNDLE. The decoded bytes are written straight to a file, never printed.
+      - name: Materialize the live trust bundle
+        if: steps.gate.outputs.present == 'true'
+        env:
+          CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
+        run: |
+          printf '%s' "$CA_BUNDLE_B64" | base64 -d > "$RUNNER_TEMP/live-ca-bundle.pem"
+
+      - name: Live contract test (${{ matrix.leg }} → start/complete×2/result/verify)
+        if: steps.gate.outputs.present == 'true'
+        working-directory: examples/reference-integration/signing-service
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          REFSVC_MODE: live
+          REFSVC_ENV: acceptance
+          REFSVC_CSC_API: ${{ matrix.csc_api }}
+          # Headless: unattended CI cannot do an interactive human approval. The headless approval
+          # mechanism is a PENDING external dependency (U1) — until it is wired, TestLive SKIPS this leg
+          # cleanly (green), and runs it for real the moment the mechanism exists. Defaults to
+          # interactive locally.
+          REFSVC_LIVE_AUTHORIZER: headless
+          # Per-leg credential from the job-level `env` above (single source of truth, same value the
+          # gate checked): ONLY this leg's own secret. This step only runs when the gate found the
+          # credential present, so the value here is always the real secret.
+          REFSVC_CLIENT_ID: ${{ env.LEG_CLIENT_ID }}
+          REFSVC_CLIENT_SECRET: ${{ env.LEG_CLIENT_SECRET }}
+          REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
+          # B-T is exercised only when a TSA URL secret is present (a missing TSA must NOT block B-B).
+          REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
+        run: |
+          export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
+          # -run Live covers exactly the configured REFSVC_CSC_API algorithm for this leg; "both" is
+          # this matrix. Keep -v so a skip (missing creds) is visible but no secret is printed.
+          go test -race -run 'Live' -v ./e2e/

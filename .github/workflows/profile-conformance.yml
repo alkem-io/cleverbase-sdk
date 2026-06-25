@@ -1,0 +1,252 @@
+name: PAdES profile conformance (opt-in)
+
+# OPT-IN PAdES/eIDAS profile-conformance gate (feature 003, task T017, FR-014).
+#
+# This job is OFF BY DEFAULT. It never runs on push or pull_request — only when manually dispatched
+# (`workflow_dispatch`) or when a PR carries the `profile-conformance` label. It is an ADDITIONAL gate
+# over the always-on credential-free E2E (test.yml), never a replacement: it asserts ETSI EN 319 142
+# PAdES BASELINE-B/-T conformance with pyHanko (AdES validation, RSA + ECDSA) and EU DSS (the
+# structural baseline-LEVEL assertion). The profile-gate toolchain (pyHanko venv + the EU DSS
+# container) is NEVER linked into or required by the shipped SDK (Constitution Principle V).
+#
+# It generates the credential-free B-B and B-T PDFs for BOTH algorithms (v1_rsa, v2_ecdsa) by booting
+# the existing mock upstream + reference signing service (no Cleverbase credentials) and driving the
+# real REST flow with curl — reusing the real service wiring, adding no SDK/e2e code — then runs
+# scripts/validate-pades.sh over each produced PDF.
+#
+# Reproducibility: the pinned tool versions (pyhanko-cli, pyHanko, the EU DSS image) are the SINGLE
+# SOURCE declared in scripts/validate-pades.sh; this workflow reads them via `--print-pins` so the
+# CI install can never drift from the local gate (Constitution Principle III).
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, opened, reopened, synchronize]
+
+# Read-only: this gate validates already-produced signatures; it publishes nothing.
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes an in-flight run.
+concurrency:
+  group: profile-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  profile-conformance:
+    name: PAdES B-B/B-T conformance (pyHanko + EU DSS)
+    runs-on: ubuntu-latest
+    # Label gate: on a pull_request event, only run when the PR carries the `profile-conformance`
+    # label (so it stays off by default); workflow_dispatch always runs. This is what keeps the
+    # heavyweight pyHanko+DSS toolchain off the default PR path.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'profile-conformance')
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust (pinned via rust-toolchain.toml)
+        run: rustup show
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.22"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      # ---------------------------------------------------------------------------------------------
+      # Read the pinned tool versions from the gate script (single source of truth — Principle III).
+      # ---------------------------------------------------------------------------------------------
+      - name: Read pinned toolchain versions from validate-pades.sh
+        id: pins
+        run: |
+          bash scripts/validate-pades.sh --print-pins | tee -a "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------------------------------
+      # Install the PINNED pyHanko CLI into a throwaway venv (never a build/runtime SDK dependency).
+      # ---------------------------------------------------------------------------------------------
+      - name: Install pinned pyHanko CLI into a throwaway venv
+        run: |
+          python -m venv "$RUNNER_TEMP/pyhanko-venv"
+          "$RUNNER_TEMP/pyhanko-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/pyhanko-venv/bin/pip" install \
+            "pyHanko==${{ steps.pins.outputs.PYHANKO_VERSION }}" \
+            "pyhanko-cli==${{ steps.pins.outputs.PYHANKO_CLI_VERSION }}"
+          "$RUNNER_TEMP/pyhanko-venv/bin/pyhanko" --version
+
+      # ---------------------------------------------------------------------------------------------
+      # Pull the pinned EU DSS validation web app (same reference the script declares via --print-pins).
+      # The default DSS_IMAGE is a pinned RELEASE TAG (a mutable registry tag, not a content digest);
+      # override DSS_IMAGE with an @sha256:... reference for a true digest pin. If this image is
+      # unavailable the gate self-skips the DSS half; pulling here surfaces the reference explicitly.
+      # ---------------------------------------------------------------------------------------------
+      - name: Pull pinned EU DSS validation image
+        run: |
+          docker pull "${{ steps.pins.outputs.DSS_IMAGE }}" || \
+            echo "::warning::EU DSS image ${{ steps.pins.outputs.DSS_IMAGE }} could not be pulled; the gate will self-skip the level assertion"
+
+      # ---------------------------------------------------------------------------------------------
+      # Build the FFI staticlib/dylib + the mock upstream and reference service binaries.
+      # ---------------------------------------------------------------------------------------------
+      - name: Build cleverbase-ffi
+        run: cargo build -p cleverbase-ffi
+
+      - name: Build mock upstream + reference signing service
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+        run: |
+          go build -o "$RUNNER_TEMP/mockupstream" \
+            ./examples/reference-integration/mock-upstream/cmd/mockupstream
+          go build -o "$RUNNER_TEMP/refsvc" \
+            ./examples/reference-integration/signing-service/cmd/refsvc
+
+      # ---------------------------------------------------------------------------------------------
+      # Produce the credential-free B-B and B-T PDFs for BOTH algorithms by driving the real REST flow
+      # (start -> authorize redirect -> complete x2 -> result) with curl against the booted services.
+      # No SDK/e2e code is added; this reuses the shipped service wiring (Principle III / FR-024).
+      # ---------------------------------------------------------------------------------------------
+      - name: Produce credential-free B-B/B-T PDFs for both algorithms
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/pades-pdfs"
+          mkdir -p "$OUT"
+          echo "PADES_TEST_PDF_DIR=$OUT" >> "$GITHUB_ENV"
+
+          API_KEY="profile-gate-key"
+          MOCK_PORT=9000
+          SVC_PORT=8080
+
+          # Boot the mock upstream once (it serves both /csc/v1 RSA and /csc/v2 ECDSA routes + TSA).
+          # REFMOCK_FIXTURES_DIR is the dir that CONTAINS upstream/ and pki/ (the mock joins those
+          # subdirs itself — see mock.New/readFixturesAndPKI), so point it at tests/fixtures, NOT
+          # tests/fixtures/upstream (matching findFixtures in the in-process tests).
+          REFMOCK_FIXTURES_DIR="$GITHUB_WORKSPACE/tests/fixtures" \
+          REFMOCK_LISTEN=":$MOCK_PORT" \
+            "$RUNNER_TEMP/mockupstream" &
+          MOCK_PID=$!
+          trap 'kill "$MOCK_PID" 2>/dev/null || true' EXIT
+          # Wait for the mock to answer. The /oauth2/authorize endpoint needs query params, so it
+          # returns 400 without them — but any HTTP status other than the curl "000" (no connection)
+          # proves the listener is up.
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MOCK_PORT/oauth2/authorize" || true)"
+            if [ -n "$code" ] && [ "$code" != "000" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          # produce <algo> <level> -> writes $OUT/<level>-<algo>.pdf
+          produce() {
+            local algo="$1" level="$2"
+            local svc_pid
+            REFSVC_MODE=fixtures \
+            REFSVC_ENV=acceptance \
+            REFSVC_CSC_API="$algo" \
+            REFSVC_CLIENT_ID=refsvc-fixtures \
+            REFSVC_CLIENT_SECRET=fixtures \
+            REFSVC_REDIRECT_URI="http://app/return" \
+            REFSVC_BASE_URL="http://127.0.0.1:$MOCK_PORT" \
+            REFSVC_TSA_URL="http://127.0.0.1:$MOCK_PORT/tsr" \
+            REFSVC_API_KEY="$API_KEY" \
+            REFSVC_DEFAULT_CONFORMANCE="$level" \
+            REFSVC_LISTEN=":$SVC_PORT" \
+              "$RUNNER_TEMP/refsvc" &
+            svc_pid=$!
+
+            # Wait for the service health endpoint.
+            for _ in $(seq 1 30); do
+              if curl -fsS -o /dev/null "http://127.0.0.1:$SVC_PORT/healthz" 2>/dev/null; then
+                break
+              fi
+              sleep 1
+            done
+
+            local doc start corr redirect code state status
+            doc="$(base64 -w0 "$GITHUB_WORKSPACE/examples/reference-integration/signing-service/cmd/refsvc/sample.pdf")"
+            start="$(curl -fsS -X POST "http://127.0.0.1:$SVC_PORT/v1/sign/start" \
+              -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+              --data "{\"document\":\"$doc\",\"conformanceLevel\":\"$level\"}")"
+            corr="$(printf '%s' "$start" | python3 -c 'import json,sys;print(json.load(sys.stdin)["correlationId"])')"
+            redirect="$(printf '%s' "$start" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("redirectUrl",""))')"
+
+            # Drive the authorize redirect -> complete loop up to twice (mirrors the e2e runFlow).
+            status=""
+            for _ in 1 2; do
+              [ -z "$redirect" ] && break
+              # Follow the authorize URL WITHOUT following its redirect; capture the Location header.
+              local loc
+              loc="$(curl -s -o /dev/null -D - "$redirect" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')"
+              code="$(printf '%s' "$loc" | sed -n 's/.*[?&]code=\([^&]*\).*/\1/p')"
+              state="$(printf '%s' "$loc" | sed -n 's/.*[?&]state=\([^&]*\).*/\1/p')"
+              local cresp
+              cresp="$(curl -fsS -X POST "http://127.0.0.1:$SVC_PORT/v1/sign/complete" \
+                -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+                --data "{\"code\":\"$code\",\"state\":\"$state\"}")"
+              status="$(printf '%s' "$cresp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))')"
+              redirect="$(printf '%s' "$cresp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("redirectUrl",""))')"
+              [ "$status" = "completed" ] && break
+            done
+
+            if [ "$status" != "completed" ]; then
+              echo "::error::producer for $level/$algo did not complete (status=$status)"
+              kill "$svc_pid" 2>/dev/null || true
+              exit 1
+            fi
+
+            curl -fsS "http://127.0.0.1:$SVC_PORT/v1/sign/result?correlationId=$corr" \
+              -H "Authorization: Bearer $API_KEY" -o "$OUT/$level-$algo.pdf"
+            echo "produced $OUT/$level-$algo.pdf ($(wc -c < "$OUT/$level-$algo.pdf") bytes)"
+
+            kill "$svc_pid" 2>/dev/null || true
+            wait "$svc_pid" 2>/dev/null || true
+          }
+
+          for algo in v1_rsa v2_ecdsa; do
+            produce "$algo" B-B
+            produce "$algo" B-T
+          done
+
+          ls -l "$OUT"
+
+      # ---------------------------------------------------------------------------------------------
+      # Materialize the synthetic CA (DER -> PEM) the credential-free fixtures chain to, for --trust.
+      # ---------------------------------------------------------------------------------------------
+      - name: Materialize synthetic CA trust bundle (PEM)
+        run: |
+          openssl x509 -inform DER \
+            -in "$GITHUB_WORKSPACE/tests/fixtures/pki/ca.cert.der" \
+            -out "$RUNNER_TEMP/ca.pem"
+          echo "TRUST_PEM=$RUNNER_TEMP/ca.pem" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------------------------------
+      # Run the gate over EVERY produced PDF (both algorithms, both levels). No sampling/skips (C1):
+      # B-B PDFs asserted at B-B, B-T PDFs asserted at B-T.
+      # ---------------------------------------------------------------------------------------------
+      - name: Run profile-conformance gate over all produced PDFs
+        env:
+          PYHANKO_VENV: ${{ runner.temp }}/pyhanko-venv
+          DSS_IMAGE: ${{ steps.pins.outputs.DSS_IMAGE }}
+        run: |
+          set -euo pipefail
+          echo "Validating B-B PDFs..."
+          bash scripts/validate-pades.sh --expect-level B-B --trust "$TRUST_PEM" \
+            "$PADES_TEST_PDF_DIR"/B-B-*.pdf
+          echo "Validating B-T PDFs..."
+          bash scripts/validate-pades.sh --expect-level B-T --trust "$TRUST_PEM" \
+            "$PADES_TEST_PDF_DIR"/B-T-*.pdf
+
+      # ---------------------------------------------------------------------------------------------
+      # Also exercise the gate's own test harness against the produced corpus (T015).
+      # ---------------------------------------------------------------------------------------------
+      - name: Run gate self-test (test-validate-pades.sh)
+        env:
+          PYHANKO_VENV: ${{ runner.temp }}/pyhanko-venv
+          DSS_IMAGE: ${{ steps.pins.outputs.DSS_IMAGE }}
+        run: bash scripts/test-validate-pades.sh
