@@ -14,7 +14,7 @@ See `specs/004-attestation-and-verification/` for the spec, plan, data-model, an
 ## Design constraints (from the plan)
 
 - **No hand-rolled crypto** (Principle IV): signatures and digests go through the SDK's existing
-  RustCrypto stack (`p256`/`ecdsa`/`rsa`/`sha2`/`x509-cert`/`cms`) plus `coset` for COSE.
+  RustCrypto stack (`p256`/`ecdsa`/`rsa`/`sha2`/`x509-cert`) plus `coset` for COSE.
 - **One Rust core** (Principle III): all attestation logic lives here, surfaced over the existing
   `cleverbase-ffi` C-ABI; the bindings stay thin.
 - **Not a wallet** (Principle IV): holder keys are the integrator's, exercised via the spec-001
@@ -26,9 +26,52 @@ User Story 1 (feature 004 — the MVP) is implemented: the global [`verify()`] e
 the always-on bar over both format verifiers ([`sdjwtvc`], [`mdoc`]), the native EU trust-list
 engine ([`trust`]), the revocation/[`status`] check (fail-closed by default), and the
 [`openid4vp`] request binding (nonce + audience), surfaced over the `cleverbase-ffi` C-ABI via
-[`wire`]. The opt-in [`qualified`]-status gate (T019) and the gated [`issuance`] path (US2)
-remain stubs filled in by later tasks; [`verify::VerifyContext::qualified_gate`] is the off-by-
-default seam for the former.
+[`wire`]. The opt-in [`qualified`]-status gate (eIDAS qualified-status determination) is
+implemented and off by default ([`verify::VerifyContext::qualified_gate`] is the seam); the gated
+[`issuance`] path (US2 — OpenID4VCI `obtain` + OpenID4VP holder `present` via the signer-hook) is
+implemented and skips when no issuer backend is configured.
+
+## Module `crypto`
+
+Shared crate-internal crypto helpers (DRY — Constitution Principle III): the **one** SHA-256
+digest, the **one** P-256 JWK → SEC1 decode, the **one** cert-DER → P-256 verifying-key path, and
+the IANA hash-algorithm name the verifier supports.
+
+The JWK decode + digest were previously copy-pasted across [`crate::sdjwtvc`] (the SD-JWT VC
+verifier), [`crate::issuance::signer`] (the holder context), and [`mod@crate::issuance::present`]
+(the `_sd_alg` name) — three independent transcriptions of the same `kty=EC`/`crv=P-256` guard,
+base64url `x`/`y` decode, 32-byte-length check, and `0x04 ‖ X ‖ Y` SEC1 assembly, plus two copies
+of `sha256(&[u8]) -> [u8; 32]` and a stray `"sha-256"` literal. The cert-DER → verifying-key
+`Certificate::from_der → subject_public_key_info.to_der() → from_public_key_der` sequence was
+likewise transcribed in both issuer-signature verifiers ([`crate::sdjwtvc`]'s JWS `x5c` leaf and
+[`crate::mdoc`]'s COSE_Sign1 `IssuerAuth` `x5chain` leaf). All are consolidated here so there is
+one authoritative source.
+
+No hand-rolled crypto (Principle IV): the digest is the SDK's vetted `sha2`, the public-point
+decode ends in `p256::ecdsa::VerifyingKey::from_sec1_bytes`, and the cert path ends in
+`from_public_key_der` — each crate's own on-curve check is preserved.
+
+## Module `datetime`
+
+One authoritative RFC 3339 / ISO 8601 **UTC** timestamp parser for the whole verifier (DRY —
+Constitution Principle III).
+
+Both the mdoc MSO `validityInfo` (`validFrom`/`validUntil`/`signed`) and the trust-list
+timestamps (TS 119 612 `NextUpdate`, qualified-status effective `startingTime`) need the same
+grammar: the `YYYY-MM-DDThh:mm:ssZ` UTC form, with optional fractional seconds. They previously
+carried two independent copies, both of which validated the day only as `1..=31` for *every*
+month — so `2023-02-31`, `2023-04-31`, and `2023-02-29` (non-leap) parsed to a **wrong instant**
+(`civil_to_unix` silently rolls an over-long day forward into the next month). For a validity
+window / stale-list boundary that is a security defect (a tampered or malformed instant is
+accepted instead of failing closed).
+
+This single parser is **correct** (day-of-month is validated against the month and leap year)
+and **fails closed** (returns `None` on any deviation), so a malformed timestamp can never parse
+to a wrong instant.
+
+No date crate: the civil-date math is the public-domain `days_from_civil` algorithm (Howard
+Hinnant) — the same self-contained algorithm `chrono`/`time` use — keeping the verifier
+pure-Rust / WASM-able with no extra dependency.
 
 ## Module `issuance`
 
@@ -112,17 +155,35 @@ returning its CBOR encoding (the `deviceAuth.deviceSignature` value).
 ##### fn `build_device_signature`
 
 ```rust
-fn build_device_signature(doc_type: &str, session_transcript: &[u8], audience: &str, nonce: &str) -> Result<DeviceSignatureBuild, SignerError>
+fn build_device_signature(doc_type: &str, session_transcript: &[u8], device_name_spaces_bytes: &[u8], audience: &str, nonce: &str) -> Result<DeviceSignatureBuild, SignerError>
 ```
 
 Build the mdoc `DeviceSignature` signing input over the `DeviceAuthentication` for `doc_type`,
 bound to a session-transcript handover that folds in `audience`/`nonce`.
 
 `session_transcript` is the CBOR `SessionTranscript` the holder signs over (for OpenID4VP, the
-[`crate::openid4vp::oid4vp_handover_transcript`] of `audience`+`nonce`); the empty
-`DeviceNameSpaces` (`#6.24(bstr .cbor {})`) is used (the device discloses no extra namespaces).
+[`crate::openid4vp::oid4vp_handover_transcript`] of `audience`+`nonce`). `device_name_spaces_bytes`
+is the **exact** `DeviceNameSpacesBytes` (`#6.24(bstr .cbor DeviceNameSpaces)`) of the
+`deviceSigned.nameSpaces` being presented — the verifier rebuilds `DeviceAuthentication` from the
+document's *actual* `deviceSigned.nameSpaces` ([`crate::mdoc`]), so the signature MUST cover the
+same bytes or a device-disclosed (non-empty) namespace map would be rejected. Use
+[`empty_device_name_spaces_bytes`] for the empty-disclosure case.
 The host signs [`DeviceSignatureBuild::input`]; [`DeviceSignatureBuild::assemble`] splices the
 result.
+
+# Errors
+
+[`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value, or a
+malformed `session_transcript` / `device_name_spaces_bytes` (not decodable CBOR).
+
+##### fn `empty_device_name_spaces_bytes`
+
+```rust
+fn empty_device_name_spaces_bytes() -> Result<Vec<u8>, SignerError>
+```
+
+The `DeviceNameSpacesBytes` for an empty device-disclosed namespace map (`#6.24(bstr .cbor {})`)
+— the bytes to sign over when the device discloses no extra namespaces.
 
 # Errors
 
@@ -168,8 +229,12 @@ reference issuer supports). The `credential_configuration_id` selects which cred
 
 ###### Fields
 
-- `pre_authorized_code: String`
-  - The OpenID4VCI `pre-authorized_code` from the offer's grant.
+- `pre_authorized_code: Secret`
+  - The OpenID4VCI `pre-authorized_code` from the offer's grant. It is a bearer grant (redeemable
+for the credential), so it is held as a redacting [`Secret`] — it never appears in
+`Debug`/log/panic output (FR-010, Constitution Principle IV), yet still (de)serializes
+transparently so the offer round-trips on the wire and the redemption site percent-encodes the
+live value (only the `Debug` exposure was the leak).
 - `credential_configuration_id: String`
   - The credential configuration id to request (e.g. `eu.europa.ec.eudi.pid_vc_sd_jwt`).
 - `format: Format`
@@ -490,6 +555,14 @@ An error building a holder presentation.
   - The signer-hook failed (the host's error rendered as a message).
 - `Build(String)`
   - Building or splicing a ceremony envelope failed.
+- `MultiDocumentMdoc(usize)`
+  - The held mdoc `DeviceResponse` carries more than one `Document`. The holder `present` seam
+signs ONE `DeviceSignature` (one [`PreparedPresentation::signing_input`], one host signature),
+so it can bind exactly one document; a multi-document held credential is rejected rather than
+producing a token whose extra documents carry a signature over the FIRST document's data (which
+the verifier — checking each document against its OWN docType + `deviceSigned.nameSpaces` —
+would reject). A holder presents individual credentials; multi-document binding is a separate,
+multi-signature seam (a documented follow-on), never a silently-invalid token.
 
 #### Functions
 
@@ -588,13 +661,27 @@ fn cnf(&self) -> Value
 ```
 
 The holder public key as a `cnf` confirmation object (`{"jwk": <public JWK>}`, RFC 7800) — the
-shape an SD-JWT VC issuer embeds so the verifier can check the KB-JWT against the bound key.
+shape an SD-JWT VC issuer embeds so the verifier can check the KB-JWT against the bound key. The
+embedded JWK is stripped of any private members via [`Self::public_jwk_only`] (FR-010).
 
 ```rust
 fn new<impl Into<String>: Into<String>>(holder_public_jwk: Value, key_handle: impl Into<String>) -> Self
 ```
 
 Construct a holder context from a public JWK and a host key handle.
+
+```rust
+fn public_jwk_only(&self) -> Value
+```
+
+The holder JWK with **every private/symmetric member stripped** (`d`, `p`, `q`, `dp`, `dq`,
+`qi`, `k`, `oth`) so only the public key is ever emitted on the wire (FR-010, Constitution
+Principle IV — the SDK MUST NEVER leak secrets).
+
+A [`HolderContext`] is supposed to carry only the holder *public* JWK, but a common JWK-export
+mistake leaves the private scalar `d` (or the RSA CRT params) attached. The SDK is the
+documented last line of defense, so it strips them here rather than trusting the integrator to
+have done so — used at **every** embed site (the PoP-JWT JOSE header and the `cnf`).
 
 ```rust
 fn public_sec1(&self) -> Option<Vec<u8>>
@@ -768,8 +855,6 @@ An error building a signing input or splicing a signature back into an envelope.
 
 ###### Variants
 
-- `CeremonyMismatch`
-  - The host returned a signature whose ceremony does not match the input it was built for.
 - `BadSignatureLength(SignatureAlgorithm, usize)`
   - The host returned a signature of the wrong length for the algorithm (ES256 raw `r‖s` is 64
 bytes).
@@ -1025,9 +1110,10 @@ owning the security-critical checks the only Rust mdoc library omits (research D
    with the Document Signer (DS) certificate's public key (ES256, via the SDK's `p256`/`ecdsa`),
    and the DS certificate is resolved from the `x5chain` COSE header and checked for trust through
    the pluggable [`crate::trust::TrustAnchorSource`] (the IACA root).
-2. **`valueDigests` integrity (in-house)** — each disclosed `IssuerSignedItem` is re-hashed (with
-   the MSO `digestAlgorithm`) over its tagged-CBOR (`#6.24`) byte string and matched against the
-   MSO `valueDigests`; any mismatch is rejected. This is the selective-disclosure-integrity check.
+2. **`valueDigests` integrity (in-house)** — each disclosed `IssuerSignedItem` is hashed (with the
+   MSO `digestAlgorithm`) over its **on-wire `IssuerSignedItemBytes`** — the `#6.24(bstr)` element
+   exactly as received (ISO/IEC 18013-5 §9.2.2.5), never a re-encode — and matched against the MSO
+   `valueDigests`; any mismatch is rejected. This is the selective-disclosure-integrity check.
 3. **MSO `validityInfo` (in-house)** — the `signed` / `validFrom` / `validUntil` bounds are
    enforced at the verification instant.
 4. **`DeviceAuth` holder binding** — the `DeviceSignature` `COSE_Sign1` over the
@@ -1072,7 +1158,57 @@ root; the role selects the per-role/format anchor set).
 [`verify()`](crate::verify()) entry point resolves through the host status source. Mirrors the SD-JWT VC
 status seam so the always-on bar's revocation check covers both formats.
 
+### Enums
+
+#### enum `DeviceBindingMachinery`
+
+```rust
+enum DeviceBindingMachinery
+```
+
+Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
+to tell a fresh-nonce/transcript mismatch apart from a genuine holder-binding fault when a
+[`verify`] run returns [`ReasonCode::HolderBinding`].
+
+A nonce/transcript mismatch (a replayed presentation) fails the `DeviceSignature` check **only**
+because the verifier rebuilds `DeviceAuthentication` over a different transcript than the holder
+signed — the binding machinery itself is intact: the `DeviceAuth` is a `DeviceSignature`, its alg
+is ES256, the MSO `DeviceKey` parses, and the signature bytes form a well-formed ES256 signature.
+A genuine fault (a corrupt/garbled signature, a non-ES256 alg, an unparseable `DeviceKey`, or a
+`DeviceMac`-only `DeviceAuth`) is **transcript-independent** — it fails for ANY transcript — so it
+is NOT a freshness mismatch and must keep [`ReasonCode::HolderBinding`].
+
+[`crate::openid4vp`] uses this to attribute the failure precisely: `Sound` (every document's
+binding machinery is intact) ⇒ the failure is the fresh-nonce mismatch ⇒ `Replay`; `Faulty` ⇒ a
+real holder-binding fault ⇒ `HolderBinding` (never masked as `Replay`).
+
+##### Variants
+
+- `Sound`
+  - Every document's `DeviceAuth` is a well-formed ES256 `DeviceSignature` over a parseable MSO
+`DeviceKey` — so a failed binding is consistent with (only) a transcript/nonce mismatch.
+- `Faulty`
+  - At least one document's binding is structurally broken (corrupt signature, non-ES256 alg,
+unparseable `DeviceKey`, or `DeviceMac`-only) — a transcript-INDEPENDENT holder-binding fault.
+
 ### Functions
+
+#### fn `device_binding_machinery`
+
+```rust
+fn device_binding_machinery(device_response: &[u8]) -> DeviceBindingMachinery
+```
+
+Classify whether the `DeviceAuth` holder-binding **machinery** of every document in a
+`DeviceResponse` is structurally sound (see [`DeviceBindingMachinery`]). Transcript-INDEPENDENT:
+it checks the `DeviceAuth` shape, the `DeviceSignature` algorithm, the MSO `DeviceKey`, and that
+the signature bytes form a well-formed ES256 signature — it deliberately does NOT verify the
+signature against any payload, so it isolates a genuine binding fault (which fails for every
+transcript) from a fresh-nonce mismatch (which fails only because the rebuilt transcript differs).
+
+Used only to refine the failure attribution when [`verify`] already returned
+[`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
+holder-binding fault is never silently downgraded to a replay).
 
 #### fn `issuer_signing_cert_der`
 
@@ -1088,6 +1224,27 @@ Returns `None` when the `DeviceResponse` does not parse or carries no `x5chain` 
 *claimed* (its trust + signature are decided by the always-on bar in [`verify`]); this read is
 only the gate's cert-matching input, never an acceptance.
 
+#### fn `issuer_signing_certs_with_issuance_der`
+
+```rust
+fn issuer_signing_certs_with_issuance_der(device_response: &[u8]) -> Option<Vec<ClaimedIssuer>>
+```
+
+Extract, per document in a `DeviceResponse`, the claimed Document Signer leaf certificate (DER)
+**paired with** that document's claimed issuance/relevant time (Unix seconds) — the input the
+opt-in [`crate::qualified`] gate folds across every document so the determination uses EACH
+issuer's own issuance time (the credential's relevant time, NOT "now").
+
+Each [`ClaimedIssuer`] entry is `(claimed_cert, claimed_issuance_time)`: the leaf from the
+document's `IssuerAuth` `x5chain` and the MSO `validityInfo.signed` (fallback `validFrom`). Either
+element is `None` when that field cannot be read; a per-document `None` issuance time fails the
+gate closed for that document ([`crate::types::QualifiedStatus::Indeterminate`]) rather than
+substituting "now".
+
+Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
+[`issuer_signing_cert_der`], the certs/times are *claimed* (trust + signature are decided by the
+always-on bar in [`verify`]); this read is only the gate's input, never an acceptance.
+
 #### fn `verify`
 
 ```rust
@@ -1097,13 +1254,28 @@ fn verify<A: TrustAnchorSource + ?Sized>(device_response: &[u8], anchors: &A, pa
 Verify a presented ISO/IEC 18013-5 mdoc `DeviceResponse`.
 
 Runs the mdoc always-on bar — `IssuerAuth` signature + DS trust, in-house `valueDigests`
-integrity, MSO `validityInfo`, and the `DeviceAuth` holder binding — over the first document in
-the response. Returns a [`VerificationResult`]: `valid = true` with the disclosed attributes when
-every check passes, or `valid = false` carrying a single specific [`ReasonCode`] on the first
-failure (no false-accept — SC-002).
+integrity, MSO `validityInfo` (including the `signed` consistency check), and the `DeviceAuth`
+holder binding — over **every** document in the response (and enforces the top-level
+`DeviceResponse.status`). Returns a [`VerificationResult`]: `valid = true` with the disclosed
+attributes only when every document clears every check, or `valid = false` carrying a single
+specific [`ReasonCode`] on the first failure (no false-accept — SC-002). Verifying every document
+is essential: a verdict that covered only `documents[0]` would let a forged second document ride
+inside a VALID result unverified.
 
 `anchors` is the configured trust-anchor source (the IACA root for mdoc); `params` carries the
 verification instant, the session transcript for the holder binding, and the issuer role.
+
+### Type aliases
+
+#### type `ClaimedIssuer`
+
+```rust
+type ClaimedIssuer = (Option<Vec<u8>>, Option<i64>)
+```
+
+One document's *claimed* qualified-gate input: its Document Signer leaf certificate (DER) and its
+issuance/relevant time (Unix seconds), each `None` when that field cannot be read. The values are
+claimed (read-only, unverified); trust + signature are decided by the always-on bar.
 
 ## Module `openid4vp`
 
@@ -1117,18 +1289,20 @@ it did not request.
 
 ## Operations
 
-- [`build_request`] — `(dcql, audience) -> PresentationRequest { dcql, nonce (fresh), audience }`.
-  The fresh `nonce` comes from the host RNG seam [`NonceSource`] (the core is sans-IO; entropy is
-  host-provided exactly as the signing core takes it via `HostContext.entropy`).
+- [`build_request`] — `(dcql, audience, response_uri) -> PresentationRequest { dcql, nonce
+  (fresh), audience, response_uri }`. The fresh `nonce` comes from the host RNG seam
+  [`NonceSource`] (the core is sans-IO; entropy is host-provided exactly as the signing core takes
+  it via `HostContext.entropy`). The `response_uri` is the verifier's response endpoint — a
+  first-class request parameter the mdoc handover binds (OpenID4VP 1.0 §B.2.6).
 - [`verify_response`] — `(vp_token, request, policy, anchors) -> VerificationResult`. Runs the
   per-format always-on bar ([`crate::sdjwtvc`] / [`crate::mdoc`]) **plus** the binding checks.
 
 ## Binding checks (FR-015 / SC-008)
 
 - **Nonce**: the presentation echoes the request's fresh `nonce` — SD-JWT VC in the KB-JWT
-  (`nonce`); mdoc in the `SessionTranscript` / OID4VPHandover the `DeviceAuth` signs over. A
-  missing/mismatched nonce ⇒ INVALID [`ReasonCode::Replay`] (a replayed presentation cannot
-  satisfy a fresh nonce).
+  (`nonce`); mdoc in the `SessionTranscript` / `OpenID4VPHandover` (OpenID4VP 1.0 §B.2.6)
+  the `DeviceAuth` signs over. A missing/mismatched nonce ⇒ INVALID
+  [`ReasonCode::Replay`] (a replayed presentation cannot satisfy a fresh nonce).
 - **Audience**: the presentation is addressed to this verifier's `client_id` — SD-JWT VC KB-JWT
   `aud`; mdoc the handover/`client_id`. Wrong audience ⇒ INVALID [`ReasonCode::WrongAudience`].
 
@@ -1211,6 +1385,13 @@ returned `vp_token` is bound to exactly this `nonce` + `audience`. Carries only 
   - The fresh per-request nonce the presentation MUST echo (replay protection).
 - `audience: String`
   - The verifier's `client_id` the presentation MUST be addressed to (audience binding).
+- `response_uri: String`
+  - The verifier's `response_uri` (or `redirect_uri`) request parameter — the endpoint the
+presentation is returned to. This is the **4th element** of the mdoc `OpenID4VPHandoverInfo`
+(OpenID4VP 1.0 §B.2.6), a distinct request parameter from the `client_id` (`audience`); the
+holder folds it into the signed handover, so the verifier MUST reconstruct the handover with
+the same value. A direct-`response_uri` deployment uses the absolute response endpoint; a
+`redirect_uri` deployment its redirect target (the spec accepts either, by Response Mode).
 
 ##### Methods
 
@@ -1268,34 +1449,65 @@ return a distinct, unpredictable value (no reuse — replay protection depends o
 #### fn `build_request`
 
 ```rust
-fn build_request<N: NonceSource + ?Sized, impl Into<String>: Into<String>>(nonce_source: &mut N, dcql: Dcql, audience: impl Into<String>) -> PresentationRequest
+fn build_request<N: NonceSource + ?Sized, impl Into<String>: Into<String>, impl Into<String>: Into<String>>(nonce_source: &mut N, dcql: Dcql, audience: impl Into<String>, response_uri: impl Into<String>) -> PresentationRequest
 ```
 
 Build an OpenID4VP presentation request: the DCQL query, a **fresh** nonce drawn from the host
-[`NonceSource`], and the verifier's audience (`client_id`).
+[`NonceSource`], the verifier's audience (`client_id`), and the verifier's `response_uri`.
 
 A fresh nonce per call is the replay-protection invariant (contracts/openid4vp-verifier.md): the
-SDK keeps the returned [`PresentationRequest`] and only accepts a `vp_token` bound to it.
+SDK keeps the returned [`PresentationRequest`] and only accepts a `vp_token` bound to it. The
+`response_uri` is the verifier's response endpoint (or `redirect_uri`); it is the 4th element of
+the mdoc handover (OpenID4VP 1.0 §B.2.6) and is therefore part of what the holder cryptographically
+binds — distinct from the `audience`/`client_id`.
 
 #### fn `oid4vp_handover_transcript`
 
 ```rust
-fn oid4vp_handover_transcript(audience: &str, nonce: &[u8]) -> Vec<u8>
+fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &str) -> Vec<u8>
 ```
 
-Build the OpenID4VP handover `SessionTranscript` bytes for an mdoc presentation from the
-`audience` (`client_id`) and `nonce`.
+Build the conformant OpenID4VP-1.0 / ISO 18013-7 mdoc `SessionTranscript` bytes for a
+redirect-invoked presentation, from the verifier's `client_id` (`audience`), request `nonce`, and
+`response_uri`.
 
-Modelled as the ISO 18013-5 `SessionTranscript` shape `[null, null, OID4VPHandover]` where the
-handover is `["OID4VPHandover", clientIdHash, nonceHash]` (SHA-256 over the audience and nonce) —
-the holder folds the same handover into the `DeviceAuthentication` it signs, so reconstructing it
-here binds the device signature to this exact request. Both the holder (test issuer) and the
-verifier MUST build it identically.
+This is the **`OpenID4VPHandover`** of OpenID4VP 1.0 §B.2.6 ("`Handover` and `SessionTranscript`
+Definitions"), NOT a custom structure — a conformant EUDI wallet signs `DeviceAuth` over exactly
+this `SessionTranscript`, so the verifier reconstructs it identically (CDDL reproduced verbatim):
+
+```text
+SessionTranscript = [null, null, OpenID4VPHandover]   ; ISO 18013-5 §9.1.5.1, with
+                                                      ; DeviceEngagementBytes = EReaderKeyBytes = null
+OpenID4VPHandover = ["OpenID4VPHandover", OpenID4VPHandoverInfoHash]
+OpenID4VPHandoverInfoHash  = bstr            ; SHA-256 of OpenID4VPHandoverInfoBytes
+OpenID4VPHandoverInfoBytes = bstr .cbor OpenID4VPHandoverInfo
+OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri]
+  clientId      = tstr   ; the `client_id` request parameter (the audience)
+  nonce         = tstr   ; the `nonce` request parameter value
+  jwkThumbprint = bstr / null  ; RFC 7638 thumbprint of the response-encryption key, else null
+  responseUri   = tstr   ; the `response_uri` (or `redirect_uri`) request parameter
+```
+
+The handover folds **one** SHA-256 over the CBOR-encoded inner `OpenID4VPHandoverInfo` array
+(not a per-field hash): every request parameter is therefore bound, and any tampered field
+changes the single hash. The holder (here the test issuer) and the verifier MUST build the
+transcript identically, so this one function is the single authoritative source for both halves.
+
+Per OpenID4VP 1.0 §B.2.6 the four `OpenID4VPHandoverInfo` elements map to the SDK as:
+- `clientId` — the `client_id` request parameter (the verifier's `audience`).
+- `nonce` — the `nonce` request parameter is a text string; the SDK carries the nonce as bytes,
+  so the conformant text value is its base64url-unpadded form (identical to the value an SD-JWT VC
+  KB-JWT echoes), keeping the two formats' nonce-on-the-wire byte-identical.
+- `jwkThumbprint` — `null`: this SDK does not negotiate response encryption (no `direct_post.jwt`),
+  so there is no verifier encryption key to thumbprint; the spec mandates `null` in that case.
+- `responseUri` — the **actual** `response_uri` (or `redirect_uri`) request parameter, a value
+  distinct from `clientId`. The spec's §B.2.6 fourth element MUST be this real endpoint, NOT the
+  `client_id`, so the SDK carries it as the first-class [`PresentationRequest::response_uri`].
 
 #### fn `verify_response`
 
 ```rust
-fn verify_response<A: TrustAnchorSource + ?Sized>(vp_token: &VpToken<'_>, request: &PresentationRequest, _policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, status: StatusOutcome) -> VerificationResult
+fn verify_response<A: TrustAnchorSource + ?Sized>(vp_token: &VpToken<'_>, request: &PresentationRequest, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, status: StatusOutcome) -> VerificationResult
 ```
 
 Verify an OpenID4VP `vp_token` is cryptographically bound to an issued request, running the
@@ -1308,8 +1520,11 @@ per-format always-on bar **plus** the nonce/audience binding (contracts/openid4v
   handover transcript reconstructed from the request nonce/audience (a fresh-nonce mismatch
   surfaces as a failed holder binding, attributed to `Replay`).
 
-`now_unix`/`role`/`status` are the remaining per-format-bar inputs the [`verify()`](crate::verify()) entry
-point supplies (the validity instant, the trust-anchor role, and the resolved status outcome).
+`policy` carries the accepted-format restriction (`policy.formats`); a `vp_token` whose format the
+policy excludes is rejected with [`ReasonCode::UnsupportedFormat`] BEFORE any bar runs, so this
+public entry honors the gate even when a native caller invokes it directly (not only via the
+[`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`status` are the remaining per-format-bar
+inputs (the validity instant, the trust-anchor role, and the resolved status outcome).
 
 ## Module `qualified`
 
@@ -1341,13 +1556,23 @@ entries (post CIR (EU) 2025/1569). This implementation is pinned to [`TS_119_615
 (`1.4.1`) and is **off by default** ([`crate::verify::VerifyContext::qualified_gate`]) — enabling
 it is opt-in, and absent fixtures honestly yield `Indeterminate`.
 
-## Trust-list authentication (scope)
+## Trust-list authentication (fail-closed — SC-007)
 
-The national TL is **authenticated** by chain-validating its embedded signer certificate against
-a configured scheme-operator anchor, reusing [`crate::trust::chain::verify_chain`] (the same X.509
-primitive the always-on bar uses — DRY). The full enveloped XML-DSig `SignatureValue`/C14N check
-is the always-on engine's remaining production hardening ([`crate::trust::xml`]); the offline
-JSON form here carries the signer cert so the gate exercises the same chain-authentication seam.
+Before any status is read, the national TL is **authenticated** by
+[`QualifiedTrustList::authenticate`]: it chain-validates the list's embedded signer certificate
+([`QualifiedTrustList::signer_cert_der`]) against a host-configured **scheme-operator trust
+anchor**, reusing [`crate::trust::chain::verify_chain`] (the same X.509 primitive the always-on
+bar uses — DRY; no re-implemented crypto), and rejects a **stale** list (`now_unix` at/after its
+`NextUpdate`). An unsigned list (no signer), a signer that does not chain to the scheme anchor,
+and a stale list all **fail** authentication. [`qualified_status`] runs `authenticate` first and
+returns [`QualifiedStatus::Indeterminate`] (NEVER [`QualifiedStatus::Qualified`]) on any failure
+— fail-closed, consistent with the always-on engine's stale/auth policy ([`crate::trust::engine`])
+and the spec-003 pattern. A forged / attacker-supplied / unsigned TL can therefore never make an
+unchained issuer report `Qualified`.
+
+The full enveloped XML-DSig `SignatureValue`/C14N check is the always-on engine's remaining
+production hardening ([`crate::trust::xml`]); the offline JSON form here carries the signer cert
+so the gate exercises the same chain-authentication seam against the same X.509 stack.
 
 ### Structs
 
@@ -1364,6 +1589,32 @@ signer certificate (for chain-authentication), and the `nextUpdate` instant.
 Carries only issuer-public certificate data (no secret), so deriving `Debug` is safe.
 
 ##### Methods
+
+```rust
+fn authenticate(&self, scheme_anchors: &[Vec<u8>], now_unix: i64) -> Result<(), QualifiedTrustError>
+```
+
+Authenticate the national Trusted List **before** any status is read (the fail-closed gate —
+SC-007).
+
+Authentication has two parts, both mandatory:
+
+1. **Signer chain** — the list's embedded signer certificate
+   ([`Self::signer_cert_der`]) must chain-validate to one of the host-configured
+   `scheme_anchors` (the scheme-operator / national-TL-operator trust anchors), at `now_unix`,
+   via [`crate::trust::chain::verify_chain`] (DRY — the same X.509 primitive the always-on bar
+   uses; no re-implemented crypto). An **unsigned** list (no signer) or a signer that does not
+   chain fails. When `scheme_anchors` is empty the list cannot be authenticated at all
+   ([`QualifiedTrustError::NoSchemeAnchor`]).
+2. **Freshness** — the list must not be **stale**: `now_unix` must be strictly before its
+   `NextUpdate` (a list with an absent/zero `NextUpdate` is treated as stale). This mirrors the
+   always-on engine's `now >= NextUpdate ⇒ stale` policy ([`crate::trust::engine`]).
+
+# Errors
+
+Returns [`QualifiedTrustError`] when no scheme anchor is configured, the list is unsigned, the
+signer does not chain to a scheme anchor, or the list is stale. Every variant is mapped to
+[`QualifiedStatus::Indeterminate`] by [`qualified_status`] (never `Qualified`).
 
 ```rust
 fn empty() -> Self
@@ -1397,6 +1648,30 @@ The list's own signing certificate (DER) from its enveloped signature, if presen
 
 ### Enums
 
+#### enum `QualifiedTrustError`
+
+```rust
+enum QualifiedTrustError
+```
+
+Why authenticating a national Trusted List failed (before any status is read).
+
+Every failure is fail-closed: [`qualified_status`] maps any of these onto
+[`QualifiedStatus::Indeterminate`] (never [`QualifiedStatus::Qualified`] — SC-007). The variants
+keep the rejection specific so a forged / unsigned / unchained / stale list is never opaque.
+
+##### Variants
+
+- `NoSchemeAnchor`
+  - No scheme-operator trust anchor was configured, so the list's authenticity cannot be
+established (can't authenticate ⇒ can't assert qualified).
+- `Unsigned`
+  - The list carries no embedded signer certificate (an unsigned list cannot be authenticated).
+- `SignerNotTrusted(ChainError)`
+  - The list's signer certificate did not chain-validate to any configured scheme-operator anchor.
+- `Stale`
+  - The list is stale: `now` is at or after its `NextUpdate` (or it carries no `NextUpdate`).
+
 #### enum `QualifiedTrustListError`
 
 ```rust
@@ -1419,23 +1694,54 @@ An error parsing the qualified-status national Trusted List.
 #### fn `qualified_status`
 
 ```rust
-fn qualified_status(issuer_cert_der: &[u8], relevant_time_unix: i64, trust_list: &QualifiedTrustList) -> QualifiedStatus
+fn qualified_status(issuer_cert_der: &[u8], now_unix: i64, relevant_time_unix: i64, trust_list: &QualifiedTrustList, scheme_anchors: &[Vec<u8>]) -> QualifiedStatus
 ```
 
 Determine the eIDAS qualified status of an attestation issuer at a relevant time (TS 119 615
 v1.4.1 cl. 4.12 — the opt-in gate, research D6).
 
-Matches `issuer_cert_der` (the credential's signing certificate) against the national TL's
-trust-service entries, then reads the effective service status **at `relevant_time_unix`** (the
-credential's issuance/relevant time, NOT "now"):
+## Two distinct times — authenticate at `now`, read status at the relevant time
+
+Trust-list **authentication** and the issuer **status read** are evaluated at *different* instants
+(the load-bearing split — RCA below):
+
+- **`now_unix`** — the verification instant ("real now"). Used to **authenticate the TL**
+  ([`QualifiedTrustList::authenticate`]): the freshness check (`now >= NextUpdate ⇒ stale`) AND the
+  TL-signer certificate's chain validity ([`crate::trust::chain::verify_chain`] `notBefore`/
+  `notAfter`). Whether the LOTL/national-TL snapshot in hand is itself **currently** fresh and
+  signed by a **currently** valid scheme operator is a *now* property — a stale or expired-signer TL
+  must never be trusted just because the credential being checked is old.
+- **`relevant_time_unix`** — the credential's issuance/relevant time. Used only to **read the
+  issuer's granted/withdrawn `EAA/Q` status** (the effective status at that instant); per eIDAS the
+  status read is "status at the relevant time" (an issuer not yet granted when it signed a
+  credential, but granted later, is NOT `Qualified` for that earlier credential).
+
+**RCA — why the split matters (the false-`Qualified` bug this fixes):** a prior fix correctly
+derived the relevant time for the *status read* from the credential's issuance time, but then passed
+that SAME old time into `authenticate`, so the TL freshness/signer-validity checks were evaluated at
+the credential's issuance time instead of `now`. A TL whose `NextUpdate` is in the past relative to
+real `now` (stale) but in the future relative to an old credential's issuance time was treated as
+fresh, yielding a false `Qualified` from a stale/withdrawn-since trust snapshot. Authentication MUST
+use `now_unix`; only the status read uses `relevant_time_unix`.
+
+**Authenticates the national TL first** ([`QualifiedTrustList::authenticate`] against the
+host-configured scheme-operator `scheme_anchors`, at `now_unix`): an unsigned / forged / unchained /
+stale list yields [`QualifiedStatus::Indeterminate`] before any status is read (fail-closed — a
+forged TL can never make an unchained issuer report `Qualified`, SC-007). Only an authenticated list
+is consulted.
+
+On an authenticated list it then matches `issuer_cert_der` (the credential's signing certificate)
+against the trust-service entries and reads the effective service status **at
+`relevant_time_unix`** (the credential's issuance/relevant time, NOT "now"):
 
 - [`QualifiedStatus::Qualified`] — some matched [`EAA_Q_SERVICE_TYPE`] service is
   [`SERVICE_STATUS_GRANTED`] at the relevant time.
 - [`QualifiedStatus::NotQualified`] — the issuer is **found** on the TL, but no `EAA/Q` service is
   granted at the relevant time (it is withdrawn/suspended, the grant had not begun, or the only
   matched service is non-`EAA/Q`).
-- [`QualifiedStatus::Indeterminate`] — the issuer is on **no** service entry (the data needed to
-  decide is absent). Never assumes qualified (no false "qualified" — SC-007).
+- [`QualifiedStatus::Indeterminate`] — the TL did not authenticate, **or** the issuer is on **no**
+  service entry (the data needed to decide is absent/unreachable). Never assumes qualified (no
+  false "qualified" — SC-007).
 
 ### Constants
 
@@ -1546,6 +1852,25 @@ or `None` to accept a presentation without holder binding (e.g. an issuer-only c
 
 ### Functions
 
+#### fn `issuance_time_unix`
+
+```rust
+fn issuance_time_unix(presentation: &str) -> Option<i64>
+```
+
+The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
+§4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
+to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
+credential is in force, the closest available proxy for the relevant time).
+
+Returns `None` when the presentation does not parse or carries **neither** `iat` nor `nbf` — the
+opt-in [`crate::qualified`] gate then fails closed ([`crate::types::QualifiedStatus::Indeterminate`])
+rather than read the issuer's status at the verification instant ("now"), which would falsely report
+`Qualified` for an issuer granted only AFTER it signed the credential (contracts/qualified-status-
+gate.md: the status is read **at the credential's issuance/relevant time, NOT "now"**). A present-
+but-non-canonical `iat`/`nbf` (RFC 7519 NumericDate must be a JSON number that fits `i64`) is
+likewise treated as absent — the gate must not assert qualification off an unreadable instant.
+
 #### fn `issuer_signing_cert_der`
 
 ```rust
@@ -1585,6 +1910,49 @@ Verify a presented SD-JWT VC against the always-on bar, returning a [`Verificati
 On any failed check the result has `valid = false` and carries the single specific
 [`ReasonCode`] for the **first** check that failed; only a credential that clears every check is
 `valid = true`, with the disclosed (and only the disclosed) attributes returned.
+
+## Module `secret`
+
+A minimal redacting secret newtype for the OAuth bearer token / one-time `c_nonce` the issuance
+flow carries (`crate::issuance::obtain`).
+
+This is a deliberate, self-contained copy of the ~20-line `Secret` newtype the signing core
+(`cleverbase-core`) defines. It is *not* a DRY violation: pulling in `cleverbase-core` solely to
+reuse this trivial leaf type dragged the whole signing stack — including `lopdf` (a PDF library) —
+into this otherwise pure-Rust / WASM-able / minimal verifier (contradicting the `lib.rs` posture).
+The correct trade-off for a trivial leaf type is a local definition rather than a heavy
+cross-crate dependency; see the removed-dependency rationale in `Cargo.toml`.
+
+Semantics match the core type exactly: the inner value never appears in `Debug` output
+(Constitution Principle IV — never leak secrets via Debug/log/panic), yet it still
+(de)serializes transparently so a CBOR-serialized `obtain` session can round-trip its
+authorization material (the host owns the wire bytes by design in the sans-IO model — only the
+`Debug` exposure was the leak).
+
+### Structs
+
+#### struct `Secret`
+
+```rust
+struct Secret
+```
+
+A secret string whose contents never appear in `Debug` output (Constitution Principle IV).
+
+It still (de)serializes its inner value so a CBOR-serialized `obtain` session can round-trip its
+bearer token / one-time nonce; the host is responsible for protecting serialized handles at rest.
+
+`pub` because it appears in a public API field ([`crate::issuance::CredentialOffer`]'s bearer
+`pre_authorized_code`), so the host can construct one from a received offer — the same surface the
+signing core's `Secret` exposes.
+
+##### Methods
+
+```rust
+fn new<impl Into<String>: Into<String>>(s: impl Into<String>) -> Self
+```
+
+Wrap a value as a redacted secret.
 
 ## Module `status`
 
@@ -1763,7 +2131,9 @@ name matches the anchor's `subject` name, and the leaf is within its validity wi
 relevant time. ISO 18013-5 IACA hierarchies and the eIDAS trusted lists are one-level (root →
 document-signer / service); a configured anchor *is* the root, so a one-hop chain is the
 production shape. The matcher also accepts an exact DER-equal leaf (a self-issued anchor that is
-itself the listed entry), which covers a trusted-list entry that pins the leaf directly.
+itself the listed entry), which covers a trusted-list entry that pins the leaf directly — but
+even that direct-pin path still enforces the leaf's validity window, so an expired pinned leaf
+is rejected rather than trusted.
 
 #### Enums
 
@@ -1806,7 +2176,8 @@ Whether `leaf_cert_der` chains to **any** of the trusted `anchor_certs_der`, val
 This is the trust-anchoring primitive: a leaf is trusted iff some anchor either (a) is DER-equal
 to the leaf (the anchor pins the leaf directly), or (b) issued the leaf — the leaf's `issuer`
 name equals the anchor's `subject` name **and** the leaf's signature verifies under the anchor's
-public key — and in case (b) the leaf is within its own validity window at `now_unix`. Returns
+public key. In **both** cases the leaf must be within its own validity window at `now_unix` (an
+expired directly-pinned leaf is rejected as [`ChainError::LeafExpired`], never trusted). Returns
 the first specific [`ChainError`] when no anchor matches.
 
 # Errors
@@ -2140,6 +2511,55 @@ chain alone must be explicitly opted into (fail-closed default — see the modul
 
 ### Structs
 
+#### struct `ChainValidatingAnchors`
+
+```rust
+struct ChainValidatingAnchors
+```
+
+The chain-validating trust source for the **C-ABI / binding** verify path (contracts/verifier.md
+step 3; data-model.md `TrustAnchorSource`).
+
+The host's trust-refresh step resolves the in-force anchors (EU LOTL / national Trusted Lists /
+IACA roots) out-of-process and passes them in as `(role, format, cert)` wire entries; this source
+treats each as a **trusted anchor/root** and, at `resolve` time, **chain-validates** the
+credential's signing leaf against the anchors configured for its role/format via
+[`crate::trust::chain::verify_chain`] (DRY — the same X.509 primitive the always-on bar and the
+[`NativeTrustEngine`] use; no re-implemented crypto). The core stays **sans-IO**: it does not
+fetch or refresh the trust list — it only chain-validates against the host-supplied anchors.
+
+This is the production C-ABI trust semantics — distinct from [`StaticTestAnchors`] (exact DER
+equality only, an offline test seam):
+
+- A host passing an **issuing CA / IACA root** trusts every credential whose leaf chains to it
+  (the EUDI chain-to-root model), where exact-leaf-match would reject every real credential.
+- The leaf's **validity window** (and a directly-pinned anchor's) is enforced at the verification
+  instant, so an expired/withdrawn pinned issuer leaf is rejected ([`crate::trust::chain::ChainError::LeafExpired`]),
+  not silently accepted.
+
+The verification instant `now_unix` (the relevant time the leaf-validity window is checked at) is
+carried on the source because [`TrustAnchorSource::resolve`] is sans-clock; the C-ABI builds one
+per verify call from the wire context.
+
+Carries only issuer-public certificates (no secret), so deriving `Debug` is safe.
+
+##### Methods
+
+```rust
+fn new(now_unix: i64) -> Self
+```
+
+Construct an empty source for the verification instant `now_unix` (trusts nothing until anchors
+are added).
+
+```rust
+fn trust(self, role: IssuerRole, format: Format, anchor_cert_der: &[u8]) -> Self
+```
+
+Add a host-resolved trusted anchor/root certificate (DER) for a `(role, format)`. A credential
+whose leaf chains to it (or is a valid direct pin) for that role/format is trusted. Returns
+`self` for builder-style configuration.
+
 #### struct `StaticTestAnchors`
 
 ```rust
@@ -2230,9 +2650,6 @@ Carries only issuer-public trust-list data (no secret), so deriving `Debug` is s
   - The credential format this anchor covers.
 - `anchor_cert_der: Vec<u8>`
   - The DER-encoded issuer/anchor certificate that the credential's signer chained to.
-- `service_name: Option<String>`
-  - A human-readable label for the trust-list service (e.g. a national TL service name), if
-known. The test anchor leaves this empty.
 
 ### Enums
 
@@ -2329,52 +2746,6 @@ nature); a host that logs a [`VerificationResult`] is logging exactly the data i
 subject to disclose — no *undisclosed* attribute is ever present.
 
 ### Structs
-
-#### struct `Attestation`
-
-```rust
-struct Attestation
-```
-
-An issuer-signed set of attributes about a subject, in one of two formats (data-model.md).
-
-For a *presentation*, `attributes` holds only the **disclosed** subset; undisclosed attributes are
-neither revealed nor required. `raw` is the encoded credential as received (compact SD-JWT(+KB) or
-CBOR `DeviceResponse`) — the verifier works from `raw`, and the structured fields are the parsed,
-verified view.
-
-##### Fields
-
-- `format: Format`
-  - The credential format.
-- `issuer: Issuer`
-  - The signing authority and its resolved trust posture.
-- `attributes: BTreeMap<String, AttributeValue>`
-  - The disclosed claims (for a presentation, only the disclosed subset).
-- `validity: Validity`
-  - The credential validity window.
-- `raw: Vec<u8>`
-  - The encoded credential as received.
-
-#### struct `Issuer`
-
-```rust
-struct Issuer
-```
-
-The signing authority of an attestation, with its resolved trust posture (data-model.md).
-
-`qualified_status` is `Some` only when the opt-in qualified gate ran; otherwise it is `None`
-(never assume qualified).
-
-##### Fields
-
-- `role: IssuerRole`
-  - The issuer role, which selects the trust anchor.
-- `trust_status: TrustStatus`
-  - Whether the issuer is on the configured trust anchor for its role/format.
-- `qualified_status: Option<QualifiedStatus>`
-  - The eIDAS qualified status, present only when the opt-in gate ran.
 
 #### struct `Validity`
 
@@ -2648,8 +3019,22 @@ The opt-in eIDAS qualified-status determination ([`crate::qualified`]) is a sepa
 default gate. [`VerifyContext::qualified_gate`] is the seam: it is **off by default**, in which
 case the always-on bar runs and returns a complete verdict and `qualified_status` stays `None`.
 When enabled (and a [`VerifyContext::qualified_trust_list`] is supplied), the gate populates
-`VerificationResult.qualified_status` via [`crate::qualified::qualified_status`]; disabling it
-leaves the always-on verdict **byte-identical** to a gate-off run (no false "qualified" — SC-007).
+`VerificationResult.qualified_status` via [`crate::qualified::qualified_status`], which first
+**authenticates** the national TL (chain-validates its signer against
+[`VerifyContext::qualified_scheme_anchors`] + checks `NextUpdate` staleness): a forged / unsigned /
+unchained / stale TL — or no scheme anchor configured — yields `Indeterminate`, never `Qualified`
+(fail-closed). Disabling the gate leaves the always-on verdict **byte-identical** to a gate-off run
+(no false "qualified" — SC-007).
+
+`qualified_status` is **only meaningful for a VALID credential** and is therefore only computed
+when `valid == true`. The determination matches the credential's CLAIMED `x5c`/`x5chain` leaf
+against the TL **without re-verifying its signature**; since X.509 certificates are public, an
+attacker could embed a real qualified issuer's leaf and sign with their own key. Only a VALID
+verdict means the always-on bar has signature-verified AND trust-anchored that exact leaf, so the
+qualified status is trustworthy. On an INVALID credential `qualified_status` stays `None` (never a
+`Qualified` read off an unverified claimed cert — SC-002/SC-007). The status is read **at the
+credential's issuance/relevant time** (SD-JWT VC `iat`/`nbf`; mdoc MSO `signed`/`validFrom`), not
+at the verification instant.
 
 ### Structs
 
@@ -2688,6 +3073,14 @@ default) the always-on bar runs unchanged and `qualified_status` stays `None`. W
   - The national Trusted List the opt-in qualified gate reads (off-path unless `qualified_gate` is
 set). `None` with the gate enabled yields an honest [`QualifiedStatus::Indeterminate`]
 (unreachable data — never a false "qualified"). Host-supplied (the core stays sans-IO).
+
+[`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
+- `qualified_scheme_anchors: &'a [Vec<u8>]`
+  - The scheme-operator trust anchor(s) (DER) the opt-in gate authenticates the national TL
+against (off-path unless `qualified_gate` is set). The gate chain-validates the TL's embedded
+signer against these before reading status; an empty set (the default) with the gate enabled
+means the TL cannot be authenticated → [`QualifiedStatus::Indeterminate`] (can't authenticate
+⇒ can't assert qualified — never a false "qualified"). Host-supplied (the core stays sans-IO).
 
 [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 
@@ -2770,15 +3163,34 @@ passed in as `(role, format, cert)` entries — data-model.md `TrustAnchorSource
 **context** (instant, role, resolved revocation/status outcome, mdoc transcript, qualified-gate
 seam), and the optional OpenID4VP **request** the presentation must be bound to.
 
-## Schema version 3
+## Trust semantics over the C-ABI
+
+The wire anchors are treated as **trusted anchors/roots** and the credential's signing leaf is
+**chain-validated** against them (per role/format) via [`ChainValidatingAnchors`], reusing the
+production [`crate::trust::chain::verify_chain`] primitive (DRY). This is the EUDI chain-to-root
+model (contracts/verifier.md step 3): a host passing an issuing **CA / IACA root** trusts every
+credential whose leaf chains to it, and the leaf's **validity window** is enforced at the
+verification instant — an expired/withdrawn pinned issuer leaf is rejected
+([`crate::trust::chain::ChainError::LeafExpired`]), never silently accepted. The core stays
+**sans-IO**: the host fetches/refreshes the trust list and passes the resolved anchors in; the
+core only chain-validates against them (it does not fetch).
+
+## Schema version 5
 
 Version 2 replaced the version-1 foundation seam (which carried only `presentation` + `policy` and
-returned `NotImplemented`) with the full always-on verifier wiring. Version 3 (this) additively
-carries the opt-in qualified-status gate's national Trusted List
-([`WireContext::qualified_trust_list`]) alongside the existing `qualified_gate` flag (T020), so
-the C-ABI gate has data. The CBOR shape changed (an additive field), so the schema version was
-bumped (Principle VII); a binding speaking an older version is refused with a clear message rather
-than mis-parsed.
+returned `NotImplemented`) with the full always-on verifier wiring. Version 3 additively carried
+the opt-in qualified-status gate's national Trusted List ([`WireContext::qualified_trust_list`])
+alongside the existing `qualified_gate` flag (T020). Version 4 additively carried the
+gate's **scheme-operator trust anchors** ([`WireContext::qualified_scheme_anchors`]) — the X.509
+anchor(s) the gate chain-authenticates the national TL's signer against before reading any status,
+so a forged / unsigned / unchained / stale TL can never report `Qualified` (fail-closed, SC-007);
+with the gate enabled but no scheme anchor the determination is `Indeterminate`. Version 5 (this)
+adds the OpenID4VP request's first-class **`response_uri`**
+([`crate::openid4vp::PresentationRequest::response_uri`]) — the 4th element of the mdoc
+`OpenID4VPHandoverInfo` (OpenID4VP 1.0 §B.2.6), previously stubbed to the `client_id`. A
+`PresentationRequest` carried in [`VerifyRequest::request`] now requires this field, so the CBOR
+shape changed and the schema version was bumped (Principle VII); a binding speaking an older
+version is refused with a clear message rather than mis-parsed.
 
 ### Structs
 
@@ -2849,6 +3261,27 @@ over [`Self::qualified_trust_list`] and populates `VerificationResult.qualified_
 `qualified-trust-list.json` form / a host-supplied national TL), carried additively on the
 wire so the C-ABI gate has data. `None` (the default) with the gate enabled yields an honest
 `Indeterminate` (unreachable data — never a false "qualified").
+- `qualified_scheme_anchors: Vec<WireSchemeAnchor>`
+  - The scheme-operator trust anchor certificate(s) (DER) the opt-in gate chain-authenticates the
+national TL's signer against **before** reading any status, carried additively on the wire.
+Empty (the default) with the gate enabled means the TL cannot be authenticated → an honest
+`Indeterminate` (can't authenticate ⇒ can't assert qualified — never a false "qualified").
+
+#### struct `WireSchemeAnchor`
+
+```rust
+struct WireSchemeAnchor
+```
+
+One scheme-operator (national-TL-operator) trust anchor carried across the wire: the DER-encoded
+anchor certificate the opt-in qualified gate authenticates the national Trusted List's signer
+against. Distinct from [`WireTrustAnchor`] (which is role/format-scoped issuer trust for the
+always-on bar); a scheme anchor is only the TL-signing root, so it carries no role/format.
+
+##### Fields
+
+- `cert_der: Vec<u8>`
+  - The DER-encoded scheme-operator anchor certificate.
 
 #### struct `WireTrustAnchor`
 
@@ -2941,9 +3374,11 @@ returns the [`VerificationResult`]; a malformed one yields [`VerifyOutcome::Err`
 #### const `ATTESTATION_SCHEMA_VERSION`
 
 ```rust
-const ATTESTATION_SCHEMA_VERSION: u32 = 3
+const ATTESTATION_SCHEMA_VERSION: u32 = 5
 ```
 
 Wire schema version of the attestation envelope. Bumped on a breaking CBOR-shape change within a
-SemVer major (independent of the signing core's `SCHEMA_VERSION`). Version 2 carries the full
-verifier inputs (the always-on bar + OpenID4VP binding); version 1 was the foundation seam.
+SemVer major (independent of the signing core's `SCHEMA_VERSION`). The current version (5) carries
+the full verifier inputs — the always-on bar + the OpenID4VP binding + the opt-in qualified-status
+gate's national Trusted List / scheme anchors + the mdoc handover `response_uri`. See the
+`## Schema version 5` module section for the per-version history (v1 was the foundation seam).

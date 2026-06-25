@@ -235,8 +235,9 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                 presentation: p,
                 anchors,
                 role: ctx.role,
-                // No request ⇒ no holder-binding challenge required (an issuer-only presentation is
-                // accepted; a KB-bound one is still verified for signature integrity downstream).
+                // No request ⇒ no `aud`/`nonce` challenge (so no replay/audience protection). A
+                // present KB-JWT is STILL signature- and `sd_hash`-verified by the bar; only the
+                // request-binding (`aud`/`nonce`) checks are skipped. See `kb_challenge_without_request`.
                 key_binding: kb_challenge_without_request(p),
                 now_unix: ctx.now_unix,
                 status: ctx.status,
@@ -397,11 +398,15 @@ where
         .unwrap_or(QualifiedStatus::Indeterminate)
 }
 
-/// For a request-less SD-JWT VC, do not impose a holder-binding challenge: a presentation that omits
-/// the KB-JWT is an issuer-only credential (accepted), and one that carries a KB-JWT still has its
-/// signature/`sd_hash` integrity checked by the bar — only the `aud`/`nonce` *challenge* match is
-/// skipped (there is no request to bind to). Returns `None` always; kept as a named seam so the
-/// intent is explicit at the call site.
+/// For a request-less SD-JWT VC, supply **no** holder-binding challenge (always `None`). This gates
+/// **only** the `aud`/`nonce` request-binding checks — there is no request to bind to, so a request-less
+/// verify provides **no replay/audience protection**. It does NOT relax the cryptographic holder check:
+/// when the presentation carries a KB-JWT, the always-on bar
+/// ([`sdjwtvc::check_holder_binding`](crate::sdjwtvc)) STILL verifies its ES256 signature (under the
+/// issuer-bound `cnf` key) AND its `sd_hash` binding to the presented issuer-JWS-plus-disclosures — so a
+/// present-but-forged/tampered KB-JWT is rejected ([`ReasonCode::HolderBinding`]) even with no request.
+/// A presentation that simply omits the KB-JWT is an issuer-only credential and is accepted. Kept as a
+/// named seam so the request-less intent is explicit at the call site.
 const fn kb_challenge_without_request(_presentation: &str) -> Option<KeyBindingChallenge<'static>> {
     None
 }

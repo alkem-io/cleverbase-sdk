@@ -632,7 +632,102 @@ fn presentation_without_holder_binding_is_accepted_when_not_required() {
     );
 }
 
+#[test]
+fn request_less_presentation_with_a_valid_kb_jwt_is_accepted() {
+    // RFC 9901 §4.3: a PRESENT KB-JWT is verified (signature + `sd_hash`) even with no request; the
+    // `aud`/`nonce` checks are the only thing a request gates. A request-less presentation carrying a
+    // genuine, holder-signed KB-JWT therefore passes the cryptographic holder-binding check and is
+    // VALID (the disclosed attributes are returned) — only the replay/audience binding is absent.
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.key_binding = None; // no challenge ⇒ skip aud/nonce, but still verify sig + sd_hash.
+    let result = verify_sd_jwt_vc(&inp);
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
+}
+
+#[test]
+fn request_less_presentation_with_a_forged_kb_signature_is_rejected_as_holder_binding() {
+    // FALSE-ACCEPT PROBE (the request-less holder-binding hole): a present KB-JWT whose ES256
+    // signature has been tampered must be rejected EVEN WITH NO CHALLENGE — the old code returned
+    // `Ok(())` early when `key_binding = None`, waving a forged KB-JWT through (valid = true). A
+    // present KB-JWT's signature is now always verified under the issuer-bound `cnf` key, so a forged
+    // signature is `HolderBinding` on the request-less path too.
+    let presentation = happy_presentation();
+    let forged = flip_kb_signature(&presentation);
+    let anchors = trusted_anchors();
+    let mut inp = input(&forged, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
+#[test]
+fn request_less_presentation_with_a_tampered_kb_sd_hash_is_rejected_as_holder_binding() {
+    // FALSE-ACCEPT PROBE (the request-less holder-binding hole, `sd_hash` arm): a present KB-JWT whose
+    // `sd_hash` does not bind the presented issuer-JWS-plus-disclosures must be rejected even with no
+    // challenge. The old early `Ok(())` skipped this; the `sd_hash` binding is now always verified for
+    // a present KB-JWT, so a tampered `sd_hash` is `HolderBinding` on the request-less path too. (The
+    // KB-JWT is re-signed by the holder over the wrong `sd_hash`, so the signature itself verifies —
+    // isolating the `sd_hash` branch as the failing check.)
+    let presentation = happy_presentation();
+    let tampered = resign_kb_with_wrong_sd_hash(&presentation);
+    let anchors = trusted_anchors();
+    let mut inp = input(&tampered, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert_invalid(&result, ReasonCode::HolderBinding);
+}
+
 // --- presentation-mutation helpers --------------------------------------------------------------
+
+/// Flip a byte in the middle of the KB-JWT signature (the final `~`-segment), invalidating the
+/// holder-binding signature while keeping the base64url framing canonical so the verifier reaches the
+/// signature check rather than a decode error.
+fn flip_kb_signature(presentation: &str) -> String {
+    let mut segments: Vec<&str> = presentation.split('~').collect();
+    let kb_idx = segments.len() - 1;
+    let mut parts: Vec<&str> = segments[kb_idx].split('.').collect();
+    let mut sig_bytes = Base64UrlUnpadded::decode_vec(parts[2]).unwrap();
+    let mid = sig_bytes.len() / 2;
+    sig_bytes[mid] ^= 0xFF;
+    let new_sig = Base64UrlUnpadded::encode_string(&sig_bytes);
+    parts[2] = &new_sig;
+    let new_kb = parts.join(".");
+    segments[kb_idx] = &new_kb;
+    segments.join("~")
+}
+
+/// Re-sign the KB-JWT (the final `~`-segment) by the holder over a corrupted `sd_hash`, so the
+/// signature itself verifies but the `sd_hash` no longer binds the presented prefix. Isolates the
+/// `sd_hash` branch of the holder-binding check (a present, holder-signed KB-JWT with a wrong binding).
+fn resign_kb_with_wrong_sd_hash(presentation: &str) -> String {
+    use p256::ecdsa::signature::Signer as _;
+    use pkcs8::DecodePrivateKey as _;
+
+    let mut segments: Vec<&str> = presentation.split('~').collect();
+    let kb_idx = segments.len() - 1;
+    let parts: Vec<&str> = segments[kb_idx].split('.').collect();
+    // Corrupt the `sd_hash` claim in the KB-JWT payload, then re-sign with the holder key so only the
+    // binding (not the signature) is wrong.
+    let payload_json = Base64UrlUnpadded::decode_vec(parts[1]).unwrap();
+    let mut payload: Value = serde_json::from_slice(&payload_json).unwrap();
+    payload["sd_hash"] = Value::String("not-the-right-sd-hash".to_string());
+    let header_b64 = parts[0].to_string();
+    let payload_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&payload).unwrap().as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = p256::ecdsa::SigningKey::from_pkcs8_der(HOLDER_KEY_PK8).unwrap();
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    let new_kb = format!("{signing_input}.{sig_b64}");
+    segments[kb_idx] = &new_kb;
+    segments.join("~")
+}
 
 /// Flip a byte in the middle of the issuer JWS signature (invalidating it while keeping the
 /// base64url framing canonical, so the verifier reaches the signature check rather than a decode

@@ -339,30 +339,48 @@ fn numeric_date(claim: Option<&Value>) -> Result<Option<i64>, ReasonCode> {
     })
 }
 
-/// Verify the holder Key-Binding JWT (RFC 9901 §4.3): the KB-JWT MUST be present when a challenge is
-/// required, be `typ=kb+jwt` / `alg=ES256`, echo the expected `aud`/`nonce`, carry the correct
-/// `sd_hash` over the issuer-JWS-plus-disclosures prefix, and verify under the issuer-bound `cnf` key.
+/// Verify the holder Key-Binding JWT (RFC 9901 §4.3), distinguishing what is checked **always** from
+/// what is gated on a challenge:
+///
+/// - **A KB-JWT that is PRESENT is ALWAYS cryptographically verified** — its ES256 signature under the
+///   issuer-bound `cnf` key AND its `sd_hash` binding to the presented issuer-JWS-plus-disclosures
+///   prefix — *regardless of whether a challenge is supplied* (RFC 9901 §4.3: a present KB-JWT SHOULD be
+///   verified). A present-but-forged/tampered KB-JWT is therefore rejected on the request-less path too,
+///   not waved through (the false-accept this guards: a structurally-present KB-JWT whose signature or
+///   `sd_hash` does not hold must never read as `valid` just because no challenge was supplied).
+/// - **`aud`/`nonce` are checked ONLY when a `challenge` is supplied** — they bind the presentation to a
+///   specific verifier request (replay/audience protection), which has no meaning without a request. A
+///   request-less verify thus gives no replay/audience protection but still proves holder possession.
+/// - **A KB-JWT that is ABSENT** is required only when a `challenge` is supplied (holder binding was
+///   demanded → `HolderBinding`); with no challenge an issuer-only presentation is accepted.
 fn check_holder_binding(
     sd_jwt: &sd_jwt_payload::SdJwt,
     presentation: &str,
     challenge: Option<&KeyBindingChallenge<'_>>,
 ) -> Result<(), ReasonCode> {
-    let Some(challenge) = challenge else {
-        // No holder binding required for this presentation.
-        return Ok(());
+    let Some(kb) = sd_jwt.key_binding_jwt() else {
+        // No KB-JWT present: required only when a challenge demanded holder binding; otherwise the
+        // presentation is issuer-only and accepted.
+        return match challenge {
+            Some(_) => Err(ReasonCode::HolderBinding),
+            None => Ok(()),
+        };
     };
-    let kb = sd_jwt.key_binding_jwt().ok_or(ReasonCode::HolderBinding)?;
     let claims = kb.claims();
 
-    // `aud`/`nonce` must match the verifier's challenge.
-    let aud_ok = claims.aud == challenge.audience;
-    let nonce_ok = claims.nonce == challenge.nonce;
-    if !aud_ok || !nonce_ok {
-        return Err(ReasonCode::HolderBinding);
+    // `aud`/`nonce` bind the presentation to a verifier's request — checked ONLY when a challenge is
+    // supplied (no challenge ⇒ no request to bind to, so no replay/audience check). The signature and
+    // `sd_hash` below run regardless: a PRESENT KB-JWT is always cryptographically verified.
+    if let Some(challenge) = challenge {
+        let aud_ok = claims.aud == challenge.audience;
+        let nonce_ok = claims.nonce == challenge.nonce;
+        if !aud_ok || !nonce_ok {
+            return Err(ReasonCode::HolderBinding);
+        }
     }
 
     // `sd_hash` MUST be the SHA-256 (base64url) digest of the presentation prefix up to and including
-    // the final `~` that precedes the KB-JWT (RFC 9901 §4.3).
+    // the final `~` that precedes the KB-JWT (RFC 9901 §4.3). Always verified for a present KB-JWT.
     let kb_compact = kb.to_string();
     let prefix = presentation
         .strip_suffix(&kb_compact)
@@ -372,7 +390,8 @@ fn check_holder_binding(
         return Err(ReasonCode::HolderBinding);
     }
 
-    // Verify the KB-JWT ES256 signature under the holder key bound by the issuer in `cnf`.
+    // Verify the KB-JWT ES256 signature under the holder key bound by the issuer in `cnf`. Always
+    // verified for a present KB-JWT (the holder-possession proof, independent of any challenge).
     let holder_key = holder_key_from_cnf(sd_jwt)?;
     verify_compact_es256(&kb_compact, &holder_key).map_err(|()| ReasonCode::HolderBinding)
 }
