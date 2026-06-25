@@ -81,6 +81,13 @@ pub(crate) struct MdocBuilder {
     /// is a structurally-broken ES256 signature — a genuine, transcript-INDEPENDENT holder-binding
     /// fault (distinct from a `corrupt_device_signature` wrong-key signature, which stays well-formed).
     mangle_device_signature: bool,
+    /// When set, re-emit the (genuine, ES256-signed) DeviceSignature COSE_Sign1 with a NON-NIL
+    /// (ATTACHED) payload as its third array element instead of `nil`. ISO/IEC 18013-5 §9.1.3 requires
+    /// the DeviceSignature to be a DETACHED COSE_Sign1 (nil payload), so an attached payload is a
+    /// malformed holder binding the verifier MUST reject (`HolderBinding`) — and MUST do so WITHOUT
+    /// reaching `coset`'s detached-verify path, whose `tbs_detached_data` asserts `payload.is_none()`
+    /// and would otherwise PANIC/ABORT on this attacker-controlled input (the DoS this knob probes).
+    device_signature_attached_payload: bool,
     /// When set, sign the IssuerAuth with a non-ES256 (ES384) algorithm header (alg-gate reject).
     issuer_auth_wrong_alg: bool,
     /// When set, emit the IssuerAuth as a `#6.18`-tagged COSE_Sign1 (the tagged form the verifier
@@ -242,6 +249,7 @@ impl MdocBuilder {
             session_transcript: None,
             device_sig_wrong_alg: false,
             mangle_device_signature: false,
+            device_signature_attached_payload: false,
             issuer_auth_wrong_alg: false,
             tag_issuer_auth: false,
             x5chain_as_array: false,
@@ -440,6 +448,15 @@ impl MdocBuilder {
     /// prove the OID4VP layer keeps `HolderBinding` (does NOT mask it as `Replay`).
     pub(crate) fn mangle_device_signature(mut self) -> Self {
         self.mangle_device_signature = true;
+        self
+    }
+
+    /// Re-emit the (genuine, ES256-signed) DeviceSignature COSE_Sign1 with a NON-NIL (ATTACHED)
+    /// payload instead of `nil` — a malformed, NON-DETACHED holder binding (ISO/IEC 18013-5 §9.1.3
+    /// mandates a detached COSE_Sign1). The verifier must reject it as `HolderBinding` WITHOUT
+    /// reaching `coset`'s detached-verify assert (which would panic/abort on this attacker input).
+    pub(crate) fn device_signature_attached_payload(mut self) -> Self {
+        self.device_signature_attached_payload = true;
         self
     }
 
@@ -742,6 +759,14 @@ impl MdocBuilder {
                     // Truncate the 64-byte `r‖s` to 10 bytes: no longer a well-formed ES256 signature
                     // (neither raw nor DER) — a structurally-broken, transcript-independent binding.
                     device_signature.signature.truncate(10);
+                }
+                if self.device_signature_attached_payload {
+                    // Flip the third COSE_Sign1 array element from `nil` to a NON-NIL (attached) bstr,
+                    // leaving the genuine ES256 protected header + `r‖s` signature intact. This is a
+                    // malformed, NON-DETACHED DeviceSignature (ISO/IEC 18013-5 §9.1.3 requires a
+                    // detached/nil payload) — the verifier must reject it as `HolderBinding` WITHOUT
+                    // reaching `coset`'s `tbs_detached_data` assert (which panics on `payload.is_some()`).
+                    device_signature.payload = Some(vec![0x01]);
                 }
                 let device_signature_bytes =
                     device_signature.to_vec().expect("encode DeviceSignature");

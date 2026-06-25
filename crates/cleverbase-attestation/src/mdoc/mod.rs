@@ -1529,6 +1529,17 @@ fn verify_cose_sign1_detached_es256(
 ) -> Result<(), ()> {
     use p256::ecdsa::signature::Verifier as _;
 
+    // The DeviceSignature MUST be a DETACHED COSE_Sign1: a nil payload (third array element `null`),
+    // with the signed `DeviceAuthentication` supplied externally (ISO/IEC 18013-5 §9.1.3). A
+    // COSE_Sign1 carrying an ATTACHED payload (a `bstr` third element) is a malformed holder binding
+    // AND a panic vector: `coset`'s `tbs_detached_data` asserts `self.payload.is_none()` (an `assert!`
+    // that fires in release too), so calling `verify_detached_signature` on attacker-controlled input
+    // whose payload is present would PANIC/ABORT (a remote DoS). Reject it here, BEFORE any coset
+    // detached-verify call, so the assert is never reachable from `verify()`.
+    if sign1.payload.is_some() {
+        return Err(());
+    }
+
     // Gate on the algorithm BEFORE any signature math (the same single predicate the IssuerAuth path
     // uses): a non-ES256 DeviceSignature is rejected on its header alone.
     if !cose_alg_is_es256(sign1) {

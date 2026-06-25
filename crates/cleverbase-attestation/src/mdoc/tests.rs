@@ -149,6 +149,31 @@ fn bad_device_signature_is_rejected_as_holder_binding() {
 }
 
 #[test]
+fn device_signature_with_attached_payload_is_rejected_not_a_panic() {
+    // DoS guard: the mdoc is OTHERWISE issuer-valid (trusted DS, valid MSO, matching digests, valid
+    // DeviceKey) but its `deviceSignature` COSE_Sign1 carries a NON-NIL (attached) payload instead of
+    // the detached/nil payload ISO/IEC 18013-5 §9.1.3 mandates. `coset`'s `tbs_detached_data` asserts
+    // `payload.is_none()` (an `assert!` that fires in release too), so verifying such a crafted
+    // DeviceSignature on the detached path would PANIC/ABORT — an attacker-triggerable remote DoS.
+    // The verifier MUST detect the attached payload up front and reject it cleanly as `HolderBinding`,
+    // never reaching the coset assert (a verifier must never panic/abort on attacker-controlled input).
+    let response = MdocBuilder::new()
+        .device_signature_attached_payload()
+        .build();
+    let result = verify(&response, &trusted_anchors(), &params());
+
+    assert!(
+        !result.valid,
+        "an attached-payload (non-detached) DeviceSignature must not verify"
+    );
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::HolderBinding],
+        "a non-detached DeviceSignature is a malformed holder binding (ISO/IEC 18013-5 §9.1.3)"
+    );
+}
+
+#[test]
 fn malformed_cbor_is_rejected_as_malformed_credential() {
     // Not CBOR at all.
     let result = verify(&[0xff, 0x00, 0x13, 0x37], &trusted_anchors(), &params());
