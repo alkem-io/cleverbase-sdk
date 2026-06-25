@@ -49,7 +49,7 @@ fn reference_backend() -> IssuerBackend {
 
 fn an_offer() -> CredentialOffer {
     CredentialOffer {
-        pre_authorized_code: "pre-auth-code-xyz".to_owned(),
+        pre_authorized_code: crate::secret::Secret::new("pre-auth-code-xyz"),
         credential_configuration_id: "eu.europa.ec.eudi.pid_vc_sd_jwt".to_owned(),
         format: Format::SdJwtVc,
     }
@@ -187,6 +187,55 @@ fn obtain_session_debug_does_not_leak_the_access_token_or_c_nonce() {
     );
 }
 
+#[test]
+fn pre_authorized_code_never_leaks_via_debug_on_the_offer_or_session() {
+    // The OpenID4VCI pre-authorized code is a bearer grant (redeemable for the credential), so it is
+    // held as a redacting `Secret`: it must NOT appear in `Debug` output of the offer, nor of the
+    // `ObtainSession` that carries it (a log line / panic message of either). The legitimate
+    // round-trip (percent-encode at the redemption site) is unaffected — only `Debug` is redacted.
+    let code = "super-secret-pre-authorized-code-xyz";
+    let offer = CredentialOffer {
+        pre_authorized_code: crate::secret::Secret::new(code),
+        credential_configuration_id: "eu.europa.ec.eudi.pid_vc_sd_jwt".to_owned(),
+        format: Format::SdJwtVc,
+    };
+    let offer_dbg = format!("{offer:?}");
+    assert!(
+        !offer_dbg.contains(code),
+        "the pre-authorized code must never appear in the offer's Debug output: {offer_dbg}"
+    );
+    assert!(
+        offer_dbg.contains("Secret(***)"),
+        "the redacted secret marker must be present: {offer_dbg}"
+    );
+
+    let (session, _step) = begin_obtain(offer, reference_backend(), holder_ctx(), NOW);
+    let session_dbg = format!("{session:?}");
+    assert!(
+        !session_dbg.contains(code),
+        "the pre-authorized code must never appear in the session's Debug output: {session_dbg}"
+    );
+
+    // The redemption site still percent-encodes the LIVE code into the token-endpoint body.
+    let (_session, step) = begin_obtain(
+        CredentialOffer {
+            pre_authorized_code: crate::secret::Secret::new(code),
+            credential_configuration_id: "cfg".to_owned(),
+            format: Format::SdJwtVc,
+        },
+        reference_backend(),
+        holder_ctx(),
+        NOW,
+    );
+    let ObtainStep::PerformHttp(effect) = step else {
+        panic!("expected the token-endpoint POST")
+    };
+    assert!(
+        String::from_utf8_lossy(&effect.body).contains(code),
+        "the live pre-authorized code must be carried in the token-endpoint body"
+    );
+}
+
 // --- Protocol failure paths (no false success) --------------------------------------------------
 
 #[test]
@@ -252,7 +301,7 @@ fn mdoc_credential_response_is_parsed_from_base64url() {
     use crate::mdoc::test_issuer::MdocBuilder;
     let device_response = MdocBuilder::new().build();
     let offer = CredentialOffer {
-        pre_authorized_code: "p".to_owned(),
+        pre_authorized_code: crate::secret::Secret::new("p"),
         credential_configuration_id: "eu.europa.ec.eudi.pid_mdoc".to_owned(),
         format: Format::Mdoc,
     };
@@ -343,7 +392,7 @@ fn credential_response_without_a_credential_member_fails() {
 #[test]
 fn mdoc_credential_with_bad_base64url_fails() {
     let offer = CredentialOffer {
-        pre_authorized_code: "p".to_owned(),
+        pre_authorized_code: crate::secret::Secret::new("p"),
         credential_configuration_id: "cfg".to_owned(),
         format: Format::Mdoc,
     };

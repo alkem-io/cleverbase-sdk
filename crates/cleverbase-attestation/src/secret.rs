@@ -3,10 +3,10 @@
 //!
 //! This is a deliberate, self-contained copy of the ~20-line `Secret` newtype the signing core
 //! (`cleverbase-core`) defines. It is *not* a DRY violation: pulling in `cleverbase-core` solely to
-//! reuse this trivial leaf type dragged the whole signing stack — including `lopdf` (a PDF library)
-//! and `cms` — into this otherwise pure-Rust / WASM-able / minimal verifier (contradicting the
-//! `lib.rs` posture). The correct trade-off for a trivial leaf type is a local definition rather
-//! than a heavy cross-crate dependency; see the removed-dependency rationale in `Cargo.toml`.
+//! reuse this trivial leaf type dragged the whole signing stack — including `lopdf` (a PDF library) —
+//! into this otherwise pure-Rust / WASM-able / minimal verifier (contradicting the `lib.rs` posture).
+//! The correct trade-off for a trivial leaf type is a local definition rather than a heavy
+//! cross-crate dependency; see the removed-dependency rationale in `Cargo.toml`.
 //!
 //! Semantics match the core type exactly: the inner value never appears in `Debug` output
 //! (Constitution Principle IV — never leak secrets via Debug/log/panic), yet it still
@@ -20,12 +20,17 @@ use serde::{Deserialize, Serialize};
 ///
 /// It still (de)serializes its inner value so a CBOR-serialized `obtain` session can round-trip its
 /// bearer token / one-time nonce; the host is responsible for protecting serialized handles at rest.
+///
+/// `pub` because it appears in a public API field ([`crate::issuance::CredentialOffer`]'s bearer
+/// `pre_authorized_code`), so the host can construct one from a received offer — the same surface the
+/// signing core's `Secret` exposes.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Secret(String);
+pub struct Secret(String);
 
 impl Secret {
     /// Wrap a value as a redacted secret.
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    #[must_use]
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 

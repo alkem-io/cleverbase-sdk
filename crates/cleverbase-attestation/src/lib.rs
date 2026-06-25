@@ -12,7 +12,7 @@
 //! ## Design constraints (from the plan)
 //!
 //! - **No hand-rolled crypto** (Principle IV): signatures and digests go through the SDK's existing
-//!   RustCrypto stack (`p256`/`ecdsa`/`rsa`/`sha2`/`x509-cert`/`cms`) plus `coset` for COSE.
+//!   RustCrypto stack (`p256`/`ecdsa`/`rsa`/`sha2`/`x509-cert`) plus `coset` for COSE.
 //! - **One Rust core** (Principle III): all attestation logic lives here, surfaced over the existing
 //!   `cleverbase-ffi` C-ABI; the bindings stay thin.
 //! - **Not a wallet** (Principle IV): holder keys are the integrator's, exercised via the spec-001
@@ -45,6 +45,7 @@
 
 #[cfg(test)]
 mod conformance;
+pub mod crypto;
 pub mod datetime;
 pub mod issuance;
 pub mod mdoc;

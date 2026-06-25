@@ -214,28 +214,9 @@ impl HolderContext {
     /// mdoc `DeviceKey` COSE_Key.
     #[must_use]
     pub fn public_sec1(&self) -> Option<Vec<u8>> {
-        let jwk = &self.holder_public_jwk;
-        if jwk.get("kty").and_then(Value::as_str) != Some("EC")
-            || jwk.get("crv").and_then(Value::as_str) != Some("P-256")
-        {
-            return None;
-        }
-        let x = jwk
-            .get("x")
-            .and_then(Value::as_str)
-            .and_then(|s| Base64UrlUnpadded::decode_vec(s).ok())?;
-        let y = jwk
-            .get("y")
-            .and_then(Value::as_str)
-            .and_then(|s| Base64UrlUnpadded::decode_vec(s).ok())?;
-        if x.len() != 32 || y.len() != 32 {
-            return None;
-        }
-        let mut sec1 = Vec::with_capacity(65);
-        sec1.push(0x04);
-        sec1.extend_from_slice(&x);
-        sec1.extend_from_slice(&y);
-        Some(sec1)
+        // The `kty=EC`/`crv=P-256` guard + base64url `x`/`y` decode + `0x04 ‖ X ‖ Y` assembly is the
+        // shared [`crate::crypto::p256_sec1_from_jwk`] (DRY — one authoritative JWK→SEC1 decode).
+        crate::crypto::p256_sec1_from_jwk(&self.holder_public_jwk)
     }
 }
 
@@ -435,13 +416,7 @@ fn public_jwk_only(jwk: &Value) -> Value {
     jwk
 }
 
-/// SHA-256 of `input` (the SDK's own `sha2` — research D1, no second crypto stack).
-fn sha256(input: &[u8]) -> [u8; 32] {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(input);
-    hasher.finalize().into()
-}
+use crate::crypto::sha256;
 
 #[cfg(test)]
 mod tests;

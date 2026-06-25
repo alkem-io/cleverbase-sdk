@@ -24,17 +24,23 @@
 /// Only the `Z` (UTC) form is accepted — both the ISO/IEC 18013-5 `tdate` fields and the TS 119 612
 /// trust-list timestamps are UTC; an offset / local time is rejected. The day-of-month is validated
 /// against the month **and leap year** (Feb 28/29; the 30-day months Apr/Jun/Sep/Nov), so an
-/// out-of-range day fails closed (`None`) rather than rolling forward to a wrong instant.
+/// out-of-range day fails closed (`None`) rather than rolling forward to a wrong instant. The year is
+/// the RFC 3339 `date-fullyear` — **exactly four digits** (`0000..=9999`), parsed like the other
+/// fixed-width fields; a longer/huge year is rejected rather than fed to [`civil_to_unix`] where it
+/// would overflow `i64` (a panic under `overflow-checks`, a wrap in release — both a wrong instant or
+/// a DoS across the C-ABI).
 ///
-/// Returns `None` on any deviation (wrong separators, out-of-range field, non-numeric component,
-/// trailing garbage, missing `Z`), so a malformed timestamp fails closed.
+/// Returns `None` on any deviation (wrong separators, out-of-range field, non-numeric or
+/// non-four-digit year, trailing garbage, missing `Z`), so a malformed timestamp fails closed.
 pub(crate) fn parse_rfc3339_utc(s: &str) -> Option<i64> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
 
-    // Date: exactly three '-'-separated numeric segments.
+    // Date: exactly three '-'-separated numeric segments. The year is the RFC 3339 four-digit
+    // `date-fullyear` (`0000..=9999`); parsing it fixed-width (like month/day) rejects a huge,
+    // otherwise-i64-parseable year that would overflow `civil_to_unix`.
     let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
+    let year: i64 = parse_fixed_width(date_parts.next()?, 4)?;
     let month: i64 = parse_fixed_width(date_parts.next()?, 2)?;
     let day: i64 = parse_fixed_width(date_parts.next()?, 2)?;
     if date_parts.next().is_some() {
@@ -52,8 +58,9 @@ pub(crate) fn parse_rfc3339_utc(s: &str) -> Option<i64> {
     }
     let second = parse_seconds_field(seconds_field)?;
 
-    // Field-range validation. The day is checked against the month + leap year (the bug fix); the
-    // year is unconstrained (proleptic Gregorian). A leap second (`60`) is tolerated.
+    // Field-range validation. The day is checked against the month + leap year; the year is the
+    // four-digit `date-fullyear` (range-enforced by the fixed-width parse above). A leap second
+    // (`60`) is tolerated.
     if !(1..=12).contains(&month)
         || !(0..=23).contains(&hour)
         || !(0..=59).contains(&minute)
@@ -65,7 +72,7 @@ pub(crate) fn parse_rfc3339_utc(s: &str) -> Option<i64> {
         return None;
     }
 
-    Some(civil_to_unix(year, month, day, hour, minute, second))
+    civil_to_unix(year, month, day, hour, minute, second)
 }
 
 /// Parse a fixed-width, all-ASCII-digit field (e.g. a two-digit month/day/hour) to `i64`.
@@ -121,16 +128,39 @@ fn is_leap_year(year: i64) -> bool {
 /// (public-domain; the same algorithm `chrono`/`time` use). Avoids a date dependency for the
 /// timestamp parses the verifier needs.
 ///
+/// Every step is **checked** arithmetic: an input that would overflow `i64` returns `None` (fails
+/// closed) rather than panicking under `overflow-checks` (the default test profile) or silently
+/// wrapping to a wrong instant in release. With the four-digit-year bound [`parse_rfc3339_utc`]
+/// enforces this can never trigger for a well-formed parse, but the helper stays total so a malformed
+/// or out-of-range input can never produce a wrong/UB result across the C-ABI.
+///
 /// Callers MUST validate the field ranges first ([`parse_rfc3339_utc`] does); a `day` beyond the
 /// month would otherwise roll forward into the next month.
-fn civil_to_unix(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
+fn civil_to_unix(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
+    let y = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?; // [0, 399]
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era * 146_097 + doe - 719_468;
-    days * 86_400 + hour * 3_600 + minute * 60 + second
+    let doe = yoe.checked_mul(365)? + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    days.checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
 }
 
 #[cfg(test)]
@@ -281,8 +311,47 @@ mod tests {
     #[test]
     fn civil_to_unix_handles_pre_epoch_and_leap_years() {
         // One day before the epoch (exercises the negative-year / month<=2 branch).
-        assert_eq!(civil_to_unix(1969, 12, 31, 0, 0, 0), -86_400);
+        assert_eq!(civil_to_unix(1969, 12, 31, 0, 0, 0), Some(-86_400));
         // A leap day (month <= 2 branch).
-        assert_eq!(civil_to_unix(2020, 2, 29, 0, 0, 0), 1_582_934_400);
+        assert_eq!(civil_to_unix(2020, 2, 29, 0, 0, 0), Some(1_582_934_400));
+    }
+
+    #[test]
+    fn civil_to_unix_returns_none_on_overflow_rather_than_panicking() {
+        // The four-digit-year bound stops this at the parser, but the helper stays total so a huge
+        // year handed in directly fails closed (`None`) instead of panicking (overflow-checks) or
+        // wrapping to a wrong instant (release). `i64::MAX` years would overflow the `era * 146_097`
+        // (and the `days * 86_400`) multiplications.
+        assert_eq!(civil_to_unix(i64::MAX, 6, 15, 0, 0, 0), None);
+        assert_eq!(civil_to_unix(i64::MIN, 6, 15, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn rejects_year_outside_the_four_digit_date_fullyear() {
+        // The HIGH finding: a huge but i64-parseable year used to pass the (absent) year check and
+        // overflow `civil_to_unix` — a panic under overflow-checks (a DoS across the C-ABI) or a
+        // silent wrap to a wrong validity-window instant in release. RFC 3339 `date-fullyear` is
+        // exactly four digits, so anything else now fails closed (`None`) at parse time — no panic.
+        assert_eq!(parse_rfc3339_utc("10000-01-01T00:00:00Z"), None); // 5-digit year
+        assert_eq!(parse_rfc3339_utc("999999-01-01T00:00:00Z"), None); // 6-digit year
+        assert_eq!(
+            parse_rfc3339_utc("9223372036854775807-01-01T00:00:00Z"),
+            None
+        ); // i64::MAX-shaped year (the overflow trigger) → no panic
+        assert_eq!(parse_rfc3339_utc("999-01-01T00:00:00Z"), None); // 3-digit year (too short)
+        assert_eq!(parse_rfc3339_utc("-001-01-01T00:00:00Z"), None); // signed year
+    }
+
+    #[test]
+    fn accepts_the_four_digit_year_boundaries() {
+        // The 4-digit `date-fullyear` boundaries still parse correctly (no panic, the real instant).
+        assert_eq!(
+            parse_rfc3339_utc("0000-01-01T00:00:00Z"),
+            Some(-62_167_219_200)
+        );
+        assert_eq!(
+            parse_rfc3339_utc("9999-12-31T23:59:59Z"),
+            Some(253_402_300_799)
+        );
     }
 }

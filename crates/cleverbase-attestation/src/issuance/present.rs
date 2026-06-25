@@ -112,7 +112,7 @@ impl sd_jwt_payload::Hasher for Sha2Hasher {
         sha2::Sha256::digest(input).to_vec()
     }
     fn alg_name(&self) -> &'static str {
-        "sha-256"
+        crate::crypto::SHA_256
     }
 }
 

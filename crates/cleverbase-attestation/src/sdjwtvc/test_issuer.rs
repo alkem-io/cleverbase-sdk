@@ -179,6 +179,55 @@ pub(crate) fn mint_sd_jwt_with_validity(
     .expect("issuer signing succeeds")
 }
 
+/// Mint a presentation whose issuer JWS signs **two different disclosures for the SAME claim name**
+/// (`given_name` = `"Ada"` and `given_name` = `"Mallory"`), both with their digests in the top-level
+/// `_sd` array, returning `<issuer-JWS>~<D-Ada>~<D-Mallory>~` (issuer-only, trailing `~`).
+///
+/// Both disclosures are issuer-signed (their digests are in `_sd`), so each passes the membership
+/// check and they have *distinct* digests (distinct salts), so the repeated-digest guard does NOT
+/// fire — the only thing that catches this is the duplicate-claim-name guard (RFC 9901 §9.3). The
+/// caller appends the two disclosures in either order to prove the holder cannot pick which value the
+/// RP sees.
+pub(crate) fn mint_dual_value_same_name(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+) -> (String, String, String) {
+    // Two object-property disclosures: ["<salt>", "given_name", <value>], distinct salts.
+    let disclosure_a = Base64UrlUnpadded::encode_string(
+        json!(["AAAAAAAAAAAAAAAAAAAAAA", "given_name", "Ada"])
+            .to_string()
+            .as_bytes(),
+    );
+    let disclosure_b = Base64UrlUnpadded::encode_string(
+        json!(["BBBBBBBBBBBBBBBBBBBBBB", "given_name", "Mallory"])
+            .to_string()
+            .as_bytes(),
+    );
+    let digest_a = Base64UrlUnpadded::encode_string(&Sha2Hasher.digest(disclosure_a.as_bytes()));
+    let digest_b = Base64UrlUnpadded::encode_string(&Sha2Hasher.digest(disclosure_b.as_bytes()));
+
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let header = json!({ "alg": "ES256", "x5c": [cert_b64] });
+    let payload = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "https://credentials.example/identity_credential",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        "_sd_alg": "sha-256",
+        "_sd": [digest_a, digest_b],
+    });
+    let header_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    let payload_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&payload).unwrap().as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = p256::ecdsa::SigningKey::from_pkcs8_der(issuer_pk8).expect("valid PKCS#8 P-256 key");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    let jws = format!("{signing_input}.{sig_b64}");
+    (jws, disclosure_a, disclosure_b)
+}
+
 /// Attach a holder KB-JWT (signed by `holder_pk8`) over the given `aud`/`nonce` to a minted SD-JWT,
 /// returning the full compact presentation string.
 pub(crate) fn attach_kb_jwt(

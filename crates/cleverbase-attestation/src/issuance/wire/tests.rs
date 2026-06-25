@@ -54,7 +54,7 @@ fn sign_with_holder(input: &SigningInput) -> Vec<u8> {
 }
 fn an_offer(format: Format) -> CredentialOffer {
     CredentialOffer {
-        pre_authorized_code: "pre-auth".to_owned(),
+        pre_authorized_code: crate::secret::Secret::new("pre-auth"),
         credential_configuration_id: "cfg".to_owned(),
         format,
     }

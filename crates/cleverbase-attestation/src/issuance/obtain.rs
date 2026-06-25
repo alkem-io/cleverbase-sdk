@@ -104,8 +104,12 @@ impl IssuerBackend {
 /// (and its [`Format`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialOffer {
-    /// The OpenID4VCI `pre-authorized_code` from the offer's grant.
-    pub pre_authorized_code: String,
+    /// The OpenID4VCI `pre-authorized_code` from the offer's grant. It is a bearer grant (redeemable
+    /// for the credential), so it is held as a redacting [`Secret`] — it never appears in
+    /// `Debug`/log/panic output (FR-010, Constitution Principle IV), yet still (de)serializes
+    /// transparently so the offer round-trips on the wire and the redemption site percent-encodes the
+    /// live value (only the `Debug` exposure was the leak).
+    pub pre_authorized_code: Secret,
     /// The credential configuration id to request (e.g. `eu.europa.ec.eudi.pid_vc_sd_jwt`).
     pub credential_configuration_id: String,
     /// The format of the credential this configuration issues (so the SDK parses the right shape).
@@ -361,7 +365,7 @@ fn token_request(backend: &IssuerBackend, offer: &CredentialOffer) -> HttpEffect
     let body = format!(
         "grant_type={}&pre-authorized_code={}",
         percent_encode("urn:ietf:params:oauth:grant-type:pre-authorized_code"),
-        percent_encode(&offer.pre_authorized_code),
+        percent_encode(offer.pre_authorized_code.expose()),
     );
     HttpEffect {
         method: HttpMethod::Post,

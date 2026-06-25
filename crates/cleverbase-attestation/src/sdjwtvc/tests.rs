@@ -13,9 +13,9 @@ use sd_jwt_payload::{Hasher, KeyBindingJwt, RequiredKeyBinding, SdJwtBuilder};
 use serde_json::{json, Value};
 
 use super::test_issuer::{
-    attach_kb_jwt, block_on, mint_sd_jwt, mint_sd_jwt_with_validity, Es256Signer, Sha2Hasher,
-    HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER,
-    WRONG_ISSUER_KEY_PK8,
+    attach_kb_jwt, block_on, mint_dual_value_same_name, mint_sd_jwt, mint_sd_jwt_with_validity,
+    Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
 };
 use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
 use crate::trust::StaticTestAnchors;
@@ -360,6 +360,50 @@ fn duplicate_disclosure_is_rejected_as_disclosure_integrity() {
     inp.key_binding = None;
     let result = verify_sd_jwt_vc(&inp);
     assert_invalid(&result, ReasonCode::DisclosureIntegrity);
+}
+
+#[test]
+fn two_issuer_signed_disclosures_for_the_same_claim_name_are_rejected_both_orderings() {
+    // RFC 9901 §9.3: the verifier MUST reject an SD-JWT that would populate a claim name more than
+    // once. Both disclosures are issuer-signed (their digests are in `_sd`) and have DISTINCT digests
+    // (distinct salts), so the membership and repeated-digest guards both pass — the only thing that
+    // can catch this is the duplicate-claim-name guard. Without it, last-writer-wins lets the holder
+    // choose which issuer-signed value the RP sees by REORDERING the disclosure segments; we prove the
+    // reject holds in BOTH orderings (issuer-only presentation, so disclosure integrity is the failing
+    // check under test). The mdoc path already closes this via `insert_no_shadow`; this is the parity.
+    let (jws, disclosure_a, disclosure_b) =
+        mint_dual_value_same_name(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let anchors = trusted_anchors();
+    for (first, second) in [
+        (&disclosure_a, &disclosure_b),
+        (&disclosure_b, &disclosure_a),
+    ] {
+        let presentation = format!("{jws}~{first}~{second}~");
+        let mut inp = input(&presentation, &anchors);
+        inp.key_binding = None;
+        let result = verify_sd_jwt_vc(&inp);
+        assert_invalid(&result, ReasonCode::DisclosureIntegrity);
+    }
+}
+
+#[test]
+fn single_disclosure_for_a_dual_minted_claim_still_verifies() {
+    // The conflict guard must NOT break the normal single-disclosure path: disclosing exactly ONE of
+    // the issuer-signed `given_name` values is a valid, accepted presentation (only the disclosed
+    // value is returned). This confirms the guard fires only on a *repeated* population, not a single
+    // one.
+    let (jws, disclosure_a, _disclosure_b) =
+        mint_dual_value_same_name(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = format!("{jws}~{disclosure_a}~");
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.key_binding = None;
+    let result = verify_sd_jwt_vc(&inp);
+    assert!(result.valid, "reasons {:?}", result.reasons);
+    assert_eq!(
+        result.disclosed_attributes.get("given_name"),
+        Some(&AttributeValue::Text("Ada".to_string()))
+    );
 }
 
 #[test]

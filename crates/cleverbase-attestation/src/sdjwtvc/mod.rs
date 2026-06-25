@@ -42,9 +42,7 @@ use crate::types::{
 /// ECDSA / P-256 / SHA-256 — HAIP 1.0 §7; research D1). Any other `alg` is rejected as unsupported.
 const ES256: &str = "ES256";
 
-/// The SD-JWT `_sd_alg` digest algorithm this verifier supports (IANA "Named Information Hash
-/// Algorithm" registry name). Per RFC 9901 the default when `_sd_alg` is absent is `sha-256`.
-const SHA_256: &str = "sha-256";
+use crate::crypto::{sha256, SHA_256};
 
 /// The revocation/status input to the verifier — the canonical [`crate::status::StatusOutcome`]
 /// (one authoritative status type, DRY). The [`verify()`](crate::verify()) entry point resolves the credential's
@@ -359,32 +357,12 @@ fn holder_key_from_cnf(
     verifying_key_from_p256_jwk(&Value::Object(jwk.clone()))
 }
 
-/// Build a P-256 verifying key from a JWK object (`kty=EC`, `crv=P-256`, base64url `x`/`y`).
+/// Build a P-256 verifying key from a JWK object (`kty=EC`, `crv=P-256`, base64url `x`/`y`),
+/// mapping any deviation to [`ReasonCode::HolderBinding`]. The decode + on-curve check is the shared
+/// [`crate::crypto::p256_verifying_key_from_jwk`] (DRY); only the module-specific reason mapping lives
+/// here.
 fn verifying_key_from_p256_jwk(jwk: &Value) -> Result<p256::ecdsa::VerifyingKey, ReasonCode> {
-    if jwk.get("kty").and_then(Value::as_str) != Some("EC")
-        || jwk.get("crv").and_then(Value::as_str) != Some("P-256")
-    {
-        return Err(ReasonCode::HolderBinding);
-    }
-    let x = jwk
-        .get("x")
-        .and_then(Value::as_str)
-        .and_then(|s| Base64UrlUnpadded::decode_vec(s).ok())
-        .ok_or(ReasonCode::HolderBinding)?;
-    let y = jwk
-        .get("y")
-        .and_then(Value::as_str)
-        .and_then(|s| Base64UrlUnpadded::decode_vec(s).ok())
-        .ok_or(ReasonCode::HolderBinding)?;
-    if x.len() != 32 || y.len() != 32 {
-        return Err(ReasonCode::HolderBinding);
-    }
-    // Uncompressed SEC1 point: 0x04 || X || Y.
-    let mut sec1 = Vec::with_capacity(65);
-    sec1.push(0x04);
-    sec1.extend_from_slice(&x);
-    sec1.extend_from_slice(&y);
-    p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| ReasonCode::HolderBinding)
+    crate::crypto::p256_verifying_key_from_jwk(jwk).ok_or(ReasonCode::HolderBinding)
 }
 
 /// Verify a compact `header.payload.signature` ES256 JWS under `key`. Returns `Err(())` on any
@@ -444,10 +422,40 @@ fn collect_disclosed_attributes(
         // latter are sub-values of a named claim and are surfaced via that claim's value, so only
         // named top-level/object disclosures become returned attributes here.
         if let Some(name) = disclosure.claim_name.as_deref() {
-            disclosed.insert(name.to_string(), json_to_attribute(&disclosure.claim_value));
+            insert_no_shadow(
+                &mut disclosed,
+                name.to_string(),
+                json_to_attribute(&disclosure.claim_value),
+            )?;
         }
     }
     Ok(disclosed)
+}
+
+/// Insert a disclosed claim, rejecting a disclosure that would populate an **already-populated** claim
+/// name with a different value (RFC 9901 §9.3 — the verifier MUST reject an SD-JWT that would populate
+/// a claim name more than once; populating it twice would let a malicious holder pick which
+/// issuer-signed value the relying party sees by reordering the disclosure segments).
+///
+/// This mirrors the mdoc path's [`crate::mdoc`] `insert_no_shadow` (parity, DRY in spirit): an
+/// identical re-disclosure is harmless (no shadowing of a different value) and is accepted; a
+/// conflicting one is rejected as a structurally untrustworthy disclosure set
+/// ([`ReasonCode::DisclosureIntegrity`]).
+fn insert_no_shadow(
+    map: &mut BTreeMap<String, AttributeValue>,
+    name: String,
+    value: AttributeValue,
+) -> Result<(), ReasonCode> {
+    match map.get(&name) {
+        // A genuine collision with a DIFFERENT value: one disclosure would shadow the other — reject.
+        Some(existing) if *existing != value => Err(ReasonCode::DisclosureIntegrity),
+        // Same name, same value (or first sighting): no shadowing risk.
+        Some(_) => Ok(()),
+        None => {
+            map.insert(name, value);
+            Ok(())
+        }
+    }
 }
 
 /// Walk a JSON value collecting every SD digest: object `_sd` arrays (strings) and array-element
@@ -476,14 +484,6 @@ fn collect_signed_digests(value: &Value, out: &mut std::collections::BTreeSet<St
         }
         _ => {}
     }
-}
-
-/// SHA-256 of `input` (the SDK's own `sha2`, not a second crypto stack — research D1).
-fn sha256(input: &[u8]) -> [u8; 32] {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(input);
-    hasher.finalize().into()
 }
 
 /// Map a disclosed `serde_json::Value` claim into the SDK's closed [`AttributeValue`] (the CBOR wire

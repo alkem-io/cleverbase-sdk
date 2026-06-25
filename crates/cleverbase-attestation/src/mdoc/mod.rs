@@ -848,13 +848,10 @@ fn mso_device_key(mso: &CborValue) -> Result<DeviceKey, VerifyFailure> {
         find_key_label_bytes(device_key_value, COSE_KEY_X).ok_or_else(VerifyFailure::malformed)?;
     let y =
         find_key_label_bytes(device_key_value, COSE_KEY_Y).ok_or_else(VerifyFailure::malformed)?;
-    if x.len() != 32 || y.len() != 32 {
-        return Err(VerifyFailure::malformed());
-    }
-    let mut sec1 = Vec::with_capacity(65);
-    sec1.push(0x04);
-    sec1.extend_from_slice(&x);
-    sec1.extend_from_slice(&y);
+    // The 32-byte-coordinate check + `0x04 ‖ X ‖ Y` assembly is the shared
+    // [`crate::crypto::p256_sec1_from_coords`] (DRY — the same SEC1 assembly the JWK path uses, just
+    // fed from COSE labels here rather than a JWK).
+    let sec1 = crate::crypto::p256_sec1_from_coords(&x, &y).ok_or_else(VerifyFailure::malformed)?;
     Ok(DeviceKey { sec1 })
 }
 
