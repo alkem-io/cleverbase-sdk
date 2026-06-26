@@ -219,7 +219,10 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                 Some(req),
             ) => {
                 // An mdoc verified against a request must carry the addressed audience (the OpenID4VP
-                // delivery channel's `client_id`); without it the binding cannot be checked.
+                // delivery channel's `client_id`); without it the OpenID4VP handover cannot be
+                // reconstructed and the binding cannot be checked. This is `MissingRequestBinding`
+                // condition (1) — the addressed-audience-absent case (see the `ReasonCode` rustdoc; one
+                // of three distinct "binding material absent" conditions the code intentionally covers).
                 let Some(audience) = audience else {
                     return VerificationResult::invalid(ReasonCode::MissingRequestBinding);
                 };

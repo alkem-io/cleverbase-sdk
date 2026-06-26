@@ -70,19 +70,21 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// A `sha-256` [`Hasher`] over the SDK's own `sha2` — the `sd-jwt-payload` [`Hasher`] adapter the test
-/// issuer/holder minters use (the crate ships no SHA-256 `Hasher` impl of its own, since production
-/// hashing goes through [`crate::crypto::sha256`], not this trait).
+/// A `sha-256` [`Hasher`] for the `sd-jwt-payload` issuer/holder minters, routed through the crate's
+/// single authoritative SHA-256 ([`crate::crypto::sha256`]) and its IANA name ([`crate::crypto::SHA_256`])
+/// — the SAME digest the production holder-presentation `Hasher` ([`crate::issuance::present`]) and
+/// verifier use, so there is no second crypto stack and no re-inlined `"sha-256"` literal (DRY —
+/// Principle III). (The production `Hasher` impl lives in `crate::issuance::present` and is private to
+/// that module; this is the matching test-support adapter, delegating to the same `crate::crypto`.)
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Sha2Hasher;
 
 impl Hasher for Sha2Hasher {
     fn digest(&self, input: &[u8]) -> Vec<u8> {
-        use sha2::Digest as _;
-        sha2::Sha256::digest(input).to_vec()
+        crate::crypto::sha256(input).to_vec()
     }
     fn alg_name(&self) -> &'static str {
-        "sha-256"
+        crate::crypto::SHA_256
     }
 }
 

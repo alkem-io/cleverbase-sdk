@@ -678,7 +678,14 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         supplied_intermediates,
     );
     if !decision.trusted {
-        return Err(VerifyFailure::reason(ReasonCode::UntrustedIssuer));
+        // A chain failure carries a coarse-but-accurate `TrustFailure`: an expired/not-yet-valid cert on
+        // the DS path → `Expired` (not a misleading `UntrustedIssuer`), any other no-trust → `UntrustedIssuer`.
+        return Err(VerifyFailure::reason(
+            decision
+                .failure
+                .unwrap_or(crate::trust::TrustFailure::NotTrusted)
+                .reason_code(),
+        ));
     }
 
     // --- MSO digestAlgorithm + validityInfo. -------------------------------------------------------
@@ -1743,7 +1750,10 @@ fn verify_device_binding(
     // the verifier MUST NOT fabricate a `[null, null, null]` transcript and "pass" the binding with
     // zero freshness/transport binding (a silent no-op false-accept). Reject up front: an explicit
     // `SessionTranscript` (or, for OpenID4VP, the reconstructed handover via `crate::openid4vp`) is
-    // required to verify the `DeviceAuth`.
+    // required to verify the `DeviceAuth`. This is `MissingRequestBinding` condition (2) — the
+    // mdoc-no-transcript case (see the `ReasonCode` rustdoc; one of three distinct "binding material
+    // absent" conditions the code intentionally covers — distinct from a present-but-invalid binding,
+    // which is `HolderBinding`).
     let Some(session_transcript_bytes) = params.session_transcript else {
         return Err(VerifyFailure::reason(ReasonCode::MissingRequestBinding));
     };

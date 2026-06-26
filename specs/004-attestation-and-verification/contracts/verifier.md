@@ -63,6 +63,31 @@ absent (never a `Qualified` read off an unverified claimed cert).
 - **No hand-rolled crypto** (IV): signatures/hashes go through the existing vetted crates + `coset`.
 - **Offline-capable** (FR-004): runs with the passed anchors + credential alone; no Cleverbase API.
 
+## Accepted design decisions (non-bugs — do NOT "fix" without a spec change)
+
+These are deliberate, reviewed choices. They are recorded here so a future reader does not mistake them
+for gaps and "restore symmetry" / "harden" in a way that re-introduces a hole or false-rejects conforming
+signers. In every case the verdict is the secure one (no false-accept).
+
+- **mdoc holder binding is MANDATORY; SD-JWT VC KB-JWT is OPTIONAL — the asymmetry is intentional.**
+  Every verified mdoc MUST carry a verifiable `DeviceSignature` over a real `SessionTranscript`
+  (ISO/IEC 18013-5 §9.1.5); there is **no issuer-only mdoc mode**. A request-less mdoc with no supplied
+  transcript is rejected up front (`missing_request_binding`) rather than "passed" against a fabricated
+  `[null,null,null]` transcript — fabricating one would be a silent no-op binding (a false-accept hole).
+  An SD-JWT VC, by contrast, MAY be presented without a KB-JWT (RFC 9901 permits issuer-only
+  presentations): a request-less verify accepts a KB-JWT-less SD-JWT VC (its issuer signature + disclosure
+  integrity still hold), and only a verify *under an OpenID4VP request* requires the KB-JWT (then
+  `missing_request_binding` when absent). Do **not** make the mdoc path accept a transcript-less document
+  for "symmetry" — that is precisely the no-op-binding hole the mandatory rule closes.
+
+- **ECDSA signatures are NOT low-S-normalized (standard ECDSA malleability is accepted).** The verifier
+  accepts both the low-S and high-S encodings of an otherwise-valid ECDSA signature; it does not enforce
+  RFC 6979 / BIP-62 low-S canonicalization. This is accepted because **replay protection is keyed on the
+  request `nonce`, not on signature bytes** — a malleated copy of a signature is still bound to the same
+  one-time nonce, so it cannot be replayed against a fresh request — and because enforcing low-S would risk
+  **false-rejecting valid signatures from conforming signers** (the EUDI baseline does not mandate low-S).
+  Do not add a low-S gate without a profile that requires it.
+
 ## Tests (must fail first)
 
 - Per format: a conformant VALID case (disclosed attributes returned); and INVALID cases for tamper,

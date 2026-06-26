@@ -24,10 +24,9 @@ use super::{
     EAA_Q_SERVICE_TYPE, SERVICE_STATUS_GRANTED, TS_119_615_VERSION,
 };
 use crate::sdjwtvc::test_issuer::{
-    mint_sd_jwt, mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8, WRONG_ISSUER_KEY_PK8,
 };
 use crate::trust::chain::ChainError;
-use crate::trust::StaticTestAnchors;
 use crate::types::{Format, IssuerRole, QualifiedStatus, TrustStatus, VerificationPolicy};
 use crate::verify::{verify, Presentation, VerifyContext};
 
@@ -347,14 +346,22 @@ fn invalid_status_starting_time_is_rejected() {
 // The verify() gate-seam wiring (the load-bearing SC-007 invariant).
 // =================================================================================================
 
-fn sd_jwt_anchors() -> StaticTestAnchors {
-    StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_CERT_DER)
+/// The PRODUCTION chain-validating trust source (the C-ABI semantics), trusting the issuing IACA root
+/// (`ca-iaca`) for `(QEAA, SD-JWT VC)` at the verification instant `now`. The credential leaf
+/// (`sdjwt-issuer`) chains to it, so this validates the FULL RFC 5280 §6.1 path (incl. each cert's
+/// validity window at `now`) — unlike the exact-DER pinning of `StaticTestAnchors` (which never checks
+/// notBefore/notAfter). Used by the end-to-end gate tests so the newly-added chain-validity hardening
+/// (`LeafExpired`/`AnchorExpired`) composes with the qualified gate through `verify()` at a COHERENT
+/// `now` — the bug the prior `now = NOW` (2025, before the leaf's 2026 notBefore) + exact-DER-pin tests
+/// silently skipped.
+fn chain_validating_anchors(now: i64) -> crate::trust::ChainValidatingAnchors {
+    crate::trust::ChainValidatingAnchors::new(now).trust(IssuerRole::Qeaa, Format::SdJwtVc, CA_IACA)
 }
 
-/// Mint an SD-JWT VC whose `nbf`/`exp` window straddles [`RELEVANT_GRANTED`] (2026-09-01), so the
+/// Mint an SD-JWT VC whose `nbf`/`exp` window straddles `RELEVANT_GRANTED` (2026-09-01), so the
 /// always-on bar accepts it at the same in-window instant the qualified gate authenticates the
-/// national TL signer (`ca-iaca`, valid 2026-06-25..). The canonical [`mint_sd_jwt`] credential is
-/// pinned to the 2025 [`NOW`] instant, which is outside the signer cert's validity window — so the
+/// national TL signer (`ca-iaca`, valid 2026-06-25..). The canonical `mint_sd_jwt` credential is
+/// pinned to the 2025 `NOW` instant, which is outside the signer cert's validity window — so the
 /// `verify()` gate tests mint an in-window credential instead (see the RCA on the `RELEVANT_*`
 /// constants).
 fn mint_in_window_sd_jwt() -> sd_jwt_payload::SdJwt {
@@ -369,17 +376,20 @@ fn mint_in_window_sd_jwt() -> sd_jwt_payload::SdJwt {
 #[test]
 fn gate_disabled_leaves_the_always_on_verdict_unchanged_and_qualified_status_none() {
     // The load-bearing SC-007 invariant: with the gate OFF the always-on VerificationResult is
-    // byte-identical to a run that supplies NO qualified TL, and qualified_status stays None.
+    // byte-identical to a run that supplies NO qualified TL, and qualified_status stays None. Run on a
+    // COHERENT timeline — an in-window credential + the production chain-validating trust source at
+    // `RELEVANT_GRANTED` (2026-09-01, inside every cert's window) — so the always-on bar's chain
+    // validity actually composes here (not the 2025 `NOW` + exact-DER-pin shortcut that skipped it).
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
-    let anchors = sd_jwt_anchors();
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
 
     // Reference run: gate off, no qualified TL at all.
     let baseline_ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Qeaa,
         ..VerifyContext::default()
     };
@@ -390,10 +400,15 @@ fn gate_disabled_leaves_the_always_on_verdict_unchanged_and_qualified_status_non
         &baseline_ctx,
         None,
     );
+    assert!(
+        baseline.valid,
+        "the in-window credential chain-validates to the IACA root: {:?}",
+        baseline.reasons
+    );
 
     // Gate-off run that *does* carry a qualified TL but never enables the gate → must be identical.
     let gate_off_ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Qeaa,
         qualified_gate: false,
         qualified_trust_list: Some(&tl),
@@ -424,7 +439,11 @@ fn gate_enabled_populates_qualified_status_qualified_for_a_qualified_issuer() {
     };
     let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
-    let anchors = sd_jwt_anchors();
+    // The PRODUCTION chain-validating trust source: the credential leaf chains to the IACA root, and
+    // RELEVANT_GRANTED (2026-09-01) is inside every cert's validity window, so the always-on bar's
+    // RFC 5280 §6.1 path validation passes end-to-end here — the chain-validity gate composes with the
+    // qualified gate at a coherent `now`.
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
 
     // The credential's leaf is sdjwt-issuer (granted EAA/Q); RELEVANT_GRANTED (2026-09-01) is within
     // the leaf's validity AND the signer cert's validity, so the always-on bar accepts the credential
@@ -458,12 +477,13 @@ fn gate_enabled_populates_qualified_status_qualified_for_a_qualified_issuer() {
 #[test]
 fn gate_enabled_but_no_trust_list_is_indeterminate_never_qualified() {
     // The gate is on but the host supplied no qualified TL → Indeterminate (unreachable data),
-    // never a false "qualified", and the always-on verdict is otherwise unaffected.
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    // never a false "qualified", and the always-on verdict is otherwise unaffected. Coherent timeline:
+    // an in-window credential + the production chain-validating trust source at RELEVANT_GRANTED.
+    let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
-    let anchors = sd_jwt_anchors();
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
     let ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Qeaa,
         qualified_gate: true,
         qualified_trust_list: None,
@@ -476,7 +496,7 @@ fn gate_enabled_but_no_trust_list_is_indeterminate_never_qualified() {
         &ctx,
         None,
     );
-    assert!(result.valid);
+    assert!(result.valid, "always-on bar passes: {:?}", result.reasons);
     assert_eq!(
         result.qualified_status,
         Some(QualifiedStatus::Indeterminate)
@@ -493,7 +513,7 @@ fn policy_qualified_gate_flag_also_enables_the_gate() {
     };
     let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
-    let anchors = sd_jwt_anchors();
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
     let policy = VerificationPolicy {
         qualified_gate: true, // enabled via the POLICY surface
         ..VerificationPolicy::default()
@@ -801,12 +821,14 @@ fn the_verify_gate_with_a_forged_trust_list_is_indeterminate_not_qualified() {
         ISSUER_CERT_DER,
     ))
     .expect("parses");
-    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    // Coherent timeline: an in-window credential + the production chain-validating trust source at
+    // RELEVANT_GRANTED (inside every cert's window), so the always-on bar's chain validity composes.
+    let sd_jwt = mint_in_window_sd_jwt();
     let presentation = sd_jwt.presentation();
-    let anchors = sd_jwt_anchors();
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
-        now_unix: NOW,
+        now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Qeaa,
         qualified_gate: true,
         qualified_trust_list: Some(&forged),
@@ -830,4 +852,139 @@ fn the_verify_gate_with_a_forged_trust_list_is_indeterminate_not_qualified() {
         Some(QualifiedStatus::Indeterminate),
         "a forged national TL must never make the gate report Qualified (SC-007)"
     );
+}
+
+// =================================================================================================
+// End-to-end chain-validity composing with the qualified gate (the test-fidelity fix).
+//
+// These run `verify()` through the PRODUCTION chain-validating trust source (`ChainValidatingAnchors`)
+// at a COHERENT `now` so the newly-added RFC 5280 chain-validity hardening (LeafExpired / not-yet-valid
+// / not-chained) is exercised end-to-end through verify()+the gate — the gap the prior tests (now =
+// 2025 NOW, before the leaf's 2026 notBefore, + exact-DER pinning that ignores the X.509 window) left.
+// A chain-validity failure → INVALID (no qualified status: the gate is gated on `valid`), proving the
+// two gates compose.
+// =================================================================================================
+
+/// A verification instant PAST the leaf's notAfter (2027-09-23) but INSIDE the IACA root's window
+/// (..2036): only the LEAF is expired, so the leaf-validity gate fires (not the anchor-validity gate).
+const NOW_LEAF_EXPIRED: i64 = 1_893_456_000; // 2030-01-01.
+/// A verification instant BEFORE every fixture cert's notBefore (2026-06-25): the leaf is not-yet-valid.
+const NOW_BEFORE_NOT_BEFORE: i64 = 1_750_000_000; // 2025-06-15 — the old (incoherent) `NOW`.
+
+#[test]
+fn the_verify_gate_with_an_expired_leaf_is_invalid_expired_and_has_no_qualified_status() {
+    // The chain-validity gate composes with the qualified gate: an in-window-MINTED credential whose
+    // signing LEAF cert has expired by `now` (past its notAfter, root still valid) chain-fails as
+    // `LeafExpired` → the always-on bar reports `Expired` (NOT a misleading `UntrustedIssuer`). The
+    // qualified gate is gated on `valid`, so `qualified_status` stays absent — never a `Qualified` read
+    // off an INVALID credential (SC-007). The credential's own `nbf`/`exp` straddle NOW_LEAF_EXPIRED so
+    // the CREDENTIAL validity window is not what fails — only the cert chain validity is.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return;
+    };
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(NOW_LEAF_EXPIRED - 1_000),
+        serde_json::json!(NOW_LEAF_EXPIRED + 1_000_000),
+    );
+    let presentation = sd_jwt.presentation();
+    let anchors = chain_validating_anchors(NOW_LEAF_EXPIRED);
+    let scheme = scheme_anchors();
+    let ctx = VerifyContext {
+        now_unix: NOW_LEAF_EXPIRED,
+        role: IssuerRole::Qeaa,
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(!result.valid, "an expired signing leaf must reject");
+    assert_eq!(
+        result.reasons,
+        vec![crate::types::ReasonCode::Expired],
+        "an expired (trusted) signing cert surfaces as Expired, not UntrustedIssuer"
+    );
+    assert!(
+        result.qualified_status.is_none(),
+        "the qualified gate never runs on an INVALID credential (SC-007)"
+    );
+}
+
+#[test]
+fn the_verify_gate_with_a_not_yet_valid_leaf_is_invalid_expired() {
+    // The exact incoherence the prior tests masked: at `now` = 2025-06-15 the signing leaf is
+    // not-yet-valid (its notBefore is 2026-06-25). The production chain-validating source enforces the
+    // X.509 window the old exact-DER pin ignored, so the credential is INVALID — `Expired` (the
+    // not-yet-valid boundary is also a validity-window failure). The credential's own `nbf`/`exp`
+    // straddle this instant, so only the cert-chain validity is what fails.
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(NOW_BEFORE_NOT_BEFORE - 1_000),
+        serde_json::json!(NOW_BEFORE_NOT_BEFORE + 1_000_000),
+    );
+    let presentation = sd_jwt.presentation();
+    let anchors = chain_validating_anchors(NOW_BEFORE_NOT_BEFORE);
+    let ctx = VerifyContext {
+        now_unix: NOW_BEFORE_NOT_BEFORE,
+        role: IssuerRole::Qeaa,
+        qualified_gate: true,
+        qualified_trust_list: None,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(!result.valid, "a not-yet-valid signing leaf must reject");
+    assert_eq!(result.reasons, vec![crate::types::ReasonCode::Expired]);
+    assert!(result.qualified_status.is_none());
+}
+
+#[test]
+fn the_verify_gate_with_a_leaf_that_does_not_chain_is_invalid_untrusted_issuer() {
+    // A genuine absence of trust (vs an expiry): a credential signed by `wrong-issuer` (self-signed,
+    // does NOT chain to the IACA root) is INVALID — `UntrustedIssuer` (NOT `Expired`), the other arm of
+    // the resolve_chain failure-category fold. Proves the in-window credential is rejected on trust, not
+    // on its own validity window (which straddles `now`).
+    let sd_jwt = mint_sd_jwt_with_validity(
+        WRONG_ISSUER_KEY_PK8,
+        WRONG_ISSUER,
+        serde_json::json!(RELEVANT_GRANTED - 1_000),
+        serde_json::json!(RELEVANT_GRANTED + 1_000_000),
+    );
+    let presentation = sd_jwt.presentation();
+    let anchors = chain_validating_anchors(RELEVANT_GRANTED);
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Qeaa,
+        qualified_gate: true,
+        qualified_trust_list: None,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(!result.valid, "a leaf that reaches no anchor must reject");
+    assert_eq!(
+        result.reasons,
+        vec![crate::types::ReasonCode::UntrustedIssuer],
+        "a no-trust chain failure surfaces as UntrustedIssuer, not Expired"
+    );
+    assert!(result.qualified_status.is_none());
 }

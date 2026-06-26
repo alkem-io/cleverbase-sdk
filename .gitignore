@@ -84,3 +84,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.tmp
+
+# Local Claude Code overrides (per-developer, never shared): e.g. settings.local.json carries the
+# local hook-disabling workaround and must not be committed into shared history.
+.claude/settings.local.json

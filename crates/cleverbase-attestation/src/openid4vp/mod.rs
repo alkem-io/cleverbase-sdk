@@ -241,7 +241,10 @@ fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
     let expected_nonce = request.nonce_b64();
 
     // Read the KB-JWT's claimed aud/nonce for precise failure attribution. A presentation with no
-    // KB-JWT cannot be bound to a request → MissingRequestBinding.
+    // KB-JWT carries no `aud`/`nonce` to bind to a request → MissingRequestBinding. This is
+    // `MissingRequestBinding` condition (3) — the SD-JWT-VC-no-KB-JWT case (see the `ReasonCode`
+    // rustdoc; one of three distinct "binding material absent" conditions the code intentionally
+    // covers — distinct from a present-but-mismatched binding, which is `WrongAudience`/`Replay`).
     let Some((aud, nonce)) = sdjwtvc::kb_jwt_aud_nonce(presentation) else {
         return VerificationResult::invalid(ReasonCode::MissingRequestBinding);
     };

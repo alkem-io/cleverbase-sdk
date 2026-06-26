@@ -184,8 +184,24 @@ pub enum ReasonCode {
     UnsupportedFormat,
     /// The credential or presentation was structurally malformed and could not be parsed.
     MalformedCredential,
-    /// The request binding was required (an OpenID4VP request was supplied) but is missing from the
-    /// presentation.
+    /// The request binding was required but the presentation carries no material to bind it. This one
+    /// code intentionally covers **three** distinct "the binding cannot be evaluated" conditions
+    /// (deliberately NOT split into separate codes — the verdict is identically INVALID and an
+    /// integrator's response is the same: the holder must re-present with a request-bound token):
+    ///
+    /// 1. **mdoc under an OpenID4VP request, no addressed audience** — the `Presentation::Mdoc` carried
+    ///    `audience: None`, so there is no `client_id` to bind the response to and the OpenID4VP handover
+    ///    cannot be reconstructed ([`mod@crate::verify`]).
+    /// 2. **mdoc without an OpenID4VP request, no `SessionTranscript`** — a `DeviceSignature` is always
+    ///    computed over a real `SessionTranscript` (ISO/IEC 18013-5 §9.1.5); with neither a request nor a
+    ///    supplied transcript the holder binding cannot be verified, and the verifier MUST NOT fabricate a
+    ///    `[null,null,null]` transcript and "pass" it ([`crate::mdoc`]).
+    /// 3. **SD-JWT VC under an OpenID4VP request, no KB-JWT** — the presentation has no Key Binding JWT, so
+    ///    there is nothing carrying the request `aud`/`nonce` to verify ([`crate::openid4vp`]).
+    ///
+    /// All three are "the binding material is absent" — distinct from [`Self::HolderBinding`] (binding
+    /// material is present but its signature did not verify) and [`Self::Replay`]/[`Self::WrongAudience`]
+    /// (binding present and valid, but bound to the wrong `nonce`/`audience`).
     MissingRequestBinding,
 }
 

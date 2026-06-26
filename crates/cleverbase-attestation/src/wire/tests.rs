@@ -82,11 +82,13 @@ fn well_formed_sd_jwt_request_verifies_valid() {
 }
 
 #[test]
-fn expired_pinned_leaf_anchor_is_untrusted_over_the_c_abi() {
+fn expired_pinned_leaf_anchor_is_rejected_as_expired_over_the_c_abi() {
     // FALSE-ACCEPT FIX (C-ABI trust): a host pins the issuer LEAF directly as the anchor, but the
     // verification instant is PAST the leaf cert's notAfter. The chain-validating C-ABI trust path
-    // enforces the leaf's validity window (reusing `verify_chain`), so the issuer is UntrustedIssuer
-    // — NOT silently accepted as the old exact-DER-equality (`StaticTestAnchors`) path would.
+    // enforces the leaf's validity window (reusing `verify_chain`), so the issuer is REJECTED — NOT
+    // silently accepted as the old exact-DER-equality (`StaticTestAnchors`) path would. The reason is
+    // `Expired` (a trusted-but-lapsed signing cert), not a misleading `UntrustedIssuer`: the
+    // `ChainError::LeafExpired` is folded to `TrustFailure::Expired` → `ReasonCode::Expired`.
     let mut req = valid_sd_jwt_request();
     // Pin the leaf itself as the anchor (a direct pin), and run far past its notAfter (≈2096).
     req.anchors = vec![WireTrustAnchor {
@@ -100,10 +102,7 @@ fn expired_pinned_leaf_anchor_is_untrusted_over_the_c_abi() {
     match resp.outcome {
         VerifyOutcome::Ok { result } => {
             assert!(!result.valid, "an expired pinned leaf must NOT be accepted");
-            assert_eq!(
-                result.reasons,
-                vec![crate::types::ReasonCode::UntrustedIssuer]
-            );
+            assert_eq!(result.reasons, vec![crate::types::ReasonCode::Expired]);
         }
         VerifyOutcome::Err { message } => panic!("unexpected error: {message}"),
     }

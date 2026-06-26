@@ -29,11 +29,12 @@ der.workspace = true
 const-oid.workspace = true
 spki.workspace = true
 x509-cert.workspace = true
-# Signature verification reused from the signing core (no hand-rolled crypto — Principle IV).
+# Signature verification reused from the signing core (no hand-rolled crypto — Principle IV). The
+# `ecdsa` / `signature` traits this crate uses are re-exported through `p256` (`p256::ecdsa::*` /
+# `p256::ecdsa::signature::*`), so they are NOT declared as direct dependencies here (every use goes
+# through `p256`) — adding them back would be a dead direct dep flagged by `-W unused-crate-dependencies`.
 rsa.workspace = true
 p256.workspace = true
-ecdsa.workspace = true
-signature.workspace = true
 base64ct.workspace = true
 # EUDI format/trust-list layers (pinned in [workspace.dependencies]).
 coset.workspace = true

@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::trust::chain::verify_chain;
+use crate::trust::chain::{verify_chain, ChainError};
 use crate::types::{Format, IssuerRole};
 
 // The native trust-list engine, split into focused modules (the X.509 [`chain`] primitive, the
@@ -70,17 +70,63 @@ pub struct TrustListEntry {
     pub anchor_cert_der: Vec<u8>,
 }
 
+/// Why an issuer resolved as **untrusted** — a coarse-but-accurate category so the verifier attributes
+/// a precise [`crate::types::ReasonCode`] (the verdict is identically INVALID either way).
+///
+/// A chain-validating source ([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) gets a specific
+/// [`crate::trust::chain::ChainError`] back from [`crate::trust::chain::verify_chain`]; collapsing it to
+/// a bare `trusted: false` would mislabel an EXPIRED (but otherwise trusted) signing cert as
+/// "untrusted issuer". This enum preserves the load-bearing distinction the verifier needs:
+///
+/// - [`TrustFailure::Expired`] — the path failed **only** because a certificate on it (the leaf, an
+///   intermediate, or the anchor) was outside its validity window at the verification instant
+///   ([`ChainError::LeafExpired`]/[`ChainError::AnchorExpired`]). The credential's signer would
+///   otherwise chain to a trusted anchor — it is an expiry, not an absence of trust → the verifier maps
+///   it to [`crate::types::ReasonCode::Expired`].
+/// - [`TrustFailure::NotTrusted`] — every other reason the path does not reach a configured anchor (no
+///   matching issuer, bad signature, a non-CA on the path, an unsupported algorithm, a malformed cert,
+///   an over-long chain, an exact-pin miss, or a stale cache) → [`crate::types::ReasonCode::UntrustedIssuer`].
+///
+/// [`ChainError::LeafExpired`]: crate::trust::chain::ChainError::LeafExpired
+/// [`ChainError::AnchorExpired`]: crate::trust::chain::ChainError::AnchorExpired
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustFailure {
+    /// A certificate on the signing path is outside its validity window (expired / not-yet-valid),
+    /// distinct from an absence of trust — surfaced as [`crate::types::ReasonCode::Expired`].
+    Expired,
+    /// The signer does not chain to any configured anchor for the role/format (or the cache is stale)
+    /// — surfaced as [`crate::types::ReasonCode::UntrustedIssuer`].
+    NotTrusted,
+}
+
+impl TrustFailure {
+    /// The [`crate::types::ReasonCode`] this untrusted-failure category maps to — the **one**
+    /// authoritative mapping (DRY — Principle III), shared by both per-format bars so an expired
+    /// signing cert reports `Expired` and a genuine no-trust reports `UntrustedIssuer` identically.
+    #[must_use]
+    pub const fn reason_code(self) -> crate::types::ReasonCode {
+        match self {
+            Self::Expired => crate::types::ReasonCode::Expired,
+            Self::NotTrusted => crate::types::ReasonCode::UntrustedIssuer,
+        }
+    }
+}
+
 /// The outcome of resolving an issuer against the configured anchors
 /// (contracts/trust-anchor-source.md).
 ///
 /// `trusted` is the always-on-bar trust decision; `entry` carries the matched [`TrustListEntry`] when
-/// `trusted` is `true` (it is `None` for an untrusted issuer).
+/// `trusted` is `true` (it is `None` for an untrusted issuer). `failure` carries the coarse-but-accurate
+/// [`TrustFailure`] category when `trusted` is `false` (so the verifier attributes `Expired` vs
+/// `UntrustedIssuer`); it is `None` for a trusted decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustDecision {
     /// Whether the issuer is on the configured trust anchor for its role/format.
     pub trusted: bool,
     /// The matched trust-list entry, present iff `trusted`.
     pub entry: Option<TrustListEntry>,
+    /// The untrusted-failure category, present iff `!trusted` (so the reason is never opaque).
+    pub failure: Option<TrustFailure>,
 }
 
 impl TrustDecision {
@@ -90,16 +136,26 @@ impl TrustDecision {
         Self {
             trusted: true,
             entry: Some(entry),
+            failure: None,
         }
     }
 
-    /// An untrusted decision (no matched entry).
+    /// An untrusted decision (no matched entry), carrying the [`TrustFailure`] category so the verifier
+    /// can attribute a precise reason.
     #[must_use]
-    pub const fn untrusted() -> Self {
+    pub const fn untrusted_because(failure: TrustFailure) -> Self {
         Self {
             trusted: false,
             entry: None,
+            failure: Some(failure),
         }
+    }
+
+    /// An untrusted decision with no specific category (the exact-DER-pin miss / fail-closed default):
+    /// the signer is simply not among the configured anchors → [`TrustFailure::NotTrusted`].
+    #[must_use]
+    pub const fn untrusted() -> Self {
+        Self::untrusted_because(TrustFailure::NotTrusted)
     }
 }
 
@@ -117,6 +173,12 @@ impl TrustDecision {
 /// anchor set is untrusted (fail-closed). On success the matched [`TrustListEntry`] carries the **leaf**
 /// as its `anchor_cert_der` (matching the other sources; the entry is informational — the bar reads
 /// only `trusted`).
+///
+/// On failure the specific [`crate::trust::chain::ChainError`] is folded to a coarse-but-accurate
+/// [`TrustFailure`] on the returned [`TrustDecision`] (NOT widened to the verdict, which stays INVALID):
+/// a cert outside its validity window on the path → [`TrustFailure::Expired`] (so the verifier reports
+/// `Expired`, not a misleading `UntrustedIssuer`); every other reason the path reaches no anchor →
+/// [`TrustFailure::NotTrusted`].
 fn resolve_chain(
     anchors_for_key: Option<&Vec<Vec<u8>>>,
     role: IssuerRole,
@@ -134,14 +196,20 @@ fn resolve_chain(
     let mut chain: Vec<&[u8]> = Vec::with_capacity(1 + supplied_intermediates.len());
     chain.push(issuer_cert_der);
     chain.extend(supplied_intermediates.iter().map(Vec::as_slice));
-    if verify_chain(&chain, anchors, now_unix).is_ok() {
-        TrustDecision::trusted(TrustListEntry {
+    match verify_chain(&chain, anchors, now_unix) {
+        Ok(()) => TrustDecision::trusted(TrustListEntry {
             role,
             format,
             anchor_cert_der: issuer_cert_der.to_vec(),
-        })
-    } else {
-        TrustDecision::untrusted()
+        }),
+        // Map the specific ChainError to the coarse-but-accurate TrustFailure the verifier needs: a
+        // cert outside its validity window on the path (the leaf, an intermediate, or the anchor) is an
+        // EXPIRY (→ `Expired`), distinct from an absence of trust (→ `UntrustedIssuer`). The verdict is
+        // identically INVALID either way; only the surfaced reason differs (accurate diagnostics).
+        Err(ChainError::LeafExpired | ChainError::AnchorExpired) => {
+            TrustDecision::untrusted_because(TrustFailure::Expired)
+        }
+        Err(_) => TrustDecision::untrusted_because(TrustFailure::NotTrusted),
     }
 }
 
@@ -163,7 +231,9 @@ fn resolve_chain(
 ///   (the EUDI chain-to-root model), where exact-leaf-match would reject every real credential.
 /// - The leaf's **validity window** (and a directly-pinned anchor's) is enforced at the verification
 ///   instant, so an expired/withdrawn pinned issuer leaf is rejected ([`crate::trust::chain::ChainError::LeafExpired`]),
-///   not silently accepted.
+///   not silently accepted. An expiry-driven chain failure carries [`TrustFailure::Expired`] on the
+///   [`TrustDecision`] (so the verifier reports `Expired`, not `UntrustedIssuer`); every other path
+///   failure carries [`TrustFailure::NotTrusted`].
 ///
 /// The verification instant `now_unix` (the relevant time the leaf-validity window is checked at) is
 /// carried on the source because [`TrustAnchorSource::resolve`] is sans-clock; the C-ABI builds one
@@ -352,7 +422,7 @@ impl TrustAnchorSource for StaticTestAnchors {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reachability, StaticTestAnchors, TrustAnchorSource};
+    use super::{Reachability, StaticTestAnchors, TrustAnchorSource, TrustFailure};
     use crate::types::{Format, IssuerRole};
 
     const ISSUER_A: &[u8] = b"-----DER-issuer-A-----";
@@ -446,10 +516,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_validating_rejects_an_expired_pinned_leaf_as_untrusted() {
+    fn chain_validating_rejects_an_expired_pinned_leaf_as_expired() {
         // A directly-pinned leaf (anchor == leaf) is STILL subject to its validity window: at a time
-        // past the leaf's notAfter it is rejected (UntrustedIssuer), never silently accepted — the
-        // false-accept `StaticTestAnchors` would allow (it ignores notAfter).
+        // past the leaf's notAfter it is rejected, never silently accepted — the false-accept
+        // `StaticTestAnchors` would allow (it ignores notAfter). The failure category is `Expired`
+        // (a valid signer that has lapsed), NOT `NotTrusted` (an absence of trust): the verifier maps it
+        // to `ReasonCode::Expired`, not a misleading `UntrustedIssuer`.
         let anchors = ChainValidatingAnchors::new(EXPIRED).trust(
             IssuerRole::Pid,
             Format::SdJwtVc,
@@ -461,18 +533,35 @@ mod tests {
             "an expired pinned leaf must be untrusted, not accepted"
         );
         assert!(decision.entry.is_none());
+        assert_eq!(
+            decision.failure,
+            Some(TrustFailure::Expired),
+            "an expired (but otherwise trusted) signer is an expiry, not an absence of trust"
+        );
+        assert_eq!(
+            decision.failure.map(TrustFailure::reason_code),
+            Some(crate::types::ReasonCode::Expired),
+            "the verifier maps an expiry-driven chain failure to Expired"
+        );
     }
 
     #[test]
     fn chain_validating_rejects_a_leaf_that_does_not_chain() {
         // A leaf that does not chain to the passed root (self-signed under a different name) is
-        // untrusted, even in-window.
+        // untrusted, even in-window. This is a genuine absence of trust (no path to an anchor), so the
+        // failure category is `NotTrusted` → the verifier reports `UntrustedIssuer` (NOT `Expired`).
         let anchors =
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
-        assert!(
-            !anchors
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER, &[])
-                .trusted
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER, &[]);
+        assert!(!decision.trusted);
+        assert_eq!(
+            decision.failure,
+            Some(TrustFailure::NotTrusted),
+            "a leaf that reaches no anchor is an absence of trust, not an expiry"
+        );
+        assert_eq!(
+            decision.failure.map(TrustFailure::reason_code),
+            Some(crate::types::ReasonCode::UntrustedIssuer)
         );
     }
 

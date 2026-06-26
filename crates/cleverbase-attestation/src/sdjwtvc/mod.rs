@@ -183,17 +183,19 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
 
     // 3. Issuer trust — the signing leaf's certification path (leaf + the supplied x5c intermediates)
     //    must validate to the configured anchor for its role/format (RFC 5280 §6.1 path validation).
-    if !input
-        .anchors
-        .resolve(
-            input.role,
-            crate::types::Format::SdJwtVc,
-            issuer_cert_der,
-            supplied_intermediates,
-        )
-        .trusted
-    {
-        return Err(ReasonCode::UntrustedIssuer);
+    //    A chain failure carries a coarse-but-accurate `TrustFailure`: an expired/not-yet-valid cert on
+    //    the path → `Expired` (not a misleading `UntrustedIssuer`), any other no-trust → `UntrustedIssuer`.
+    let decision = input.anchors.resolve(
+        input.role,
+        crate::types::Format::SdJwtVc,
+        issuer_cert_der,
+        supplied_intermediates,
+    );
+    if !decision.trusted {
+        return Err(decision
+            .failure
+            .unwrap_or(crate::trust::TrustFailure::NotTrusted)
+            .reason_code());
     }
 
     // 4. Validity window (`nbf`/`exp`).

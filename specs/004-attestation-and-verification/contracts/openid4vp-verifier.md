@@ -30,6 +30,22 @@ presentation it didn't request.
 - `verifyResponse` requires the originating `request` — a presentation cannot be verified "bound" without
   the nonce/audience it must match.
 
+## Accepted design decisions (non-bugs — do NOT "fix" without a spec change)
+
+- **Single-document mdoc: a wrong-key `DeviceSignature` surfaces as `replay`, not `holder_binding`.**
+  For a single-document mdoc, an attacker can supply a well-formed `DeviceSignature` over the detached
+  `DeviceAuthentication` transcript that simply does not verify under the device key. Whether that failure
+  is "wrong holder key" or "stale/replayed nonce in the transcript the signature commits to" is **not
+  distinguishable** from a single well-formed signature over a detached transcript — both manifest as
+  "this signature does not verify against the expected (key, transcript) pair". The verifier therefore
+  attributes the request-bound failure as `replay` (the freshness/binding check the request drives). Both
+  outcomes are `valid=false`, so the verdict is identical and secure; only the machine-readable reason is
+  the coarser-but-honest `replay` rather than `holder_binding`. Do not "sharpen" this to `holder_binding`
+  by assuming wrong-key — that assumption is unprovable here and would mislabel a genuine stale-nonce replay.
+
+See `verifier.md` → "Accepted design decisions" for the related mandatory-mdoc-binding and
+ECDSA-malleability decisions.
+
 ## Tests (must fail first)
 
 - A presentation correctly bound to an issued request → VALID; the same presentation **replayed** (or built

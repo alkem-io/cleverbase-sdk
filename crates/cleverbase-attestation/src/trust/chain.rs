@@ -49,8 +49,12 @@ use x509_cert::Certificate;
 
 /// Why a candidate issuer certificate failed to chain to a trusted anchor.
 ///
-/// Every rejection carries a specific reason so an untrusted verdict is never opaque (the engine
-/// maps these onto [`crate::types::ReasonCode::UntrustedIssuer`] / `Expired`).
+/// Every rejection carries a specific reason so an untrusted verdict is never opaque. `resolve_chain`
+/// folds these to a coarse-but-accurate [`crate::trust::TrustFailure`] on the [`crate::trust::TrustDecision`],
+/// which the verifier maps to a [`crate::types::ReasonCode`]: [`Self::LeafExpired`]/[`Self::AnchorExpired`]
+/// (a cert outside its validity window) → [`crate::types::ReasonCode::Expired`]; every other variant (no
+/// path, bad signature, non-CA, unsupported algorithm, malformed, over-long) →
+/// [`crate::types::ReasonCode::UntrustedIssuer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
     /// A certificate (leaf, supplied intermediate, or anchor) could not be parsed as DER X.509.
