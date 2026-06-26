@@ -139,12 +139,6 @@ impl NativeTrustEngine {
         self.now_unix = now_unix;
     }
 
-    /// The current engine clock (Unix seconds).
-    #[must_use]
-    pub const fn now_unix(&self) -> i64 {
-        self.now_unix
-    }
-
     /// Configure the offline JSON manifest list under the given logical name (builder-style).
     #[must_use]
     pub fn with_json_manifest(mut self, name: impl Into<String>) -> Self {
@@ -693,10 +687,31 @@ mod tests {
     }
 
     #[test]
-    fn clock_seam_round_trips() {
+    fn clock_seam_advances_staleness_evaluation() {
+        // The clock is a behavioral seam (U1): the SAME reachable list refreshes fresh at `NOW`
+        // (before its 2036 NextUpdate) but fails closed as Stale once `set_now` advances the clock
+        // past NextUpdate — observed through the refresh outcome + a subsequent resolve, not a getter.
         let mut engine = json_engine(NOW, Reachability::FailClosed);
-        assert_eq!(engine.now_unix(), NOW);
+        let mut fetcher = MapFetcher::default().with("test-lotl", TRUST_LIST_JSON);
+        engine.refresh_with(&mut fetcher).expect("fresh at NOW");
+        assert!(
+            engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
+                .trusted,
+            "a fresh list resolves a trusted issuer"
+        );
+
+        // Advance the clock past the list's NextUpdate via the seam; the next refresh now sees Stale.
         engine.set_now(NOW_STALE);
-        assert_eq!(engine.now_unix(), NOW_STALE);
+        let err = engine
+            .refresh_with(&mut fetcher)
+            .expect_err("stale once the clock is past NextUpdate");
+        assert!(matches!(err, TrustError::Stale(_)), "got {err:?}");
+        assert!(
+            !engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
+                .trusted,
+            "a fail-closed stale refresh clears trust"
+        );
     }
 }

@@ -395,7 +395,7 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
         // from the client_id.
         CborValue::Text(response_uri.to_owned()),
     ]);
-    let handover_info_bytes = encode_cbor(&handover_info);
+    let handover_info_bytes = crate::cbor_to_vec(&handover_info);
     // The crate's single authoritative SHA-256 (DRY — `crate::crypto` is the one digest helper),
     // adapting its fixed `[u8; 32]` to the `Vec<u8>` the CBOR `bstr` carries.
     let handover_info_hash = crate::crypto::sha256(&handover_info_bytes).to_vec();
@@ -407,13 +407,7 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
     ]);
     // SessionTranscript = [null, null, OpenID4VPHandover].
     let transcript = CborValue::Array(vec![CborValue::Null, CborValue::Null, handover]);
-    encode_cbor(&transcript)
-}
-
-/// Encode a plain CBOR value into an in-memory `Vec` (infallible — a `Vec` writer never errors). The
-/// one authoritative CBOR-into-Vec helper [`crate::cbor_to_vec`] (DRY — Principle III).
-fn encode_cbor(value: &CborValue) -> Vec<u8> {
-    crate::cbor_to_vec(value)
+    crate::cbor_to_vec(&transcript)
 }
 
 #[cfg(test)]

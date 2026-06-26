@@ -197,27 +197,14 @@ impl Default for MdocVerifyParams<'_> {
 /// those distinct (never a false `DisclosureIntegrity` reject) and preserves the namespace provenance a
 /// consumer needs. Across multiple documents the namespaces merge, with a same-`(namespace, id)`
 /// conflicting value rejected as `DisclosureIntegrity` (an identical re-disclosure merges cleanly).
-/// (This shape is mdoc-specific; SD-JWT VC keeps its own claim layout. See contracts/verifier.md.)
-///
-/// `anchors` is the configured trust-anchor source (the IACA root for mdoc); `params` carries the
-/// verification instant, the session transcript for the holder binding, and the issuer role.
-#[must_use]
-pub fn verify<A: TrustAnchorSource + ?Sized>(
-    device_response: &[u8],
-    anchors: &A,
-    params: &MdocVerifyParams<'_>,
-) -> VerificationResult {
-    verify_with_meta(device_response, anchors, params).0
-}
-
 /// The byproducts the single always-on-bar pass already computed about a `DeviceResponse`, surfaced
 /// alongside the [`VerificationResult`] so the callers that would otherwise RE-DECODE the same response
 /// (the OpenID4VP replay classifier and the opt-in qualified gate) read these cached results instead.
 ///
 /// Every field is derived from the ONE `ciborium` decode + per-document parse [`verify_with_meta`]
-/// already performs; nothing here changes the verdict (it is the same `VerificationResult` [`verify`]
-/// returns) — it only avoids the duplicate decodes those callers used to trigger (an
-/// attacker-multipliable soft-DoS lever: documents × IssuerAuth/MSO size).
+/// already performs; nothing here changes the verdict (it is the same `VerificationResult`
+/// [`verify_with_meta`] returns) — it only avoids the duplicate decodes those callers used to trigger
+/// (an attacker-multipliable soft-DoS lever: documents × IssuerAuth/MSO size).
 #[derive(Debug, Clone, Default)]
 pub struct MdocVerifyMeta {
     /// The `documents` array length (`0` when the response is too malformed to read it). The OpenID4VP
@@ -229,9 +216,8 @@ pub struct MdocVerifyMeta {
     /// VALID bar pass (and EMPTY on any INVALID verdict). The opt-in [`crate::qualified`] gate folds
     /// these (it runs only on a VALID credential), reading EACH document's already-extracted cert + its
     /// issuance/relevant time rather than re-decoding the response. On a VALID credential `signed` is
-    /// mandatory (the bar requires it), so this equals what [`issuer_signing_certs_with_issuance_der`]
-    /// would yield for the gate's use; the standalone reader keeps its own `validFrom` fallback for the
-    /// (bar-rejected) `signed`-absent case.
+    /// mandatory (the bar requires it), so this is the single source the gate folds — the per-document
+    /// `(leaf, signed)` already paired by the bar pass.
     pub claimed_issuers: Vec<(Vec<u8>, i64)>,
     /// The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
     /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
@@ -240,12 +226,13 @@ pub struct MdocVerifyMeta {
     pub binding_machinery: Option<DeviceBindingMachinery>,
 }
 
-/// Verify a presented mdoc `DeviceResponse` (exactly as [`verify`]) AND surface the [`MdocVerifyMeta`]
-/// the single bar pass already computed — the per-document claimed issuer `(cert, issuance_time)`, the
-/// document count, and (on a `HolderBinding` failure) the holder-binding-machinery soundness — so the
-/// OpenID4VP binding verifier and the qualified gate read these cached results instead of re-decoding
-/// the response. The [`VerificationResult`] is byte-identical to [`verify`]'s (this is the path
-/// [`verify`] delegates to); only the redundant re-decodes those callers used to trigger are removed.
+/// Verify a presented mdoc `DeviceResponse` against the always-on bar (the IACA-rooted issuer chain,
+/// the MSO `validityInfo` window, selective-disclosure integrity, and the `DeviceAuth` holder binding)
+/// AND surface the [`MdocVerifyMeta`] the single bar pass already computed — the per-document claimed
+/// issuer `(cert, issuance_time)`, the document count, and (on a `HolderBinding` failure) the
+/// holder-binding-machinery soundness — so the OpenID4VP binding verifier and the qualified gate read
+/// these cached results instead of re-decoding the response. This is the canonical mdoc entry point;
+/// callers that do not need the meta simply take the [`VerificationResult`] (`.0`).
 #[must_use]
 pub fn verify_with_meta<A: TrustAnchorSource + ?Sized>(
     device_response: &[u8],
@@ -260,7 +247,7 @@ pub fn verify_with_meta<A: TrustAnchorSource + ?Sized>(
 
 /// Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
 /// to tell a fresh-nonce/transcript mismatch apart from a genuine holder-binding fault when a
-/// [`verify`] run returns [`ReasonCode::HolderBinding`].
+/// [`verify_with_meta`] run returns [`ReasonCode::HolderBinding`].
 ///
 /// A nonce/transcript mismatch (a replayed presentation) fails the `DeviceSignature` check **only**
 /// because the verifier rebuilds `DeviceAuthentication` over a different transcript than the holder
@@ -290,7 +277,7 @@ pub enum DeviceBindingMachinery {
 /// signature against any payload, so it isolates a genuine binding fault (which fails for every
 /// transcript) from a fresh-nonce mismatch (which fails only because the rebuilt transcript differs).
 ///
-/// Used only to refine the failure attribution when [`verify`] already returned
+/// Used only to refine the failure attribution when [`verify_with_meta`] already returned
 /// [`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
 /// holder-binding fault is never silently downgraded to a replay).
 ///
@@ -377,8 +364,8 @@ fn device_binding_machinery_sound(document: &CborValue) -> bool {
 /// The disclosed attributes recovered by the **issuer-side** conformance verification of an mdoc
 /// `DeviceResponse`'s first document, GROUPED BY NAMESPACE: keyed by namespace, each value an
 /// [`AttributeValue::Map`] of that namespace's `{ elementIdentifier: elementValue }` (the same
-/// namespace-grouped shape [`verify`] returns — `elementIdentifier`s are unique only within a
-/// namespace, ISO/IEC 18013-5).
+/// namespace-grouped shape [`verify_with_meta`] returns — `elementIdentifier`s are unique only within
+/// a namespace, ISO/IEC 18013-5).
 ///
 /// Returned by [`verify_issuer_auth_against_vector`] — the external-vector entry that runs the
 /// issuer-side bar (IssuerAuth signature + DS trust + MSO validity + `valueDigests` recompute) without
@@ -683,7 +670,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         return Err(VerifyFailure::reason(
             decision
                 .failure
-                .unwrap_or(crate::trust::TrustFailure::NotTrusted)
+                .unwrap_or_else(crate::trust::TrustFailure::not_trusted)
                 .reason_code(),
         ));
     }
@@ -1131,7 +1118,11 @@ fn get_text(value: &CborValue, key: &str) -> Option<String> {
     get_map_entry(value, key).and_then(|v| v.as_text().map(ToOwned::to_owned))
 }
 
-/// Extract the first `Document` from a `DeviceResponse`'s `documents` array.
+/// Extract the first `Document` from a `DeviceResponse`'s `documents` array. Only the
+/// external-vector conformance entry [`verify_issuer_auth_against_vector`] (single-document) reads the
+/// first document this way; the always-on bar folds across EVERY document, so this is gated to the
+/// same `test`/`test-vectors` builds as its sole caller.
+#[cfg(any(test, feature = "test-vectors"))]
 fn first_document(root: &CborValue) -> Result<&CborValue, VerifyFailure> {
     let documents = get_map_entry(root, "documents")
         .and_then(CborValue::as_array)
@@ -1183,93 +1174,6 @@ fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
     CoseSign1::from_cbor_value(array.clone()).map_err(|_| VerifyFailure::malformed())
 }
 
-/// Extract the Document Signer signing certificate (DER) a presented mdoc claims in its `IssuerAuth`
-/// `x5chain`, without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf
-/// against the national Trusted List's `EAA/Q` service entries).
-///
-/// Returns `None` when the `DeviceResponse` does not parse or carries no `x5chain` leaf. The value is
-/// *claimed* (its trust + signature are decided by the always-on bar in [`verify`]); this read is
-/// only the gate's cert-matching input, never an acceptance.
-#[must_use]
-pub fn issuer_signing_cert_der(device_response: &[u8]) -> Option<Vec<u8>> {
-    let root: CborValue = ciborium::from_reader(device_response).ok()?;
-    let document = first_document(&root).ok()?;
-    issuer_signing_cert_of_document(document)
-}
-
-/// Extract the claimed Document Signer leaf certificate (DER) from a single `Document`'s `IssuerAuth`
-/// `x5chain` (read-only, no verification — the shared body of [`issuer_signing_cert_der`] and the
-/// per-document [`issuer_signing_certs_with_issuance_der`]). Returns `None` when the document carries
-/// no resolvable leaf.
-fn issuer_signing_cert_of_document(document: &CborValue) -> Option<Vec<u8>> {
-    let issuer_signed = get_map_entry(document, "issuerSigned")?;
-    let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
-    let issuer_auth = parse_cose_sign1(issuer_auth_value).ok()?;
-    ds_cert_from_x5chain(&issuer_auth).ok()
-}
-
-/// Extract the claimed issuance/relevant time (Unix seconds) of a single `Document` from its MSO
-/// `validityInfo`: `signed` (the instant the issuer asserts it signed the MSO — ISO/IEC 18013-5
-/// §9.1.2.4, the credential's issuance time), falling back to `validFrom` when `signed` is absent
-/// (the start of the validity window, `validFrom >= signed`). Read-only, no verification.
-///
-/// Returns `None` when the document carries no parseable MSO or neither `signed` nor `validFrom` can
-/// be read — the opt-in [`crate::qualified`] gate then fails closed for this document rather than
-/// reading the issuer's status at "now" (contracts/qualified-status-gate.md: status is read at the
-/// credential's issuance/relevant time, NOT "now").
-fn issuance_time_of_document(document: &CborValue) -> Option<i64> {
-    let issuer_signed = get_map_entry(document, "issuerSigned")?;
-    let issuer_auth_value = get_map_entry(issuer_signed, "issuerAuth")?;
-    let issuer_auth = parse_cose_sign1(issuer_auth_value).ok()?;
-    let mso_bytes = issuer_auth.payload.as_ref()?;
-    let mso_inner = unwrap_bstr_tagged_payload(mso_bytes).ok()?;
-    let mso: CborValue = ciborium::from_reader(mso_inner.as_slice()).ok()?;
-    let info = get_map_entry(&mso, "validityInfo")?;
-    // `signed` is the issuance instant; `validFrom` is the fallback relevant time. `tdate_field`
-    // returns the RFC 3339 instant as Unix seconds; map its `Result` to `Option` (a read, not a gate).
-    tdate_field(info, "signed")
-        .ok()
-        .or_else(|| tdate_field(info, "validFrom").ok())
-}
-
-/// One document's *claimed* qualified-gate input: its Document Signer leaf certificate (DER) and its
-/// issuance/relevant time (Unix seconds), each `None` when that field cannot be read. The values are
-/// claimed (read-only, unverified); trust + signature are decided by the always-on bar.
-pub type ClaimedIssuer = (Option<Vec<u8>>, Option<i64>);
-
-/// Extract, per document in a `DeviceResponse`, the claimed Document Signer leaf certificate (DER)
-/// **paired with** that document's claimed issuance/relevant time (Unix seconds) — the input the
-/// opt-in [`crate::qualified`] gate folds across every document so the determination uses EACH
-/// issuer's own issuance time (the credential's relevant time, NOT "now").
-///
-/// Each [`ClaimedIssuer`] entry is `(claimed_cert, claimed_issuance_time)`: the leaf from the
-/// document's `IssuerAuth` `x5chain` and the MSO `validityInfo.signed` (fallback `validFrom`). Either
-/// element is `None` when that field cannot be read; a per-document `None` issuance time fails the
-/// gate closed for that document ([`crate::types::QualifiedStatus::Indeterminate`]) rather than
-/// substituting "now".
-///
-/// Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
-/// [`issuer_signing_cert_der`], the certs/times are *claimed* (trust + signature are decided by the
-/// always-on bar in [`verify`]); this read is only the gate's input, never an acceptance.
-#[must_use]
-pub fn issuer_signing_certs_with_issuance_der(
-    device_response: &[u8],
-) -> Option<Vec<ClaimedIssuer>> {
-    let root: CborValue = ciborium::from_reader(device_response).ok()?;
-    let documents = get_map_entry(&root, "documents").and_then(CborValue::as_array)?;
-    Some(
-        documents
-            .iter()
-            .map(|doc| {
-                (
-                    issuer_signing_cert_of_document(doc),
-                    issuance_time_of_document(doc),
-                )
-            })
-            .collect(),
-    )
-}
-
 /// Resolve the full Document Signer certificate chain (DER, leaf-first) from a COSE_Sign1's `x5chain`
 /// header (RFC 9360). The leaf is the first certificate; any further entries are the intermediate
 /// sub-CAs the leaf chains through. A single-cert chain may be carried as a bare `bstr` rather than an
@@ -1293,13 +1197,6 @@ fn ds_chain_from_x5chain(sign1: &CoseSign1) -> Result<Vec<Vec<u8>>, VerifyFailur
             .collect(),
         _ => Err(VerifyFailure::malformed()),
     }
-}
-
-/// Resolve just the Document Signer leaf certificate (DER) from a COSE_Sign1's `x5chain` — the first
-/// entry of [`ds_chain_from_x5chain`] (DRY — one x5chain parser). Used where only the leaf is needed.
-fn ds_cert_from_x5chain(sign1: &CoseSign1) -> Result<Vec<u8>, VerifyFailure> {
-    let mut chain = ds_chain_from_x5chain(sign1)?;
-    Ok(chain.swap_remove(0))
 }
 
 /// Whether a COSE_Sign1's protected-header `alg` names ES256 — the single authoritative
@@ -1394,9 +1291,9 @@ fn parse_es256_sig(sig_bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
 ///
 /// `signed` is returned because it is the credential's issuance/relevant time (ISO/IEC 18013-5 §9.1.2.4
 /// — what the opt-in qualified gate reads status at). The bar REQUIRES `signed` (this errors when it is
-/// absent), so on a VALID credential the returned `signed` equals what the standalone
-/// [`issuance_time_of_document`] would compute (its `validFrom` fallback only fires for a `signed`-absent
-/// MSO, which the bar rejects), letting the gate read this cached value instead of re-parsing the MSO.
+/// absent), so on a VALID credential the returned `signed` is the single issuance time the bar pass
+/// surfaces (via [`MdocVerifyMeta::claimed_issuers`]), letting the gate read this cached value instead
+/// of re-parsing the MSO.
 fn parse_validity_info(mso: &CborValue, now_unix: i64) -> Result<(Validity, i64), VerifyFailure> {
     let info = get_map_entry(mso, "validityInfo").ok_or_else(VerifyFailure::malformed)?;
     let signed = tdate_field(info, "signed")?;
@@ -1478,7 +1375,7 @@ fn enforce_validity(validity: &Validity, now_unix: i64) -> Result<(), VerifyFail
 /// `{ elementIdentifier: elementValue }` map for that namespace: `{ ns: { id: value } }`. This (i) never
 /// false-rejects two distinct `(namespace, id)` pairs that merely share an `id`, and (ii) preserves the
 /// namespace provenance a consumer needs to tell the two apart. (It is projected to the public
-/// `{ ns: AttributeValue::Map }` shape once in [`verify_inner`] — see [`verify`] / contracts/verifier.md.)
+/// `{ ns: AttributeValue::Map }` shape once in [`verify_inner`] — see [`verify_with_meta`] / contracts/verifier.md.)
 ///
 /// The disclosure works from the [`scan_raw_issuer_items`] **records** (`raw_items`): each record
 /// carries the item's exact `IssuerSignedItemBytes` span (`#6.24(bstr .cbor IssuerSignedItem)`)
@@ -1848,7 +1745,7 @@ mod unit {
     //! Direct unit tests of the pure helpers whose error branches are awkward to reach end-to-end.
 
     use super::{
-        cbor_to_attribute, cose_alg_is_es256, ds_cert_from_x5chain, find_key_label,
+        cbor_to_attribute, cose_alg_is_es256, ds_chain_from_x5chain, find_key_label,
         insert_no_shadow, integer_label, scan_raw_issuer_items, tdate_field,
         unwrap_tagged_cbor_payload, CborCursor, DigestAlgorithm, COSE_HEADER_X5CHAIN,
         TAG_ENCODED_CBOR,
@@ -2130,16 +2027,16 @@ mod unit {
     }
 
     #[test]
-    fn ds_cert_from_x5chain_rejects_malformed_chains() {
+    fn ds_chain_from_x5chain_rejects_malformed_chains() {
         // An array whose first element is not a bstr is malformed.
         let bad_array = sign1_with_x5chain(CborValue::Array(vec![CborValue::Integer(1.into())]));
-        assert!(ds_cert_from_x5chain(&bad_array).is_err());
+        assert!(ds_chain_from_x5chain(&bad_array).is_err());
         // A scalar that is neither bstr nor array is malformed.
         let scalar = sign1_with_x5chain(CborValue::Integer(1.into()));
-        assert!(ds_cert_from_x5chain(&scalar).is_err());
-        // A bare-bstr chain resolves to the leaf bytes.
+        assert!(ds_chain_from_x5chain(&scalar).is_err());
+        // A bare-bstr chain resolves to a single-cert chain whose leaf is the bytes.
         let good = sign1_with_x5chain(CborValue::Bytes(vec![9, 9]));
-        assert_eq!(ds_cert_from_x5chain(&good).unwrap(), vec![9, 9]);
+        assert_eq!(ds_chain_from_x5chain(&good).unwrap(), vec![vec![9, 9]]);
     }
 
     #[test]
@@ -2271,17 +2168,18 @@ mod unit {
         // End-to-end: a deeply-nested `DeviceResponse` must yield a clean `MalformedCredential`
         // verdict, never a process abort — neither the always-on `ciborium` parse nor the raw cursor
         // may overflow the stack on adversarial nesting.
-        use super::{verify, MdocVerifyParams};
+        use super::{verify_with_meta, MdocVerifyParams};
         use crate::trust::StaticTestAnchors;
         // 400 nested arrays (deeper than ciborium's 256 recursion limit) wrapped so the bytes parse as
         // far as the nesting bound, then bottom out — the verifier must reject, not abort.
         let mut deep = vec![0x81u8; 400];
         deep.push(0x00); // a terminal 0 so the innermost array has its one element
-        let result = verify(
+        let result = verify_with_meta(
             &deep,
             &StaticTestAnchors::new(),
             &MdocVerifyParams::default(),
-        );
+        )
+        .0;
         assert!(!result.valid, "a deeply-nested response must not be VALID");
         assert_eq!(
             result.reasons,

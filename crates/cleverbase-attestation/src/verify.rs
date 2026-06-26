@@ -306,8 +306,8 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 /// yet granted `EAA/Q` when it signed a credential, but granted later, must NOT be reported
 /// `Qualified` for that credential (a false "qualified"). The relevant time is therefore derived from
 /// the credential itself — SD-JWT VC `iat` (fallback `nbf`) via [`sdjwtvc::issuance_time_unix`]; mdoc
-/// MSO `validityInfo.signed` (fallback `validFrom`) per document via
-/// [`mdoc::issuer_signing_certs_with_issuance_der`] — and passed as `relevant_time_unix`. A credential
+/// MSO `validityInfo.signed` per document, surfaced by the always-on bar pass in
+/// [`MdocVerifyMeta::claimed_issuers`] — and passed as `relevant_time_unix`. A credential
 /// that carries **no** issuance time fails closed ([`QualifiedStatus::Indeterminate`]); `ctx.now_unix`
 /// is never silently substituted.
 ///
@@ -372,8 +372,8 @@ fn qualified_status_for(
             // always-on bar already extracted EACH document's `(ds_cert_der, signed)` and surfaced them
             // in `mdoc_meta.claimed_issuers` — fold those CACHED pairs (the bar's single decode; no
             // second `DeviceResponse` decode + per-document COSE/MSO re-parse). On a VALID mdoc `signed`
-            // is mandatory, so a cached `(cert, signed)` equals what `issuer_signing_certs_with_issuance_der`
-            // would re-derive. A `None` meta (no claimed issuers to fold) fails closed — empty fold →
+            // is mandatory, so the cached `(cert, signed)` pairs are the single authoritative issuer
+            // view. A `None` meta (no claimed issuers to fold) fails closed — empty fold →
             // `Indeterminate` — never a false "qualified".
             let claimed = mdoc_meta.map(|meta| meta.claimed_issuers.as_slice());
             fold_qualified(

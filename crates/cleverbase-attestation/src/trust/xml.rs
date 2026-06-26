@@ -226,12 +226,6 @@ impl XmlTrustList {
     pub const fn next_update_unix(&self) -> i64 {
         self.next_update_unix
     }
-
-    /// The list's own signing certificate (DER) from the enveloped `<ds:Signature>`, if signed.
-    #[must_use]
-    pub fn signer_cert_der(&self) -> Option<&[u8]> {
-        self.signer_cert_der.as_deref()
-    }
 }
 
 /// The local (namespace-stripped, lowercased) name of an XML tag, e.g. `ds:X509Certificate` →
@@ -354,7 +348,9 @@ mod tests {
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0], SDJWT_ISSUER);
         assert!(list.next_update_unix() > 2_000_000_000);
-        assert_eq!(list.signer_cert_der(), Some(CA_IACA));
+        // The enveloped signer is the IACA root: chain-only authentication against the IACA scheme
+        // anchor succeeds (observing the parsed signer through behavior, not a getter).
+        assert!(list.authenticate(&[CA_IACA.to_vec()], NOW, true).is_ok());
     }
 
     #[test]
@@ -401,7 +397,8 @@ mod tests {
   <TrustServiceProviderList></TrustServiceProviderList>
 </TrustServiceStatusList>"#;
         let list = XmlTrustList::parse(xml.as_bytes(), IssuerRole::Qeaa, Format::SdJwtVc).unwrap();
-        assert!(list.signer_cert_der().is_none());
+        // No enveloped `<ds:Signature>` → no signer → authentication fails closed as `Unsigned`
+        // (observing the absent signer through behavior, not a getter).
         assert!(matches!(
             list.authenticate(&[CA_IACA.to_vec()], NOW, true),
             Err(XmlTrustListError::Unsigned)
@@ -455,6 +452,11 @@ mod tests {
         assert!(list
             .anchors_for(IssuerRole::Qeaa, Format::SdJwtVc)
             .is_empty());
-        assert!(list.signer_cert_der().is_none());
+        // The stray cert is neither a service anchor nor the signer: with no signer parsed,
+        // authentication fails closed as `Unsigned` (observing the absent signer through behavior).
+        assert!(matches!(
+            list.authenticate(&[CA_IACA.to_vec()], NOW, true),
+            Err(XmlTrustListError::Unsigned)
+        ));
     }
 }

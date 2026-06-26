@@ -125,10 +125,10 @@ pub fn kb_jwt_aud_nonce(presentation: &str) -> Option<(String, String)> {
 #[must_use]
 pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
     let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
-    let jws = sd_jwt.presentation();
-    let header_b64 = jws.split('~').next()?.split('.').next()?;
-    let header_json = Base64UrlUnpadded::decode_vec(header_b64).ok()?;
-    let header: Value = serde_json::from_slice(&header_json).ok()?;
+    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation.
+    let presentation = sd_jwt.presentation();
+    let jws = presentation.split('~').next()?;
+    let header = decode_jws_protected_header(jws)?;
     issuer_cert_from_header(&header).ok()
 }
 
@@ -194,7 +194,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     if !decision.trusted {
         return Err(decision
             .failure
-            .unwrap_or(crate::trust::TrustFailure::NotTrusted)
+            .unwrap_or_else(crate::trust::TrustFailure::not_trusted)
             .reason_code());
     }
 
@@ -237,18 +237,19 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
         .next()
         .ok_or(ReasonCode::MalformedCredential)?;
     let mut parts = jws.split('.');
-    let header_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
+    let _header_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
     let _payload_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
     let _sig_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
     if parts.next().is_some() {
         return Err(ReasonCode::MalformedCredential);
     }
 
-    // Issuer-specific header handling: require alg=ES256 and read the x5c leaf certificate.
-    let header_json =
-        Base64UrlUnpadded::decode_vec(header_b64).map_err(|_| ReasonCode::MalformedCredential)?;
-    let header: Value =
-        serde_json::from_slice(&header_json).map_err(|_| ReasonCode::MalformedCredential)?;
+    // Issuer-specific header handling: require alg=ES256 and read the x5c leaf certificate. The
+    // protected-header decode (base64url → JSON) is the SAME body the cert read and the KB-JWT alg
+    // check use — share the single [`decode_jws_protected_header`] (DRY — Principle III); the framing
+    // guard above already established `jws` as a 3-segment compact JWS, so the helper's first-segment
+    // split re-reads the header that guard validated.
+    let header = decode_jws_protected_header(jws).ok_or(ReasonCode::MalformedCredential)?;
     if header.get("alg").and_then(Value::as_str) != Some(ES256) {
         return Err(ReasonCode::UnsupportedFormat);
     }
@@ -270,6 +271,23 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
     verify_compact_es256(jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
 
     Ok(chain)
+}
+
+/// Decode the protected JOSE header of a compact JWS (`header.payload.signature`) into a JSON
+/// [`Value`]: take the first `.`-segment, base64url-decode it (RFC 7515 §2 — the protected header is
+/// `BASE64URL(UTF8(JWS Protected Header))`), and parse the bytes as JSON. Returns `None` when the
+/// string has no first segment, the segment is not base64url, or the bytes are not JSON.
+///
+/// One authoritative header-decode (DRY — Principle III): the issuer cert read
+/// ([`issuer_signing_cert_der`]), the issuer signature path ([`verify_issuer_signature`]), and the
+/// holder KB-JWT alg check ([`require_kb_jwt_es256_alg`]) all share this body and each wraps the
+/// `None` with its own [`ReasonCode`] and reads its own header field (`x5c` vs `alg`). The caller is
+/// responsible for any compact-JWS framing guard (e.g. the issuer path's exactly-3-segment check);
+/// this helper only reads the header segment, so a non-JWS string simply yields `None`.
+fn decode_jws_protected_header(jws: &str) -> Option<Value> {
+    let header_b64 = jws.split('.').next()?;
+    let header_json = Base64UrlUnpadded::decode_vec(header_b64).ok()?;
+    serde_json::from_slice(&header_json).ok()
 }
 
 /// Extract the FULL signing certificate chain (DER, leaf-first) from a JWS header's `x5c` (RFC 7515
@@ -449,14 +467,10 @@ fn check_holder_binding(
 /// `typ`, NOT the specific alg). A KB-JWT header that does not decode as JSON with a string `alg` is a
 /// malformed holder binding ([`ReasonCode::HolderBinding`]).
 fn require_kb_jwt_es256_alg(kb_compact: &str) -> Result<(), ReasonCode> {
-    let header_b64 = kb_compact
-        .split('.')
-        .next()
-        .ok_or(ReasonCode::HolderBinding)?;
-    let header_json =
-        Base64UrlUnpadded::decode_vec(header_b64).map_err(|_| ReasonCode::HolderBinding)?;
-    let header: Value =
-        serde_json::from_slice(&header_json).map_err(|_| ReasonCode::HolderBinding)?;
+    // The protected-header decode (first dot-segment → base64url → JSON) is the SAME body the issuer
+    // JWS paths use — share the single [`decode_jws_protected_header`] (DRY — Principle III); only the
+    // holder-binding reason mapping (a header that does not decode is `HolderBinding`) lives here.
+    let header = decode_jws_protected_header(kb_compact).ok_or(ReasonCode::HolderBinding)?;
     if header.get("alg").and_then(Value::as_str) != Some(ES256) {
         return Err(ReasonCode::UnsupportedFormat);
     }

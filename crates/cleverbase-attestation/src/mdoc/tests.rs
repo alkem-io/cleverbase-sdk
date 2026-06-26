@@ -10,10 +10,22 @@ use super::test_issuer::{
     default_session_transcript, mdoc_ds_cert_der, wrong_issuer_cert_der, DigestAlg, Element,
     MdocBuilder,
 };
-use super::{verify, verify_with_meta, DeviceBindingMachinery, MdocVerifyParams};
+use super::{verify_with_meta, DeviceBindingMachinery, MdocVerifyParams};
 use crate::status::StatusOutcome;
-use crate::trust::StaticTestAnchors;
+use crate::trust::{StaticTestAnchors, TrustAnchorSource};
 use crate::types::{AttributeValue, Format, IssuerRole, ReasonCode, TrustStatus};
+
+/// Run the always-on mdoc bar and take just the [`crate::types::VerificationResult`], discarding the
+/// [`super::MdocVerifyMeta`] — the byproducts only the OpenID4VP/qualified callers consume. The
+/// production entry point is [`verify_with_meta`]; these verdict-only tests take its `.0` through this
+/// one helper rather than transcribing the projection at every call site (DRY).
+fn verify<A: TrustAnchorSource + ?Sized>(
+    device_response: &[u8],
+    anchors: &A,
+    params: &MdocVerifyParams<'_>,
+) -> crate::types::VerificationResult {
+    verify_with_meta(device_response, anchors, params).0
+}
 
 /// The verification instant (2024-06-01T00:00:00Z) — inside the default issued window.
 const NOW: i64 = 1_717_200_000;
@@ -895,65 +907,6 @@ fn absent_device_response_status_is_rejected_as_malformed() {
     let result = verify(&response, &trusted_anchors(), &params());
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
-}
-
-#[test]
-fn issuer_signing_cert_der_reads_the_claimed_ds_leaf() {
-    // The qualified-gate cert-matching helper reads the claimed DS leaf from `documents[0]`'s
-    // IssuerAuth x5chain without verifying anything; a well-formed response yields the DS cert DER,
-    // and unparseable bytes yield `None` (never a panic). This also covers the `first_document` read
-    // path the helper relies on.
-    let response = MdocBuilder::new().build();
-    assert_eq!(
-        super::issuer_signing_cert_der(&response).as_deref(),
-        Some(mdoc_ds_cert_der())
-    );
-    // Not CBOR at all → no claimed cert (the helper is read-only and total).
-    assert!(super::issuer_signing_cert_der(&[0xff, 0x00]).is_none());
-    // Valid CBOR but no `documents` → no claimed cert.
-    let mut empty = Vec::new();
-    ciborium::into_writer(&CborValue::Map(vec![]), &mut empty).unwrap();
-    assert!(super::issuer_signing_cert_der(&empty).is_none());
-}
-
-#[test]
-fn issuer_signing_certs_with_issuance_reads_the_claimed_cert_and_relevant_time() {
-    // The qualified-gate per-document input reads each document's claimed DS leaf PAIRED with that
-    // document's MSO `validityInfo.signed` (the issuance/relevant time) — read-only, no verification.
-    // The default builder mints `signed = 2023-01-01T00:00:00Z` (1672531200).
-    let response = MdocBuilder::new()
-        .signed("2026-08-01T00:00:00Z") // 1785542400
-        .validity("2026-08-01T00:00:00Z", "2027-02-01T00:00:00Z")
-        .build();
-    let per_doc =
-        super::issuer_signing_certs_with_issuance_der(&response).expect("documents present");
-    assert_eq!(per_doc.len(), 1);
-    let (cert, issued) = &per_doc[0];
-    assert_eq!(cert.as_deref(), Some(mdoc_ds_cert_der()));
-    assert_eq!(*issued, Some(1_785_542_400)); // the MSO `signed`, NOT "now"
-                                              // A second document with its OWN issuance window yields its OWN relevant time (per-document).
-    let multi = MdocBuilder::new()
-        .signed("2026-08-01T00:00:00Z")
-        .validity("2026-08-01T00:00:00Z", "2027-09-01T00:00:00Z")
-        .append_valid_document_issued_at("2027-04-01T00:00:00Z", "2027-09-01T00:00:00Z")
-        .build();
-    let per_doc = super::issuer_signing_certs_with_issuance_der(&multi).expect("documents present");
-    assert_eq!(per_doc.len(), 2);
-    assert_eq!(per_doc[0].1, Some(1_785_542_400)); // documents[0] signed 2026-08-01
-    assert_eq!(per_doc[1].1, Some(1_806_537_600)); // documents[1] signed 2027-04-01
-                                                   // When the MSO omits `signed`, the reader falls back to `validFrom` (the issuance-time fallback).
-    let no_signed = MdocBuilder::new()
-        .omit_mso_signed()
-        .validity("2026-08-01T00:00:00Z", "2027-02-01T00:00:00Z")
-        .build();
-    let per_doc =
-        super::issuer_signing_certs_with_issuance_der(&no_signed).expect("documents present");
-    assert_eq!(per_doc[0].1, Some(1_785_542_400)); // falls back to validFrom = 2026-08-01
-                                                   // Not CBOR / no `documents` → None (read-only and total).
-    assert!(super::issuer_signing_certs_with_issuance_der(&[0xff, 0x00]).is_none());
-    let mut empty = Vec::new();
-    ciborium::into_writer(&CborValue::Map(vec![]), &mut empty).unwrap();
-    assert!(super::issuer_signing_certs_with_issuance_der(&empty).is_none());
 }
 
 #[test]
