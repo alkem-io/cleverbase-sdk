@@ -47,13 +47,61 @@
 use der::{Decode as _, Encode as _};
 use x509_cert::Certificate;
 
+/// The role/format-appropriate **key purpose** the leaf (the credential's signing certificate) must
+/// carry — enforced once, on the leaf, before the path walk, so a genuinely-chained-but-WRONG-PURPOSE
+/// leaf is rejected (e.g. a TLS `serverAuth` cert issued under the same trusted root, or an mdoc DS
+/// cert presented as the SD-JWT VC issuer leaf).
+///
+/// A chain that validates structurally (name/signature/CA/validity) is **not** sufficient: RFC 5280
+/// and the format profiles constrain *what the leaf may be used for*. The verifier threads the
+/// credential's format here (mdoc → [`Self::MdocDocumentSigner`], SD-JWT VC →
+/// [`Self::SdJwtVcIssuer`]); the trust-list-signer-authentication call sites (the LOTL / national-TL
+/// signer in `trust::xml` and `qualified`) pass [`Self::TrustListSigner`], which imposes no
+/// credential-leaf purpose (a TL signer is governed by a different ETSI profile, not the credential
+/// leaf profiles below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafPurpose {
+    /// **ISO/IEC 18013-5:2021 Annex B (Table B.3, mDL document signer certificate).** The Document
+    /// Signer leaf MUST carry an `extendedKeyUsage` that includes the mDL-DS key-purpose OID
+    /// `id-mso-mdl-DS` = `1.0.18013.5.1.2` ([`OID_MDL_DS`]). The EKU extension is **mandatory** (field
+    /// type `m` in Table B.3); ISO does **not** require it marked critical (only the `keyUsage` /
+    /// `basicConstraints` rows are `mc`), and RFC 5280 §4.2.1.12 leaves EKU criticality at the issuer's
+    /// option, so the criticality is not asserted here — only the OID's presence. A DS leaf lacking the
+    /// mdlDS EKU (or carrying only a foreign purpose such as `serverAuth`) is rejected
+    /// ([`ChainError::WrongLeafPurpose`]).
+    MdocDocumentSigner,
+    /// **SD-JWT VC issuer (PID / (Q)EAA) leaf.** No governing specification mandates a specific EKU for
+    /// the SD-JWT VC issuer certificate referenced by the JWS `x5c` (verified online: IETF
+    /// `draft-ietf-oauth-sd-jwt-vc` §2.5 / RFC 9901 are silent on EKU/keyUsage; OpenID4VC HAIP 1.0
+    /// §6.1.1 mandates only chain-to-anchor structure; the EUDI ARF / Commission IRs distinguish issuer
+    /// certs by **QcStatement** OIDs and `keyUsage`, never by an EKU; ETSI EN 319 412-2 §4.3.10 even
+    /// forbids marking EKU critical and assigns no EKU value). So the enforced policy is the spec's
+    /// minimum sensible floor: the leaf **MUST NOT be a CA** (`basicConstraints cA=TRUE` is rejected — a
+    /// CA certificate must not double as an end-entity signer), and **if** a `keyUsage` extension is
+    /// present it **MUST** assert `digitalSignature` (or `nonRepudiation`/content-commitment — the
+    /// signing bits ETSI EN 319 412-2 Types A/B/C all carry); a `keyUsage` that asserts only unrelated
+    /// bits (e.g. `keyEncipherment` only) is rejected. No EKU is required.
+    SdJwtVcIssuer,
+    /// **Trust-list signer authentication** (the LOTL / national Trusted List signer, not a credential
+    /// leaf). Imposes no credential-leaf key-purpose constraint — the only requirement is that the
+    /// signer chains to a configured scheme-operator anchor (the structural §6.1 path). Used by
+    /// `trust::xml` and `qualified` when authenticating a signed trust list.
+    TrustListSigner,
+}
+
+/// The ISO/IEC 18013-5 mDL Document Signer extended-key-usage OID `id-mso-mdl-DS`
+/// (`{iso(1) standard(0) driving-licence(18013) part-5(5) kp(1) mdlDS(2)}`). A conformant mdoc DS leaf
+/// MUST list this OID in its `extendedKeyUsage` (ISO/IEC 18013-5:2021 Annex B, Table B.3); it is the
+/// purpose [`LeafPurpose::MdocDocumentSigner`] enforces.
+pub const OID_MDL_DS: &str = "1.0.18013.5.1.2";
+
 /// Why a candidate issuer certificate failed to chain to a trusted anchor.
 ///
 /// Every rejection carries a specific reason so an untrusted verdict is never opaque. `resolve_chain`
 /// folds these to a coarse-but-accurate [`crate::trust::TrustFailure`] on the [`crate::trust::TrustDecision`],
 /// which the verifier maps to a [`crate::types::ReasonCode`]: [`Self::LeafExpired`]/[`Self::AnchorExpired`]
 /// (a cert outside its validity window) → [`crate::types::ReasonCode::Expired`]; every other variant (no
-/// path, bad signature, non-CA, unsupported algorithm, malformed, over-long) →
+/// path, bad signature, non-CA, wrong leaf purpose, unsupported algorithm, malformed, over-long) →
 /// [`crate::types::ReasonCode::UntrustedIssuer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
@@ -90,6 +138,14 @@ pub enum ChainError {
     /// where the configured anchor *is* the pinned certificate, is exempt: pinning a specific
     /// end-entity certificate as trusted is an intentional, distinct model.)
     NotACa,
+    /// The leaf (the credential's signing certificate) does not carry the role/format-appropriate
+    /// **key purpose** required by [`LeafPurpose`], so it is genuinely chained to a trusted anchor but
+    /// **not fit for the purpose presented**: an mdoc Document Signer leaf lacking the mdlDS EKU
+    /// (`1.0.18013.5.1.2`, ISO/IEC 18013-5:2021 Annex B Table B.3), or carrying a foreign purpose (e.g.
+    /// TLS `serverAuth`); or an SD-JWT VC issuer leaf that is a CA, or whose present `keyUsage` asserts
+    /// no signing bit. This closes the "right chain, wrong purpose" false-accept. Fail-closed on a
+    /// malformed/duplicate `extendedKeyUsage` / `keyUsage` extension.
+    WrongLeafPurpose,
 }
 
 /// The maximum certification-path length [`verify_chain`] will validate: the leaf plus up to seven
@@ -98,6 +154,21 @@ pub enum ChainError {
 /// small cap rejects an absurdly long **attacker-supplied** chain — bounding the validation work it
 /// can demand — without rejecting any conformant credential.
 pub const MAX_PATH_LEN: usize = 8;
+
+/// A hard ceiling on the **total** number of issued-by ATTEMPTS (the dominant per-candidate
+/// signature-verify work) the backtracking path-walk will perform across the whole search, independent
+/// of the per-branch [`MAX_PATH_LEN`] depth cap.
+///
+/// The walk **backtracks** over candidate issuers, so when an attacker supplies many intermediates that
+/// all name-match each other (e.g. dozens of mutually-issuing self-issued certs / cross-certificates),
+/// the depth-bounded DFS could otherwise explore a combinatorial (worst-case factorial) number of
+/// branches — an attacker-multiplied denial-of-service the depth cap alone does not bound. This global
+/// budget bounds the total verify work to a fixed ceiling: a conformant credential reaches its anchor
+/// after at most a handful of attempts (≤ [`MAX_PATH_LEN`] hops × the few configured anchors +
+/// supplied intermediates), far under this budget, so it is never rejected; an adversarial branchy
+/// chain that would blow up is cut off as [`ChainError::PathTooLong`]. The value is generous (thousands
+/// of attempts) so only a genuinely pathological supplied chain can hit it.
+const MAX_NODE_VISITS: u32 = 4096;
 
 impl core::fmt::Display for ChainError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -124,6 +195,10 @@ impl core::fmt::Display for ChainError {
             Self::NotACa => write!(
                 f,
                 "issuing anchor is not a CA (basicConstraints cA=TRUE / keyUsage keyCertSign required)"
+            ),
+            Self::WrongLeafPurpose => write!(
+                f,
+                "leaf certificate lacks the required key purpose for its role/format (e.g. mdoc DS EKU id-mso-mdl-DS, or an SD-JWT VC issuer that is a CA / has no signing keyUsage)"
             ),
         }
     }
@@ -164,13 +239,17 @@ impl SigAlg {
 
 /// Whether the supplied certification path `supplied_chain` (leaf-first: `[leaf, intermediate₁, …]`)
 /// builds a valid RFC 5280 §6.1 path to **any** of the trusted `anchor_certs_der`, valid at
-/// `now_unix`.
+/// `now_unix`, with the leaf carrying the `leaf_purpose`-appropriate key purpose.
 ///
 /// This is the trust-anchoring primitive. A path is trusted iff, starting from the leaf
 /// (`supplied_chain[0]`), it can be walked up — through zero or more of the supplied intermediates —
 /// to a certificate that **is** a configured anchor (a direct DER-equal pin) or is **issued by** a
-/// configured anchor, enforcing at every hop:
+/// configured anchor, enforcing:
 ///
+/// - **leaf key purpose** — the leaf carries the role/format-appropriate purpose required by
+///   [`LeafPurpose`] (mdoc DS EKU `id-mso-mdl-DS`; SD-JWT VC issuer not-a-CA + signing `keyUsage`),
+///   else [`ChainError::WrongLeafPurpose`]. Checked once, on the leaf, before the walk — a genuinely
+///   chained but wrong-purpose leaf (e.g. a TLS `serverAuth` cert under the same root) is rejected;
 /// - **direct pin** — a cert byte-equal to a configured anchor terminates the path as trusted, still
 ///   subject to that cert's own validity window (an expired pinned cert is [`ChainError::LeafExpired`],
 ///   never trusted), but exempt from the CA constraint (pinning a specific end-entity cert is a
@@ -178,10 +257,18 @@ impl SigAlg {
 /// - **issued-by** — the child's `issuer` equals the issuer's `subject`, the child's signature
 ///   verifies under the issuer's subject public key, the issuer is a CA (`basicConstraints` present,
 ///   critical, `cA=TRUE`, `keyCertSign` when `keyUsage` is present, and a `pathLenConstraint` wide
-///   enough for the intermediates that follow — [`ChainError::NotACa`] otherwise), the issuer is
-///   within its validity window
+///   enough for the **non-self-issued** intermediates that follow — [`ChainError::NotACa`] otherwise),
+///   the issuer is within its validity window
 ///   ([`ChainError::AnchorExpired`] otherwise), and the child is within its own
 ///   ([`ChainError::LeafExpired`] for the leaf).
+///
+/// The walk is a **bounded depth-first search that backtracks** over candidate issuers: when several
+/// supplied intermediates name-match the current certificate (e.g. a cross-certificate or an alternate
+/// sub-CA), each is tried in turn, and a branch that dead-ends is unwound so an alternate is explored.
+/// A conformant credential whose chain reaches a configured anchor via **some** valid path is therefore
+/// accepted, even when a greedy first-match would have committed to a dead-end branch. Per RFC 5280
+/// §6.1.4 (l) / §4.2.1.9 a **self-issued** intermediate (subject DN == issuer DN, e.g. a key-rollover
+/// cert) does not consume path-length budget, so it is not counted toward a CA's `pathLenConstraint`.
 ///
 /// The supplied intermediates are **attacker-controlled**: they are honoured only as candidate
 /// issuers, never as trust roots, so a path that never reaches a configured anchor is rejected. The
@@ -190,14 +277,16 @@ impl SigAlg {
 ///
 /// # Errors
 ///
-/// Returns [`ChainError`] when the supplied chain is empty or a certificate is malformed, the path
-/// reaches no configured anchor ([`ChainError::IssuerMismatch`]), a signature does not verify, an
-/// algorithm is unsupported, an issuing certificate is not a CA or is outside its validity window, the
-/// leaf is outside its validity window, or the path exceeds [`MAX_PATH_LEN`].
+/// Returns [`ChainError`] when the supplied chain is empty or a certificate is malformed, the leaf has
+/// the wrong key purpose ([`ChainError::WrongLeafPurpose`]), the path reaches no configured anchor
+/// ([`ChainError::IssuerMismatch`]), a signature does not verify, an algorithm is unsupported, an
+/// issuing certificate is not a CA or is outside its validity window, the leaf is outside its validity
+/// window, or the path exceeds [`MAX_PATH_LEN`].
 pub fn verify_chain(
     supplied_chain: &[&[u8]],
     anchor_certs_der: &[Vec<u8>],
     now_unix: i64,
+    leaf_purpose: LeafPurpose,
 ) -> Result<(), ChainError> {
     // The leaf is the head of the supplied chain; the tail are candidate path-building intermediates.
     let (leaf_der, intermediates_der) = supplied_chain
@@ -217,75 +306,256 @@ pub fn verify_chain(
         intermediates.push((der, cert));
     }
 
-    // Walk the path leaf → intermediate → … → anchor. `current` is the certificate whose issuer we are
-    // resolving; `depth` is the number of intermediates already traversed below it (= the number of
-    // intermediates that follow a CA which issues `current`, the input to its pathLenConstraint check).
-    // `used` marks supplied intermediates already consumed so a cycle cannot reuse one (and the cap is
-    // a hard ceiling regardless). The leaf's own validity is enforced once, before the walk.
+    // Pre-parse the configured anchors ONCE (like the intermediates) so each hop reuses the parsed
+    // form instead of re-decoding every anchor per hop (efficiency: the anchors are invariant across
+    // the whole walk). A malformed anchor is a CONFIGURATION fault, recorded in `last_err` only if
+    // nothing more specific is known but skipped so it cannot mask a valid match (the documented
+    // "only-unusable anchors ⇒ IssuerMismatch" contract).
+    let mut last_err = ChainError::IssuerMismatch;
+    let mut anchors: Vec<(&[u8], Certificate)> = Vec::with_capacity(anchor_certs_der.len());
+    for anchor_der in anchor_certs_der {
+        match Certificate::from_der(anchor_der) {
+            Ok(cert) => anchors.push((anchor_der.as_slice(), cert)),
+            Err(e) => {
+                record_more_specific(&mut last_err, ChainError::Malformed(format!("anchor: {e}")));
+            }
+        }
+    }
+
+    // The leaf must carry the role/format-appropriate key purpose (mdoc DS EKU / SD-JWT VC issuer
+    // not-a-CA + signing keyUsage) — enforced ONCE, on the leaf, before the walk, so a
+    // genuinely-chained-but-WRONG-PURPOSE leaf is rejected up front (closing the "right chain, wrong
+    // purpose" false-accept). EXCEPTION — a leaf byte-equal to a configured anchor is a deliberate
+    // DIRECT PIN: the operator pinned this exact certificate as trusted for this role/format, an
+    // intentional, distinct trust decision (the same model that exempts a directly-pinned cert from the
+    // issued-by CA constraint). A direct pin is therefore exempt from the leaf-purpose check too — e.g.
+    // an operator may pin an IACA root directly. (The pin still enforces the cert's validity window
+    // below, so an expired pin is rejected; only the key-purpose floor is the operator's to waive.)
+    let leaf_is_direct_pin = anchors.iter().any(|(a, _)| a == leaf_der);
+    if !leaf_is_direct_pin {
+        leaf_has_purpose(&leaf, leaf_purpose)?;
+    }
+
+    // The leaf's own validity is enforced once, before the walk (the issued-by step enforces each
+    // promoted intermediate's window as it is promoted).
     if !cert_is_valid_at(&leaf, now_unix) {
         return Err(ChainError::LeafExpired);
     }
-    let mut current_der: &[u8] = leaf_der;
-    let mut current = leaf;
-    let mut depth: usize = 0;
+
+    // Walk the path leaf → intermediate → … → anchor as a bounded, BACKTRACKING depth-first search.
+    // `used` marks supplied intermediates already on the current branch so a cycle cannot reuse one
+    // (and `MAX_PATH_LEN` is a hard ceiling regardless). The walk threads two counters from the leaf
+    // (both 0): `pathlen_depth` (non-self-issued intermediates, the input to a CA's `pathLenConstraint`)
+    // and `hops` (every promotion, the DoS cap) — see [`walk`].
     let mut used = vec![false; intermediates.len()];
-    // Track the most specific failure across all candidate issuers at the current hop.
-    let mut last_err = ChainError::IssuerMismatch;
-
-    loop {
-        // (a) Direct pin: `current` is byte-equal to a configured anchor → terminate as trusted. The
-        // anchor pins this exact certificate; `current`'s validity is already enforced (the leaf
-        // before the loop, each promoted intermediate at the issued-by step that promoted it). Exempt
-        // from the CA constraint by design.
-        if anchor_certs_der.iter().any(|a| a.as_slice() == current_der) {
-            return Ok(());
-        }
-
-        // (b) Issued-by a configured anchor → terminate as trusted (the path reaches a trust root).
-        match issued_by_any(&current, anchor_certs_der, now_unix, depth, &mut last_err) {
-            IssuedBy::Verified => return Ok(()),
-            IssuedBy::Rejected => {}
-        }
-
-        // (c) Issued-by a supplied intermediate → promote it to `current` and continue walking up.
-        // The promoted intermediate must itself be a CA, in-window, and have signed `current`.
-        let Some(idx) = promote_intermediate(
-            &current,
-            &intermediates,
-            &used,
-            now_unix,
-            depth,
-            &mut last_err,
-        ) else {
-            // No configured anchor and no unused supplied intermediate issued `current` → the path
-            // cannot reach a trusted anchor. Surface the most specific reason seen.
-            return Err(last_err);
-        };
-        // `idx` was just produced by `promote_intermediate` so it indexes a real, unused entry; resolve
-        // it through `.get()` (no panicking index — the crate forbids `clippy::indexing_slicing`) and
-        // mark it consumed so the walk cannot reuse the same supplied cert.
-        let Some(used_flag) = used.get_mut(idx) else {
-            return Err(last_err);
-        };
-        *used_flag = true;
-        let Some((next_der, next_cert)) = intermediates.get(idx) else {
-            return Err(last_err);
-        };
-        current_der = next_der;
-        current = next_cert.clone();
-        depth += 1;
-        if depth >= MAX_PATH_LEN {
-            return Err(ChainError::PathTooLong);
-        }
+    let ctx = WalkCtx {
+        anchors: &anchors,
+        intermediates: &intermediates,
+        now_unix,
+    };
+    let mut state = WalkState {
+        used: &mut used,
+        budget: MAX_NODE_VISITS,
+        last_err,
+    };
+    match walk(&ctx, leaf_der, &leaf, 0, 0, &mut state) {
+        WalkResult::Reached => Ok(()),
+        WalkResult::DeadEnd => Err(state.last_err),
+        WalkResult::TooLong => Err(ChainError::PathTooLong),
     }
 }
 
-/// Outcome of trying to terminate the path at a configured anchor that issued `current`.
-enum IssuedBy {
-    /// A configured anchor issued `current` and satisfied every §6.1 requirement — the path is trusted.
-    Verified,
-    /// No configured anchor both name-matched and satisfied the requirements (`last_err` records why).
-    Rejected,
+/// Read-only context shared across every recursive [`walk`] frame: the pre-parsed anchors and
+/// supplied intermediates (each as `(DER slice, parsed cert)`) plus the validation instant. Bundling
+/// these keeps the recursive signature small and avoids re-threading four invariants through the DFS.
+struct WalkCtx<'a> {
+    /// Pre-parsed configured anchors (DER slice + parsed cert); a path terminates at any of these.
+    anchors: &'a [(&'a [u8], Certificate)],
+    /// Pre-parsed supplied intermediates (DER slice + parsed cert) — attacker-controlled path material.
+    intermediates: &'a [(&'a [u8], Certificate)],
+    /// The verification instant (Unix seconds) every certificate's validity window is checked at.
+    now_unix: i64,
+}
+
+/// The mutable search state threaded by `&mut` through the recursive [`walk`] (kept in one struct so
+/// the DFS signature stays small): the per-branch `used` flags (cycle guard), the global work `budget`
+/// (the DoS ceiling, [`MAX_NODE_VISITS`]), and the most-specific failure reason seen so far.
+struct WalkState<'a> {
+    /// Per-branch consumed-intermediate flags (index-aligned with [`WalkCtx::intermediates`]); set on
+    /// descent and cleared on backtrack so a cert is never revisited on the current branch (no cycle).
+    used: &'a mut [bool],
+    /// The remaining global issued-by-attempt budget; charged per attempt, exhaustion ⇒ `TooLong`.
+    budget: u32,
+    /// The most specific [`ChainError`] seen across all candidate issuers (surfaced when no path validates).
+    last_err: ChainError,
+}
+
+/// The outcome of one [`walk`] branch.
+enum WalkResult {
+    /// A configured anchor was reached on this branch — the path is trusted.
+    Reached,
+    /// This branch dead-ended (no anchor, every candidate issuer exhausted); `last_err` records why.
+    DeadEnd,
+    /// This branch hit the [`MAX_PATH_LEN`] cap before reaching an anchor — a hard reject.
+    TooLong,
+}
+
+/// One recursion of the backtracking certification-path DFS: resolve the issuer of `current`
+/// (`current_der` its DER), having already promoted `hops` intermediates below it of which
+/// `pathlen_depth` were non-self-issued.
+///
+/// Two distinct counters are threaded because they answer two distinct questions (RFC 5280
+/// distinguishes them — verified online):
+/// - **`pathlen_depth`** is the number of **non-self-issued** intermediates already traversed below
+///   `current` — the input to an issuing CA's `pathLenConstraint` check (§6.1.4 (l)/(m), §4.2.1.9: a
+///   self-issued cert "is not counted when evaluating path length", so it does not consume budget);
+/// - **`hops`** is the total number of intermediates promoted on this branch (self-issued **included**)
+///   — the denial-of-service guard, bounded by [`MAX_PATH_LEN`] so an attacker cannot make the walk run
+///   unbounded by stuffing the supplied chain with self-issued certs (which would never grow
+///   `pathlen_depth`). The two must be separate: tying the DoS cap to `pathlen_depth` would let a chain
+///   of self-issued certs evade it.
+///
+/// Termination, in order, mirroring the §6.1 path-build:
+/// 1. **direct pin** — `current` is byte-equal to a configured anchor → [`WalkResult::Reached`]
+///    (exempt from the CA constraint by design; `current`'s validity is already enforced before this
+///    frame).
+/// 2. **issued-by an anchor** — a configured anchor name-matches and validly issued `current`
+///    (signature + CA constraint for the `pathlen_depth` non-self-issued intermediates below it + the
+///    anchor's own validity) → [`WalkResult::Reached`].
+/// 3. **issued-by a supplied intermediate** — for EACH unused supplied intermediate that validly issued
+///    `current`, recurse with it as the new `current`. A self-issued promoted intermediate increments
+///    `hops` but NOT `pathlen_depth` (§6.1.4 (l)). If a branch dead-ends, the intermediate is released
+///    (backtrack) and the next candidate is tried; only when every candidate is exhausted does the
+///    frame report [`WalkResult::DeadEnd`].
+///
+/// `state.used` prevents revisiting a supplied cert on the current branch (no cycle), the `hops` cap
+/// bounds branch length, and the global `state.budget` (decremented per issued-by attempt) bounds TOTAL
+/// work across all branches, so the backtracking search is finite — and cheaply so — even on
+/// attacker-supplied material that name-matches combinatorially.
+fn walk(
+    ctx: &WalkCtx<'_>,
+    current_der: &[u8],
+    current: &Certificate,
+    pathlen_depth: usize,
+    hops: usize,
+    state: &mut WalkState<'_>,
+) -> WalkResult {
+    // (a) Direct pin: `current` is byte-equal to a configured anchor → terminate as trusted.
+    if ctx.anchors.iter().any(|(a, _)| *a == current_der) {
+        return WalkResult::Reached;
+    }
+
+    // (b) Issued-by a configured anchor → terminate as trusted (the path reaches a trust root). Compute
+    // `current`'s TBS DER ONCE here: it is invariant across every candidate issuer at this hop, so the
+    // signature check reuses it rather than re-encoding per candidate (efficiency).
+    let Ok(tbs_der) = current.tbs_certificate.to_der() else {
+        record_more_specific(
+            &mut state.last_err,
+            ChainError::Malformed("re-encode TBSCertificate".into()),
+        );
+        return WalkResult::DeadEnd;
+    };
+    for (_, anchor) in ctx.anchors {
+        // Global work budget: charge one unit per issued-by ATTEMPT (the signature verify is the
+        // dominant cost). Exhausting it means the supplied chain × anchors forced more path-building
+        // work than any conformant credential needs → a denial-of-service reject.
+        match state.budget.checked_sub(1) {
+            Some(remaining) => state.budget = remaining,
+            None => return WalkResult::TooLong,
+        }
+        match issued_by(current, &tbs_der, anchor, ctx.now_unix, pathlen_depth) {
+            Ok(()) => return WalkResult::Reached,
+            Err(e) => record_more_specific(&mut state.last_err, e),
+        }
+    }
+
+    // DoS cap: stepping to a further intermediate would exceed MAX_PATH_LEN total hops. Report TooLong
+    // only when there is in fact an unused intermediate that name-matches (an actual over-long branch);
+    // otherwise this is a plain dead-end (no candidate to step to), which must NOT masquerade as
+    // PathTooLong.
+    if hops >= MAX_PATH_LEN {
+        let has_unused_candidate =
+            state
+                .used
+                .iter()
+                .zip(ctx.intermediates)
+                .any(|(is_used, (_, cand))| {
+                    !*is_used && current.tbs_certificate.issuer == cand.tbs_certificate.subject
+                });
+        return if has_unused_candidate {
+            WalkResult::TooLong
+        } else {
+            WalkResult::DeadEnd
+        };
+    }
+
+    // (c) Issued-by a supplied intermediate → try EACH unused candidate that validly issued `current`,
+    // recursing into it, and BACKTRACK over the rest if a branch dead-ends.
+    let mut saw_too_long = false;
+    for idx in 0..ctx.intermediates.len() {
+        // Resolve through `.get()` (no panicking index — the crate forbids `clippy::indexing_slicing`).
+        let Some((cand_der, candidate)) = ctx.intermediates.get(idx) else {
+            continue;
+        };
+        let Some(&is_used) = state.used.get(idx) else {
+            continue;
+        };
+        if is_used {
+            continue;
+        }
+        // Charge the global work budget per issued-by ATTEMPT (the dominant signature-verify cost),
+        // bounding the TOTAL work the backtracking search can do across all branches.
+        match state.budget.checked_sub(1) {
+            Some(remaining) => state.budget = remaining,
+            None => return WalkResult::TooLong,
+        }
+        if let Err(e) = issued_by(current, &tbs_der, candidate, ctx.now_unix, pathlen_depth) {
+            record_more_specific(&mut state.last_err, e);
+            continue;
+        }
+        // The candidate validly issued `current` and becomes the new `current`. It always consumes one
+        // DoS hop; it consumes a pathLen unit only when it is NOT self-issued (subject DN == issuer DN
+        // ⇒ a key-rollover / policy cert that §6.1.4 (l) does not count toward path length).
+        let next_pathlen_depth = if is_self_issued(candidate) {
+            pathlen_depth
+        } else {
+            pathlen_depth + 1
+        };
+        if let Some(flag) = state.used.get_mut(idx) {
+            *flag = true;
+        }
+        match walk(
+            ctx,
+            cand_der,
+            candidate,
+            next_pathlen_depth,
+            hops + 1,
+            state,
+        ) {
+            WalkResult::Reached => return WalkResult::Reached,
+            WalkResult::TooLong => saw_too_long = true,
+            WalkResult::DeadEnd => {}
+        }
+        // Backtrack: release this intermediate so an alternate branch may consider it again.
+        if let Some(flag) = state.used.get_mut(idx) {
+            *flag = false;
+        }
+    }
+    // No candidate issuer reached an anchor on any branch. Surface TooLong only if the sole obstacle
+    // was the length cap (a deeper branch existed but was capped); otherwise this is a dead-end whose
+    // specific reason is in `last_err`.
+    if saw_too_long {
+        WalkResult::TooLong
+    } else {
+        WalkResult::DeadEnd
+    }
+}
+
+/// Whether `cert` is **self-issued** per RFC 5280 §6.1: the same distinguished name appears in its
+/// `subject` and `issuer` fields (a CA cert issued to itself for key rollover / policy change). A
+/// self-issued intermediate is not counted against a CA's `pathLenConstraint` (§6.1.4 (l) / §4.2.1.9).
+fn is_self_issued(cert: &Certificate) -> bool {
+    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
 }
 
 /// Record `candidate` into `last_err` only when it is **more specific** than the current value, so a
@@ -309,67 +579,17 @@ fn record_more_specific(last_err: &mut ChainError, candidate: ChainError) {
     }
 }
 
-/// Try to terminate the path: does **any** configured anchor issue `current` and satisfy the RFC 5280
-/// §6.1 issued-by requirements (name chaining, signature, CA constraint incl. `pathLenConstraint` for
-/// the `intermediates_following` certs below it, and the anchor's own validity window)? A malformed
-/// anchor is a configuration fault recorded in `last_err` (only if nothing more specific is known) but
-/// skipped so it cannot mask a valid match.
-fn issued_by_any(
-    current: &Certificate,
-    anchor_certs_der: &[Vec<u8>],
-    now_unix: i64,
-    intermediates_following: usize,
-    last_err: &mut ChainError,
-) -> IssuedBy {
-    for anchor_der in anchor_certs_der {
-        let anchor = match Certificate::from_der(anchor_der) {
-            Ok(c) => c,
-            Err(e) => {
-                record_more_specific(last_err, ChainError::Malformed(format!("anchor: {e}")));
-                continue;
-            }
-        };
-        match issued_by(current, &anchor, now_unix, intermediates_following) {
-            Ok(()) => return IssuedBy::Verified,
-            Err(e) => record_more_specific(last_err, e),
-        }
-    }
-    IssuedBy::Rejected
-}
-
-/// Try to promote a supplied intermediate to the next `current`: find an **unused** supplied
-/// intermediate that issues `current` (name + signature) and satisfies the issuer requirements (CA
-/// constraint incl. `pathLenConstraint`, and its own validity window). Returns its index, recording the
-/// most specific failure in `last_err` when a name match is found but a later check rejects it.
-fn promote_intermediate(
-    current: &Certificate,
-    intermediates: &[(&[u8], Certificate)],
-    used: &[bool],
-    now_unix: i64,
-    intermediates_following: usize,
-    last_err: &mut ChainError,
-) -> Option<usize> {
-    for (idx, (is_used, (_, candidate))) in used.iter().zip(intermediates.iter()).enumerate() {
-        if *is_used {
-            continue;
-        }
-        match issued_by(current, candidate, now_unix, intermediates_following) {
-            Ok(()) => return Some(idx),
-            Err(e) => record_more_specific(last_err, e),
-        }
-    }
-    None
-}
-
 /// Whether `issuer` validly issued `child` per the RFC 5280 §6.1 issued-by requirements: the child's
 /// `issuer` name equals the issuer's `subject` (§6.1.3 (a)(4)), the child's signature verifies under
 /// the issuer's subject public key (§6.1.3 (a)(1)), the issuer is a CA wide enough for the
 /// `intermediates_following` certs below it (§6.1.4 (k)/(m)/(n), §4.2.1.9, §4.2.1.3), and the issuer is
-/// within its own validity window at `now_unix` (§6.1.3 (a)(2)). The order matters for error
-/// specificity: a name mismatch is "not this issuer" (leave `IssuerMismatch`), then signature, then CA
-/// constraint, then validity.
+/// within its own validity window at `now_unix` (§6.1.3 (a)(2)). `child_tbs_der` is the child's
+/// re-encoded `TBSCertificate` — computed ONCE per hop by the caller and reused across every candidate
+/// issuer (it is invariant of the issuer). The order matters for error specificity: a name mismatch is
+/// "not this issuer" (leave `IssuerMismatch`), then signature, then CA constraint, then validity.
 fn issued_by(
     child: &Certificate,
+    child_tbs_der: &[u8],
     issuer: &Certificate,
     now_unix: i64,
     intermediates_following: usize,
@@ -377,7 +597,7 @@ fn issued_by(
     if child.tbs_certificate.issuer != issuer.tbs_certificate.subject {
         return Err(ChainError::IssuerMismatch);
     }
-    verify_signed_under(child, issuer)?;
+    verify_signed_under(child, child_tbs_der, issuer)?;
     // The issuer really signed the child — now it must be a CA permitted to do so (basicConstraints
     // critical cA=TRUE + keyCertSign, and a pathLenConstraint wide enough for the intermediates that
     // follow it toward the leaf), and itself be within its validity window at the relevant time.
@@ -390,14 +610,16 @@ fn issued_by(
     Ok(())
 }
 
-/// Verify `child`'s signature over its TBSCertificate under the `issuer`'s subject public key, routing
-/// the digest+signature through the SDK's existing RustCrypto stack (no hand-rolled crypto).
-fn verify_signed_under(child: &Certificate, issuer: &Certificate) -> Result<(), ChainError> {
+/// Verify `child`'s signature over its (already re-encoded) `child_tbs_der` `TBSCertificate` under the
+/// `issuer`'s subject public key, routing the digest+signature through the SDK's existing RustCrypto
+/// stack (no hand-rolled crypto). `child_tbs_der` is passed in (computed once per hop) so it is not
+/// re-encoded per candidate issuer.
+fn verify_signed_under(
+    child: &Certificate,
+    child_tbs_der: &[u8],
+    issuer: &Certificate,
+) -> Result<(), ChainError> {
     let alg = SigAlg::from_oid(child.signature_algorithm.oid)?;
-    let tbs_der = child
-        .tbs_certificate
-        .to_der()
-        .map_err(|e| ChainError::Malformed(format!("re-encode TBSCertificate: {e}")))?;
     let signature = child
         .signature
         .as_bytes()
@@ -409,10 +631,69 @@ fn verify_signed_under(child: &Certificate, issuer: &Certificate) -> Result<(), 
         .map_err(|e| ChainError::Malformed(format!("issuer SPKI: {e}")))?;
 
     match alg {
-        SigAlg::EcdsaP256Sha256 => verify_ecdsa_p256(&spki_der, &tbs_der, signature),
-        SigAlg::RsaSha256 => verify_rsa::<sha2::Sha256>(&spki_der, &tbs_der, signature),
-        SigAlg::RsaSha384 => verify_rsa::<sha2::Sha384>(&spki_der, &tbs_der, signature),
-        SigAlg::RsaSha512 => verify_rsa::<sha2::Sha512>(&spki_der, &tbs_der, signature),
+        SigAlg::EcdsaP256Sha256 => verify_ecdsa_p256(&spki_der, child_tbs_der, signature),
+        SigAlg::RsaSha256 => verify_rsa::<sha2::Sha256>(&spki_der, child_tbs_der, signature),
+        SigAlg::RsaSha384 => verify_rsa::<sha2::Sha384>(&spki_der, child_tbs_der, signature),
+        SigAlg::RsaSha512 => verify_rsa::<sha2::Sha512>(&spki_der, child_tbs_der, signature),
+    }
+}
+
+/// Whether the leaf carries the role/format-appropriate **key purpose** ([`LeafPurpose`]), using
+/// `x509-cert`'s typed `ExtendedKeyUsage` / `KeyUsage` / `BasicConstraints` decoders (no hand-rolled
+/// ASN.1). Fail-closed: a malformed or duplicate `extendedKeyUsage` / `keyUsage` / `basicConstraints`
+/// extension is rejected (a leaf whose purpose cannot be parsed is not trusted to act in that role).
+///
+/// - **[`LeafPurpose::MdocDocumentSigner`]** — ISO/IEC 18013-5:2021 Annex B Table B.3: the DS leaf MUST
+///   carry `extendedKeyUsage` containing `id-mso-mdl-DS` ([`OID_MDL_DS`]). Absent / unparsable EKU, or
+///   an EKU not listing the OID (e.g. only `serverAuth`), is [`ChainError::WrongLeafPurpose`].
+///   Criticality is not required (RFC 5280 §4.2.1.12 leaves it at the issuer's option; ISO marks the
+///   row `m`, not `mc`).
+/// - **[`LeafPurpose::SdJwtVcIssuer`]** — no spec mandates an EKU (verified online). The enforced floor
+///   is: the leaf MUST NOT be a CA (`basicConstraints cA=TRUE` ⇒ [`ChainError::WrongLeafPurpose`]); and
+///   IF a `keyUsage` extension is present it MUST assert a signing bit (`digitalSignature` or
+///   `nonRepudiation`/content-commitment) — a present `keyUsage` with neither is rejected. An absent
+///   `keyUsage` is permitted (the spec leaves all usages allowed).
+/// - **[`LeafPurpose::TrustListSigner`]** — no credential-leaf purpose constraint (a TL signer is
+///   governed by a separate ETSI profile); always accepted by this check.
+fn leaf_has_purpose(leaf: &Certificate, purpose: LeafPurpose) -> Result<(), ChainError> {
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+
+    match purpose {
+        LeafPurpose::TrustListSigner => Ok(()),
+        LeafPurpose::MdocDocumentSigner => {
+            // The mdlDS key-purpose OID the DS leaf's extendedKeyUsage MUST list.
+            let mdl_ds: der::asn1::ObjectIdentifier = OID_MDL_DS
+                .parse()
+                .map_err(|_| ChainError::WrongLeafPurpose)?;
+            match leaf.tbs_certificate.get::<ExtendedKeyUsage>() {
+                // EKU present and parsable: it MUST list id-mso-mdl-DS.
+                Ok(Some((_critical, eku))) if eku.0.contains(&mdl_ds) => Ok(()),
+                // EKU present but does not list the OID, EKU absent, or a parse error (duplicate /
+                // malformed) ⇒ not a conformant DS leaf (fail closed).
+                _ => Err(ChainError::WrongLeafPurpose),
+            }
+        }
+        LeafPurpose::SdJwtVcIssuer => {
+            // The issuer leaf MUST NOT be a CA: a basicConstraints with cA=TRUE (parsable) is rejected;
+            // an absent basicConstraints (cA defaults FALSE) or cA=FALSE is fine. A parse error ⇒ fail
+            // closed (a leaf whose basicConstraints cannot be decoded is not trusted as an end entity).
+            match leaf.tbs_certificate.get::<BasicConstraints>() {
+                Ok(Some((_critical, bc))) if bc.ca => return Err(ChainError::WrongLeafPurpose),
+                Ok(_) => {}
+                Err(_) => return Err(ChainError::WrongLeafPurpose),
+            }
+            // If keyUsage is present it MUST assert a signing bit (digitalSignature or the
+            // content-commitment / nonRepudiation bit — ETSI EN 319 412-2 issuer Types A/B/C). A
+            // present keyUsage asserting neither, or an unparsable (duplicate) one, is rejected. Absent
+            // keyUsage is permitted (the spec leaves all usages allowed).
+            match leaf.tbs_certificate.get::<KeyUsage>() {
+                Ok(Some((_critical, ku))) if ku.digital_signature() || ku.non_repudiation() => {
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                _ => Err(ChainError::WrongLeafPurpose),
+            }
+        }
     }
 }
 
@@ -528,9 +809,21 @@ fn unix_secs_not_after(time: x509_cert::time::Time) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_secs, verify_chain, ChainError, SigAlg, MAX_PATH_LEN};
+    use super::{clamp_secs, verify_chain, ChainError, LeafPurpose, SigAlg, MAX_PATH_LEN};
     use der::{Decode as _, Encode as _};
     use x509_cert::Certificate;
+
+    // The structural path-validation tests below predate the leaf key-purpose gate; their leaves are
+    // generic CA:FALSE + digitalSignature end-entities (which satisfy the SD-JWT VC issuer purpose), so
+    // they exercise the §6.1 path machinery without the EKU gate interfering. The dedicated EKU/purpose
+    // tests use the format-specific purposes (`MdocDocumentSigner` / `SdJwtVcIssuer`) explicitly.
+    const SDJWT: LeafPurpose = LeafPurpose::SdJwtVcIssuer;
+    // The mdoc Document Signer leaf purpose (requires the id-mso-mdl-DS EKU).
+    const MDOC: LeafPurpose = LeafPurpose::MdocDocumentSigner;
+    // A CA certificate presented directly as the "leaf" (a direct-pin of a root/sub-CA) carries CA
+    // semantics, not a credential-leaf purpose; the trust-list-signer purpose imposes no leaf-purpose
+    // constraint, the correct gate for these direct-pin-of-a-CA structural tests.
+    const SIGNER: LeafPurpose = LeafPurpose::TrustListSigner;
 
     const CA_IACA: &[u8] =
         include_bytes!("../../../../tests/fixtures/attestation/ca-iaca.cert.der");
@@ -581,6 +874,40 @@ mod tests {
         include_bytes!("../../../../tests/fixtures/attestation/nolen-ca.cert.der");
     const NOLEN_LEAF: &[u8] =
         include_bytes!("../../../../tests/fixtures/attestation/nolen-leaf.cert.der");
+    // Leaf key-purpose (EKU) fixtures, all issued by `mt-root` (a same-root trio): `mt-mdoc-ds` carries
+    // the CORRECT mdlDS EKU (1.0.18013.5.1.2), `mt-mdoc-ds-serverauth` carries a FOREIGN serverAuth EKU,
+    // and `mt-mdoc-ds-no-eku` carries NO EKU — isolating the leaf-purpose gate (only the EKU differs).
+    // See tests/fixtures/attestation/gen.sh.
+    const MT_MDOC_DS: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/mt-mdoc-ds.cert.der");
+    const MT_MDOC_DS_SERVERAUTH: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/mt-mdoc-ds-serverauth.cert.der");
+    const MT_MDOC_DS_NO_EKU: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/mt-mdoc-ds-no-eku.cert.der");
+    // Cross-certificate / alternate-intermediate fixtures (backtracking path-walk): `xc-intermediate`
+    // and `xc-deadend` share the SAME subject DN and key (so both validly issue `xc-leaf`) but have
+    // DIFFERENT issuers — `xc-intermediate` is issued by `mt-root` (reaches the anchor), `xc-deadend` by
+    // the rogue `attacker-ca` (a dead-end). Only a backtracking walk reaches mt-root when the dead-end is
+    // tried first. See tests/fixtures/attestation/gen.sh.
+    const XC_LEAF: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/xc-leaf.cert.der");
+    const XC_INTERMEDIATE: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/xc-intermediate.cert.der");
+    const XC_DEADEND: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/xc-deadend.cert.der");
+    // Self-issued (key-rollover) fixtures (RFC 5280 §6.1.4 (l) / §4.2.1.9: self-issued certs are NOT
+    // counted toward pathLenConstraint). Path si-leaf → si-subca → si-rollover → si-root: `si-root`
+    // (pathlen:1) and `si-rollover` (SELF-ISSUED — subject DN == issuer DN — pathlen:1) precede the one
+    // NON-self-issued sub-CA `si-subca`. Counting the rollover would exceed si-root's pathlen:1; excluding
+    // it (per §6.1.4 (l)) the path validates. See tests/fixtures/attestation/gen.sh.
+    const SI_ROOT: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/si-root.cert.der");
+    const SI_ROLLOVER: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/si-rollover.cert.der");
+    const SI_SUBCA: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/si-subca.cert.der");
+    const SI_LEAF: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/si-leaf.cert.der");
     // The signing-core RSA PKI (`sha256WithRSAEncryption`): an RSA CA that signs an RSA leaf —
     // exercises the RSA-PKCS#1v1.5 certificate-signature path, which the EC-only attestation
     // fixtures cannot. Reused (DRY) rather than minting a parallel RSA fixture set.
@@ -597,15 +924,15 @@ mod tests {
     #[test]
     fn issuer_leaf_chains_to_trusted_iaca_root() {
         let anchors = vec![CA_IACA.to_vec()];
-        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW).is_ok());
-        assert!(verify_chain(&[MDOC_DS], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT).is_ok());
+        assert!(verify_chain(&[MDOC_DS], &anchors, NOW, MDOC).is_ok());
     }
 
     #[test]
     fn self_issued_anchor_is_trusted_as_a_direct_pin() {
         // The root chained against itself: DER-equal direct pin (no issuer step needed).
         let anchors = vec![CA_IACA.to_vec()];
-        assert!(verify_chain(&[CA_IACA], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[CA_IACA], &anchors, NOW, SIGNER).is_ok());
     }
 
     #[test]
@@ -617,7 +944,7 @@ mod tests {
         let anchors = vec![CA_IACA.to_vec()];
         let far_future = 4_000_000_000; // year ~2096, past every fixture's validity.
         assert_eq!(
-            verify_chain(&[CA_IACA], &anchors, far_future),
+            verify_chain(&[CA_IACA], &anchors, far_future, SIGNER),
             Err(ChainError::LeafExpired)
         );
     }
@@ -631,7 +958,7 @@ mod tests {
         // `AnchorExpired`, never trusted (the anchor-validity-not-enforced fix).
         let anchors = vec![EXPIRED_CA.to_vec()];
         assert_eq!(
-            verify_chain(&[EXPIRED_CA_LEAF], &anchors, NOW),
+            verify_chain(&[EXPIRED_CA_LEAF], &anchors, NOW, SDJWT),
             Err(ChainError::AnchorExpired)
         );
     }
@@ -645,7 +972,7 @@ mod tests {
         // "any cert is a CA" gap — never trusted on the issued-by path.
         let anchors = vec![NON_CA.to_vec()];
         assert_eq!(
-            verify_chain(&[NON_CA_LEAF], &anchors, NOW),
+            verify_chain(&[NON_CA_LEAF], &anchors, NOW, SDJWT),
             Err(ChainError::NotACa)
         );
     }
@@ -657,10 +984,10 @@ mod tests {
         // cA=TRUE. `sdjwt-issuer` is a CA:FALSE leaf; pinned directly and within its validity window
         // it is trusted as-is (no issued-by CA-constraint applies to the direct pin).
         let anchors = vec![SDJWT_ISSUER.to_vec()];
-        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT).is_ok());
         // The non-CA fixture, pinned directly, is likewise trusted (CA constraint is issued-by only).
         let anchors = vec![NON_CA.to_vec()];
-        assert!(verify_chain(&[NON_CA], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[NON_CA], &anchors, NOW, SDJWT).is_ok());
     }
 
     #[test]
@@ -668,7 +995,7 @@ mod tests {
         // wrong-issuer is self-signed under a different name → no anchor subject matches its issuer.
         let anchors = vec![CA_IACA.to_vec()];
         assert_eq!(
-            verify_chain(&[WRONG_ISSUER], &anchors, NOW),
+            verify_chain(&[WRONG_ISSUER], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -676,7 +1003,7 @@ mod tests {
     #[test]
     fn leaf_is_rejected_when_no_anchors_configured() {
         assert_eq!(
-            verify_chain(&[SDJWT_ISSUER], &[], NOW),
+            verify_chain(&[SDJWT_ISSUER], &[], NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -687,7 +1014,7 @@ mod tests {
         // always supply at least the leaf, but verify_chain must not panic on an empty slice).
         let anchors = vec![CA_IACA.to_vec()];
         assert_eq!(
-            verify_chain(&[], &anchors, NOW),
+            verify_chain(&[], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -700,7 +1027,7 @@ mod tests {
         let anchors = vec![CA_IACA.to_vec()];
         let leaf_expired_root_valid = 1_893_456_000; // 2030-01-01: past the leaf, inside the root.
         assert_eq!(
-            verify_chain(&[SDJWT_ISSUER], &anchors, leaf_expired_root_valid),
+            verify_chain(&[SDJWT_ISSUER], &anchors, leaf_expired_root_valid, SDJWT),
             Err(ChainError::LeafExpired)
         );
     }
@@ -709,7 +1036,7 @@ mod tests {
     fn malformed_leaf_is_rejected() {
         let anchors = vec![CA_IACA.to_vec()];
         let not_a_cert: &[u8] = b"not a certificate";
-        match verify_chain(&[not_a_cert], &anchors, NOW) {
+        match verify_chain(&[not_a_cert], &anchors, NOW, SDJWT) {
             Err(ChainError::Malformed(_)) => {}
             other => panic!("expected Malformed, got {other:?}"),
         }
@@ -726,7 +1053,7 @@ mod tests {
         let anchors = vec![CA_IACA.to_vec()];
         // Either the DER re-parse fails (Malformed) or the signature fails (SignatureInvalid);
         // both are correct rejections. The fixture flips a signature byte, so it must NOT be Ok.
-        assert!(verify_chain(&[tampered.as_slice()], &anchors, NOW).is_err());
+        assert!(verify_chain(&[tampered.as_slice()], &anchors, NOW, SDJWT).is_err());
     }
 
     #[test]
@@ -737,6 +1064,9 @@ mod tests {
         assert!(ChainError::LeafExpired.to_string().contains("validity"));
         assert!(ChainError::AnchorExpired.to_string().contains("validity"));
         assert!(ChainError::NotACa.to_string().contains("CA"));
+        assert!(ChainError::WrongLeafPurpose
+            .to_string()
+            .contains("key purpose"));
         assert!(ChainError::UnsupportedAlgorithm("1.2.3".into())
             .to_string()
             .contains("1.2.3"));
@@ -784,7 +1114,7 @@ mod tests {
     fn rsa_leaf_chains_to_trusted_rsa_ca() {
         // Exercises the RSA-PKCS#1v1.5 (SHA-256) certificate-signature verification path.
         let anchors = vec![RSA_CA.to_vec()];
-        assert!(verify_chain(&[RSA_LEAF], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[RSA_LEAF], &anchors, NOW, SDJWT).is_ok());
     }
 
     #[test]
@@ -792,7 +1122,7 @@ mod tests {
         // The RSA leaf's issuer is the RSA CA, not the EC IACA → no name match.
         let anchors = vec![CA_IACA.to_vec()];
         assert_eq!(
-            verify_chain(&[RSA_LEAF], &anchors, NOW),
+            verify_chain(&[RSA_LEAF], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -807,7 +1137,7 @@ mod tests {
         cert.signature_algorithm.oid = ed25519;
         let mangled = cert.to_der().expect("re-encode");
         let anchors = vec![CA_IACA.to_vec()];
-        match verify_chain(&[mangled.as_slice()], &anchors, NOW) {
+        match verify_chain(&[mangled.as_slice()], &anchors, NOW, SDJWT) {
             Err(ChainError::UnsupportedAlgorithm(oid)) => assert_eq!(oid, "1.3.101.112"),
             other => panic!("expected UnsupportedAlgorithm, got {other:?}"),
         }
@@ -818,7 +1148,7 @@ mod tests {
         // A malformed anchor in the set must not mask a valid match from a good anchor (the parser
         // records the malformed-anchor error but keeps scanning).
         let anchors = vec![b"garbage anchor".to_vec(), CA_IACA.to_vec()];
-        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT).is_ok());
     }
 
     #[test]
@@ -827,7 +1157,7 @@ mod tests {
         // surfaces "no trusted anchor", not a parse panic).
         let anchors = vec![b"garbage anchor".to_vec()];
         assert_eq!(
-            verify_chain(&[SDJWT_ISSUER], &anchors, NOW),
+            verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -1020,7 +1350,7 @@ mod tests {
         // one-hop-only regression: before path validation this was FALSE-REJECTED.
         let anchors = vec![MT_ROOT.to_vec()];
         assert!(
-            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW).is_ok(),
+            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW, SDJWT).is_ok(),
             "leaf → intermediate sub-CA → configured root must be trusted"
         );
     }
@@ -1031,7 +1361,7 @@ mod tests {
         // the path cannot reach a configured anchor, so it is untrusted (no false-accept).
         let anchors = vec![CA_IACA.to_vec()];
         assert_eq!(
-            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW),
+            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -1042,7 +1372,7 @@ mod tests {
         // the leaf's issuer is the intermediate, which is neither supplied nor a configured anchor.
         let anchors = vec![MT_ROOT.to_vec()];
         assert_eq!(
-            verify_chain(&[MT_LEAF], &anchors, NOW),
+            verify_chain(&[MT_LEAF], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch)
         );
     }
@@ -1057,7 +1387,13 @@ mod tests {
         bad_intermediate[last] ^= 0xFF;
         let anchors = vec![MT_ROOT.to_vec()];
         assert!(
-            verify_chain(&[MT_LEAF, bad_intermediate.as_slice()], &anchors, NOW).is_err(),
+            verify_chain(
+                &[MT_LEAF, bad_intermediate.as_slice()],
+                &anchors,
+                NOW,
+                SDJWT
+            )
+            .is_err(),
             "a broken intermediate→root signature must not yield a trusted path"
         );
     }
@@ -1069,7 +1405,7 @@ mod tests {
         // it cannot act as a path intermediate → NotACa (the CA-constraint gate on the intermediate).
         let anchors = vec![MT_ROOT.to_vec()];
         assert_eq!(
-            verify_chain(&[MT_NOCA_LEAF, MT_NOCA_INTERMEDIATE], &anchors, NOW),
+            verify_chain(&[MT_NOCA_LEAF, MT_NOCA_INTERMEDIATE], &anchors, NOW, SDJWT),
             Err(ChainError::NotACa)
         );
     }
@@ -1082,7 +1418,12 @@ mod tests {
         // though the leaf's own window is current.
         let anchors = vec![MT_ROOT.to_vec()];
         assert_eq!(
-            verify_chain(&[MT_EXPIRED_LEAF, MT_EXPIRED_INTERMEDIATE], &anchors, NOW),
+            verify_chain(
+                &[MT_EXPIRED_LEAF, MT_EXPIRED_INTERMEDIATE],
+                &anchors,
+                NOW,
+                SDJWT
+            ),
             Err(ChainError::AnchorExpired)
         );
     }
@@ -1097,13 +1438,13 @@ mod tests {
         // trust by supplying their own chain.
         let anchors = vec![MT_ROOT.to_vec()];
         assert_eq!(
-            verify_chain(&[ATTACKER_LEAF, ATTACKER_CA], &anchors, NOW),
+            verify_chain(&[ATTACKER_LEAF, ATTACKER_CA], &anchors, NOW, SDJWT),
             Err(ChainError::IssuerMismatch),
             "an attacker chain that never reaches a configured anchor must be untrusted"
         );
         // Even configuring ca-iaca as well does not help the attacker — still no reachable anchor.
         let anchors = vec![MT_ROOT.to_vec(), CA_IACA.to_vec()];
-        assert!(verify_chain(&[ATTACKER_LEAF, ATTACKER_CA], &anchors, NOW).is_err());
+        assert!(verify_chain(&[ATTACKER_LEAF, ATTACKER_CA], &anchors, NOW, SDJWT).is_err());
     }
 
     #[test]
@@ -1113,7 +1454,7 @@ mod tests {
         // hop, so the trailing junk is never consulted (it is unreachable past the termination).
         let anchors = vec![CA_IACA.to_vec()];
         assert!(
-            verify_chain(&[SDJWT_ISSUER, ATTACKER_CA], &anchors, NOW).is_ok(),
+            verify_chain(&[SDJWT_ISSUER, ATTACKER_CA], &anchors, NOW, SDJWT).is_ok(),
             "leaf chaining directly to the anchor is trusted; trailing supplied junk is ignored"
         );
     }
@@ -1125,7 +1466,7 @@ mod tests {
         // supplied cert terminates the path).
         let anchors = vec![MT_INTERMEDIATE.to_vec()];
         assert!(
-            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW).is_ok(),
+            verify_chain(&[MT_LEAF, MT_INTERMEDIATE], &anchors, NOW, SDJWT).is_ok(),
             "an intermediate pinned directly as an anchor terminates the path as trusted"
         );
     }
@@ -1135,8 +1476,8 @@ mod tests {
         // Regression: the existing single-tier sdjwt-issuer / mdoc-ds → ca-iaca chains (the production
         // direct-IACA shape) remain trusted under the new path-validation primitive.
         let anchors = vec![CA_IACA.to_vec()];
-        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW).is_ok());
-        assert!(verify_chain(&[MDOC_DS], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT).is_ok());
+        assert!(verify_chain(&[MDOC_DS], &anchors, NOW, MDOC).is_ok());
     }
 
     #[test]
@@ -1145,13 +1486,16 @@ mod tests {
         // unbounded. `nolen-ca` is SELF-SIGNED with NO pathLenConstraint (subject == issuer, and it
         // signed itself), so each copy supplied as a fresh entry name-matches AND signature-verifies as
         // the issuer of the previous one and, being a CA the pathLen gate never short-circuits, is
-        // promoted — driving `depth` up one per hop. With more than MAX_PATH_LEN such promotions and NO
-        // configured anchor to terminate at, the length cap fires (rather than NotACa/IssuerMismatch).
+        // promoted — driving the `hops` DoS counter up one per hop. Because nolen-ca is SELF-ISSUED its
+        // promotions do NOT grow the pathLen counter (RFC 5280 §6.1.4 (l)), which is exactly why the
+        // DoS cap must be a SEPARATE total-hops counter: a self-issued-cert flood would otherwise evade
+        // a pathLen-tied cap. With more than MAX_PATH_LEN such promotions and NO configured anchor to
+        // terminate at, the hop cap (PathTooLong) fires (rather than NotACa/IssuerMismatch).
         let mut chain: Vec<&[u8]> = vec![NOLEN_LEAF];
         chain.extend(core::iter::repeat_n(NOLEN_CA, MAX_PATH_LEN + 2));
         let anchors = vec![MT_ROOT.to_vec()]; // present but never reached (rogue self-signed chain).
         assert_eq!(
-            verify_chain(&chain, &anchors, NOW),
+            verify_chain(&chain, &anchors, NOW, SDJWT),
             Err(ChainError::PathTooLong),
             "a supplied chain longer than MAX_PATH_LEN must be rejected as PathTooLong"
         );
@@ -1164,7 +1508,257 @@ mod tests {
         // anchor — confirming the fixture is a well-formed, usable CA (so the cap test's rejection is
         // the LENGTH cap, not a malformed/unusable cert).
         let anchors = vec![NOLEN_CA.to_vec()];
-        assert!(verify_chain(&[NOLEN_LEAF, NOLEN_CA], &anchors, NOW).is_ok());
-        assert!(verify_chain(&[NOLEN_LEAF], &anchors, NOW).is_ok());
+        assert!(verify_chain(&[NOLEN_LEAF, NOLEN_CA], &anchors, NOW, SDJWT).is_ok());
+        assert!(verify_chain(&[NOLEN_LEAF], &anchors, NOW, SDJWT).is_ok());
+    }
+
+    // =============================================================================================
+    // Leaf key-purpose (EKU) enforcement — ISO/IEC 18013-5:2021 Annex B (mdoc DS) + SD-JWT VC issuer.
+    // =============================================================================================
+
+    #[test]
+    fn genuine_mdoc_ds_with_mdl_ds_eku_is_trusted_as_a_document_signer() {
+        // The genuine ca-iaca-rooted DS fixture carries the critical mdlDS EKU (1.0.18013.5.1.2); under
+        // the MdocDocumentSigner purpose it chains and is trusted (the EKU-present happy path).
+        let anchors = vec![CA_IACA.to_vec()];
+        assert!(verify_chain(&[MDOC_DS], &anchors, NOW, MDOC).is_ok());
+        // The mt-root-rooted DS fixture (same correct EKU) is likewise trusted under its own root.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(verify_chain(&[MT_MDOC_DS], &anchors, NOW, MDOC).is_ok());
+    }
+
+    #[test]
+    fn mdoc_ds_leaf_with_serverauth_eku_is_rejected_as_wrong_purpose() {
+        // FALSE-ACCEPT guard: `mt-mdoc-ds-serverauth` chains PERFECTLY to the configured mt-root (same
+        // root as the trusted `mt-mdoc-ds`), differing ONLY in its EKU — a foreign TLS serverAuth purpose
+        // instead of mdlDS. Presented as an mdoc Document Signer leaf it MUST be rejected as
+        // WrongLeafPurpose (ISO/IEC 18013-5 Annex B Table B.3 requires the DS EKU id-mso-mdl-DS), never
+        // trusted just because the chain is sound.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert_eq!(
+            verify_chain(&[MT_MDOC_DS_SERVERAUTH], &anchors, NOW, MDOC),
+            Err(ChainError::WrongLeafPurpose),
+            "a serverAuth leaf chained to the trusted root is NOT a valid mdoc DS"
+        );
+    }
+
+    #[test]
+    fn mdoc_ds_leaf_without_any_eku_is_rejected_as_wrong_purpose() {
+        // The DS EKU is MANDATORY (ISO 18013-5 Annex B field type `m`); a DS leaf with NO EKU at all is
+        // rejected even though it chains to the trusted root.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert_eq!(
+            verify_chain(&[MT_MDOC_DS_NO_EKU], &anchors, NOW, MDOC),
+            Err(ChainError::WrongLeafPurpose)
+        );
+    }
+
+    #[test]
+    fn serverauth_leaf_is_accepted_under_the_sdjwt_vc_issuer_purpose() {
+        // The SAME serverAuth-EKU leaf, presented as an SD-JWT VC issuer (not an mdoc DS), is NOT
+        // rejected for its EKU: no spec mandates an EKU for the SD-JWT VC issuer (verified online), and
+        // the floor (not-a-CA + a signing keyUsage) is satisfied (it is CA:FALSE with digitalSignature).
+        // This proves the purpose gate is FORMAT-SPECIFIC, not a blanket "must be mdlDS".
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(
+            verify_chain(&[MT_MDOC_DS_SERVERAUTH], &anchors, NOW, SDJWT).is_ok(),
+            "a serverAuth EKU does not disqualify an SD-JWT VC issuer leaf (no mandated EKU)"
+        );
+    }
+
+    #[test]
+    fn genuine_sdjwt_issuer_is_trusted_under_the_issuer_purpose() {
+        // The genuine SD-JWT VC issuer leaf (CA:FALSE, critical digitalSignature keyUsage, no EKU) is
+        // trusted under the SdJwtVcIssuer purpose — the not-a-CA + signing-keyUsage floor is met.
+        let anchors = vec![CA_IACA.to_vec()];
+        assert!(verify_chain(&[SDJWT_ISSUER], &anchors, NOW, SDJWT).is_ok());
+    }
+
+    #[test]
+    fn a_ca_certificate_presented_as_an_sdjwt_issuer_leaf_is_rejected() {
+        // A CA certificate presented as an SD-JWT VC issuer LEAF is rejected (the issuer leaf MUST NOT be
+        // a CA — a CA cert must not double as an end-entity signer). `mt-intermediate` is a CA:TRUE sub-CA
+        // that CHAINS to the configured `mt-root` (so it is NOT a direct pin — the purpose floor applies);
+        // under the SdJwtVcIssuer purpose it is WrongLeafPurpose despite the sound chain.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert_eq!(
+            verify_chain(&[MT_INTERMEDIATE], &anchors, NOW, SDJWT),
+            Err(ChainError::WrongLeafPurpose),
+            "a CA certificate that chains to the anchor is still not a valid SD-JWT VC issuer leaf"
+        );
+    }
+
+    #[test]
+    fn a_directly_pinned_ca_root_is_exempt_from_the_leaf_purpose_check() {
+        // The DIRECT-PIN exemption: a leaf byte-equal to a configured anchor is a deliberate operator
+        // pin, exempt from the leaf-purpose floor (the same model that exempts a direct pin from the CA
+        // constraint). An IACA / multi-tier root pinned directly is trusted under the SD-JWT VC issuer
+        // purpose even though it is a CA (which the purpose floor would otherwise reject). The validity
+        // window is still enforced — only the key-purpose floor is the operator's to waive.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(
+            verify_chain(&[MT_ROOT], &anchors, NOW, SDJWT).is_ok(),
+            "a directly-pinned CA root is trusted (purpose check waived for a direct pin)"
+        );
+        // And a directly-pinned CA root presented under the mdoc DS purpose is likewise exempt from the
+        // mandatory-mdlDS-EKU floor (the operator pinned this exact cert).
+        assert!(verify_chain(&[MT_ROOT], &anchors, NOW, MDOC).is_ok());
+    }
+
+    #[test]
+    fn the_trust_list_signer_purpose_imposes_no_leaf_key_purpose_constraint() {
+        // The TrustListSigner purpose (used for LOTL / national-TL signer authentication) imposes no
+        // credential-leaf key purpose: a CA root pinned directly is trusted, and the serverAuth leaf
+        // chained to mt-root is trusted — neither the not-a-CA nor the mdlDS-EKU rule applies.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(verify_chain(&[MT_ROOT], &anchors, NOW, SIGNER).is_ok());
+        assert!(verify_chain(&[MT_MDOC_DS_SERVERAUTH], &anchors, NOW, SIGNER).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_or_duplicate_leaf_basic_constraints_fails_closed_under_the_issuer_purpose() {
+        // Fail-closed: a leaf whose basicConstraints cannot be decoded (two basicConstraints extensions
+        // ⇒ the typed `get::<BasicConstraints>()` returns Err) must be rejected under the SD-JWT VC
+        // issuer purpose (we cannot prove it is not a CA), never trusted. Duplicate the extension on the
+        // genuine issuer leaf and re-encode; it still chains by name+signature, but the purpose gate
+        // fails closed first.
+        use const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS;
+        let mut cert = Certificate::from_der(SDJWT_ISSUER).expect("parse sdjwt-issuer");
+        let exts = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .expect("sdjwt-issuer carries extensions");
+        let bc = exts
+            .iter()
+            .find(|e| e.extn_id == ID_CE_BASIC_CONSTRAINTS)
+            .expect("sdjwt-issuer carries basicConstraints")
+            .clone();
+        exts.push(bc); // a second basicConstraints ⇒ get::<BasicConstraints>() is Err ⇒ fail closed.
+        let mangled = cert.to_der().expect("re-encode");
+        let anchors = vec![CA_IACA.to_vec()];
+        assert_eq!(
+            verify_chain(&[mangled.as_slice()], &anchors, NOW, SDJWT),
+            Err(ChainError::WrongLeafPurpose)
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_duplicate_leaf_key_usage_fails_closed_under_the_issuer_purpose() {
+        // Fail-closed: a leaf whose keyUsage cannot be decoded (two keyUsage extensions ⇒ the typed
+        // `get::<KeyUsage>()` returns Err) must be rejected under the SD-JWT VC issuer purpose, never
+        // trusted. Duplicate the keyUsage extension on the genuine issuer leaf and re-encode.
+        use const_oid::db::rfc5280::ID_CE_KEY_USAGE;
+        let mut cert = Certificate::from_der(SDJWT_ISSUER).expect("parse sdjwt-issuer");
+        let exts = cert
+            .tbs_certificate
+            .extensions
+            .as_mut()
+            .expect("sdjwt-issuer carries extensions");
+        let ku = exts
+            .iter()
+            .find(|e| e.extn_id == ID_CE_KEY_USAGE)
+            .expect("sdjwt-issuer carries keyUsage")
+            .clone();
+        exts.push(ku); // a second keyUsage ⇒ get::<KeyUsage>() is Err ⇒ fail closed.
+        let mangled = cert.to_der().expect("re-encode");
+        // The leaf still chains by name+signature to the root, but the purpose gate fails closed first.
+        let anchors = vec![CA_IACA.to_vec()];
+        assert_eq!(
+            verify_chain(&[mangled.as_slice()], &anchors, NOW, SDJWT),
+            Err(ChainError::WrongLeafPurpose)
+        );
+    }
+
+    // =============================================================================================
+    // Backtracking path-walk — an alternate / cross-certified intermediate must not false-reject.
+    // =============================================================================================
+
+    #[test]
+    fn cross_certified_alternate_intermediate_is_found_by_backtracking() {
+        // FALSE-REJECT guard: the supplied x5chain carries TWO intermediates that both validly issue the
+        // leaf (same subject DN + same key) — `xc-deadend` (issued by the rogue attacker-ca, reaches no
+        // anchor) and `xc-intermediate` (issued by mt-root, reaches the configured anchor). A greedy walk
+        // that commits to the FIRST name-matching issuer (xc-deadend, supplied first) dead-ends and
+        // false-rejects; a backtracking walk explores xc-intermediate and reaches mt-root. The dead-end
+        // is supplied FIRST so the test fails without backtracking.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(
+            verify_chain(
+                &[XC_LEAF, XC_DEADEND, XC_INTERMEDIATE],
+                &anchors,
+                NOW,
+                SDJWT
+            )
+            .is_ok(),
+            "a credential reaching the anchor via SOME valid path must be trusted (backtracking)"
+        );
+        // Order-independence: the same chain with the reaching intermediate first is also trusted.
+        assert!(verify_chain(
+            &[XC_LEAF, XC_INTERMEDIATE, XC_DEADEND],
+            &anchors,
+            NOW,
+            SDJWT
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cross_certified_chain_with_only_the_dead_end_intermediate_is_untrusted() {
+        // Control: supplying ONLY the dead-end cross-cert (no path to mt-root) is correctly untrusted —
+        // backtracking finds NO reaching path, so it does not manufacture trust.
+        let anchors = vec![MT_ROOT.to_vec()];
+        assert!(
+            verify_chain(&[XC_LEAF, XC_DEADEND], &anchors, NOW, SDJWT).is_err(),
+            "with no reaching intermediate the cross-cert leaf must stay untrusted"
+        );
+    }
+
+    #[test]
+    fn a_combinatorially_branchy_supplied_chain_is_bounded_not_exponential() {
+        // DoS guard for the BACKTRACKING walk: an attacker supplies MANY MUTUALLY-name-matching certs —
+        // `nolen-ca` is self-signed (subject DN == issuer DN), so EVERY supplied copy name-matches AND
+        // signature-verifies as the issuer of EVERY other copy. A depth-bounded DFS that backtracks over
+        // all of them would explore a FACTORIAL number of ordered branches (here ~30!/(30-8)! ≈ 10¹¹).
+        // The global MAX_NODE_VISITS budget caps the TOTAL frames visited, so the walk terminates
+        // promptly with a reject (PathTooLong) rather than hanging — and never trusts (no anchor is
+        // reached). A hang here would be the unbounded-backtracking regression.
+        let mut chain: Vec<&[u8]> = vec![NOLEN_LEAF];
+        chain.extend(core::iter::repeat_n(NOLEN_CA, 30));
+        let anchors = vec![MT_ROOT.to_vec()]; // present but never reached.
+        assert_eq!(
+            verify_chain(&chain, &anchors, NOW, SDJWT),
+            Err(ChainError::PathTooLong),
+            "a factorially-branchy attacker chain must be bounded-rejected, not hang or trust"
+        );
+    }
+
+    // =============================================================================================
+    // Self-issued (key-rollover) certificate path-length exclusion — RFC 5280 §6.1.4 (l) / §4.2.1.9.
+    // =============================================================================================
+
+    #[test]
+    fn a_self_issued_rollover_cert_does_not_count_toward_path_length() {
+        // FALSE-REJECT guard (RFC 5280 §6.1.4 (l) / §4.2.1.9): the path
+        // si-leaf → si-subca → si-rollover → si-root has TWO intermediates following the pathlen:1 root,
+        // but `si-rollover` is SELF-ISSUED (a key-rollover cert: subject DN == issuer DN), which is NOT
+        // counted toward pathLenConstraint. The ONLY non-self-issued intermediate is si-subca (1 ≤ 1), so
+        // the path validates. Counting the rollover (the bug) would make it 2 > 1 → a wrong NotACa reject.
+        let anchors = vec![SI_ROOT.to_vec()];
+        assert!(
+            verify_chain(&[SI_LEAF, SI_SUBCA, SI_ROLLOVER], &anchors, NOW, SDJWT).is_ok(),
+            "a self-issued rollover cert mid-chain must not consume pathLen budget"
+        );
+    }
+
+    #[test]
+    fn the_self_issued_rollover_cert_is_classified_self_issued() {
+        use super::is_self_issued;
+        // The rollover cert's subject DN equals its issuer DN ⇒ self-issued; si-subca (a normal sub-CA)
+        // is not. This is the property the pathLen-exclusion hinges on.
+        let rollover = Certificate::from_der(SI_ROLLOVER).expect("parse si-rollover");
+        assert!(is_self_issued(&rollover), "si-rollover is self-issued");
+        let subca = Certificate::from_der(SI_SUBCA).expect("parse si-subca");
+        assert!(!is_self_issued(&subca), "si-subca is not self-issued");
     }
 }

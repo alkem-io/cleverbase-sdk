@@ -321,6 +321,113 @@ der_and_pk8 nolen-ca
 issue_under nolen-leaf "/CN=Cleverbase SDK Test Leaf Of Unbounded CA/O=Rogue Test/C=XX" \
   nolen-ca "${EE_EXTS}"
 
+# --- Wrong leaf key-purpose fixtures (leaf EKU / key-purpose enforcement) ---------------------------
+# The trust engine enforces the role/format-appropriate LEAF key purpose (ISO/IEC 18013-5:2021 Annex B
+# Table B.3: an mdoc Document Signer leaf MUST carry extendedKeyUsage = id-mso-mdl-DS 1.0.18013.5.1.2;
+# RFC 5280 §4.2.1.12 leaves EKU criticality at the issuer's option). A genuinely-chained-but-WRONG-
+# PURPOSE leaf (a TLS serverAuth cert issued under the same trusted root) MUST be rejected even though
+# it chains perfectly — closing the "right chain, wrong purpose" false-accept. These leaves are issued
+# by `mt-root` (so they chain to a configured anchor by name+signature) and form a same-root trio that
+# isolates the EKU gate: only the key purpose differs between the trusted and rejected leaves.
+#   mt-mdoc-ds            EC P-256 DS leaf with the CORRECT mdlDS EKU → trusted as an mdoc DS.
+#   mt-mdoc-ds-serverauth EC P-256 leaf with EKU = serverAuth (1.3.6.1.5.5.7.3.1), NOT id-mso-mdl-DS →
+#       presented as an mdoc DS leaf it MUST be rejected (WrongLeafPurpose).
+#   mt-mdoc-ds-no-eku     EC P-256 leaf with NO extendedKeyUsage at all. ISO 18013-5 Annex B makes the
+#       DS EKU mandatory, so a DS leaf lacking it MUST be rejected (WrongLeafPurpose).
+# (The genuine ca-iaca-rooted `mdoc-ds` fixture remains the production-shape positive case; mt-root is
+# used here because its CA key is available to mint the negative variants, where ca-iaca's is not.)
+EKU_SERVER_AUTH="1.3.6.1.5.5.7.3.1" # id-kp-serverAuth (TLS server) — a FOREIGN purpose for an mdoc DS.
+issue_under mt-mdoc-ds "/CN=Cleverbase SDK Test Multi-Tier mdoc DS (mdlDS EKU)/O=Alkemio Test/C=NL" \
+  mt-root "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,${EKU_MDL_DS}\n"
+issue_under mt-mdoc-ds-serverauth "/CN=Cleverbase SDK Test Multi-Tier Wrong-EKU DS (serverAuth)/O=Alkemio Test/C=NL" \
+  mt-root "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,${EKU_SERVER_AUTH}\n"
+issue_under mt-mdoc-ds-no-eku "/CN=Cleverbase SDK Test Multi-Tier No-EKU DS/O=Alkemio Test/C=NL" \
+  mt-root 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+
+# --- Cross-certificate / alternate-intermediate fixtures (backtracking path-walk) ------------------
+# A conformant credential may carry x5c/x5chain intermediates of which SEVERAL name-match (and validly
+# issue) the leaf — e.g. a cross-certified sub-CA: two certificates with the SAME subject DN and the
+# SAME public key, one self-signed (a dead-end that reaches no anchor) and one issued by the configured
+# root. A greedy non-backtracking walk that commits to the FIRST name-matching issuer FALSE-REJECTS the
+# credential when the dead-end is tried first; a backtracking walk explores the alternate and accepts.
+#
+# `xc-key` is ONE EC key reused as the cross-cert sub-CA public key. The leaf is issued by it (so the
+# leaf's signature verifies under EITHER cross-cert, since they share the key):
+#   xc-intermediate  subject "…Cross-Cert Sub-CA", key=xc-key, CA:TRUE, ISSUED BY mt-root → reaches root.
+#   xc-deadend       subject "…Cross-Cert Sub-CA" (SAME DN), key=xc-key, CA:TRUE, but ISSUED BY the rogue
+#                    `attacker-ca` (a DIFFERENT issuer DN, NOT supplied and NOT a configured anchor) →
+#                    a genuine dead-end: nothing in the supplied set or anchors matches its issuer DN.
+#   xc-leaf          end-entity issued by the xc-key sub-CA (its issuer DN is the shared sub-CA subject).
+# Supplied as [xc-leaf, xc-deadend, xc-intermediate], only the BACKTRACKING walk reaches mt-root: a
+# greedy walk that commits to xc-deadend (a valid issuer of xc-leaf) dead-ends and FALSE-REJECTS.
+XC_SUBJECT="/CN=Cleverbase SDK Test Cross-Cert Sub-CA/O=Alkemio Test/C=NL"
+genec xc-key.key.pem
+# xc-intermediate: the shared-key sub-CA, issued by mt-root (reaches the configured root).
+openssl req -new -key xc-key.key.pem -subj "${XC_SUBJECT}" -out xc-intermediate.csr
+openssl x509 -req -in xc-intermediate.csr -CA mt-root.cert.pem -CAkey mt-root.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_INT}" \
+  -extfile <(printf '%b' "${CA_EXTS}") -out xc-intermediate.cert.pem
+der_and_pk8 xc-intermediate
+# xc-deadend: the SAME subject + SAME key, but ISSUED BY the rogue attacker-ca (a different issuer DN
+# that is neither supplied nor a configured anchor) → a genuine dead-end branch.
+openssl req -new -key xc-key.key.pem -subj "${XC_SUBJECT}" -out xc-deadend.csr
+openssl x509 -req -in xc-deadend.csr -CA attacker-ca.cert.pem -CAkey attacker-ca.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_INT}" \
+  -extfile <(printf '%b' "${CA_EXTS}") -out xc-deadend.cert.pem
+der_and_pk8 xc-deadend
+# xc-leaf: an end-entity whose issuer is the shared sub-CA subject; its signature verifies under xc-key.
+# Issue it under xc-intermediate (which holds xc-key) so the issuer DN is the shared sub-CA subject.
+genec xc-leaf.key.pem
+openssl req -new -key xc-leaf.key.pem \
+  -subj "/CN=Cleverbase SDK Test Cross-Cert Leaf/O=Alkemio Test/C=NL" -out xc-leaf.csr
+openssl x509 -req -in xc-leaf.csr -CA xc-intermediate.cert.pem -CAkey xc-key.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_LEAF}" \
+  -extfile <(printf '%b' "${EE_EXTS}") -out xc-leaf.cert.pem
+der_and_pk8 xc-leaf
+
+# --- Self-issued (key-rollover) intermediate fixtures (RFC 5280 §6.1.4 (l) / §4.2.1.9) -------------
+# A self-issued certificate (subject DN == issuer DN, e.g. a CA's key-rollover cert) is NOT counted
+# toward pathLenConstraint ("the maximum number of NON-SELF-ISSUED intermediate certificates that may
+# follow this certificate", §4.2.1.9). A path that includes a self-issued rollover cert mid-chain MUST
+# therefore be accepted even when counting it would exceed the issuing root's pathlen.
+#
+#   si-root      self-signed root, basicConstraints critical CA:TRUE,pathlen:1 (≤1 NON-self-issued
+#                intermediate may follow) + keyCertSign.
+#   si-rollover  a KEY-ROLLOVER cert: subject DN == issuer DN == si-root's DN (SELF-ISSUED), carrying a
+#                NEW key, but SIGNED BY si-root's old key (so it chains to si-root). CA:TRUE. Being
+#                self-issued it does NOT consume pathLen budget.
+#   si-subca     a real (NON-self-issued) sub-CA issued by si-rollover (using the new key). CA:TRUE.
+#   si-leaf      end-entity issued by si-subca.
+# Path si-leaf → si-subca → si-rollover → si-root: the ONLY non-self-issued intermediate following
+# si-root is si-subca (si-rollover is self-issued, excluded), so pathlen:1 is satisfied. Counting the
+# rollover would make it 2 > 1 → a (wrong) PathTooLong/NotACa reject. This fixture guards that.
+SI_ROOT_SUBJECT="/CN=Cleverbase SDK Test Self-Issued Rollover Root/O=Alkemio Test/C=NL"
+genec si-root.key.pem
+openssl req -x509 -new -key si-root.key.pem -sha256 -days "${DAYS_CA}" \
+  -subj "${SI_ROOT_SUBJECT}" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:1" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -out si-root.cert.pem
+der_and_pk8 si-root
+# si-rollover: a NEW key, subject == si-root's DN, signed by si-root (issuer == si-root's DN) → the
+# issuer and subject DNs are identical ⇒ SELF-ISSUED. CA:TRUE so it may issue the next sub-CA.
+genec si-rollover.key.pem
+openssl req -new -key si-rollover.key.pem -subj "${SI_ROOT_SUBJECT}" -out si-rollover.csr
+openssl x509 -req -in si-rollover.csr -CA si-root.cert.pem -CAkey si-root.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_INT}" \
+  -extfile <(printf '%b' "${CA_EXTS}") -out si-rollover.cert.pem
+der_and_pk8 si-rollover
+# si-subca: a real non-self-issued sub-CA issued BY si-rollover (signed with the new rollover key).
+genec si-subca.key.pem
+openssl req -new -key si-subca.key.pem \
+  -subj "/CN=Cleverbase SDK Test Self-Issued Path Sub-CA/O=Alkemio Test/C=NL" -out si-subca.csr
+openssl x509 -req -in si-subca.csr -CA si-rollover.cert.pem -CAkey si-rollover.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_INT}" \
+  -extfile <(printf '%b' "${CA_EXTS}") -out si-subca.cert.pem
+der_and_pk8 si-subca
+issue_under si-leaf "/CN=Cleverbase SDK Test Self-Issued Path Leaf/O=Alkemio Test/C=NL" \
+  si-subca "${EE_EXTS}"
+
 # --- Minimal test trust-list anchor (JSON manifest for T009/T013) ----------------------------------
 # The native EU trust-list engine (T013) fetches/authenticates signed TS 119 612 XML in production;
 # for the OFFLINE suite the configured test anchor (StaticTestAnchors) is seeded from this manifest:
@@ -444,6 +551,17 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   attacker-leaf.*  leaf issued by attacker-ca (supplied chain terminates at a non-anchor → untrusted)
   nolen-ca.*       self-signed CA with NO pathLenConstraint (path-length DoS-cap / PathTooLong fixture)
   nolen-leaf.*     leaf issued by nolen-ca
+  mt-mdoc-ds.*     mt-root-issued mdoc DS leaf WITH the correct mdlDS EKU (1.0.18013.5.1.2) — purpose OK
+  mt-mdoc-ds-serverauth.*  mt-root-issued leaf with a FOREIGN serverAuth EKU (wrong mdoc DS purpose)
+  mt-mdoc-ds-no-eku.*  mt-root-issued leaf with NO EKU (mandatory mdoc DS EKU missing → wrong purpose)
+  xc-key.*         the EC key SHARED by the two cross-certificates below (one committed pk8)
+  xc-intermediate.* cross-cert sub-CA (subject S, key xc-key) issued by mt-root → reaches the anchor
+  xc-deadend.*     cross-cert sub-CA (SAME subject S + key) issued by the rogue attacker-ca → dead-end
+  xc-leaf.*        end-entity issued by the shared sub-CA (both cross-certs validly issue it → backtrack)
+  si-root.*        self-signed root (pathlen:1) for the self-issued key-rollover path fixtures
+  si-rollover.*    SELF-ISSUED key-rollover cert (subject DN == issuer DN, pathlen:1) signed by si-root
+  si-subca.*       the one NON-self-issued sub-CA (issued by si-rollover) — the only pathLen-counted hop
+  si-leaf.*        end-entity issued by si-subca (path validates only when the rollover is NOT counted)
   trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
   qualified-trust-list.json
                    minimal national Trusted List with EAA/Q services + per-service status history
@@ -496,6 +614,25 @@ if openssl verify -CAfile mt-root.cert.der -untrusted attacker-ca.cert.der attac
 fi
 echo "attacker-leaf [+ attacker-ca]: correctly REJECTED against mt-root.cert.der (expected)"
 echo "mt-{noca,expired}-intermediate: multi-tier broken-hop linkage minted (rejected by the SDK gates, by design)"
+
+# Leaf key-purpose trio: all three chain to mt-root by name+signature (only the EKU differs — the SDK's
+# leaf-purpose gate distinguishes them, not the signature math, so verify the chains are sound).
+openssl verify -CAfile mt-root.cert.der mt-mdoc-ds.cert.der
+openssl verify -CAfile mt-root.cert.der mt-mdoc-ds-serverauth.cert.der
+openssl verify -CAfile mt-root.cert.der mt-mdoc-ds-no-eku.cert.der
+echo "mt-mdoc-ds{,-serverauth,-no-eku}: chains sound; EKU purpose distinguished by the SDK (by design)"
+# Cross-cert backtracking: the leaf verifies via xc-intermediate (reaches mt-root); xc-deadend (same
+# subject+key, issued by the rogue attacker-ca) does NOT reach the anchor.
+openssl verify -CAfile mt-root.cert.der -untrusted xc-intermediate.cert.der xc-leaf.cert.der
+if openssl verify -CAfile mt-root.cert.der -untrusted xc-deadend.cert.der xc-leaf.cert.der >/dev/null 2>&1; then
+  echo "ERROR: xc-leaf unexpectedly verified via xc-deadend — backtracking fixture is broken." >&2
+  exit 1
+fi
+echo "xc-leaf: verifies via xc-intermediate→mt-root; the xc-deadend cross-cert is a true dead-end (expected)"
+# Self-issued rollover path: si-leaf → si-subca → si-rollover (self-issued) → si-root validates only
+# because the self-issued rollover is NOT counted toward si-root's pathlen:1 (RFC 5280 §6.1.4 (l)).
+openssl verify -CAfile si-root.cert.der -untrusted <(cat si-rollover.cert.der si-subca.cert.der) si-leaf.cert.der
+echo "si-leaf: self-issued rollover excluded from pathLen, path validates (RFC 5280 §6.1.4 (l)) (expected)"
 
 # --- drop transient working files ------------------------------------------------------------------
 # The tests load only the DER certs + PKCS#8 keys (+ the JSON/JWK/YAML/Kotlin material); the CSRs and

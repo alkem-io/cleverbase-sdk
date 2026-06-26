@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::trust::chain::{verify_chain, ChainError};
+use crate::trust::chain::{verify_chain, ChainError, LeafPurpose};
 use crate::types::{Format, IssuerRole};
 
 // The native trust-list engine, split into focused modules (the X.509 [`chain`] primitive, the
@@ -196,7 +196,15 @@ fn resolve_chain(
     let mut chain: Vec<&[u8]> = Vec::with_capacity(1 + supplied_intermediates.len());
     chain.push(issuer_cert_der);
     chain.extend(supplied_intermediates.iter().map(Vec::as_slice));
-    match verify_chain(&chain, anchors, now_unix) {
+    // The credential's format fixes the role/format-appropriate leaf key purpose the chain validator
+    // enforces on the signing leaf (mdoc DS EKU id-mso-mdl-DS; SD-JWT VC issuer not-a-CA + signing
+    // keyUsage) — a genuinely-chained-but-WRONG-PURPOSE leaf is rejected (no "right chain, wrong
+    // purpose" false-accept).
+    let leaf_purpose = match format {
+        Format::Mdoc => LeafPurpose::MdocDocumentSigner,
+        Format::SdJwtVc => LeafPurpose::SdJwtVcIssuer,
+    };
+    match verify_chain(&chain, anchors, now_unix, leaf_purpose) {
         Ok(()) => TrustDecision::trusted(TrustListEntry {
             role,
             format,

@@ -23,6 +23,23 @@ refresh() -> ()    // fetch + cache signed trust-list XML/JSON; host-driven, not
 | (new) **LoTE** | ETSI TS 119 602 "Lists of Trusted Entities" JSON/XML (coexists with TS 119 612) |
 | **test/offline** | a configured self-signed test root / IACA (the offline suite's anchor) |
 
+## Leaf key-purpose (per role/format)
+
+`resolve` chain-validates the signing leaf via `trust::chain::verify_chain`, which enforces the
+role/format-appropriate **leaf key purpose** so a genuinely-chained-but-WRONG-PURPOSE leaf is rejected
+(a TLS `serverAuth` cert under the same root, or an mdoc-DS cert presented as the SD-JWT VC issuer leaf):
+
+- **mdoc DS** (ISO/IEC 18013-5:2021 Annex B) — the Document Signer leaf MUST carry `extendedKeyUsage`
+  containing `id-mso-mdl-DS` = `1.0.18013.5.1.2` (criticality not required — RFC 5280 §4.2.1.12).
+- **SD-JWT VC issuer** — no spec mandates an EKU (verified online: IETF SD-JWT VC §2.5 / HAIP §6.1.1 /
+  EUDI ARF are silent, the latter distinguishing issuers by QcStatement OIDs); the enforced floor is
+  "leaf is NOT a CA, and if `keyUsage` is present it asserts a signing bit". See `standards-conformance.md` §1.1.
+- **Trust-list signer** authentication imposes no credential-leaf purpose (a separate ETSI profile).
+
+The path build is a **backtracking** DFS (a cross-cert / alternate intermediate reaching the anchor is
+accepted, not greedily false-rejected) and excludes self-issued key-rollover certs from `pathLenConstraint`
+(RFC 5280 §4.2.1.9 / §6.1.4 (l)).
+
 ## Invariants
 
 - The engine **authenticates** each trust list (the LOTL signs national-TL pointers; each national TL is

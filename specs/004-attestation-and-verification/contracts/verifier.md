@@ -24,7 +24,15 @@ verify(presentation: bytes, policy: VerificationPolicy, anchors: TrustAnchors, r
    an expired/withdrawn issuer leaf → INVALID `untrusted_issuer`. The C-ABI / binding path uses this same
    chain-validating rule (`trust::chain::verify_chain`) over the host-passed anchors — it does **not** do
    exact-leaf-equality (which would reject every credential under a CA/root and accept an expired pinned
-   leaf). Absent/expired/revoked anchor → INVALID `untrusted_issuer`.
+   leaf). The chain validator additionally builds the path as a **backtracking** DFS (a credential whose
+   `x5c`/`x5chain` reaches the anchor via some valid path — e.g. a cross-cert / alternate intermediate — is
+   accepted, not greedily false-rejected) and excludes **self-issued** key-rollover certs from the
+   `pathLenConstraint` count (RFC 5280 §4.2.1.9 / §6.1.4 (l)). It also enforces the **leaf key purpose**
+   appropriate to the credential's format — an mdoc Document Signer leaf MUST carry the `id-mso-mdl-DS` EKU
+   (`1.0.18013.5.1.2`, ISO/IEC 18013-5:2021 Annex B); an SD-JWT VC issuer leaf MUST NOT be a CA and, if it
+   carries `keyUsage`, MUST assert a signing bit (no EKU is mandated for SD-JWT VC issuers — verified
+   online; see `standards-conformance.md` §1.1). A genuinely-chained-but-WRONG-PURPOSE leaf → INVALID
+   `untrusted_issuer`. Absent/expired/revoked anchor → INVALID `untrusted_issuer`.
 4. **Validity period** in range at the relevant time (SD-JWT VC `nbf`/`exp`; mdoc MSO `validityInfo`).
 5. **Revocation/status** — checked per the credential's status mechanism; **unreachable → fail-closed by
    default** (policy-configurable) → INVALID `status_unavailable` (never silent VALID).

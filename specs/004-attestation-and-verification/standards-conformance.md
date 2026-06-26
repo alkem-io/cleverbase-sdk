@@ -37,6 +37,47 @@ Notes:
   SD-JWT VC issuer/KB-JWT JOSE signatures and the mdoc COSE signatures are verified over it.
 - **EU DSS** is a **test-only** parity oracle for the trust-list engine, never a runtime/build dep.
 
+### 1.1 Leaf key-purpose policy (X.509 path validation — `src/trust/chain.rs`)
+
+`verify_chain` enforces the role/format-appropriate **leaf key purpose** on the credential's signing
+certificate (the `LeafPurpose` parameter), so a genuinely-chained-but-WRONG-PURPOSE leaf is rejected
+(closing the "right chain, wrong purpose" false-accept — e.g. a TLS `serverAuth` cert issued under the
+same trusted root, or an mdoc-DS cert presented as the SD-JWT VC issuer leaf). The purpose is threaded
+from the credential's `Format` by `resolve_chain`; the trust-list-signer authentication paths
+(`trust::xml`, `qualified`) pass `TrustListSigner`, which imposes no credential-leaf purpose (a TL
+signer is governed by a separate ETSI profile).
+
+| Leaf role/format | Enforced leaf-purpose rule | Standard (verified online) |
+|------------------|----------------------------|----------------------------|
+| **mdoc Document Signer** (`Format::Mdoc`) | `extendedKeyUsage` MUST be present and contain `id-mso-mdl-DS` = **`1.0.18013.5.1.2`**. Absent EKU, or an EKU not listing the OID (e.g. only `serverAuth`), is rejected (`WrongLeafPurpose`). Criticality is **not** required: ISO marks the EKU row mandatory-but-not-critical (field type `m`, not `mc`), and RFC 5280 §4.2.1.12 leaves EKU criticality at the issuer's option. | **ISO/IEC 18013-5:2021 Annex B, Table B.3** (mDL document signer certificate). OID cross-checked at the OID registry. Criticality per **RFC 5280 §4.2.1.12**. |
+| **SD-JWT VC issuer** (`Format::SdJwtVc`) | **No EKU is mandated by any governing spec.** Enforced floor: the leaf **MUST NOT be a CA** (`basicConstraints cA=TRUE` ⇒ rejected — a CA cert must not double as an end-entity signer); and **if** `keyUsage` is present it MUST assert a signing bit (`digitalSignature` or `nonRepudiation`/content-commitment — ETSI EN 319 412-2 issuer Types A/B/C). Absent `keyUsage` is permitted. No EKU is required (an EKU, if present, is not rejected). | IETF **`draft-ietf-oauth-sd-jwt-vc`** §2.5 + **RFC 9901** (silent on EKU/keyUsage); **OpenID4VC HAIP 1.0** §6.1.1 (chain-to-anchor only, no EKU); **EUDI ARF** / Commission IRs (issuer distinguished by **QcStatement** OIDs `0.4.0.194126.1.x`, **not** an EKU); **ETSI TS 119 412-6** / **EN 319 412-2** (keyUsage Types A/B/C/F mandated; §4.3.10 forbids marking EKU critical and assigns no EKU). |
+| **Trust-list signer** (`TrustListSigner`) | No credential-leaf key-purpose constraint (the signer is authenticated solely by chaining to a configured scheme-operator anchor). | n/a — TL signer governed by a separate ETSI profile, not the credential-leaf profiles above. |
+
+Fail-closed throughout: a malformed or duplicate `extendedKeyUsage` / `keyUsage` / `basicConstraints`
+extension is rejected (a leaf whose purpose cannot be decoded is not trusted to act in that role), using
+`x509-cert`'s typed `ExtendedKeyUsage` / `KeyUsage` / `BasicConstraints` decoders (no hand-rolled ASN.1).
+
+Source URLs: ISO 18013-5 DS profile (Table B.3) — https://www.iso.org/standard/69084.html (DS EKU
+`1.0.18013.5.1.2`, https://oid-base.com/get/1.0.18013.5.1.2); RFC 5280 §4.2.1.9 (pathLenConstraint
+"non-self-issued"), §4.2.1.12 (EKU criticality), §6.1 (self-issued = subject DN == issuer DN), §6.1.4
+(l) (self-issued not counted toward path length) — https://www.rfc-editor.org/rfc/rfc5280; SD-JWT VC
+§2.5 — https://www.ietf.org/archive/id/draft-ietf-oauth-sd-jwt-vc-16.html; HAIP 1.0 §6.1.1 —
+https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html; ETSI TS 119 412-6
+/ EN 319 412-2 — https://www.etsi.org/deliver/etsi_ts/119400_119499/11941206/.
+
+### 1.2 Certification-path validation hardening (RFC 5280 §6.1 — `src/trust/chain.rs`)
+
+`verify_chain` walks the supplied `x5c`/`x5chain` to a configured anchor as a **bounded, backtracking
+depth-first search**: when several supplied intermediates name-match (and validly issue) the current
+certificate — a cross-certificate or an alternate sub-CA — each is tried in turn and a dead-end branch
+is unwound so an alternate is explored. A conformant credential that reaches a configured anchor via
+**some** valid path is therefore accepted (no false-reject from a greedy first-match commit). Two path
+counters are threaded distinctly per **RFC 5280**: `pathLenConstraint` counts only **non-self-issued**
+intermediates (§4.2.1.9 / §6.1.4 (l): a self-issued — subject DN == issuer DN — key-rollover cert "is
+not counted when evaluating path length"), while the `MAX_PATH_LEN` denial-of-service cap counts every
+hop (so a self-issued-cert flood cannot evade it). Source: https://www.rfc-editor.org/rfc/rfc5280
+§4.2.1.9, §6.1, §6.1.4.
+
 ## 2. Crate version pins (the format/trust + crypto layers)
 
 The format/trust layers added for this feature are pinned to EXACT versions (`=x.y.z`) in the root

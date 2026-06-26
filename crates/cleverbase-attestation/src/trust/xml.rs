@@ -198,9 +198,16 @@ impl XmlTrustList {
             .as_deref()
             .ok_or(XmlTrustListError::Unsigned)?;
         // The list carries a single signer certificate (no supplied intermediate chain), so the
-        // supplied path is the one-element `[signer]` validated against the scheme anchors.
-        verify_chain(&[signer], scheme_anchors_der, now_unix)
-            .map_err(XmlTrustListError::SignerUntrusted)?;
+        // supplied path is the one-element `[signer]` validated against the scheme anchors. A trust-list
+        // signer is not a credential leaf — it is governed by a separate ETSI profile, not the mdoc/
+        // SD-JWT VC leaf key-purpose rules — so it carries no credential-leaf purpose constraint.
+        verify_chain(
+            &[signer],
+            scheme_anchors_der,
+            now_unix,
+            crate::trust::chain::LeafPurpose::TrustListSigner,
+        )
+        .map_err(XmlTrustListError::SignerUntrusted)?;
         if chain_only {
             Ok(())
         } else {

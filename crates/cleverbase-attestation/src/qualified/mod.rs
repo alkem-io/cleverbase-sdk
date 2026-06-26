@@ -304,9 +304,16 @@ impl QualifiedTrustList {
             .ok_or(QualifiedTrustError::Unsigned)?;
         // Chain-validate the signer against the scheme-operator anchor(s) — reuse the always-on X.509
         // primitive (DRY); a forged/attacker-supplied signer that does not chain is rejected. The list
-        // carries a single signer certificate, so the supplied path is the one-element `[signer]`.
-        crate::trust::chain::verify_chain(&[signer], scheme_anchors, now_unix)
-            .map_err(QualifiedTrustError::SignerNotTrusted)?;
+        // carries a single signer certificate, so the supplied path is the one-element `[signer]`. A
+        // trust-list signer is not a credential leaf (separate ETSI profile), so it carries no
+        // credential-leaf key-purpose constraint.
+        crate::trust::chain::verify_chain(
+            &[signer],
+            scheme_anchors,
+            now_unix,
+            crate::trust::chain::LeafPurpose::TrustListSigner,
+        )
+        .map_err(QualifiedTrustError::SignerNotTrusted)?;
         // Freshness: a list at/after its NextUpdate (or with none) is stale — never authoritative.
         if self.next_update_unix <= 0 || now_unix >= self.next_update_unix {
             return Err(QualifiedTrustError::Stale);
