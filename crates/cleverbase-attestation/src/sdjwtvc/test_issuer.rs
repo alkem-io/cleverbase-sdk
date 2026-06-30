@@ -137,26 +137,81 @@ pub(crate) fn mint_sd_jwt(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
     )
 }
 
-/// Mint an SD-JWT VC with caller-supplied `nbf`/`exp` JSON values, so the issuer signature is valid
-/// over a *non-canonical* `NumericDate` (a JSON string, a non-integer float, or an out-of-`i64`-range
-/// integer) — the false-accept probes for [`super::check_validity`]. The non-canonical bound is
-/// signed by the real issuer key, so the credential clears the signature/trust checks and reaches the
-/// validity check, exactly as a forged credential with a non-canonical `exp` would.
+/// The default SD-JWT VC `vct` the test mints carry — a Collision-Resistant Name (an HTTPS URI), per
+/// SD-JWT VC §type-claim / RFC 7515 §2.
+pub(crate) const DEFAULT_VCT: &str = "https://credentials.example/identity_credential";
+
+/// Mint an SD-JWT VC with caller-supplied `nbf`/`exp` JSON values — used to exercise
+/// [`super::check_validity`] / [`super::numeric_date`] across the spectrum: a canonical integer, a
+/// spec-valid FRACTIONAL number (RFC 7519 §2, floored), and a *non-canonical* bound (a JSON string or
+/// an out-of-`i64`-range integer) that must reject. A `null` value omits the claim (the absent case).
+/// The bound is signed by the real issuer key, so the credential clears the signature/trust checks and
+/// reaches the validity check, exactly as a credential with that `exp` would.
 pub(crate) fn mint_sd_jwt_with_validity(
     issuer_pk8: &[u8],
     issuer_cert_der: &[u8],
     nbf: Value,
     exp: Value,
 ) -> SdJwt {
+    mint_with(
+        issuer_pk8,
+        issuer_cert_der,
+        nbf,
+        exp,
+        Some(DEFAULT_VCT),
+        "dc+sd-jwt",
+    )
+}
+
+/// Mint a happy-path SD-JWT VC whose issuer JWS protected header declares the given `typ` — the SD-JWT
+/// VC media-type probe (draft-ietf-oauth-sd-jwt-vc-16 §3.2.1: `dc+sd-jwt`, transitionally `vc+sd-jwt`).
+/// `typ` must be a value the `sd_jwt_payload` builder accepts (it requires a `+sd-jwt` suffix).
+pub(crate) fn mint_sd_jwt_with_typ(issuer_pk8: &[u8], issuer_cert_der: &[u8], typ: &str) -> SdJwt {
+    mint_with(
+        issuer_pk8,
+        issuer_cert_der,
+        json!(NOW - 1_000),
+        json!(NOW + 1_000_000),
+        Some(DEFAULT_VCT),
+        typ,
+    )
+}
+
+/// Mint an SD-JWT VC OMITTING the REQUIRED `vct` type claim — the missing-`vct` probe for the always-on
+/// bar's [`super::check_vct`] (everything else, incl. the trusted issuer signature + window, is sound).
+pub(crate) fn mint_sd_jwt_without_vct(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
+    mint_with(
+        issuer_pk8,
+        issuer_cert_der,
+        json!(NOW - 1_000),
+        json!(NOW + 1_000_000),
+        None,
+        "dc+sd-jwt",
+    )
+}
+
+/// Shared minting core (DRY — one body for every happy-path variant): `iss` + optional `vct` +
+/// `given_name`/`family_name`/`birthdate` (all concealable) + optional `nbf`/`exp` + a `cnf` holder
+/// binding, signed by `issuer_pk8` with the issuer JWS protected-header `typ`.
+fn mint_with(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    nbf: Value,
+    exp: Value,
+    vct: Option<&str>,
+    typ: &str,
+) -> SdJwt {
     let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
     let mut claims = json!({
         "iss": "https://issuer.example/cb",
-        "vct": "https://credentials.example/identity_credential",
         "given_name": "Ada",
         "family_name": "Lovelace",
         "birthdate": "1815-12-10",
     });
     let object = claims.as_object_mut().expect("claims is a JSON object");
+    if let Some(vct) = vct {
+        object.insert("vct".to_owned(), json!(vct));
+    }
     // A `null` bound means "omit the claim entirely" — the way to mint a credential that ASSERTS no
     // `nbf`/`exp` (the absent case), distinct from a present-but-malformed bound (any other value).
     if !nbf.is_null() {
@@ -170,6 +225,8 @@ pub(crate) fn mint_sd_jwt_with_validity(
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
             .unwrap()
             .header("x5c", json!([cert_b64]))
+            // SD-JWT VC §3.2.1: the issuer JWS `typ` identifies the SD-JWT VC media type.
+            .header("typ", json!(typ))
             .make_concealable("/given_name")
             .unwrap()
             .make_concealable("/family_name")
@@ -210,7 +267,7 @@ pub(crate) fn mint_dual_value_same_name(
     let digest_b = Base64UrlUnpadded::encode_string(&Sha2Hasher.digest(disclosure_b.as_bytes()));
 
     let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
-    let header = json!({ "alg": "ES256", "x5c": [cert_b64] });
+    let header = json!({ "alg": "ES256", "typ": "dc+sd-jwt", "x5c": [cert_b64] });
     let payload = json!({
         "iss": "https://issuer.example/cb",
         "vct": "https://credentials.example/identity_credential",
@@ -252,6 +309,7 @@ pub(crate) fn mint_nested_shared_leaf(issuer_pk8: &[u8], issuer_cert_der: &[u8])
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
             .unwrap()
             .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
             .make_concealable("/address/locality")
             .unwrap()
             .make_concealable("/place_of_birth/locality")
@@ -283,6 +341,7 @@ pub(crate) fn mint_concealable_object_with_concealable_child(
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
             .unwrap()
             .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
             // Make the nested claim concealable first, then the whole object: disclosing both yields a
             // disclosed `address` value that still carries an `_sd` for `locality`.
             .make_concealable("/address/locality")
@@ -306,7 +365,7 @@ pub(crate) fn sign_issuer_jws(
     payload: &Value,
 ) -> String {
     let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
-    let header = json!({ "alg": "ES256", "x5c": [cert_b64] });
+    let header = json!({ "alg": "ES256", "typ": "dc+sd-jwt", "x5c": [cert_b64] });
     let header_b64 =
         Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
     let payload_b64 =
@@ -351,6 +410,7 @@ pub(crate) fn mint_array_element_disclosures(issuer_pk8: &[u8], issuer_cert_der:
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
             .unwrap()
             .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
             .make_concealable("/nationalities/0")
             .unwrap()
             .make_concealable("/nationalities/1")
@@ -362,17 +422,24 @@ pub(crate) fn mint_array_element_disclosures(issuer_pk8: &[u8], issuer_cert_der:
 }
 
 /// Attach a holder KB-JWT (signed by `holder_pk8`) over the given `aud`/`nonce` to a minted SD-JWT,
-/// returning the full compact presentation string.
-pub(crate) fn attach_kb_jwt(
+/// returning the full compact presentation string. The KB-JWT `iat` is the canonical [`NOW`].
+pub(crate) fn attach_kb_jwt(sd_jwt: SdJwt, holder_pk8: &[u8], aud: &str, nonce: &str) -> String {
+    attach_kb_jwt_with_iat(sd_jwt, holder_pk8, aud, nonce, NOW)
+}
+
+/// Like [`attach_kb_jwt`] but stamps a caller-chosen KB-JWT `iat` — the freshness-window probe for the
+/// verifier's RFC 9901 §7.3 step 5.e `iat` check (a KB-JWT minted far from the verification time).
+pub(crate) fn attach_kb_jwt_with_iat(
     mut sd_jwt: SdJwt,
     holder_pk8: &[u8],
     aud: &str,
     nonce: &str,
+    iat: i64,
 ) -> String {
     let holder = Es256Signer::from_pkcs8(holder_pk8);
     let kb = block_on(
         KeyBindingJwt::builder()
-            .iat(NOW)
+            .iat(iat)
             .aud(aud)
             .nonce(nonce)
             .finish(&sd_jwt, &Sha2Hasher, "ES256", &holder),

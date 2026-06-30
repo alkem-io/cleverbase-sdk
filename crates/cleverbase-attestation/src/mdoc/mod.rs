@@ -70,6 +70,13 @@ const COSE_KEY_KTY: i64 = 1;
 /// COSE_Key `kty` value for an EC2 key (`2`).
 const COSE_KTY_EC2: i64 = 2;
 
+/// The one ISO/IEC 18013-5 schema version this verifier implements. The standard fixes BOTH the
+/// `DeviceResponse.version` (§8.3.2.1.2.2) and the `MobileSecurityObject.version` (§9.1.2.4) to the
+/// text string `"1.0"`. An absent or different version is an unrecognized schema this verifier cannot
+/// claim to validate, so it is rejected as malformed (never guessed/up-converted) — confirmed against
+/// the ISO CDDL (e.g. the auth0-lab/mdl reference parser likewise enforces the MSO version is `"1.0"`).
+const MDOC_SCHEMA_VERSION: &str = "1.0";
+
 /// The hash algorithm named by the MSO `digestAlgorithm` field (ISO/IEC 18013-5 §9.1.2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DigestAlgorithm {
@@ -427,16 +434,29 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
 /// A `DeviceResponse` MAY carry more than one `Document`. The verdict is VALID only when **every**
 /// document clears the full always-on bar — verifying just `documents[0]` would let a forged second
 /// document ride inside a VALID verdict, with no signature/trust/validity/status/holder-binding check
-/// (a false-accept). The top-level `DeviceResponse.status` is also enforced (a non-zero `status`
-/// signals the holder reported an error and the response MUST NOT be treated as a clean success), and
-/// a present `documentErrors` entry rejects the response (the device could not return a requested
-/// document, so the response is not a complete success).
+/// (a false-accept). The top-level `DeviceResponse.version` (must be `"1.0"`) and `DeviceResponse.status`
+/// (a non-zero `status` signals the holder reported an error and the response MUST NOT be treated as a
+/// clean success) are enforced. A present `documentErrors` entry does NOT reject the response: ISO/IEC
+/// 18013-5 §8.3 makes `documentErrors` informational — it names docType(s) the device could NOT return,
+/// not a fault of the document(s) it DID return — so the verdict stands on the documents that ARE
+/// present (an empty/absent `documents` array is still rejected: there is nothing to verify).
 #[allow(clippy::type_complexity)] // the (result, meta) pair on both arms is the function's whole point
 fn verify_inner<A: TrustAnchorSource + ?Sized>(
     device_response: &[u8],
     anchors: &A,
     params: &MdocVerifyParams<'_>,
 ) -> Result<(VerificationResult, MdocVerifyMeta), (VerifyFailure, MdocVerifyMeta)> {
+    // --- Deterministic-CBOR gate: reject indefinite-length encoding BEFORE the permissive decode. ----
+    // ISO/IEC 18013-5 §9.1.1 mandates deterministic CBOR for the mdoc structures, and RFC 8949 §4.2.1
+    // (Core Deterministic Encoding Requirements) states "Indefinite-length items MUST NOT appear."
+    // `ciborium::from_reader` below would otherwise ACCEPT an indefinite-length `DeviceResponse`, so it
+    // is rejected up front with a single definite-length structural pre-scan of the whole item (the
+    // integrity raw cursor already enforces this on the `IssuerSignedItemBytes`; this extends the same
+    // guarantee to the top-level decode). Fail-closed → `MalformedCredential`.
+    if reject_indefinite_length_cbor(device_response).is_err() {
+        return Err((VerifyFailure::malformed(), MdocVerifyMeta::default()));
+    }
+
     let root: CborValue = match ciborium::from_reader(device_response) {
         Ok(root) => root,
         // Unparseable bytes: nothing decoded, so the meta is empty (the failure is not `HolderBinding`).
@@ -448,18 +468,24 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     // meta (the document count is filled once `documents` is in hand).
     let early = |failure: VerifyFailure| (failure, MdocVerifyMeta::default());
 
+    // --- DeviceResponse.version: ISO/IEC 18013-5 §8.3.2.1.2.2 fixes the schema version to "1.0"; an
+    //     absent/other version is an unrecognized DeviceResponse schema (reject as malformed). --------
+    if get_text(&root, "version").as_deref() != Some(MDOC_SCHEMA_VERSION) {
+        return Err(early(VerifyFailure::malformed()));
+    }
+
     // --- DeviceResponse.status: a non-zero status (ISO/IEC 18013-5 §8.3.2.1.2.2) means the holder
     //     reported an error; a clean success is `status == 0`. A non-zero status MUST NOT carry a
     //     VALID verdict. -------------------------------------------------------------------------------
     enforce_device_response_status(&root).map_err(early)?;
 
-    // --- documentErrors: if the device could not return a requested document, the response is not a
-    //     complete success — reject rather than silently accept a partial response. ------------------
-    if get_map_entry(&root, "documentErrors").is_some() {
-        return Err(early(VerifyFailure::reason(
-            ReasonCode::MalformedCredential,
-        )));
-    }
+    // --- documentErrors (ISO/IEC 18013-5 §8.3): INFORMATIONAL — it names docType(s) the device could
+    //     NOT return, NOT a fault of the document(s) it DID return. A partially-fulfilled multi-doc
+    //     request whose returned documents are all valid must therefore NOT be rejected merely because
+    //     `documentErrors` is present; the verdict stands on the documents that ARE present (verified
+    //     in full below). An empty/absent `documents` array is still rejected — there is nothing to
+    //     verify. (Previously any `documentErrors` entry hard-rejected the response: an over-strict
+    //     false-reject, conformance-audit T7.5.) ------------------------------------------------------
 
     let documents = match get_map_entry(&root, "documents").and_then(CborValue::as_array) {
         Some(documents) => documents,
@@ -644,6 +670,12 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     let mso_inner = unwrap_bstr_tagged_payload(mso_bytes)?;
     let mso: CborValue =
         ciborium::from_reader(mso_inner.as_slice()).map_err(|_| VerifyFailure::malformed())?;
+
+    // MSO `version`: ISO/IEC 18013-5 §9.1.2.4 fixes the MobileSecurityObject version to "1.0"; an
+    // absent/other version is an unrecognized MSO schema (reject as malformed, never guessed).
+    if get_text(&mso, "version").as_deref() != Some(MDOC_SCHEMA_VERSION) {
+        return Err(VerifyFailure::malformed());
+    }
 
     // --- Resolve the DS chain from the x5chain and verify the IssuerAuth signature under the leaf. ---
     // The full x5chain (leaf-first) is read, not just the leaf: an mdoc DS leaf may chain to the
@@ -1003,6 +1035,25 @@ impl<'a> CborCursor<'a> {
     }
 }
 
+/// Reject a `DeviceResponse` that uses indefinite-length (or reserved) CBOR encoding ANYWHERE in its
+/// top-level item — ISO/IEC 18013-5 §9.1.1 mandates deterministic CBOR, and RFC 8949 §4.2.1 states
+/// "Indefinite-length items MUST NOT appear." `ciborium` (the always-on bar's decoder) would otherwise
+/// accept indefinite-length encoding, so this walks the WHOLE response with the definite-length-only
+/// [`CborCursor`] — whose [`CborCursor::read_head`] returns `None` for any indefinite-length (additional
+/// info 31) or reserved (28..=30) head — and requires it to consume EXACTLY the input. A successful,
+/// fully-consuming walk proves definite-length encoding with no trailing bytes (the deterministic
+/// "one well-formed item" rule); any deviation fails closed ([`VerifyFailure::malformed`]). The cursor
+/// is iterative (O(1) stack), so this is also safe against adversarial nesting.
+fn reject_indefinite_length_cbor(device_response: &[u8]) -> Result<(), VerifyFailure> {
+    let mut cursor = CborCursor::new(device_response);
+    match cursor.skip_item() {
+        // Exactly one complete, definite-length top-level item that consumes the whole input.
+        Some(()) if cursor.pos == device_response.len() => Ok(()),
+        // An indefinite/reserved head (cursor returns `None`), a truncated item, or trailing bytes.
+        _ => Err(VerifyFailure::malformed()),
+    }
+}
+
 /// Decode a [`RawIssuerItem`] record for one on-wire `#6.24(bstr .cbor IssuerSignedItem)` element from
 /// its exact full span (`raw_bytes`, the digest input) and the inner bstr content (`inner`, the
 /// `.cbor IssuerSignedItem` bytes) — the two slices the cursor's [`CborCursor::take_tagged_bstr_item`]
@@ -1181,7 +1232,41 @@ fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
         CborValue::Tag(_, inner) => inner.as_ref(),
         other => other,
     };
-    CoseSign1::from_cbor_value(array.clone()).map_err(|_| VerifyFailure::malformed())
+    let sign1 =
+        CoseSign1::from_cbor_value(array.clone()).map_err(|_| VerifyFailure::malformed())?;
+    // RFC 9052 §3.1 (`crit`) enforcement, applied at this single COSE_Sign1 construction chokepoint so
+    // BOTH the `IssuerAuth` and `DeviceSignature` paths inherit it (DRY — Principle III).
+    reject_unprocessed_crit(&sign1)?;
+    Ok(sign1)
+}
+
+/// Enforce the COSE `crit` (critical headers) protected-header parameter (RFC 9052 §3.1).
+///
+/// RFC 9052 §3.1 defines `crit` (label 2) as the list that "indicate[s] which protected header
+/// parameters an application that is processing a message is required to understand"; if a recipient
+/// does not process a header parameter listed there, the spec is explicit that "this is a fatal error
+/// in processing the message". This verifier processes exactly ONE protected header parameter — the
+/// standard `alg` (label 1) it already pins to ES256 — and implements NO extension headers, so ANY
+/// other label appearing in `crit` is one it does not understand and the message MUST be rejected
+/// (fail-closed forward-compat: an issuer that marks a header critical is demanding the verifier honor
+/// it, so silently ignoring it would be a false-trust — conformance-audit T2.1). A `crit` listing only
+/// `alg` is accepted (it IS understood; RFC 9052 §3.1 separately notes such "Integer labels in the
+/// range of 0 to 7 SHOULD be omitted", but a redundant listing is not an interop failure here).
+/// `coset` already parses `crit` into `protected.header.crit`; this only enforces it. Rejected as
+/// [`ReasonCode::MalformedCredential`] (a structurally-unprocessable message).
+fn reject_unprocessed_crit(sign1: &CoseSign1) -> Result<(), VerifyFailure> {
+    let all_understood = sign1.protected.header.crit.iter().all(|label| {
+        // The sole protected header parameter this verifier processes is `alg` (label 1).
+        matches!(
+            label,
+            RegisteredLabelWithPrivate::Assigned(coset::iana::HeaderParameter::Alg)
+        )
+    });
+    if all_understood {
+        Ok(())
+    } else {
+        Err(VerifyFailure::malformed())
+    }
 }
 
 /// Resolve the full Document Signer certificate chain (DER, leaf-first) from a COSE_Sign1's `x5chain`

@@ -19,7 +19,10 @@ use crate::types::{Format, IssuerRole, VerificationPolicy};
 const AUDIENCE: &str = "https://verifier.example/cb";
 /// The verifier's `response_uri` request parameter (OpenID4VP 1.0 §B.2.6 4th handover element).
 const RESPONSE_URI: &str = "https://verifier.example/cb/response";
-const NOW: i64 = 1_700_000_000;
+/// The holder's present-time clock (the KB-JWT `iat` the SD-JWT VC tests stamp). Aligned with the
+/// SD-JWT issuer/verify clock ([`crate::sdjwtvc::test_issuer::NOW`]) so the KB-JWT `iat` sits inside the
+/// verifier's acceptable-window check (RFC 9901 §7.3 step 5.e); the mdoc present path ignores `iat`.
+const NOW: i64 = crate::sdjwtvc::test_issuer::NOW;
 
 /// A stub holder HSM (the only holder of a private key) signing the SDK-built input.
 struct StubHsm {
@@ -300,6 +303,9 @@ fn mint_with_array_disclosures() -> String {
         SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
             .expect("builder")
             .header("x5c", json!([cert_b64]))
+            // SD-JWT VC §3.2.1: the verifier requires the issuer JWS `typ` to be the SD-JWT VC media
+            // type (`dc+sd-jwt`); this fixture is verified end-to-end via `verify_response`.
+            .header("typ", json!("dc+sd-jwt"))
             .make_concealable("/given_name")
             .expect("conceal given_name")
             .make_concealable("/nationalities/0")

@@ -920,13 +920,26 @@ fn empty_documents_array_is_rejected_as_malformed() {
 }
 
 #[test]
-fn document_errors_present_is_rejected_as_malformed() {
-    // A `documentErrors` entry means the device could not return a requested document; the response
-    // is not a complete success and must be rejected rather than partially accepted.
+fn document_errors_present_does_not_reject_valid_returned_documents() {
+    // ISO/IEC 18013-5 §8.3 (conformance-audit T7.5): `documentErrors` is INFORMATIONAL — it names
+    // docType(s) the device could NOT return, NOT a fault of the document(s) it DID return. A
+    // partially-fulfilled multi-doc request whose returned document is present and valid must NOT be
+    // rejected merely because some OTHER docType errored (the previous behavior was an over-strict
+    // false-reject). The verdict stands on the documents that ARE present, and their attributes are
+    // disclosed. (The builder's `documentErrors` names a DIFFERENT docType than the returned mDL.)
     let response = MdocBuilder::new().add_document_errors().build();
     let result = verify(&response, &trusted_anchors(), &params());
-    assert!(!result.valid);
-    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+    assert!(
+        result.valid,
+        "a documentErrors entry for an UNRETURNED docType must not fail the valid returned mDL: {:?}",
+        result.reasons
+    );
+    assert!(result.reasons.is_empty());
+    assert_eq!(
+        disclosed_attr(&result, "given_name"),
+        Some(&AttributeValue::Text("Ada".to_owned())),
+        "the present, valid document's attributes are still disclosed"
+    );
 }
 
 #[test]
@@ -1023,6 +1036,121 @@ fn verify_with_meta_surfaces_claimed_issuers_on_valid_and_binding_machinery_on_h
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::HolderBinding]);
     assert_eq!(meta.binding_machinery, Some(DeviceBindingMachinery::Faulty));
+}
+
+#[test]
+fn cose_sign1_with_unknown_critical_header_is_rejected_both_paths() {
+    // RFC 9052 §3.1 (conformance-audit T2.1): the COSE `crit` parameter "indicate[s] which protected
+    // header parameters an application that is processing a message is required to understand"; a
+    // recipient that does not process a header listed there cannot process the message ("this is a
+    // fatal error in processing the message"). This verifier processes ONLY the standard `alg`, so a
+    // COSE_Sign1 marking ANY other header critical MUST be rejected — proven on BOTH COSE_Sign1 paths,
+    // which inherit the check from the single `parse_cose_sign1` chokepoint.
+
+    // (1) IssuerAuth carries `crit:[content type]` (a header the verifier does not process).
+    let issuer_crit = MdocBuilder::new().issuer_auth_unknown_crit().build();
+    let result = verify(&issuer_crit, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "an IssuerAuth marking an unprocessed header critical must not verify"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    // (2) DeviceSignature carries `crit:[content type]` (the holder-binding COSE_Sign1 path).
+    let device_crit = MdocBuilder::new().device_sig_unknown_crit().build();
+    let result = verify(&device_crit, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a DeviceSignature marking an unprocessed header critical must not verify"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    // Baseline: the SAME builder WITHOUT any crit injection (no critical header) verifies — so the
+    // unprocessed critical header is the sole cause of each rejection above.
+    assert!(
+        verify(&MdocBuilder::new().build(), &trusted_anchors(), &params()).valid,
+        "the only change driving the rejects above is the unprocessed critical header"
+    );
+}
+
+#[test]
+fn indefinite_length_device_response_is_rejected_as_malformed_no_panic() {
+    // ISO/IEC 18013-5 §9.1.1 mandates deterministic (definite-length) CBOR; RFC 8949 §4.2.1:
+    // "Indefinite-length items MUST NOT appear." (conformance-audit T7.2). `ciborium` itself ACCEPTS
+    // indefinite-length encoding, so the verifier MUST reject it with its own definite-length pre-scan.
+    // Hand-build an indefinite-length top-level map (0xBF … 0xFF) carrying a DeviceResponse-shaped body
+    // and prove (a) ciborium decodes it (it IS valid CBOR ciborium accepts) yet (b) the verifier
+    // rejects it as MalformedCredential WITHOUT panicking.
+    let mut wire = vec![0xBF_u8]; // map(*) — indefinite-length head
+    for (key, value) in [
+        ("version", CborValue::Text("1.0".to_owned())),
+        ("status", CborValue::Integer(0.into())),
+    ] {
+        wire.extend(encode_cbor(&CborValue::Text(key.to_owned())));
+        wire.extend(encode_cbor(&value));
+    }
+    wire.push(0xFF); // break — closes the indefinite-length map
+
+    // Precondition: this IS well-formed CBOR that ciborium accepts (so the rejection below is OUR
+    // deterministic-encoding pre-scan, not a ciborium parse failure of malformed bytes).
+    assert!(
+        ciborium::from_reader::<CborValue, _>(wire.as_slice()).is_ok(),
+        "the indefinite-length encoding is valid CBOR ciborium accepts"
+    );
+
+    let result = verify(&wire, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "an indefinite-length DeviceResponse must not verify"
+    );
+    assert_eq!(
+        result.reasons,
+        vec![ReasonCode::MalformedCredential],
+        "indefinite-length encoding is rejected fail-closed, never a panic"
+    );
+}
+
+#[test]
+fn device_response_version_must_be_present_and_1_0() {
+    // ISO/IEC 18013-5 §8.3.2.1.2.2 fixes `DeviceResponse.version` to the text string "1.0". A different
+    // version is an unrecognized schema, and an absent version is structurally malformed — both reject
+    // (never up-converted/guessed).
+    let wrong = MdocBuilder::new().device_response_version("2.0").build();
+    let result = verify(&wrong, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "a DeviceResponse version != 1.0 must not verify"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    let absent = MdocBuilder::new().omit_device_response_version().build();
+    let result = verify(&absent, &trusted_anchors(), &params());
+    assert!(
+        !result.valid,
+        "an absent DeviceResponse version must not verify"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    // Baseline: the same builder with the spec "1.0" verifies — so the version is the sole cause above.
+    assert!(verify(&MdocBuilder::new().build(), &trusted_anchors(), &params()).valid);
+}
+
+#[test]
+fn mso_version_must_be_present_and_1_0() {
+    // ISO/IEC 18013-5 §9.1.2.4 fixes the MobileSecurityObject `version` to the text string "1.0". A
+    // different/absent MSO version is an unrecognized MSO schema and is rejected as malformed.
+    let wrong = MdocBuilder::new().mso_version("2.0").build();
+    let result = verify(&wrong, &trusted_anchors(), &params());
+    assert!(!result.valid, "an MSO version != 1.0 must not verify");
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    let absent = MdocBuilder::new().omit_mso_version().build();
+    let result = verify(&absent, &trusted_anchors(), &params());
+    assert!(!result.valid, "an absent MSO version must not verify");
+    assert_eq!(result.reasons, vec![ReasonCode::MalformedCredential]);
+
+    // Baseline: the spec "1.0" MSO verifies — so the MSO version is the sole cause above.
+    assert!(verify(&MdocBuilder::new().build(), &trusted_anchors(), &params()).valid);
 }
 
 /// Encode a `ciborium` value to CBOR bytes (test helper).

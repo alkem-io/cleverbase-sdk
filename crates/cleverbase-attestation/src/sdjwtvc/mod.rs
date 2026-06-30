@@ -46,6 +46,22 @@ use crate::types::{
 /// into the JOSE header it builds (DRY — Principle III).
 const ES256: &str = crate::issuance::signer::SignatureAlgorithm::Es256.jose_alg();
 
+/// The SD-JWT VC issuer JWS `typ` (media type) values this verifier accepts — RFC 9901 §9.11 (explicit
+/// typing) + draft-ietf-oauth-sd-jwt-vc-16 §3.2.1. `dc+sd-jwt` is the current SD-JWT VC media type;
+/// `vc+sd-jwt` is the legacy value (used before the Nov-2024 rename away from the W3C-conflicting `vc`)
+/// and is accepted ONLY for the spec-mandated transition ("both `vc+sd-jwt` and `dc+sd-jwt` should be
+/// accepted as the value of the `typ` header for a reasonable transitional period"). Any other value,
+/// or an absent `typ`, is not an SD-JWT VC issuer JWS and is rejected (see [`require_issuer_typ`]).
+const ACCEPTED_ISSUER_TYP: &[&str] = &["dc+sd-jwt", "vc+sd-jwt"];
+
+/// The acceptable clock-skew window (seconds, each direction) for the holder Key Binding JWT's `iat` —
+/// RFC 9901 §7.3 step 5.e: "Check that the creation time of the Key Binding JWT, as determined by the
+/// `iat` claim, is within an acceptable window." A KB-JWT whose `iat` is more than this far in the
+/// FUTURE (a skewed/forged holder clock) or in the PAST (a stale/replayed presentation) relative to the
+/// verification time is rejected. Conservative default; the `nonce`/`aud` challenge is the primary
+/// replay defense and this `iat` window is defense-in-depth freshness (see [`check_holder_binding`]).
+const KB_JWT_IAT_ACCEPTABLE_SKEW_SECS: u64 = 300;
+
 use crate::crypto::{sha256, SHA_256};
 
 /// The revocation/status input to the verifier — the canonical [`crate::status::StatusOutcome`]
@@ -201,6 +217,13 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             .reason_code());
     }
 
+    // 3a. SD-JWT VC type claim. `vct` is REQUIRED and MUST be a Collision-Resistant Name (RFC 9901 /
+    //     SD-JWT VC §type-claim). It is read from the issuer-signed clear payload, now established as
+    //     issuer-signed (step 2) and trusted (step 3). A missing/empty/non-string/non-CRN `vct` is a
+    //     malformed SD-JWT VC and rejected here (Type Metadata + `vct#integrity` resolution is a
+    //     documented sans-IO scope cut — see [`check_vct`]).
+    check_vct(sd_jwt.claims())?;
+
     // 4. Validity window (`nbf`/`exp`).
     check_validity(sd_jwt.claims(), input.now_unix)?;
 
@@ -211,8 +234,14 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         StatusInput::Unavailable => return Err(ReasonCode::StatusUnavailable),
     }
 
-    // 6. Holder binding (KB-JWT over `aud`/`nonce`/`sd_hash`, verified against the `cnf` key).
-    check_holder_binding(&sd_jwt, input.presentation, input.key_binding.as_ref())?;
+    // 6. Holder binding (KB-JWT over `aud`/`nonce`/`sd_hash`, verified against the `cnf` key; a present
+    //    KB-JWT's `iat` freshness window is checked against `now`).
+    check_holder_binding(
+        &sd_jwt,
+        input.presentation,
+        input.key_binding.as_ref(),
+        input.now_unix,
+    )?;
 
     // 7. Selective-disclosure integrity — every disclosed claim matches an issuer-signed digest, and
     //    the disclosed claim set is what we return (undisclosed attributes are never revealed).
@@ -253,9 +282,16 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
     // guard above already established `jws` as a 3-segment compact JWS, so the helper's first-segment
     // split re-reads the header that guard validated.
     let header = decode_jws_protected_header(jws).ok_or(ReasonCode::MalformedCredential)?;
+    // RFC 7515 §4.1.11: a `crit` header listing any extension the recipient does not understand
+    // invalidates the JWS. This verifier implements no critical extension Header Parameter, so any
+    // `crit` member is unsupported — reject (shared with the KB-JWT header check; DRY — Principle III).
+    reject_unsupported_crit(&header)?;
     if header.get("alg").and_then(Value::as_str) != Some(ES256) {
         return Err(ReasonCode::UnsupportedFormat);
     }
+    // SD-JWT VC §3.2.1 + RFC 9901 §9.11: the issuer JWS `typ` MUST identify the SD-JWT VC media type
+    // (`dc+sd-jwt`, or transitionally `vc+sd-jwt`); a wrong/absent `typ` is rejected.
+    require_issuer_typ(&header)?;
     // Read the FULL x5c chain (leaf-first), not just the leaf: eIDAS/EUDI issuers commonly present
     // [leaf, intermediate, …] where the leaf chains to the trusted root via an intermediate sub-CA, so
     // the supplied intermediates are path-building material the trust step (step 3) needs.
@@ -283,14 +319,46 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
 ///
 /// One authoritative header-decode (DRY — Principle III): the issuer cert read
 /// ([`issuer_signing_cert_der`]), the issuer signature path ([`verify_issuer_signature`]), and the
-/// holder KB-JWT alg check ([`require_kb_jwt_es256_alg`]) all share this body and each wraps the
-/// `None` with its own [`ReasonCode`] and reads its own header field (`x5c` vs `alg`). The caller is
-/// responsible for any compact-JWS framing guard (e.g. the issuer path's exactly-3-segment check);
-/// this helper only reads the header segment, so a non-JWS string simply yields `None`.
+/// holder KB-JWT header check ([`check_kb_jwt_jose_header`]) all share this body and each wraps the
+/// `None` with its own [`ReasonCode`] and reads its own header field (`x5c` vs `alg`/`typ`/`crit`). The
+/// caller is responsible for any compact-JWS framing guard (e.g. the issuer path's exactly-3-segment
+/// check); this helper only reads the header segment, so a non-JWS string simply yields `None`.
 fn decode_jws_protected_header(jws: &str) -> Option<Value> {
     let header_b64 = jws.split('.').next()?;
     let header_json = Base64UrlUnpadded::decode_vec(header_b64).ok()?;
     serde_json::from_slice(&header_json).ok()
+}
+
+/// Reject a JWS whose protected JOSE header carries a `crit` (Critical) Header Parameter this verifier
+/// does not understand — RFC 7515 §4.1.11: "If any of the listed extension Header Parameters are not
+/// understood and supported by the recipient, then the JWS is invalid." This verifier implements NO
+/// critical extension Header Parameter, and §4.1.11 forbids a producer from listing the registered
+/// `alg`/`x5c`/`typ` in `crit` ("Producers MUST NOT include Header Parameter names defined by this
+/// specification ... for use with [`crit`]") — so ANY `crit` member is, by definition, one we do not
+/// understand. A present `crit` (of any shape, including the spec-forbidden empty array `[]`) is
+/// therefore rejected as [`ReasonCode::UnsupportedFormat`]; an absent `crit` (the conformant common
+/// case) passes. Shared by the issuer-JWS and KB-JWT header checks (DRY — Principle III).
+fn reject_unsupported_crit(header: &Value) -> Result<(), ReasonCode> {
+    match header.get("crit") {
+        None => Ok(()),
+        Some(_) => Err(ReasonCode::UnsupportedFormat),
+    }
+}
+
+/// Require the issuer JWS protected header `typ` to identify the SD-JWT VC media type — RFC 9901 §9.11
+/// (explicit typing) + draft-ietf-oauth-sd-jwt-vc-16 §3.2.1: `typ` MUST be `dc+sd-jwt`, or the legacy
+/// `vc+sd-jwt` accepted only for the spec-mandated transitional period (see [`ACCEPTED_ISSUER_TYP`]). A
+/// `typ` that is absent, not a string, or any other value is not an SD-JWT VC issuer JWS and is
+/// rejected as [`ReasonCode::UnsupportedFormat`] (symmetric with the non-ES256 `alg` reject). The
+/// KB-JWT's own `typ=kb+jwt` is enforced separately by the pinned `sd_jwt_payload` parser, so it is not
+/// re-checked here.
+fn require_issuer_typ(header: &Value) -> Result<(), ReasonCode> {
+    let typ = header.get("typ").and_then(Value::as_str);
+    if typ.is_some_and(|value| ACCEPTED_ISSUER_TYP.contains(&value)) {
+        Ok(())
+    } else {
+        Err(ReasonCode::UnsupportedFormat)
+    }
 }
 
 /// Extract the FULL signing certificate chain (DER, leaf-first) from a JWS header's `x5c` (RFC 7515
@@ -330,12 +398,24 @@ fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::Verifying
 
 /// Check the `nbf`/`exp` validity window against `now` (RFC 9901 carries the JWT `nbf`/`exp` claims).
 ///
-/// `nbf`/`exp` are JWT `NumericDate`s (RFC 7519 §2): a JSON number of seconds since the epoch. A
-/// **present** bound MUST be a NumericDate this verifier can evaluate; a present-but-unparseable bound
-/// (a JSON string `"200"`, a non-integer float `200.5`, or a magnitude outside `i64`) is NOT silently
-/// ignored — that would let an expired credential with a non-canonical `exp` be accepted as having
-/// unbounded validity (a false-accept). Instead it rejects: a malformed bound is `MalformedCredential`
-/// (we cannot trust a window we cannot read).
+/// `nbf`/`exp` are JWT `NumericDate`s (RFC 7519 §2): a JSON number of seconds since the epoch (a
+/// fractional value is permitted and floored — see [`numeric_date`]). A **present** bound MUST be a
+/// NumericDate this verifier can evaluate; a present-but-unparseable bound (a JSON string `"200"`,
+/// `null`, or a magnitude outside `i64`) is NOT silently ignored — that would let an expired credential
+/// with a non-canonical `exp` be accepted as having unbounded validity (a false-accept). Instead it
+/// rejects: a malformed bound is `MalformedCredential` (we cannot trust a window we cannot read).
+///
+/// ## Validity is read from the issuer-signed clear payload (RFC 9901 §9.7)
+///
+/// `nbf`/`exp` are read from [`sd_jwt_payload::SdJwt::claims`] — the issuer-signed **clear** JWT payload
+/// — never from holder-reconstructed disclosures. RFC 9901 §9.7 requires the Verifier to "ensure that
+/// all claims they deem necessary for checking the validity ... are present", and a validity-
+/// controlling claim belongs in the clear payload, not behind selective disclosure. So a selectively-
+/// disclosable `exp`/`nbf` (one carried only as an `_sd` digest and absent from the clear payload) is
+/// intentionally NOT honoured as a validity bound here: `claims.get("exp")` returns `None` for it and
+/// the credential carries no upper bound, rather than the verifier trusting a holder-controlled expiry.
+/// This is the secure reading — a malicious holder cannot extend validity by withholding a disclosable
+/// `exp` (documented behavior; no behavior change, the clear payload has always been the only source).
 ///
 /// A bound that is **absent** is permitted (RFC 9901 / SD-JWT VC make `exp`/`nbf` optional). This is
 /// an intentional, documented policy: a credential with no `exp` carries no upper temporal bound here.
@@ -373,23 +453,88 @@ fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Vali
     })
 }
 
-/// Read an optional JWT `NumericDate` claim (`nbf`/`exp`), distinguishing **absent** from
-/// **present-but-malformed**.
+/// Require the issuer-signed payload's `vct` (Verifiable Credential Type) claim — SD-JWT VC §type-claim
+/// makes `vct` REQUIRED, a case-sensitive string, and (draft-ietf-oauth-sd-jwt-vc-16) its value "MUST be
+/// a Collision-Resistant Name as defined in Section 2 of [RFC7515]". A missing, empty, non-string, or
+/// non-Collision-Resistant `vct` is rejected as [`ReasonCode::MalformedCredential`].
+///
+/// Documented scope cut (research D2, sans-IO core): the always-on bar does NOT fetch the Type Metadata
+/// document nor validate a `vct#integrity` hash — both require network I/O. `vct` is validated for shape
+/// here; surfacing it for DCQL type-matching is a later wave (audit T4.1).
+fn check_vct(claims: &sd_jwt_payload::SdJwtClaims) -> Result<(), ReasonCode> {
+    let vct = claims
+        .get("vct")
+        .and_then(Value::as_str)
+        .ok_or(ReasonCode::MalformedCredential)?;
+    if vct.is_empty() || !is_collision_resistant_name(vct) {
+        return Err(ReasonCode::MalformedCredential);
+    }
+    Ok(())
+}
+
+/// Whether `name` is a plausible Collision-Resistant Name (RFC 7515 §2: "A name in a namespace that
+/// enables names to be allocated in a manner such that they are highly unlikely to collide with other
+/// names" — e.g. Domain Names, OIDs, UUIDs). The two dominant SD-JWT VC `vct` shapes are accepted:
+///
+/// - a **URI** — a value bearing an RFC 3986 §3.1 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`)
+///   followed by `:` and a non-empty remainder, e.g. `https://credentials.example/id`, `urn:…`,
+///   `did:…` (a URN-wrapped OID/UUID such as `urn:oid:…`/`urn:uuid:…` is covered here); or
+/// - a **reverse-domain-style identifier** — two or more non-empty dot-separated DNS-style labels
+///   (`[A-Za-z0-9-]`), e.g. `com.example.identity` (a bare domain name `example.com` is included).
+///
+/// A bare single token with neither a scheme nor a dotted namespace (e.g. `identity`) is NOT collision-
+/// resistant and is rejected. This is a shape check only — it never resolves or dereferences the name.
+fn is_collision_resistant_name(name: &str) -> bool {
+    // URI: a scheme (letter, then letters/digits/`+`/`-`/`.`) before the first `:`, with a non-empty
+    // remainder after it (RFC 3986 §3.1 `scheme ":" hier-part`).
+    if let Some((scheme, rest)) = name.split_once(':') {
+        let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if scheme_ok && !rest.is_empty() {
+            return true;
+        }
+    }
+    // Reverse-domain-style / domain name: ≥2 non-empty DNS-style labels separated by `.`.
+    let label_ok = |label: &str| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    name.contains('.') && name.split('.').all(label_ok)
+}
+
+/// Read an optional JWT `NumericDate` claim (`nbf`/`exp`/`iat`), distinguishing **absent** from
+/// **present-but-malformed**, and accepting the spec's fractional form.
 ///
 /// - `None` (claim absent) → `Ok(None)`: the bound is optional and simply not asserted.
-/// - A JSON integer that fits `i64` → `Ok(Some(_))`: the canonical NumericDate.
-/// - A claim that is **present** but is not an `i64`-representable integer (a JSON string, a
-///   non-integer float, `null`, or a number outside `i64`) → `Err(MalformedCredential)`: the window
-///   is uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential
-///   with a non-canonical `exp` would read as unbounded). RFC 7519 §2 defines NumericDate as a JSON
-///   number; we reject anything we cannot evaluate against `now` rather than ignore it.
+/// - A JSON number → `Ok(Some(seconds))`: RFC 7519 §2 defines NumericDate as a JSON numeric value and
+///   states "Non-integer values can be represented", so a FRACTIONAL value (e.g. `200.5`) is valid; it
+///   is floored to whole seconds (toward the past — the conservative direction for both a lower and an
+///   upper temporal bound). An integer that already fits `i64` is taken verbatim.
+/// - A claim that is **present** but is not a JSON number (a string, `null`, a boolean, an object/
+///   array), is non-finite, or floors outside `i64` → `Err(MalformedCredential)`: the bound is
+///   uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential with a
+///   non-canonical `exp` would read as having unbounded validity). We reject anything we cannot
+///   evaluate against `now` rather than ignore it.
 fn numeric_date(claim: Option<&Value>) -> Result<Option<i64>, ReasonCode> {
-    claim.map_or(Ok(None), |value| {
-        value
-            .as_i64()
-            .map(Some)
-            .ok_or(ReasonCode::MalformedCredential)
-    })
+    let Some(value) = claim else { return Ok(None) };
+    // A canonical integer NumericDate that already fits `i64` is taken verbatim.
+    if let Some(int) = value.as_i64() {
+        return Ok(Some(int));
+    }
+    // RFC 7519 §2: "Non-integer values can be represented." Accept any JSON number and floor it to
+    // whole seconds; reject a non-number, or one that floors outside `i64` (a non-finite value is not
+    // in range either, so the range check below also rejects NaN/±∞).
+    let seconds = value.as_f64().ok_or(ReasonCode::MalformedCredential)?;
+    let floored = seconds.floor();
+    // 2^63 is exactly representable in f64; bound the saturating f64→i64 cast against overflow without
+    // an `i64::MAX as f64` cast (`cast_precision_loss`) or a 2^63 literal (`lossy_float_literal`). The
+    // accepted range is `[-2^63, 2^63)` = `[i64::MIN, i64::MAX + 1)`.
+    let limit = 2.0_f64.powi(63);
+    if !(-limit..limit).contains(&floored) {
+        return Err(ReasonCode::MalformedCredential);
+    }
+    Ok(Some(floored as i64))
 }
 
 /// Verify the holder Key-Binding JWT (RFC 9901 §4.3), distinguishing what is checked **always** from
@@ -401,6 +546,8 @@ fn numeric_date(claim: Option<&Value>) -> Result<Option<i64>, ReasonCode> {
 ///   verified). A present-but-forged/tampered KB-JWT is therefore rejected on the request-less path too,
 ///   not waved through (the false-accept this guards: a structurally-present KB-JWT whose signature or
 ///   `sd_hash` does not hold must never read as `valid` just because no challenge was supplied).
+/// - **The KB-JWT `iat` freshness window is ALWAYS checked** against `now` (RFC 9901 §7.3 step 5.e) for
+///   a present KB-JWT — it is a property of the holder's signature instant, independent of a challenge.
 /// - **`aud`/`nonce` are checked ONLY when a `challenge` is supplied** — they bind the presentation to a
 ///   specific verifier request (replay/audience protection), which has no meaning without a request. A
 ///   request-less verify thus gives no replay/audience protection but still proves holder possession.
@@ -410,6 +557,7 @@ fn check_holder_binding(
     sd_jwt: &sd_jwt_payload::SdJwt,
     presentation: &str,
     challenge: Option<&KeyBindingChallenge<'_>>,
+    now: i64,
 ) -> Result<(), ReasonCode> {
     let Some(kb) = sd_jwt.key_binding_jwt() else {
         // No KB-JWT present: required only when a challenge demanded holder binding; otherwise the
@@ -420,6 +568,16 @@ fn check_holder_binding(
         };
     };
     let claims = kb.claims();
+
+    // RFC 9901 §7.3 step 5.e: a PRESENT KB-JWT's `iat` (its creation time) MUST be within an acceptable
+    // window of the verification time — checked for every present KB-JWT, independent of a challenge (a
+    // freshness property of the holder's signature, not of the request binding). `iat` is typed `i64`
+    // and required-present by the pinned `sd_jwt_payload` parser; this adds the window bound the dep
+    // does not enforce. A KB-JWT minted far in the future (skewed/forged clock) or absurdly old (stale/
+    // replayed) is rejected. `abs_diff` avoids any `i64` subtraction overflow at the timeline extremes.
+    if claims.iat.abs_diff(now) > KB_JWT_IAT_ACCEPTABLE_SKEW_SECS {
+        return Err(ReasonCode::HolderBinding);
+    }
 
     // `aud`/`nonce` bind the presentation to a verifier's request — checked ONLY when a challenge is
     // supplied (no challenge ⇒ no request to bind to, so no replay/audience check). The signature and
@@ -449,8 +607,9 @@ fn check_holder_binding(
     // ES384/RS256/any non-ES256 value) is rejected even though the holder still signs with P-256 and
     // the `sd_hash` matches — a JOSE alg-confusion guard. A non-ES256 KB-JWT `alg` maps to
     // [`ReasonCode::UnsupportedFormat`], SYMMETRIC with the issuer JWS path (which rejects a non-ES256
-    // `alg` with the same reason); a genuine signature/framing failure below stays `HolderBinding`.
-    require_kb_jwt_es256_alg(&kb_compact)?;
+    // `alg` with the same reason); a genuine signature/framing failure below stays `HolderBinding`. The
+    // same check also enforces RFC 7515 §4.1.11 `crit` on the KB-JWT (an unsupported critical header).
+    check_kb_jwt_jose_header(&kb_compact)?;
 
     // Verify the KB-JWT ES256 signature under the holder key bound by the issuer in `cnf`. Always
     // verified for a present KB-JWT (the holder-possession proof, independent of any challenge).
@@ -458,22 +617,25 @@ fn check_holder_binding(
     verify_compact_es256(&kb_compact, &holder_key).map_err(|()| ReasonCode::HolderBinding)
 }
 
-/// Require the compact KB-JWT's protected JOSE header to declare `alg=ES256` (RFC 7515 §4.1.1), the
-/// only signature algorithm this verifier accepts for the holder Key-Binding JWT (HAIP 1.0 §7).
+/// Check the compact KB-JWT's protected JOSE header: it MUST declare `alg=ES256` (RFC 7515 §4.1.1) —
+/// the only signature algorithm this verifier accepts for the holder Key-Binding JWT (HAIP 1.0 §7) —
+/// and MUST NOT carry an unsupported `crit` (RFC 7515 §4.1.11, via [`reject_unsupported_crit`]).
 ///
-/// This is the holder-binding counterpart of the issuer JWS alg check in [`verify_issuer_signature`]
-/// and rejects a non-ES256 `alg` with the SAME [`ReasonCode::UnsupportedFormat`], so the two
-/// signature paths are symmetric. Without it, a present KB-JWT whose header lies (`alg`: ES384/RS256/
-/// any non-ES256 value) would be waved through as long as the holder still raw-signs with P-256 and
-/// the `sd_hash` matches — a JOSE alg-confusion false-accept that violates this module's own invariant
-/// (ES256 for issuer AND KB-JWT signatures; `sd_jwt_payload`'s parse only rejects `alg=="none"` and
-/// `typ`, NOT the specific alg). A KB-JWT header that does not decode as JSON with a string `alg` is a
-/// malformed holder binding ([`ReasonCode::HolderBinding`]).
-fn require_kb_jwt_es256_alg(kb_compact: &str) -> Result<(), ReasonCode> {
+/// This is the holder-binding counterpart of the issuer JWS header checks in [`verify_issuer_signature`]
+/// and rejects a non-ES256 `alg` (and any present `crit`) with the SAME [`ReasonCode::UnsupportedFormat`],
+/// so the two signature paths are symmetric. Without the `alg` check, a present KB-JWT whose header lies
+/// (`alg`: ES384/RS256/any non-ES256 value) would be waved through as long as the holder still raw-signs
+/// with P-256 and the `sd_hash` matches — a JOSE alg-confusion false-accept that violates this module's
+/// own invariant (ES256 for issuer AND KB-JWT signatures; `sd_jwt_payload`'s parse only rejects
+/// `alg=="none"` and the `typ`, NOT the specific alg). A KB-JWT header that does not decode as JSON with
+/// a string `alg` is a malformed holder binding ([`ReasonCode::HolderBinding`]).
+fn check_kb_jwt_jose_header(kb_compact: &str) -> Result<(), ReasonCode> {
     // The protected-header decode (first dot-segment → base64url → JSON) is the SAME body the issuer
     // JWS paths use — share the single [`decode_jws_protected_header`] (DRY — Principle III); only the
     // holder-binding reason mapping (a header that does not decode is `HolderBinding`) lives here.
     let header = decode_jws_protected_header(kb_compact).ok_or(ReasonCode::HolderBinding)?;
+    // RFC 7515 §4.1.11: an unsupported `crit` invalidates the JWS — shared with the issuer-JWS path.
+    reject_unsupported_crit(&header)?;
     if header.get("alg").and_then(Value::as_str) != Some(ES256) {
         return Err(ReasonCode::UnsupportedFormat);
     }
@@ -553,6 +715,11 @@ fn collect_disclosed_attributes(
     // walk (membership / `DisclosureIntegrity`).
     let mut disclosures_by_digest = BTreeMap::new();
     for disclosure in sd_jwt.disclosures() {
+        // RFC 9901 §4.1.1: `_sd_alg` is a top-level-only claim. A disclosed value carrying an `_sd_alg`
+        // (anywhere within it) would place `_sd_alg` in a nested position once substituted — reject.
+        if contains_sd_alg_key(&disclosure.claim_value) {
+            return Err(ReasonCode::MalformedCredential);
+        }
         let digest = Base64UrlUnpadded::encode_string(&sha256(disclosure.as_str().as_bytes()));
         if disclosures_by_digest.insert(digest, disclosure).is_some() {
             return Err(ReasonCode::DisclosureIntegrity);
@@ -569,6 +736,16 @@ fn collect_disclosed_attributes(
     let claims_object = claims_value
         .as_object()
         .ok_or(ReasonCode::MalformedCredential)?;
+
+    // RFC 9901 §4.1.1: `_sd_alg` MUST appear only at the TOP level of the payload, never nested. The
+    // top-level value was already validated above; reject an `_sd_alg` key anywhere inside a top-level
+    // child value (a nested object/array of the issuer-signed payload). The top-level `_sd_alg` key's
+    // own value is a scalar string, so scanning the child VALUES never flags the legitimate top-level
+    // occurrence.
+    if claims_object.values().any(contains_sd_alg_key) {
+        return Err(ReasonCode::MalformedCredential);
+    }
+
     let mut used_digests = std::collections::BTreeSet::new();
     let disclosed = disclosed_object(claims_object, &disclosures_by_digest, &mut used_digests)?;
 
@@ -655,6 +832,11 @@ fn substitute_sd_array(
             .claim_name
             .as_deref()
             .ok_or(ReasonCode::DisclosureIntegrity)?;
+        // RFC 9901 §7.1 step 3.c.ii: if a disclosure's claim name is `_sd` or `...`, the SD-JWT MUST be
+        // rejected — those are SD-JWT machinery names, never legitimate object-property claim names.
+        if matches!(name, "_sd" | "...") {
+            return Err(ReasonCode::DisclosureIntegrity);
+        }
         let value =
             reconstruct_value(&disclosure.claim_value, disclosures_by_digest, used_digests)?;
         insert_unique_at_level(&mut out, name, value)?;
@@ -666,6 +848,19 @@ fn substitute_sd_array(
 /// `_sd_alg` selector, and the `cnf` holder-binding key (RFC 9901 / SD-JWT VC machinery, not claims).
 fn is_sd_reserved_key(key: &str) -> bool {
     matches!(key, "_sd" | "_sd_alg" | "cnf")
+}
+
+/// Whether a JSON value contains an `_sd_alg` key at this object level or anywhere nested within it.
+/// RFC 9901 §4.1.1: `_sd_alg` "MUST appear at the top level of the SD-JWT payload. It MUST NOT be used
+/// in any object nested within the payload." [`collect_disclosed_attributes`] validates the legitimate
+/// top-level `_sd_alg` separately and uses this scanner to reject a nested occurrence (in a child of the
+/// issuer-signed payload, or inside any disclosed value).
+fn contains_sd_alg_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.contains_key("_sd_alg") || map.values().any(contains_sd_alg_key),
+        Value::Array(items) => items.iter().any(contains_sd_alg_key),
+        _ => false,
+    }
 }
 
 /// Reconstruct a disclosed object value **in full** (RFC 9901 §7.1 recursive processing): keep every

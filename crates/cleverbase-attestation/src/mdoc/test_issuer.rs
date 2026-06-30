@@ -150,9 +150,27 @@ pub(crate) struct MdocBuilder {
     omit_status: bool,
     /// When set, emit an EMPTY `documents` array (drives the no-documents-to-verify reject).
     empty_documents: bool,
-    /// When set, add a top-level `documentErrors` entry (the device could not return a requested
-    /// document — the response is not a complete success and must be rejected).
+    /// When set, add a top-level `documentErrors` entry for a DIFFERENT docType than the returned
+    /// document (the device could not return some OTHER requested docType). ISO/IEC 18013-5 §8.3 makes
+    /// this informational, so it must NOT reject the valid returned document.
     add_document_errors: bool,
+    /// When set, mark a protected header parameter the verifier does not process (`content type`,
+    /// label 3) as CRITICAL in the IssuerAuth COSE_Sign1 `crit` — RFC 9052 §3.1 requires the verifier
+    /// to reject a message listing a critical header it does not understand.
+    issuer_auth_unknown_crit: bool,
+    /// As [`Self::issuer_auth_unknown_crit`] but on the DeviceSignature COSE_Sign1 — the holder-binding
+    /// COSE_Sign1 path of the same RFC 9052 §3.1 `crit` enforcement.
+    device_sig_unknown_crit: bool,
+    /// When `Some`, override the top-level `DeviceResponse.version` text (else `"1.0"`); used to drive
+    /// the unrecognized-schema-version reject (ISO/IEC 18013-5 §8.3.2.1.2.2 fixes it to `"1.0"`).
+    device_response_version_override: Option<String>,
+    /// When set, omit the top-level `DeviceResponse.version` field entirely (absent-version reject).
+    omit_device_response_version: bool,
+    /// When `Some`, override the MSO `version` text (else `"1.0"`); drives the unrecognized-MSO-schema
+    /// reject (ISO/IEC 18013-5 §9.1.2.4 fixes the MobileSecurityObject version to `"1.0"`).
+    mso_version_override: Option<String>,
+    /// When set, omit the MSO `version` field entirely (absent-MSO-version reject).
+    omit_mso_version: bool,
     /// When set, omit the MSO `validityInfo.signed` field (keeping `validFrom`/`validUntil`) — used to
     /// exercise the qualified-gate issuance-time reader's `signed → validFrom` fallback.
     omit_mso_signed: bool,
@@ -310,6 +328,12 @@ impl MdocBuilder {
             omit_status: false,
             empty_documents: false,
             add_document_errors: false,
+            issuer_auth_unknown_crit: false,
+            device_sig_unknown_crit: false,
+            device_response_version_override: None,
+            omit_device_response_version: false,
+            mso_version_override: None,
+            omit_mso_version: false,
             omit_mso_signed: false,
             append_forged_item: None,
         }
@@ -348,9 +372,48 @@ impl MdocBuilder {
         self
     }
 
-    /// Add a top-level `documentErrors` entry (the device reported it could not return a document).
+    /// Add a top-level `documentErrors` entry for a DIFFERENT docType than the returned document (the
+    /// device reported it could not return some OTHER requested docType — informational per §8.3).
     pub(super) fn add_document_errors(mut self) -> Self {
         self.add_document_errors = true;
+        self
+    }
+
+    /// Mark an unknown (unprocessed) header parameter CRITICAL in the IssuerAuth COSE_Sign1 `crit`
+    /// (RFC 9052 §3.1) — the verifier must reject the message.
+    pub(super) fn issuer_auth_unknown_crit(mut self) -> Self {
+        self.issuer_auth_unknown_crit = true;
+        self
+    }
+
+    /// Mark an unknown (unprocessed) header parameter CRITICAL in the DeviceSignature COSE_Sign1
+    /// `crit` (RFC 9052 §3.1) — the verifier must reject the holder-binding message.
+    pub(super) fn device_sig_unknown_crit(mut self) -> Self {
+        self.device_sig_unknown_crit = true;
+        self
+    }
+
+    /// Override the top-level `DeviceResponse.version` text (else `"1.0"`).
+    pub(super) fn device_response_version(mut self, version: &str) -> Self {
+        self.device_response_version_override = Some(version.to_owned());
+        self
+    }
+
+    /// Omit the top-level `DeviceResponse.version` field entirely.
+    pub(super) fn omit_device_response_version(mut self) -> Self {
+        self.omit_device_response_version = true;
+        self
+    }
+
+    /// Override the MSO `version` text (else `"1.0"`).
+    pub(super) fn mso_version(mut self, version: &str) -> Self {
+        self.mso_version_override = Some(version.to_owned());
+        self
+    }
+
+    /// Omit the MSO `version` field entirely.
+    pub(super) fn omit_mso_version(mut self) -> Self {
+        self.omit_mso_version = true;
         self
     }
 
@@ -745,7 +808,11 @@ impl MdocBuilder {
         let mso = CborValue::Map(vec![
             (
                 CborValue::Text("version".to_owned()),
-                CborValue::Text("1.0".to_owned()),
+                CborValue::Text(
+                    self.mso_version_override
+                        .clone()
+                        .unwrap_or_else(|| "1.0".to_owned()),
+                ),
             ),
             (
                 CborValue::Text("digestAlgorithm".to_owned()),
@@ -782,6 +849,12 @@ impl MdocBuilder {
                 CborValue::Map(info)
             }),
         ]);
+        // Drive the absent-MSO-version reject: strip the `version` entry entirely when requested.
+        let mso = if self.omit_mso_version {
+            strip_map_key(mso, "version")
+        } else {
+            mso
+        };
         let mso_inner = encode(&mso);
         let mso_payload = encode(&CborValue::Tag(
             TAG_ENCODED_CBOR,
@@ -800,7 +873,14 @@ impl MdocBuilder {
         } else {
             coset::iana::Algorithm::ES256
         };
-        let protected = HeaderBuilder::new().algorithm(issuer_alg).build();
+        let mut protected_builder = HeaderBuilder::new().algorithm(issuer_alg);
+        if self.issuer_auth_unknown_crit {
+            // RFC 9052 §3.1: mark a header the verifier does not process (`content type`, label 3) as
+            // critical — the verifier must reject a message listing an unprocessed critical header.
+            protected_builder =
+                protected_builder.add_critical(coset::iana::HeaderParameter::ContentType);
+        }
+        let protected = protected_builder.build();
         let mut unprotected = HeaderBuilder::new();
         if !self.omit_x5chain {
             let x5chain = if self.x5chain_as_array {
@@ -882,7 +962,13 @@ impl MdocBuilder {
         } else {
             coset::iana::Algorithm::ES256
         };
-        let device_protected = HeaderBuilder::new().algorithm(device_alg).build();
+        let mut device_protected_builder = HeaderBuilder::new().algorithm(device_alg);
+        if self.device_sig_unknown_crit {
+            // RFC 9052 §3.1: an unprocessed critical header on the DeviceSignature COSE_Sign1.
+            device_protected_builder =
+                device_protected_builder.add_critical(coset::iana::HeaderParameter::ContentType);
+        }
+        let device_protected = device_protected_builder.build();
         let device_signature_value = self.device_signature_override.as_ref().map_or_else(
             || {
                 let mut device_signature = CoseSign1Builder::new()
@@ -973,7 +1059,11 @@ impl MdocBuilder {
         let mut response_entries = vec![
             (
                 CborValue::Text("version".to_owned()),
-                CborValue::Text("1.0".to_owned()),
+                CborValue::Text(
+                    self.device_response_version_override
+                        .clone()
+                        .unwrap_or_else(|| "1.0".to_owned()),
+                ),
             ),
             (
                 CborValue::Text("documents".to_owned()),
@@ -985,17 +1075,22 @@ impl MdocBuilder {
             ),
         ];
         if self.add_document_errors {
-            // A `documentErrors` map: one requested docType the device could not return.
+            // A `documentErrors` map naming a DIFFERENT docType the device could NOT return (ErrorCode
+            // 0 = "data not returned", ISO/IEC 18013-5 §8.3). It is informational and must NOT fail the
+            // valid returned mDL.
             response_entries.push((
                 CborValue::Text("documentErrors".to_owned()),
                 CborValue::Array(vec![CborValue::Map(vec![(
-                    CborValue::Text("org.iso.18013.5.1.mDL".to_owned()),
+                    CborValue::Text("org.iso.23220.photoid.1".to_owned()),
                     CborValue::Integer(0.into()),
                 )])]),
             ));
         }
         if self.omit_status {
             response_entries.retain(|(k, _)| k.as_text() != Some("status"));
+        }
+        if self.omit_device_response_version {
+            response_entries.retain(|(k, _)| k.as_text() != Some("version"));
         }
         encode(&CborValue::Map(response_entries))
     }
@@ -1155,6 +1250,20 @@ fn corrupt_issuer_auth_in_issuer_signed(issuer_signed: &CborValue) -> CborValue 
         })
         .collect();
     CborValue::Map(forged)
+}
+
+/// Remove a text-keyed entry from a CBOR map value — the omit-field negative cases (absent MSO
+/// `version`) strip one mandatory key after the well-formed structure is built.
+fn strip_map_key(value: CborValue, key: &str) -> CborValue {
+    match value {
+        CborValue::Map(entries) => CborValue::Map(
+            entries
+                .into_iter()
+                .filter(|(k, _)| k.as_text() != Some(key))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Encode a `ciborium` value to CBOR bytes.

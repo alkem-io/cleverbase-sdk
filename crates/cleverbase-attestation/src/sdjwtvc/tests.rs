@@ -13,11 +13,12 @@ use sd_jwt_payload::{Hasher, KeyBindingJwt, RequiredKeyBinding, SdJwtBuilder};
 use serde_json::{json, Value};
 
 use super::test_issuer::{
-    array_disclosure, attach_kb_jwt, block_on, disclosure_digest, mint_array_element_disclosures,
-    mint_concealable_object_with_concealable_child, mint_dual_value_same_name,
-    mint_nested_shared_leaf, mint_sd_jwt, mint_sd_jwt_with_validity, object_disclosure,
-    sign_issuer_jws, Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER,
-    ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
+    array_disclosure, attach_kb_jwt, attach_kb_jwt_with_iat, block_on, disclosure_digest,
+    mint_array_element_disclosures, mint_concealable_object_with_concealable_child,
+    mint_dual_value_same_name, mint_nested_shared_leaf, mint_sd_jwt, mint_sd_jwt_with_typ,
+    mint_sd_jwt_with_validity, mint_sd_jwt_without_vct, object_disclosure, sign_issuer_jws,
+    Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
 };
 use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
 use crate::trust::StaticTestAnchors;
@@ -188,9 +189,10 @@ fn non_integer_string_exp_is_rejected_not_ignored() {
 }
 
 #[test]
-fn non_integer_float_exp_is_rejected_not_ignored() {
-    // FALSE-ACCEPT PROBE: a non-integer float `exp` (200.5) is not an `i64`; the old `as_i64()` path
-    // returned `None` and skipped the bound. A present-but-non-integer NumericDate MUST reject.
+fn fractional_past_exp_is_floored_and_rejected_as_expired() {
+    // RFC 7519 §2: "Non-integer values can be represented." A FRACTIONAL `exp` (200.5) is a valid
+    // NumericDate — it is floored to 200 (no longer false-rejected as malformed), then honored as a
+    // real upper bound: verifying at `now = NOW` (≫ 200) → Expired (NOT MalformedCredential).
     let sd_jwt = mint_sd_jwt_with_validity(
         ISSUER_KEY_PK8,
         ISSUER_CERT_DER,
@@ -200,7 +202,27 @@ fn non_integer_float_exp_is_rejected_not_ignored() {
     let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
     let anchors = trusted_anchors();
     let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
-    assert_invalid(&result, ReasonCode::MalformedCredential);
+    assert_invalid(&result, ReasonCode::Expired);
+}
+
+#[test]
+fn fractional_future_exp_is_accepted_not_false_rejected() {
+    // FALSE-REJECT FIX (T7.1): a spec-valid fractional `exp` inside the window must VERIFY. `exp = 200.5`
+    // floors to 200; verifying at `now = 100` (< 200) is in-window → VALID. (Issuer-only presentation +
+    // no challenge so the KB-JWT `iat` freshness window — pinned to NOW — is not in play at `now = 100`.)
+    let sd_jwt =
+        mint_sd_jwt_with_validity(ISSUER_KEY_PK8, ISSUER_CERT_DER, Value::Null, json!(200.5));
+    let presentation = sd_jwt.presentation();
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.key_binding = None;
+    inp.now_unix = 100;
+    let result = verify_sd_jwt_vc(&inp);
+    assert!(
+        result.valid,
+        "a spec-valid fractional in-window exp must verify; reasons {:?}",
+        result.reasons
+    );
 }
 
 #[test]
@@ -281,12 +303,17 @@ fn check_validity_distinguishes_absent_from_malformed_bounds() {
         Err(ReasonCode::MalformedCredential)
     );
 
-    // A present float `nbf` → MalformedCredential.
-    let bad_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 1.5 })).unwrap();
+    // A present `null` `exp` → MalformedCredential (a present, uninterpretable bound, never skipped).
+    let null_exp: SdJwtClaims = serde_json::from_value(json!({ "exp": null })).unwrap();
     assert_eq!(
-        check_validity(&bad_nbf, NOW),
+        check_validity(&null_exp, NOW),
         Err(ReasonCode::MalformedCredential)
     );
+
+    // RFC 7519 §2: a FRACTIONAL `nbf` is a valid NumericDate — floored (1.5 → 1) and honored, NOT
+    // malformed. `now = NOW` (≫ 1) is at/after the floored not-before → OK.
+    let frac_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 1.5 })).unwrap();
+    assert!(check_validity(&frac_nbf, NOW).is_ok());
 }
 
 #[test]
@@ -745,6 +772,222 @@ fn kb_jwt_resigned_with_honest_es256_alg_header_still_verifies() {
     );
 }
 
+// --- conformance: JOSE crit / issuer typ / vct / KB-JWT iat / nested _sd_alg ---------------------
+
+#[test]
+fn issuer_jws_with_unknown_crit_header_is_rejected() {
+    // RFC 7515 §4.1.11: a JWS whose `crit` lists an extension the recipient does not understand is
+    // invalid. This verifier supports NO critical extension, so any `crit` member → reject. The `crit`
+    // check runs before the issuer signature is verified (it does not re-sign), so it fires first.
+    let presentation = happy_presentation();
+    let with_crit = add_issuer_crit(&presentation, "urn:example:unknown-ext");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&with_crit, &anchors));
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn kb_jwt_with_unknown_crit_header_is_rejected() {
+    // RFC 7515 §4.1.11 applies to the holder KB-JWT too: a `crit` listing an unsupported extension →
+    // reject. The KB-JWT is re-signed over the new header so everything else (sig/sd_hash/aud/nonce/
+    // iat) holds — only the `crit` can be the failing check.
+    let presentation = happy_presentation();
+    let with_crit = resign_kb_with_crit(&presentation, "urn:example:unknown-ext");
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&with_crit, &anchors));
+    assert_invalid(&result, ReasonCode::UnsupportedFormat);
+}
+
+#[test]
+fn issuer_jws_with_wrong_or_absent_typ_is_rejected() {
+    // SD-JWT VC §3.2.1 + RFC 9901 §9.11: the issuer JWS `typ` MUST be the SD-JWT VC media type. A
+    // wrong `typ` (`"JWT"`) and an ABSENT `typ` are both rejected (the `typ` check runs before the
+    // signature verify, so rewriting the header without re-signing still reaches it).
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    for typ in [Some("JWT"), None] {
+        let mangled = rewrite_issuer_typ(&presentation, typ);
+        let result = verify_sd_jwt_vc(&input(&mangled, &anchors));
+        assert_invalid(&result, ReasonCode::UnsupportedFormat);
+    }
+}
+
+#[test]
+fn issuer_jws_with_transitional_vc_sd_jwt_typ_is_accepted() {
+    // SD-JWT VC §3.2.1: the legacy `vc+sd-jwt` typ is accepted for the transitional period (alongside
+    // the current `dc+sd-jwt`, which the happy path already covers). A real mint with `vc+sd-jwt`
+    // verifies VALID.
+    let sd_jwt = mint_sd_jwt_with_typ(ISSUER_KEY_PK8, ISSUER_CERT_DER, "vc+sd-jwt");
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert!(
+        result.valid,
+        "the transitional `vc+sd-jwt` typ must verify; reasons {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn missing_vct_is_rejected_as_malformed_credential() {
+    // SD-JWT VC §type-claim: `vct` is REQUIRED. A credential omitting `vct` (otherwise well-formed,
+    // trusted issuer, in-window, valid KB-JWT) is rejected as MalformedCredential.
+    let sd_jwt = mint_sd_jwt_without_vct(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert_invalid(&result, ReasonCode::MalformedCredential);
+}
+
+#[test]
+fn valid_crn_vct_is_accepted() {
+    // The happy path already proves a URI `vct` (a Collision-Resistant Name) verifies VALID; this
+    // asserts it explicitly as the positive arm of the `vct` requirement.
+    let presentation = happy_presentation();
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert!(
+        result.valid,
+        "a CRN `vct` must verify; reasons {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn vct_collision_resistant_name_shapes() {
+    // RFC 7515 §2 Collision-Resistant Name shapes the verifier accepts (URI or reverse-domain) vs the
+    // non-CRN values it rejects — unit coverage of `is_collision_resistant_name`.
+    use super::is_collision_resistant_name;
+    // URIs (scheme ":" non-empty remainder).
+    assert!(is_collision_resistant_name(
+        "https://credentials.example/identity_credential"
+    ));
+    assert!(is_collision_resistant_name("urn:eudi:pid:1"));
+    assert!(is_collision_resistant_name(
+        "urn:uuid:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    ));
+    // Reverse-domain-style / domain names (≥2 dotted labels).
+    assert!(is_collision_resistant_name("com.example.identity"));
+    assert!(is_collision_resistant_name("example.com"));
+    // Non-CRN: a bare token, a scheme with no remainder, a dangling-label dotted name, empty.
+    assert!(!is_collision_resistant_name("identity"));
+    assert!(!is_collision_resistant_name("https:"));
+    assert!(!is_collision_resistant_name("example."));
+    assert!(!is_collision_resistant_name(""));
+}
+
+#[test]
+fn check_vct_rejects_missing_non_string_empty_and_non_crn() {
+    // SD-JWT VC §type-claim: `vct` is REQUIRED, a (case-sensitive) STRING, and a Collision-Resistant
+    // Name. `check_vct` reads it via the claims map, so a crafted payload exercises every reject arm.
+    use super::check_vct;
+    let check = |value: Value| {
+        let claims: sd_jwt_payload::SdJwtClaims = serde_json::from_value(value).unwrap();
+        check_vct(&claims)
+    };
+    // Missing entirely.
+    assert_eq!(
+        check(json!({ "iss": "x" })),
+        Err(ReasonCode::MalformedCredential)
+    );
+    // Present but not a string.
+    assert_eq!(
+        check(json!({ "vct": 42 })),
+        Err(ReasonCode::MalformedCredential)
+    );
+    // Present but empty.
+    assert_eq!(
+        check(json!({ "vct": "" })),
+        Err(ReasonCode::MalformedCredential)
+    );
+    // Present, a non-empty string, but NOT a Collision-Resistant Name (a bare token).
+    assert_eq!(
+        check(json!({ "vct": "identity" })),
+        Err(ReasonCode::MalformedCredential)
+    );
+    // A valid CRN → accepted.
+    assert!(check(json!({ "vct": "https://credentials.example/id" })).is_ok());
+}
+
+#[test]
+fn kb_jwt_iat_outside_the_acceptable_window_is_rejected() {
+    // RFC 9901 §7.3 step 5.e: a present KB-JWT's `iat` MUST be within an acceptable window of the
+    // verification time. A KB-JWT minted far in the FUTURE or absurdly in the PAST (relative to `now`)
+    // is rejected as HolderBinding, even though its signature/sd_hash/aud/nonce are all otherwise valid.
+    let anchors = trusted_anchors();
+    for iat in [NOW + 10_000, NOW - 10_000] {
+        let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+        let presentation = attach_kb_jwt_with_iat(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE, iat);
+        let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+        assert_invalid(&result, ReasonCode::HolderBinding);
+    }
+}
+
+#[test]
+fn kb_jwt_iat_within_the_acceptable_window_is_accepted() {
+    // NO-FALSE-REJECT GUARD: a small skew (within the window) must still VERIFY — the `iat` check fires
+    // only outside the conservative window, never on a genuine, near-now holder binding.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt_with_iat(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE, NOW + 100);
+    let anchors = trusted_anchors();
+    let result = verify_sd_jwt_vc(&input(&presentation, &anchors));
+    assert!(
+        result.valid,
+        "a near-now KB-JWT iat must verify; reasons {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn a_disclosure_named_sd_or_ellipsis_is_rejected() {
+    // RFC 9901 §7.1 step 3.c.ii: a disclosure whose claim name is `_sd` or `...` MUST invalidate the
+    // SD-JWT (those are SD-JWT machinery names, never legitimate object-property claim names).
+    for bad_name in ["_sd", "..."] {
+        let disclosure = object_disclosure("AAAAAAAAAAAAAAAAAAAAAA", bad_name, json!("x"));
+        let digest = disclosure_digest(&disclosure);
+        let payload = json!({ "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [digest] });
+        assert_eq!(
+            collect_over_crafted(&payload, &[&disclosure]),
+            Err(ReasonCode::DisclosureIntegrity)
+        );
+    }
+}
+
+#[test]
+fn a_nested_sd_alg_in_the_issuer_payload_is_rejected() {
+    use super::collect_disclosed_attributes;
+    // RFC 9901 §4.1.1: `_sd_alg` MUST appear only at the top level — never nested. A nested `_sd_alg`
+    // (here inside `address`) is rejected as MalformedCredential.
+    let payload = json!({
+        "iss": "x", "vct": "y", "_sd_alg": "sha-256",
+        "address": { "_sd_alg": "sha-256", "country": "UK" },
+    });
+    let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, &payload);
+    let presentation = format!("{jws}~");
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    assert_eq!(
+        collect_disclosed_attributes(&sd_jwt),
+        Err(ReasonCode::MalformedCredential)
+    );
+}
+
+#[test]
+fn a_nested_sd_alg_inside_a_disclosed_value_is_rejected() {
+    // RFC 9901 §4.1.1: a disclosed object VALUE carrying an `_sd_alg` would place it in a nested
+    // position once substituted — rejected as MalformedCredential.
+    let disclosure = object_disclosure(
+        "AAAAAAAAAAAAAAAAAAAAAA",
+        "address",
+        json!({ "_sd_alg": "sha-256" }),
+    );
+    let digest = disclosure_digest(&disclosure);
+    let payload = json!({ "iss": "x", "vct": "y", "_sd_alg": "sha-256", "_sd": [digest] });
+    assert_eq!(
+        collect_over_crafted(&payload, &[&disclosure]),
+        Err(ReasonCode::MalformedCredential)
+    );
+}
+
 // --- presentation-mutation helpers --------------------------------------------------------------
 
 /// Flip a byte in the middle of the KB-JWT signature (the final `~`-segment), invalidating the
@@ -791,24 +1034,21 @@ fn resign_kb_with_wrong_sd_hash(presentation: &str) -> String {
     segments.join("~")
 }
 
-/// Re-sign the KB-JWT (the final `~`-segment) with the holder key over a **lying `alg` header**: the
-/// protected JOSE header declares `new_alg` (e.g. `ES384`/`RS256`) while the holder still ES256-signs
-/// with its P-256 key, leaving the `sd_hash` and `aud`/`nonce` claims untouched. The resulting KB-JWT
-/// therefore carries a VALID raw P-256 signature over its own `header.payload` AND a matching
-/// `sd_hash` — so it would pass an alg-blind signature check; only an explicit `alg=ES256` header
-/// check can reject it (the JOSE alg-confusion probe for [`super::require_kb_jwt_es256_alg`]).
-fn resign_kb_with_alg(presentation: &str, new_alg: &str) -> String {
+/// Re-sign the KB-JWT (the final `~`-segment) with the holder key after mutating its protected JOSE
+/// header in place. The holder still ES256-signs with its P-256 key and the payload (sd_hash/aud/
+/// nonce/iat) is left verbatim, so the result carries a VALID raw P-256 signature over its own
+/// `header.payload` AND a matching `sd_hash` — isolating the mutated header field as the only thing a
+/// header check can reject. Shared core for the alg-confusion and `crit` probes (DRY).
+fn resign_kb_header(presentation: &str, mutate: impl FnOnce(&mut Value)) -> String {
     use p256::ecdsa::signature::Signer as _;
     use pkcs8::DecodePrivateKey as _;
 
     let mut segments: Vec<&str> = presentation.split('~').collect();
     let kb_idx = segments.len() - 1;
     let parts: Vec<&str> = segments[kb_idx].split('.').collect();
-    // Rewrite the KB-JWT protected header `alg` to the lying value, keep the payload (sd_hash/aud/
-    // nonce) verbatim, then re-sign with the holder key so the signature verifies over the new header.
     let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
     let mut header: Value = serde_json::from_slice(&header_json).unwrap();
-    header["alg"] = Value::String(new_alg.to_string());
+    mutate(&mut header);
     let header_b64 =
         Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
     let payload_b64 = parts[1].to_string();
@@ -819,6 +1059,23 @@ fn resign_kb_with_alg(presentation: &str, new_alg: &str) -> String {
     let new_kb = format!("{signing_input}.{sig_b64}");
     segments[kb_idx] = &new_kb;
     segments.join("~")
+}
+
+/// Re-sign the KB-JWT over a **lying `alg` header** (`ES384`/`RS256`/…) — a VALID raw P-256 signature
+/// over a header that lies about the alg; only an explicit `alg=ES256` header check can reject it (the
+/// JOSE alg-confusion probe for [`super::check_kb_jwt_jose_header`]).
+fn resign_kb_with_alg(presentation: &str, new_alg: &str) -> String {
+    resign_kb_header(presentation, |header| {
+        header["alg"] = Value::String(new_alg.to_string());
+    })
+}
+
+/// Re-sign the KB-JWT after adding an unsupported `crit` member — the RFC 7515 §4.1.11 probe for
+/// [`super::check_kb_jwt_jose_header`] (everything else stays valid, so only the `crit` can fail).
+fn resign_kb_with_crit(presentation: &str, member: &str) -> String {
+    resign_kb_header(presentation, |header| {
+        header["crit"] = json!([member]);
+    })
 }
 
 /// Flip a byte in the middle of the issuer JWS signature (invalidating it while keeping the
@@ -843,6 +1100,40 @@ fn rewrite_issuer_alg(presentation: &str, new_alg: &str) -> String {
     let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
     let mut header: Value = serde_json::from_slice(&header_json).unwrap();
     header["alg"] = Value::String(new_alg.to_string());
+    let new_header =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    format!("{new_header}.{}.{}~{rest}", parts[1], parts[2])
+}
+
+/// Add a `crit` member to the issuer JWS protected header, re-encoding the header (the signature now
+/// won't verify, but the RFC 7515 §4.1.11 `crit` check runs before the signature verify so it fires
+/// first).
+fn add_issuer_crit(presentation: &str, member: &str) -> String {
+    let (jws, rest) = split_first_segment(presentation);
+    let parts: Vec<&str> = jws.split('.').collect();
+    let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
+    let mut header: Value = serde_json::from_slice(&header_json).unwrap();
+    header["crit"] = json!([member]);
+    let new_header =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    format!("{new_header}.{}.{}~{rest}", parts[1], parts[2])
+}
+
+/// Set (`Some`) or remove (`None`) the issuer JWS protected-header `typ`, re-encoding the header. The
+/// `typ` check runs before the signature verify, so the (now-invalid) signature is never reached.
+fn rewrite_issuer_typ(presentation: &str, typ: Option<&str>) -> String {
+    let (jws, rest) = split_first_segment(presentation);
+    let parts: Vec<&str> = jws.split('.').collect();
+    let header_json = Base64UrlUnpadded::decode_vec(parts[0]).unwrap();
+    let mut header: Value = serde_json::from_slice(&header_json).unwrap();
+    match typ {
+        Some(value) => {
+            header["typ"] = Value::String(value.to_string());
+        }
+        None => {
+            header.as_object_mut().unwrap().remove("typ");
+        }
+    }
     let new_header =
         Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
     format!("{new_header}.{}.{}~{rest}", parts[1], parts[2])
