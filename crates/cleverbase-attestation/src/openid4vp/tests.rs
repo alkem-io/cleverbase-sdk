@@ -7,13 +7,16 @@
 
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 
+use std::collections::BTreeMap;
+
 use super::{
-    build_request, oid4vp_handover_transcript, verify_response, Dcql, MdocVpToken, NonceSource,
-    PresentationRequest, VpToken,
+    build_request, oid4vp_handover_transcript, verify_response, verify_vp_token, Dcql, MdocVpToken,
+    NonceSource, PresentationRequest, VpToken,
 };
 use crate::mdoc::test_issuer::MdocBuilder;
 use crate::sdjwtvc::test_issuer::{
-    attach_kb_jwt, mint_sd_jwt, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_vct, HOLDER_KEY_PK8, ISSUER_CERT_DER,
+    ISSUER_KEY_PK8, NOW,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
@@ -565,4 +568,434 @@ fn handover_transcript_is_the_conformant_openid4vp_1_0_structure() {
         transcript_bytes, stubbed,
         "the real response_uri transcript MUST differ from the old responseUri = client_id stub"
     );
+}
+
+// =================================================================================================
+// DCQL "did I get what I requested" gate (OpenID4VP 1.0 §"VP Token Validation" step 2.2 + §6 DCQL)
+// — conformance-audit T4.1/T4.2. The always-on bar already proved the credential sound, trusted, and
+// request-bound; these assert it must ALSO satisfy the DCQL Credential Query, and a sound credential of
+// the WRONG vct/doctype or missing a requested claim is rejected as `QueryNotSatisfied` (the false-
+// trust the gate closes). Role derivation/validation (T4.3) is covered at the bottom.
+// =================================================================================================
+
+/// The default `vct` the SD-JWT VC test issuer mints (a non-PID Collision-Resistant Name).
+const SD_JWT_VCT: &str = "https://credentials.example/identity_credential";
+
+/// A request bound to `(audience, nonce)` carrying an explicit DCQL query.
+fn request_with_dcql(audience: &str, nonce: &[u8], dcql_json: &str) -> PresentationRequest {
+    PresentationRequest {
+        dcql: Dcql::from_json(dcql_json),
+        nonce: nonce.to_vec(),
+        audience: audience.to_owned(),
+        response_uri: RESPONSE_URI.to_owned(),
+    }
+}
+
+#[test]
+fn sd_jwt_satisfying_the_dcql_query_is_valid() {
+    // The credential's vct ∈ vct_values AND every requested claim is disclosed → VALID.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["given_name"]}},{{"path":["family_name"]}}]}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let presentation = sd_jwt_presentation(AUDIENCE, &request.nonce_b64());
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "a credential matching its DCQL query is VALID: {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn sd_jwt_of_the_wrong_vct_is_query_not_satisfied() {
+    // The credential is sound, trusted, and request-bound — but its vct is NOT one the verifier asked
+    // for. Before this gate it passed as VALID (the T4.1 false-trust); now it is rejected.
+    let dcql = r#"{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:example:some-other-type"]}}]}"#;
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], dcql);
+    let presentation = sd_jwt_presentation(AUDIENCE, &request.nonce_b64());
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        !result.valid,
+        "a wrong-vct credential must NOT pass as VALID"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+    assert!(
+        result.disclosed_attributes.is_empty(),
+        "a rejected verdict surfaces no disclosures"
+    );
+}
+
+#[test]
+fn sd_jwt_missing_a_requested_claim_is_query_not_satisfied() {
+    // vct matches, but a requested claim was not disclosed → the verifier did not get what it asked for.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["email_address"]}}]}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let presentation = sd_jwt_presentation(AUDIENCE, &request.nonce_b64());
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+}
+
+#[test]
+fn sd_jwt_claim_value_match_and_mismatch() {
+    // The test issuer mints family_name = "Lovelace".
+    let matching = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["family_name"],"values":["Lovelace"]}}]}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &matching);
+    let presentation = sd_jwt_presentation(AUDIENCE, &request.nonce_b64());
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "the disclosed family_name matches the requested value: {:?}",
+        result.reasons
+    );
+
+    // A value the credential does not carry → not what was requested.
+    let mismatch = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["family_name"],"values":["Smith"]}}]}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &mismatch);
+    let presentation = sd_jwt_presentation(AUDIENCE, &request.nonce_b64());
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+}
+
+#[test]
+fn mdoc_matching_doctype_is_valid_and_wrong_doctype_is_query_not_satisfied() {
+    let request_match = {
+        let dcql = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"},"claims":[{"path":["org.iso.18013.5.1","given_name"]}]}]}"#;
+        request_with_dcql(AUDIENCE, &[3u8; 16], dcql)
+    };
+    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request_match.nonce);
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request_match,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "an mdoc matching its DCQL doctype + claim is VALID: {:?}",
+        result.reasons
+    );
+
+    // Wrong doctype_value → QueryNotSatisfied (a sound, trusted, bound mdoc of the wrong type).
+    let dcql_wrong = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.other"}}]}"#;
+    let request_wrong = request_with_dcql(AUDIENCE, &[3u8; 16], dcql_wrong);
+    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request_wrong.nonce);
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request_wrong,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+}
+
+// ---- Role derivation/validation (conformance-audit T4.3) -----------------------------------------
+
+#[test]
+fn pid_typed_sd_jwt_under_the_pid_role_is_valid() {
+    // A PID vct anchored under IssuerRole::Pid: role derivation derives Pid (matches the caller) and
+    // anchors against the PID list, which trusts the issuer → VALID.
+    let presentation = {
+        let sd_jwt = mint_sd_jwt_with_vct(ISSUER_KEY_PK8, ISSUER_CERT_DER, "urn:eudi:pid:1");
+        attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, &request().nonce_b64())
+    };
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request(),
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        result.valid,
+        "a PID credential under the PID role is VALID: {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn pid_typed_sd_jwt_under_a_non_pid_role_is_role_mismatch() {
+    // The credential's vct is a EUDI PID type, but the caller anchored it under QEAA — per-role trust
+    // anchoring would otherwise be only as good as the (wrong) host input. The contradiction is
+    // rejected BEFORE the trust resolve (T4.3), so it never anchors under the wrong per-role list.
+    let presentation = {
+        let sd_jwt = mint_sd_jwt_with_vct(ISSUER_KEY_PK8, ISSUER_CERT_DER, "urn:eudi:pid:1");
+        attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, &request().nonce_b64())
+    };
+    let result = verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request(),
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Qeaa,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        !result.valid,
+        "a PID credential under a non-PID role must be rejected"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::RoleMismatch]);
+}
+
+#[test]
+fn pid_typed_mdoc_under_a_non_pid_role_is_role_mismatch() {
+    let request = request();
+    let transcript = oid4vp_handover_transcript(AUDIENCE, &request.nonce, RESPONSE_URI);
+    let device_response = MdocBuilder::new()
+        .doc_type("eu.europa.ec.eudi.pid.1")
+        .session_transcript(transcript)
+        .build();
+    let token = MdocVpToken {
+        audience: AUDIENCE.to_owned(),
+        device_response,
+    };
+    let result = verify_response(
+        &VpToken::Mdoc(token),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Qeaa,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::RoleMismatch]);
+}
+
+/// A request fixed to `AUDIENCE` + a constant nonce with a non-constraining DCQL (the role-mismatch
+/// tests fire before the gate, so the query is irrelevant).
+fn request() -> PresentationRequest {
+    request_with(AUDIENCE, &[9u8; 16])
+}
+
+// ---- verify_vp_token — set-level semantics (§"VP Token Validation" step 3 + §"Selecting Credentials")
+
+/// Mint an SD-JWT VC of `vct` bound to `request`, ready to wrap in a [`VpToken::SdJwtVc`].
+fn sd_jwt_of_vct(vct: &str, request: &PresentationRequest) -> String {
+    let sd_jwt = mint_sd_jwt_with_vct(ISSUER_KEY_PK8, ISSUER_CERT_DER, vct);
+    attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, &request.nonce_b64())
+}
+
+const VCT_A: &str = "https://credentials.example/type-a";
+const VCT_B: &str = "https://credentials.example/type-b";
+
+/// A two-SD-JWT-credential DCQL (`a` ⇒ VCT_A, `b` ⇒ VCT_B) plus the supplied `credential_sets` JSON.
+fn two_credential_dcql(credential_sets: &str) -> String {
+    format!(
+        r#"{{"credentials":[
+            {{"id":"a","format":"dc+sd-jwt","meta":{{"vct_values":["{VCT_A}"]}}}},
+            {{"id":"b","format":"dc+sd-jwt","meta":{{"vct_values":["{VCT_B}"]}}}}
+        ]{credential_sets}}}"#
+    )
+}
+
+#[test]
+fn verify_vp_token_required_set_satisfied_by_one_option() {
+    let dcql =
+        two_credential_dcql(r#","credential_sets":[{"options":[["a"],["b"]],"required":true}]"#);
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let pres_a = sd_jwt_of_vct(VCT_A, &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("a".to_owned(), vec![VpToken::SdJwtVc(&pres_a)]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        outcome.satisfied,
+        "option [a] of the required set is satisfied"
+    );
+    assert!(outcome.credentials.get("a").is_some_and(|c| c.satisfied));
+}
+
+#[test]
+fn verify_vp_token_wrong_vct_under_an_id_is_unsatisfied() {
+    // No credential_sets ⇒ every credential must be satisfied; here `a` carries a credential of a type
+    // (`type-c`) that matches NEITHER query, so it both fails the per-credential match for `a` AND is
+    // itself rejected as `QueryNotSatisfied` (it is not what ANY part of the request asked for).
+    let dcql = two_credential_dcql("");
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let pres_wrong = sd_jwt_of_vct("https://credentials.example/type-c", &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("a".to_owned(), vec![VpToken::SdJwtVc(&pres_wrong)]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(!outcome.satisfied);
+    let credential = outcome.credentials.get("a").expect("entry for id a");
+    assert!(!credential.satisfied);
+    assert_eq!(
+        credential.presentations.first().map(|r| r.reasons.clone()),
+        Some(vec![ReasonCode::QueryNotSatisfied]),
+        "the wrong-vct presentation is itself rejected as QueryNotSatisfied"
+    );
+}
+
+#[test]
+fn verify_vp_token_optional_set_absent_does_not_block() {
+    let dcql = two_credential_dcql(
+        r#","credential_sets":[{"options":[["a"]],"required":true},{"options":[["b"]],"required":false}]"#,
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let pres_a = sd_jwt_of_vct(VCT_A, &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("a".to_owned(), vec![VpToken::SdJwtVc(&pres_a)]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        outcome.satisfied,
+        "required set [a] satisfied; optional set [b] may be absent"
+    );
+}
+
+#[test]
+fn verify_vp_token_required_optional_set_unsatisfied_when_required_missing() {
+    let dcql = two_credential_dcql(
+        r#","credential_sets":[{"options":[["a"]],"required":true},{"options":[["b"]],"required":false}]"#,
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    // Only the OPTIONAL credential `b` is returned; the REQUIRED `a` is absent → overall unsatisfied.
+    let pres_b = sd_jwt_of_vct(VCT_B, &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("b".to_owned(), vec![VpToken::SdJwtVc(&pres_b)]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        !outcome.satisfied,
+        "the required set [a] is unsatisfied even though optional [b] is present"
+    );
+    assert!(outcome.credentials.get("b").is_some_and(|c| c.satisfied));
+}
+
+#[test]
+fn verify_vp_token_multiple_false_rejects_two_presentations() {
+    // `multiple` omitted ⇒ default false ⇒ at most one Presentation per Credential Query.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{"vct_values":["{VCT_A}"]}}}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let pres1 = sd_jwt_of_vct(VCT_A, &request);
+    let pres2 = sd_jwt_of_vct(VCT_A, &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![VpToken::SdJwtVc(&pres1), VpToken::SdJwtVc(&pres2)],
+    );
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(
+        !outcome.satisfied,
+        "two Presentations for a multiple:false query violate the cardinality"
+    );
+    assert!(outcome.credentials.get("a").is_some_and(|c| !c.satisfied));
+}
+
+#[test]
+fn verify_vp_token_mdoc_credential_is_satisfied() {
+    let dcql = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}"#;
+    let request = request_with_dcql(AUDIENCE, &[3u8; 16], dcql);
+    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("mdl".to_owned(), vec![VpToken::Mdoc(token)]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_mdoc(),
+        MDOC_NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    );
+    assert!(outcome.satisfied, "the mdoc matches its DCQL query");
+    assert!(outcome.credentials.get("mdl").is_some_and(|c| c.satisfied));
 }

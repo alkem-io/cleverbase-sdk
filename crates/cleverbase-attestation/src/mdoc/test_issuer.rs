@@ -579,6 +579,14 @@ impl MdocBuilder {
         self
     }
 
+    /// Set the document `docType` (and, absent [`Self::mso_doc_type_mismatch`], the matching MSO
+    /// `docType`). Used by the DCQL `doctype_value` match + role-derivation tests (e.g. a EUDI PID
+    /// `docType` `eu.europa.ec.eudi.pid.1`).
+    pub(crate) fn doc_type(mut self, doc_type: &str) -> Self {
+        self.doc_type = doc_type.to_owned();
+        self
+    }
+
     /// Set the MSO `digestAlgorithm` (SHA-384, or an unsupported name to drive the reject path).
     pub(super) fn digest_algorithm(mut self, alg: DigestAlg) -> Self {
         self.digest_algorithm = alg;

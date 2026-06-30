@@ -177,6 +177,20 @@ pub(crate) fn mint_sd_jwt_with_typ(issuer_pk8: &[u8], issuer_cert_der: &[u8], ty
     )
 }
 
+/// Mint a happy-path SD-JWT VC carrying a caller-supplied `vct` — the DCQL `vct_values` match +
+/// role-derivation probe (e.g. a EUDI PID `vct` `urn:eudi:pid:1`). Everything else (trusted issuer
+/// signature + window + holder binding) is sound, so it clears the always-on bar and reaches the gate.
+pub(crate) fn mint_sd_jwt_with_vct(issuer_pk8: &[u8], issuer_cert_der: &[u8], vct: &str) -> SdJwt {
+    mint_with(
+        issuer_pk8,
+        issuer_cert_der,
+        json!(NOW - 1_000),
+        json!(NOW + 1_000_000),
+        Some(vct),
+        "dc+sd-jwt",
+    )
+}
+
 /// Mint an SD-JWT VC OMITTING the REQUIRED `vct` type claim — the missing-`vct` probe for the always-on
 /// bar's [`super::check_vct`] (everything else, incl. the trusted issuer signature + window, is sound).
 pub(crate) fn mint_sd_jwt_without_vct(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {

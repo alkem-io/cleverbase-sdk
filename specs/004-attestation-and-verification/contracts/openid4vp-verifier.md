@@ -24,6 +24,64 @@ verifyResponse(vp_token: bytes, request: PresentationRequest, policy, anchors) -
 Owning both halves makes replay/audience binding **correct by construction** — the verifier never accepts a
 presentation it didn't request.
 
+## DCQL satisfaction — "did I get what I requested" (now enforced IN-CORE)
+
+OpenID4VP **1.0 §6 (DCQL)** + **§"VP Token Validation" steps 2.2 + 3** (verified online:
+<https://openid.net/specs/openid-4-verifiable-presentations-1_0.html>; source `openid/OpenID4VP`
+`1.0/openid-4-verifiable-presentations-1_0.md`). The DCQL query is no longer carried opaquely: it is
+parsed and evaluated **in-core** (`src/dcql.rs`) — the explicit product decision, per §"Security Checks
+on the Returned Credentials and Presentations": *"the Verifier MUST NOT rely on the Wallet to enforce
+these constraints."* This closes the conformance-audit **T4.1/T4.2** false-trust: a trusted,
+freshly-bound credential of the **wrong `vct`/`docType`**, missing a requested claim, or carrying a
+value outside the query's `values`, used to pass as VALID.
+
+After the always-on bar accepts a presentation, the verifier checks it SATISFIES the matching DCQL
+Credential Query (`verify_response`/`verify` apply it automatically when the request carries an
+enforceable DCQL):
+
+- **format** matches the Credential Query `format` (§6.1).
+- **meta** matches (§6.1): SD-JWT VC `vct` ∈ `meta.vct_values`; mdoc every `docType` == `meta.doctype_value`.
+- every requested **claim path** (§"Claims Path Pointer": JSON-nested for SD-JWT VC;
+  `[namespace, elementIdentifier]` for mdoc) resolves in the verified **disclosed** attributes,
+  honoring `claim_sets` (§"Selecting Claims": at least one listed option fully present).
+- if a claim specifies **`values`** (§6.3), the disclosed value ∈ `values`.
+
+A sound, trusted, request-bound credential that does **not** satisfy its query ⇒ INVALID with the new
+`ReasonCode::QueryNotSatisfied` (distinct from `Tamper`/`UntrustedIssuer`/`HolderBinding` — the
+credential is sound, it is simply not the one requested).
+
+**Set-level / multiplicity** (§"VP Token Validation" step 3 + §"Selecting Credentials"):
+`openid4vp::verify_vp_token(request, vp_token, …)` evaluates a whole `{ credential_id: [presentations] }`
+`vp_token` in-core — each Presentation runs the bar + binding + per-query DCQL match, then the set fold
+requires every **required** Credential Set Query to have a fully-satisfied `option` (or, with no
+`credential_sets`, every Credential Query satisfied); a `multiple:false` query MUST carry at most one
+Presentation.
+
+### Role derivation/validation (T4.3)
+
+`IssuerRole` is no longer "only as good as the host's input". The credential's claimed type derives /
+validates the trust-anchoring role in-core (`dcql::reconcile_role`): a EUDI **PID** type
+(`vct urn:eudi:pid:1`/`eu.europa.ec.eudi.pid.1`; mdoc `docType eu.europa.ec.eudi.pid.1`) MUST anchor
+under `IssuerRole::Pid`, so a caller role that contradicts the claimed type is rejected
+(`ReasonCode::RoleMismatch`) **before** the trust resolve — it can never anchor under the wrong per-role
+list. A type with no standardized role mapping keeps the caller-supplied role. The reconciled role is
+the one threaded into `TrustAnchorSource::resolve` (and the per-role QcStatement leaf-purpose floor).
+
+### DCQL scope cuts (documented, not silently omitted)
+
+- **`trusted_authorities`** (§6.1.1) is not evaluated by the DCQL layer — issuer trust is the always-on
+  bar's per-role/format chain-to-anchor (the spec note: *"Verifiers must verify that the issuer … is
+  trusted on their own"*; `trusted_authorities` is a wallet-side data-minimization hint).
+- **`require_cryptographic_holder_binding:false`** is not honored — the SDK **always** requires holder
+  binding (a documented secure default; see `verifier.md`).
+- **Value matching** is enforced verifier-side here (the verifier sees the real returned value), even
+  though §6.3 treats `values` as best-effort for the *Wallet*; for mdoc the CBOR value is matched as its
+  JSON form (RFC 8949 §6.1), which the SDK's decoded `AttributeValue` already is.
+- Claim paths resolve against the **verified disclosed** set (the privacy-minimal claims actually
+  presented); a path targeting an always-visible non-disclosed scalar is treated as not-present.
+- **Encrypted responses** (`direct_post.jwt`) and the **DC-API** handover remain out of scope (carried
+  forward from `verifier.md` / the audit's documented cuts).
+
 ## Invariants
 
 - A fresh `nonce` per `buildRequest` (no reuse); the SDK tracks the issued request to verify against it.

@@ -148,6 +148,24 @@ pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
     issuer_cert_from_header(&header).ok()
 }
 
+/// Extract the issuer-signed `vct` (Verifiable Credential Type) a presented SD-JWT VC asserts, for the
+/// in-core OpenID4VP DCQL type match (SD-JWT VC `vct` ∈ DCQL `meta.vct_values` — [`crate::dcql`]).
+///
+/// Returns `None` when the presentation does not parse or carries no string `vct`. The value is read
+/// from the issuer-signed clear payload; the [`crate::openid4vp`] DCQL gate calls this **only after**
+/// [`verify_sd_jwt_vc`] returned `valid` (so the same `vct` has already been signature-verified,
+/// trusted, and shape-validated by [`check_vct`]) — this re-read of the same claim is the type-match
+/// input, never an acceptance.
+#[must_use]
+pub(crate) fn verified_vct(presentation: &str) -> Option<String> {
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+    sd_jwt
+        .claims()
+        .get("vct")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
 /// §4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
 /// to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
@@ -197,12 +215,28 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         .split_first()
         .ok_or(ReasonCode::MalformedCredential)?;
 
+    // 2a. Role derivation/validation (conformance-audit T4.3). The claimed `vct` (signature-verified in
+    //     step 2; its full shape is validated in step 3a) selects/validates the trust-anchoring role:
+    //     a EUDI PID `vct` MUST anchor under `IssuerRole::Pid`, so a caller role that contradicts the
+    //     credential's claimed type is rejected (`RoleMismatch`) rather than silently anchoring under
+    //     the wrong per-role list. A `vct` with no standardized role mapping keeps the caller's role.
+    //     The reconciled role is what step 3 anchors against (and what the per-role QcStatement leaf-
+    //     purpose floor keys on), so the role is no longer "only as good as the host's input".
+    let claimed_vct = sd_jwt
+        .claims()
+        .get("vct")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let effective_role =
+        crate::dcql::reconcile_role(input.role, crate::types::Format::SdJwtVc, claimed_vct)
+            .map_err(|()| ReasonCode::RoleMismatch)?;
+
     // 3. Issuer trust — the signing leaf's certification path (leaf + the supplied x5c intermediates)
     //    must validate to the configured anchor for its role/format (RFC 5280 §6.1 path validation).
     //    A chain failure carries a coarse-but-accurate `TrustFailure`: an expired/not-yet-valid cert on
     //    the path → `Expired` (not a misleading `UntrustedIssuer`), any other no-trust → `UntrustedIssuer`.
     let decision = input.anchors.resolve(
-        input.role,
+        effective_role,
         crate::types::Format::SdJwtVc,
         issuer_cert_der,
         supplied_intermediates,

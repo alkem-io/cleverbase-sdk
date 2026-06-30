@@ -226,6 +226,13 @@ pub struct MdocVerifyMeta {
     /// mandatory (the bar requires it), so this is the single source the gate folds — the per-document
     /// `(leaf, signed)` already paired by the bar pass.
     pub claimed_issuers: Vec<(Vec<u8>, i64)>,
+    /// Per-document verified `docType` (the signed MSO `docType`, one per document), collected during a
+    /// VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL gate
+    /// ([`crate::dcql`]) matches these against the query's `meta.doctype_value` (mdoc `docType` ==
+    /// `doctype_value`), reading the bar's already-decoded `docType` rather than re-decoding the
+    /// response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
+    /// it), so this is the authoritative type view for the "did I get what I requested" check.
+    pub doc_types: Vec<String>,
     /// The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
     /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
     /// classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
@@ -509,6 +516,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             MdocVerifyMeta {
                 document_count,
                 claimed_issuers: Vec::new(),
+                doc_types: Vec::new(),
                 binding_machinery,
             },
         )
@@ -531,6 +539,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     // qualified gate folds (the gate runs only on the VALID verdict this loop completing produces).
     let mut disclosed: DisclosedByNamespace = BTreeMap::new();
     let mut claimed_issuers: Vec<(Vec<u8>, i64)> = Vec::with_capacity(document_count);
+    let mut doc_types: Vec<String> = Vec::with_capacity(document_count);
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
@@ -538,6 +547,11 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         let (doc_disclosed, claimed_issuer) =
             verify_one_document(document, doc_raw_items, anchors, params).map_err(fail)?;
         claimed_issuers.push(claimed_issuer);
+        // The document's `docType` (verified == the signed MSO `docType` inside `verify_one_document`)
+        // is the DCQL `doctype_value` match input the in-core OpenID4VP gate reads from the meta.
+        if let Some(doc_type) = get_text(document, "docType") {
+            doc_types.push(doc_type);
+        }
         // `doc_disclosed` is namespace-grouped (`{ ns: { id: value } }`); merge each `(namespace, id,
         // value)` triple so the cross-document no-shadow rule is keyed per `(namespace, id)`.
         for (namespace, ns_map) in doc_disclosed {
@@ -561,6 +575,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         MdocVerifyMeta {
             document_count,
             claimed_issuers,
+            doc_types,
             binding_machinery: None,
         },
     ))
@@ -688,6 +703,22 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     // Verify the IssuerAuth ES256 signature over the MSO with the DS certificate's key.
     verify_cose_sign1_es256(&issuer_auth, ds_cert_der)?;
 
+    // --- Role derivation/validation (conformance-audit T4.3). The signed MSO `docType` (verified above;
+    //     its consistency with the document `docType` is checked below) selects/validates the trust-
+    //     anchoring role: a EUDI PID `docType` MUST anchor under `IssuerRole::Pid`, so a caller role that
+    //     contradicts the credential's claimed type is rejected (`RoleMismatch`) rather than silently
+    //     anchoring under the wrong per-role IACA list. A `docType` with no standardized role mapping
+    //     keeps the caller's role. The reconciled role is what the trust step below anchors against.
+    let effective_role = match get_text(&mso, "docType") {
+        Some(doc_type) => {
+            crate::dcql::reconcile_role(params.role, crate::types::Format::Mdoc, &doc_type)
+                .map_err(|()| VerifyFailure::reason(ReasonCode::RoleMismatch))?
+        }
+        // No MSO `docType` to derive from → keep the caller role (the missing `docType` is rejected by
+        // the MSO-vs-document `docType` consistency check below).
+        None => params.role,
+    };
+
     // --- MSO validityInfo: parsed FIRST so its `signed` time is the DS-leaf validity instant. --------
     // ISO/IEC 18013-5 §9.3.1 requires the Document Signer certificate's validity window to contain the
     // MSO `signed` time (DS certs rotate ~monthly while mDLs live for years → checking the DS window at
@@ -700,7 +731,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     // --- IssuerAuth trust: the DS leaf's certification path (leaf + supplied x5chain intermediates)
     //     must validate to the configured anchor for the role/format. -------------------------------
     let decision = anchors.resolve(
-        params.role,
+        effective_role,
         crate::types::Format::Mdoc,
         ds_cert_der,
         supplied_intermediates,

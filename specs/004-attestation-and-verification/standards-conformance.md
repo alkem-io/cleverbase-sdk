@@ -21,7 +21,7 @@ Test names are the in-crate `#[cfg(test)]` cases (run with `cargo test -p clever
 | **eIDAS** — Regulation (EU) 910/2014 **as amended by (EU) 2024/1183** (the qualified/(Q)EAA + per-role trust framing: PID Art. 5a(18), PuB-EAA Art. 45f(3)) | Consolidated 2024/1183 | T013, T019 | `src/trust/`, `src/qualified/` | `qualified::tests::qualified_issuer_granted_at_the_relevant_time_is_qualified`, `qualified::tests::trusted_but_non_qualified_issuer_is_not_qualified` |
 | **SD-JWT VC** — `draft-ietf-oauth-sd-jwt-vc` + **SD-JWT** RFC 9901 | draft-16 / RFC 9901 | T011 | `src/sdjwtvc/` | `sdjwtvc::tests::valid_credential_from_trusted_issuer_is_accepted_with_disclosed_attributes`, `selective_disclosure_reveals_only_the_presented_subset`, `tampered_issuer_signature_is_rejected_as_tamper` |
 | **ISO/IEC 18013-5** — mdoc (`DeviceResponse`, MSO `valueDigests`/`validityInfo`, `DeviceAuth`) | 18013-5:2021 | T012 | `src/mdoc/` | `mdoc::tests::valid_mdoc_verifies_and_returns_disclosed_attributes`, `value_digest_mismatch_is_rejected_as_disclosure_integrity`, `expired_validity_info_is_rejected_as_expired` |
-| **OpenID4VP** — request build (DCQL + fresh nonce + audience) + `vp_token` binding verify | 1.0 (DCQL) | T015 | `src/openid4vp/` | `openid4vp::tests::build_request_draws_a_fresh_nonce_each_call`, `sd_jwt_bound_to_the_issued_request_is_valid`, `sd_jwt_replayed_with_a_stale_nonce_is_replay` |
+| **OpenID4VP** — request build (DCQL + fresh nonce + audience) + `vp_token` binding verify + **in-core DCQL satisfaction** (§6 + §"VP Token Validation" 2.2/3) | 1.0 (DCQL) | T015 | `src/openid4vp/`, `src/dcql.rs` | `openid4vp::tests::build_request_draws_a_fresh_nonce_each_call`, `sd_jwt_bound_to_the_issued_request_is_valid`, `sd_jwt_replayed_with_a_stale_nonce_is_replay`, `sd_jwt_of_the_wrong_vct_is_query_not_satisfied`, `verify_vp_token_required_set_satisfied_by_one_option`, `dcql::tests::*` |
 | **OpenID4VCI** — pre-authorized-code `obtain` (sans-IO state machine + signer-hook PoP) | **1.0 final** (see §1.3) | T025 | `src/issuance/obtain.rs`, `src/issuance/signer.rs` | `issuance::obtain::tests::*` (skip-when-`None`, reference round-trip, `proofs` array, Nonce-Endpoint, `credentials` array, `tx_code`, deferred-202), `issuance::signer::tests::*` |
 | **ETSI TS 119 612** — Trusted Lists (LOTL / national TL, TLv6) | v2.4.1 / TLv6 | T013 | `src/trust/xml.rs`, `src/trust/engine.rs`, `src/trust/chain.rs` | `trust::engine::tests::*` (present/absent/expired-entry/unreachable→fail-closed/stale→fail-closed), `trust::xml::tests::*`, `trust::chain::tests::*` |
 | **ETSI TS 119 602** — Lists of Trusted Entities (LoTE) data model the TL reader follows | v1.x | T013 | `src/trust/xml.rs`, `src/trust/manifest.rs` | `trust::xml::tests::*`, `trust::manifest::tests::*` |
@@ -181,6 +181,46 @@ Also implemented (T8.4, partial):
 These cuts keep the *implemented* flow interop-correct with a real 1.0 issuer (and the in-test double,
 which speaks the 1.0 shapes); the deferred / `authorization_details` legs are reasoned omissions, not
 silent gaps.
+
+### 1.4 In-core DCQL satisfaction + credential-role derivation (OpenID4VP 1.0 §6 — `src/dcql.rs`)
+
+The OpenID4VP DCQL query is parsed and evaluated **in-core** (verified online against the 1.0 spec
+<https://openid.net/specs/openid-4-verifiable-presentations-1_0.html> and the `openid/OpenID4VP` source
+`1.0/openid-4-verifiable-presentations-1_0.md`) — not carried opaquely and not delegated to the wallet
+(§"Security Checks on the Returned Credentials and Presentations": *"the Verifier MUST NOT rely on the
+Wallet to enforce these constraints"*). This closes the conformance-audit **T4.1/T4.2** false-trust (a
+trusted, freshly-bound credential of the **wrong `vct`/`docType`**, or missing a requested claim, used
+to pass as VALID) and the **T4.3** role-anchoring robustness gap.
+
+| DCQL requirement (§ref) | Implemented behavior |
+|-------------------------|----------------------|
+| **§6.1 `format` + `meta`** | After the always-on bar accepts a presentation, the verifier checks format match + meta match (SD-JWT VC `vct` ∈ `meta.vct_values`; mdoc every `docType` == `meta.doctype_value`). A mismatch ⇒ `ReasonCode::QueryNotSatisfied`. |
+| **§6.3 `claims` + §"Claims Path Pointer"** | Every requested claim path resolves in the verified **disclosed** attributes (JSON-nested key/index/`null`-all-elements for SD-JWT VC; `[namespace, elementIdentifier]` for mdoc); `claim_sets` (§"Selecting Claims") satisfied iff at least one option fully resolves. |
+| **§6.3 `values`** | If a Claims Query lists `values`, the disclosed value MUST be one of them (verifier-side; for mdoc the CBOR value is matched as its JSON form per RFC 8949 §6.1). |
+| **§"VP Token Validation" step 3 + §"Selecting Credentials"** | `openid4vp::verify_vp_token` folds the per-credential results: every **required** Credential Set Query needs a fully-satisfied `option` (or, with no `credential_sets`, every Credential Query satisfied); a `multiple:false` query carries at most one Presentation (§"Response Parameters"). |
+| **Role derivation (EUDI ARF — T4.3)** | The credential's claimed type derives/validates the per-role trust-anchoring role (`dcql::reconcile_role`): a EUDI **PID** type (`vct urn:eudi:pid:1` / `eu.europa.ec.eudi.pid.1`; mdoc `docType eu.europa.ec.eudi.pid.1` — EUDI ARF PID Rulebook, <https://eudi.dev/1.7.1/annexes/annex-3/annex-3.01-pid-rulebook/>) MUST anchor under `IssuerRole::Pid`; a contradicting caller role ⇒ `ReasonCode::RoleMismatch`, rejected **before** the `TrustAnchorSource::resolve`. A type with no standardized mapping keeps the caller role. |
+
+New `ReasonCode`s (closed enum, SemVer-minor additive): `QueryNotSatisfied`, `RoleMismatch`. The C-ABI
+`wire` schema version is **unchanged (5)**: the credential type is matched in-core (not surfaced on
+`VerificationResult`), and adding `ReasonCode` variants is the documented additive-by-minor contract (no
+CBOR envelope-shape change).
+
+**DCQL scope cuts (documented, not silent):**
+
+- **`trusted_authorities`** (§6.1.1) is not evaluated by the DCQL layer — issuer trust is the always-on
+  bar's per-role/format chain-to-anchor (the spec itself: *"Verifiers must verify that the issuer … is
+  trusted on their own"*; `trusted_authorities` is a wallet-side data-minimization hint).
+- **`require_cryptographic_holder_binding:false`** is not honored — the SDK **always** requires holder
+  binding (the documented secure default — see §B / `verifier.md`).
+- Claim paths resolve against the **verified disclosed** set (the privacy-minimal claims actually
+  presented); a path targeting an always-visible non-disclosed scalar is treated as not-present (DCQL
+  Claims Queries target selectively-disclosable subject claims).
+- An empty/legacy/unparseable DCQL imposes **no** claim/type constraint (the prior opaque behavior is
+  preserved); a malformed/unsupported-format Credential Query is dropped leniently so one bad entry never
+  disables the gate for the rest. The query is verifier-controlled, so leniency here is not a holder-side
+  bypass.
+- **Encrypted responses** (`direct_post.jwt`) and the **DC-API** handover remain out of scope (carried
+  forward from the audit's documented cuts).
 
 ## 2. Crate version pins (the format/trust + crypto layers)
 

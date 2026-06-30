@@ -48,6 +48,7 @@
 mod conformance;
 pub mod crypto;
 pub mod datetime;
+pub mod dcql;
 pub mod issuance;
 pub mod mdoc;
 pub mod openid4vp;

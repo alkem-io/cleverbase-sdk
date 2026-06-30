@@ -32,6 +32,8 @@
 //! in the (signed, but here pre-verification read) KB-JWT, so both are attributed precisely before
 //! the full cryptographic bar runs.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use ciborium::value::Value as CborValue;
 use serde::{Deserialize, Serialize};
 
@@ -52,13 +54,17 @@ pub trait NonceSource {
     fn fresh_nonce(&mut self) -> Vec<u8>;
 }
 
-/// A DCQL (Digital Credentials Query Language — OpenID4VP 1.0) query.
+/// A DCQL (Digital Credentials Query Language — OpenID4VP 1.0 §6) query.
 ///
 /// OpenID4VP 1.0 removed Presentation-Exchange `presentation_definition`; the query is **DCQL**. The
-/// binding verifier does not interpret the query's selection semantics (that is the holder/wallet's
-/// job when building the presentation) — it carries the query opaquely as its canonical JSON so the
-/// issued request is reproducible and auditable. Carrying it as a structured-but-opaque value keeps
-/// the wire contract explicit without re-implementing DCQL evaluation in the verifier.
+/// query is carried on the wire as its canonical JSON text (so the issued request stays reproducible
+/// and auditable) AND is now **evaluated in-core** ([`parse`](Self::parse) → [`crate::dcql::DcqlQuery`]):
+/// the verifier no longer treats it opaquely — after the always-on bar accepts a presentation it checks
+/// the credential SATISFIES the query (correct `vct`/`docType`, requested claims present, values
+/// matched) per OpenID4VP 1.0 §"VP Token Validation" step 2.2, closing the "did I get what I requested"
+/// gap (conformance-audit T4.1). This was the explicit product decision — full DCQL evaluation in-core,
+/// not delegated to the wallet (§"Security Checks on the Returned Credentials and Presentations":
+/// *"the Verifier MUST NOT rely on the Wallet to enforce these constraints"*).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dcql {
     /// The DCQL query as its canonical JSON text (what a wallet receives in the request).
@@ -72,6 +78,16 @@ impl Dcql {
         Self {
             query_json: query_json.into(),
         }
+    }
+
+    /// Parse this query into the structured [`crate::dcql::DcqlQuery`] the in-core evaluator uses
+    /// (OpenID4VP 1.0 §6). See [`crate::dcql::DcqlQuery::parse`] for the (lenient) parsing contract.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::dcql::DcqlError`] when the query text is not JSON or not a JSON object.
+    pub fn parse(&self) -> Result<crate::dcql::DcqlQuery, crate::dcql::DcqlError> {
+        crate::dcql::DcqlQuery::parse(&self.query_json)
     }
 }
 
@@ -154,10 +170,21 @@ pub struct MdocVpToken {
 /// [`verify()`](crate::verify()) entry point).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VpToken<'a> {
-    /// A compact SD-JWT VC presentation (`<issuer-JWS>~<D>…~<KB-JWT>`).
+    /// A compact SD-JWT VC presentation (`<issuer-JWS>…~<KB-JWT>`).
     SdJwtVc(&'a str),
     /// An mdoc `DeviceResponse` plus its addressed audience.
     Mdoc(MdocVpToken),
+}
+
+impl VpToken<'_> {
+    /// The credential format this `vp_token` carries.
+    #[must_use]
+    pub const fn format(&self) -> Format {
+        match self {
+            Self::SdJwtVc(_) => Format::SdJwtVc,
+            Self::Mdoc(_) => Format::Mdoc,
+        }
+    }
 }
 
 /// Verify an OpenID4VP `vp_token` is cryptographically bound to an issued request, running the
@@ -205,10 +232,7 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     // Format gate (identical to the `verify()` entry point's, so the public `verify_response` honors
     // the `policy` it takes): the policy may restrict accepted formats (an empty set = both). A
     // presented format the policy excludes is rejected up front — never run through the bar.
-    let format = match vp_token {
-        VpToken::SdJwtVc(_) => Format::SdJwtVc,
-        VpToken::Mdoc(_) => Format::Mdoc,
-    };
+    let format = vp_token.format();
     if !policy.formats.is_empty() && !policy.formats.contains(&format) {
         return (
             VerificationResult::invalid(ReasonCode::UnsupportedFormat),
@@ -216,16 +240,48 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
         );
     }
 
-    match vp_token {
-        VpToken::SdJwtVc(presentation) => (
-            verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status),
-            None,
-        ),
+    // Run the per-format always-on bar + request binding, and surface the verified credential type the
+    // DCQL gate keys on (SD-JWT VC `vct`; mdoc `docType`s) from what the bar already produced.
+    let (mut result, meta, credential_type) = match vp_token {
+        VpToken::SdJwtVc(presentation) => {
+            let result =
+                verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status);
+            // Read the verified `vct` only on a VALID presentation (the bar has signature-verified +
+            // trusted + shape-validated it); on an INVALID one there is nothing to match.
+            let vct = result
+                .valid
+                .then(|| sdjwtvc::verified_vct(presentation))
+                .flatten();
+            (result, None, crate::dcql::CredentialType::Vct(vct))
+        }
         VpToken::Mdoc(token) => {
             let (result, meta) = verify_mdoc_bound(token, request, anchors, now_unix, role, status);
-            (result, Some(meta))
+            let doc_types = meta.doc_types.clone();
+            (
+                result,
+                Some(meta),
+                crate::dcql::CredentialType::DocTypes(doc_types),
+            )
         }
+    };
+
+    // DCQL "did I get what I requested" gate (OpenID4VP 1.0 §"VP Token Validation" step 2.2 + §6 DCQL).
+    // Runs ONLY on a presentation the always-on bar already accepted, and ONLY when the request carries
+    // an enforceable DCQL query (an empty/legacy/opaque query is `Inactive` — the prior behavior). A
+    // sound, trusted, request-bound credential that does NOT satisfy the query (wrong `vct`/`docType`,
+    // missing requested claim, or value mismatch) is rejected as `QueryNotSatisfied` (the credential is
+    // sound but is not the one requested — distinct from `Tamper`/`UntrustedIssuer`/`HolderBinding`).
+    if result.valid
+        && crate::dcql::evaluate_single(
+            &request.dcql.query_json,
+            format,
+            &credential_type,
+            &result.disclosed_attributes,
+        ) == crate::dcql::DcqlGate::NotSatisfied
+    {
+        result = VerificationResult::invalid(ReasonCode::QueryNotSatisfied);
     }
+    (result, meta)
 }
 
 /// SD-JWT VC binding: attribute a nonce/audience mismatch precisely (from the KB-JWT), then run the
@@ -408,6 +464,160 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
     // SessionTranscript = [null, null, OpenID4VPHandover].
     let transcript = CborValue::Array(vec![CborValue::Null, CborValue::Null, handover]);
     crate::cbor_to_vec(&transcript)
+}
+
+/// The per-credential outcome within a [`verify_vp_token`] evaluation.
+///
+/// `presentations` carries the [`VerificationResult`] of EACH Presentation returned under this
+/// Credential Query `id` (in input order); `satisfied` is whether this Credential Query is fulfilled —
+/// at least one returned Presentation both verified (always-on bar + binding) AND matched this query
+/// (format + `meta` + claims), honoring the `multiple` cardinality (a `multiple:false` query MUST carry
+/// at most one Presentation — OpenID4VP 1.0 §"Response Parameters").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialVerification {
+    /// The verification result of each Presentation returned under this Credential Query `id`.
+    pub presentations: Vec<VerificationResult>,
+    /// Whether this Credential Query is satisfied (≥1 verified-and-matching Presentation; cardinality
+    /// respected).
+    pub satisfied: bool,
+}
+
+/// The outcome of evaluating a whole OpenID4VP `vp_token` against its DCQL query (OpenID4VP 1.0 §"VP
+/// Token Validation" steps 2 + 3): the per-credential results plus the set-level verdict.
+///
+/// `satisfied` is the overall set-level decision (§"VP Token Validation" step 3 + §"Selecting
+/// Credentials"): with no `credential_sets`, EVERY Credential Query in `credentials` must be satisfied;
+/// otherwise EVERY **required** Credential Set Query must have at least one fully-satisfied `option`
+/// (non-required sets are optional).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpTokenVerification {
+    /// Whether the returned set of Presentations satisfies the request's set-level requirements.
+    pub satisfied: bool,
+    /// The per-credential outcomes, keyed by the Credential Query `id` the Presentations were returned
+    /// under.
+    pub credentials: BTreeMap<String, CredentialVerification>,
+}
+
+/// Evaluate a full OpenID4VP `vp_token` (the `{ credential_id: [presentations] }` shape — OpenID4VP 1.0
+/// §"Response Parameters") against the DCQL query carried in `request`, enforcing the complete
+/// §"VP Token Validation" + §6 DCQL semantics **in-core** (the explicit product decision — not delegated
+/// to the wallet, §"Security Checks on the Returned Credentials and Presentations").
+///
+/// For EACH `(credential_id, presentations)` entry it runs, per Presentation, the always-on bar + the
+/// request binding ([`verify_response`]) AND the per-query DCQL match (format + `meta` + claims/values),
+/// then folds the per-credential satisfaction into the set-level verdict (the [`crate::dcql`] set fold):
+/// step 3 — every required Credential Set Query has a fully-satisfied option (or, with no
+/// `credential_sets`, every Credential Query is satisfied).
+///
+/// The per-credential trust-anchoring **role** is derived from the matching Credential Query's expected
+/// type (`meta`) when it names a EUDI PID type (conformance-audit T4.3 — the verifier's own query states
+/// the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
+/// validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
+/// [`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
+/// for the response, mirroring the single-credential [`verify_response`]).
+pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
+    request: &PresentationRequest,
+    vp_token: &BTreeMap<String, Vec<VpToken<'_>>>,
+    policy: &VerificationPolicy,
+    anchors: &A,
+    now_unix: i64,
+    role: IssuerRole,
+    status: StatusOutcome,
+) -> VpTokenVerification {
+    // Parse the DCQL once. An unparseable query has no enforceable structure → nothing is satisfied
+    // (the explicit multi-credential entry needs a real query; the single-presentation gate is the
+    // lenient/backward-compatible path).
+    let query = request.dcql.parse().unwrap_or_default();
+    let by_id: BTreeMap<&str, &crate::dcql::CredentialQuery> = query
+        .credentials
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect();
+
+    let mut credentials = BTreeMap::new();
+    let mut satisfied_ids: BTreeSet<String> = BTreeSet::new();
+    for (credential_id, tokens) in vp_token {
+        let credential_query = by_id.get(credential_id.as_str()).copied();
+        // Per-credential anchoring role derived from the query's EXPECTED type (PID), else the caller's.
+        let credential_role = credential_query
+            .and_then(|candidate| crate::dcql::role_from_meta(&candidate.meta))
+            .unwrap_or(role);
+        // `multiple:false` (default) ⇒ at most one Presentation per Credential Query (§"Response
+        // Parameters": "When `multiple` is omitted, or set to `false`, the array MUST contain only one
+        // Presentation.").
+        let multiple_allowed = credential_query.is_some_and(|candidate| candidate.multiple);
+        let cardinality_ok = multiple_allowed || tokens.len() <= 1;
+
+        let mut presentations = Vec::with_capacity(tokens.len());
+        let mut matched = 0usize;
+        for token in tokens {
+            let (result, meta) = verify_response_with_meta(
+                token,
+                request,
+                policy,
+                anchors,
+                now_unix,
+                credential_role,
+                status,
+            );
+            // The Presentation counts toward THIS Credential Query only if it both verified AND matches
+            // this specific query (by id) — format + `meta` + claims/`claim_sets`/`values`.
+            let matches_query = result.valid
+                && credential_query.is_some_and(|candidate| {
+                    let credential_type = credential_type_of(token, &result, meta.as_ref());
+                    crate::dcql::query_satisfied_by(
+                        candidate,
+                        token.format(),
+                        &credential_type,
+                        &result.disclosed_attributes,
+                    )
+                });
+            if matches_query {
+                matched += 1;
+            }
+            presentations.push(result);
+        }
+
+        let satisfied = credential_query.is_some() && cardinality_ok && matched >= 1;
+        if satisfied {
+            satisfied_ids.insert(credential_id.clone());
+        }
+        credentials.insert(
+            credential_id.clone(),
+            CredentialVerification {
+                presentations,
+                satisfied,
+            },
+        );
+    }
+
+    let satisfied_refs: BTreeSet<&str> = satisfied_ids.iter().map(String::as_str).collect();
+    let satisfied = crate::dcql::credential_sets_satisfied(&query, &satisfied_refs);
+    VpTokenVerification {
+        satisfied,
+        credentials,
+    }
+}
+
+/// The verified credential type the DCQL `meta` match keys on, read from what the always-on bar already
+/// produced: the SD-JWT VC `vct` (re-read from the now-verified presentation) or the mdoc `docType`s
+/// (from the bar's [`MdocVerifyMeta`]). Empty/`None` on an INVALID presentation (nothing verified).
+fn credential_type_of(
+    token: &VpToken<'_>,
+    result: &VerificationResult,
+    meta: Option<&MdocVerifyMeta>,
+) -> crate::dcql::CredentialType {
+    match token {
+        VpToken::SdJwtVc(presentation) => crate::dcql::CredentialType::Vct(
+            result
+                .valid
+                .then(|| sdjwtvc::verified_vct(presentation))
+                .flatten(),
+        ),
+        VpToken::Mdoc(_) => crate::dcql::CredentialType::DocTypes(
+            meta.map(|meta| meta.doc_types.clone()).unwrap_or_default(),
+        ),
+    }
 }
 
 #[cfg(test)]

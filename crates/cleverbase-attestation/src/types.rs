@@ -203,6 +203,24 @@ pub enum ReasonCode {
     /// material is present but its signature did not verify) and [`Self::Replay`]/[`Self::WrongAudience`]
     /// (binding present and valid, but bound to the wrong `nonce`/`audience`).
     MissingRequestBinding,
+    /// The presentation verified cryptographically (signature + trust + binding + disclosure integrity)
+    /// but does **not** satisfy the OpenID4VP 1.0 DCQL Credential Query it was requested under — the
+    /// verifier did **not** get what it asked for. This closes the "did I get what I requested" gap
+    /// (conformance-audit T4.1): a trusted, freshly-bound credential of the **wrong** `vct`/`docType`,
+    /// missing a requested claim, or carrying a claim value outside the query's `values`, is rejected
+    /// rather than waved through as VALID (OpenID4VP 1.0 §"VP Token Validation" step 2.2; §6 DCQL —
+    /// <https://openid.net/specs/openid-4-verifiable-presentations-1_0.html>). It is attributed AFTER
+    /// the always-on crypto/trust bar passes, so it is distinct from [`Self::Tamper`] /
+    /// [`Self::UntrustedIssuer`] / [`Self::HolderBinding`] (those are the credential being unsound) — the
+    /// credential is sound, it is simply not the one the DCQL query requested.
+    QueryNotSatisfied,
+    /// The caller-supplied [`crate::types::IssuerRole`] is inconsistent with the credential's claimed
+    /// type — e.g. a credential whose `vct`/`docType` is a EUDI **PID** type presented under a non-PID
+    /// trust-anchoring role (conformance-audit T4.3: per-role trust anchoring is only as good as the
+    /// role input, so the role is derived from / validated against the credential's claimed type and a
+    /// contradiction is rejected rather than silently anchoring under the wrong per-role list). A type
+    /// with no standardized role mapping keeps the caller-supplied role (no mismatch).
+    RoleMismatch,
 }
 
 /// The verdict of a verification (data-model.md `VerificationResult`).
@@ -297,6 +315,8 @@ mod tests {
             ReasonCode::UnsupportedFormat,
             ReasonCode::MalformedCredential,
             ReasonCode::MissingRequestBinding,
+            ReasonCode::QueryNotSatisfied,
+            ReasonCode::RoleMismatch,
         ] {
             assert_eq!(cbor_roundtrip(&reason), reason);
         }
