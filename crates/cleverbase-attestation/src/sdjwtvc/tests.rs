@@ -15,12 +15,13 @@ use serde_json::{json, Value};
 use super::test_issuer::{
     array_disclosure, attach_kb_jwt, attach_kb_jwt_with_iat, block_on, disclosure_digest,
     mint_array_element_disclosures, mint_concealable_object_with_concealable_child,
-    mint_dual_value_same_name, mint_nested_shared_leaf, mint_sd_jwt, mint_sd_jwt_with_typ,
-    mint_sd_jwt_with_validity, mint_sd_jwt_without_vct, object_disclosure, sign_issuer_jws,
-    Es256Signer, Sha2Hasher, HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
-    WRONG_ISSUER_CERT_DER, WRONG_ISSUER_KEY_PK8,
+    mint_dual_value_same_name, mint_nested_shared_leaf, mint_sd_jwt,
+    mint_sd_jwt_with_clear_subject_claim, mint_sd_jwt_with_typ, mint_sd_jwt_with_validity,
+    mint_sd_jwt_without_vct, object_disclosure, sign_issuer_jws, Es256Signer, Sha2Hasher,
+    HOLDER_JWK_JSON, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_CERT_DER,
+    WRONG_ISSUER_KEY_PK8,
 };
-use super::{verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
+use super::{presented_claims, verify_sd_jwt_vc, KeyBindingChallenge, SdJwtVcInput, StatusInput};
 use crate::trust::StaticTestAnchors;
 use crate::types::{AttributeValue, Format, IssuerRole, ReasonCode, TrustStatus};
 
@@ -189,10 +190,10 @@ fn non_integer_string_exp_is_rejected_not_ignored() {
 }
 
 #[test]
-fn fractional_past_exp_is_floored_and_rejected_as_expired() {
+fn fractional_past_exp_is_rounded_and_rejected_as_expired() {
     // RFC 7519 §2: "Non-integer values can be represented." A FRACTIONAL `exp` (200.5) is a valid
-    // NumericDate — it is floored to 200 (no longer false-rejected as malformed), then honored as a
-    // real upper bound: verifying at `now = NOW` (≫ 200) → Expired (NOT MalformedCredential).
+    // NumericDate — it is rounded up to 201 (no longer false-rejected as malformed), then honored as a
+    // real upper bound: verifying at `now = NOW` (≫ 201) → Expired (NOT MalformedCredential).
     let sd_jwt = mint_sd_jwt_with_validity(
         ISSUER_KEY_PK8,
         ISSUER_CERT_DER,
@@ -208,8 +209,8 @@ fn fractional_past_exp_is_floored_and_rejected_as_expired() {
 #[test]
 fn fractional_future_exp_is_accepted_not_false_rejected() {
     // FALSE-REJECT FIX (T7.1): a spec-valid fractional `exp` inside the window must VERIFY. `exp = 200.5`
-    // floors to 200; verifying at `now = 100` (< 200) is in-window → VALID. (Issuer-only presentation +
-    // no challenge so the KB-JWT `iat` freshness window — pinned to NOW — is not in play at `now = 100`.)
+    // rounds up to 201; verifying at `now = 100` (< 201) is in-window → VALID. (Issuer-only presentation
+    // + no challenge so the KB-JWT `iat` freshness window — pinned to NOW — is not in play at `now=100`.)
     let sd_jwt =
         mint_sd_jwt_with_validity(ISSUER_KEY_PK8, ISSUER_CERT_DER, Value::Null, json!(200.5));
     let presentation = sd_jwt.presentation();
@@ -310,10 +311,93 @@ fn check_validity_distinguishes_absent_from_malformed_bounds() {
         Err(ReasonCode::MalformedCredential)
     );
 
-    // RFC 7519 §2: a FRACTIONAL `nbf` is a valid NumericDate — floored (1.5 → 1) and honored, NOT
-    // malformed. `now = NOW` (≫ 1) is at/after the floored not-before → OK.
+    // RFC 7519 §2: a FRACTIONAL `nbf` is a valid NumericDate — rounded up (1.5 → 2) and honored, NOT
+    // malformed. `now = NOW` (≫ 2) is at/after the not-before → OK.
     let frac_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 1.5 })).unwrap();
     assert!(check_validity(&frac_nbf, NOW).is_ok());
+}
+
+#[test]
+fn fractional_bounds_round_up_so_a_sub_second_window_is_honored_exactly() {
+    // FALSE-REJECT FIX (#2): a fractional NumericDate must reflect the issuer's true sub-second window
+    // when compared against the whole-second `now` clock, never clip it a second early. Rounding BOTH
+    // bounds UP reproduces RFC 7519 §4.1.4 (`now < exp`) and §4.1.5 (`now >= nbf`) exactly for integer
+    // `now` — see `super::DateRounding::Up`. (`check_validity` reports a not-yet-valid `nbf` failure with
+    // the same `Expired` reason as an `exp` failure.)
+    use super::check_validity;
+    use sd_jwt_payload::SdJwtClaims;
+
+    // exp = T.5: VALID at now = T (RFC 7519 §4.1.4: 200 < 200.5 — the regression this fixes), Expired at
+    // now = T + 1 (201 not < 200.5).
+    let frac_exp: SdJwtClaims = serde_json::from_value(json!({ "exp": 200.5 })).unwrap();
+    assert!(
+        check_validity(&frac_exp, 200).is_ok(),
+        "exp=200.5 must stay valid through second 200 (true expiry is 200.5)"
+    );
+    assert_eq!(
+        check_validity(&frac_exp, 201),
+        Err(ReasonCode::Expired),
+        "exp=200.5 must be Expired once now is past it"
+    );
+
+    // nbf = T.5: not-yet-valid at now = T (RFC 7519 §4.1.5: 200 < 200.5 → reject), VALID at now = T + 1
+    // (201 >= 200.5). Flooring nbf would have wrongly accepted it at 200 (a sub-second before its
+    // issuer-asserted not-before).
+    let frac_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 200.5 })).unwrap();
+    assert_eq!(
+        check_validity(&frac_nbf, 200),
+        Err(ReasonCode::Expired),
+        "nbf=200.5 must be not-yet-valid at second 200 (true not-before is 200.5)"
+    );
+    assert!(
+        check_validity(&frac_nbf, 201).is_ok(),
+        "nbf=200.5 must be valid once now reaches/passes it"
+    );
+
+    // INTEGER bounds are unchanged: exp = T is Expired at now = T (exclusive upper bound, §4.1.4) and
+    // valid before; nbf = T is valid at now = T (inclusive lower bound, §4.1.5) and not-yet-valid before.
+    let int_exp: SdJwtClaims = serde_json::from_value(json!({ "exp": 200 })).unwrap();
+    assert_eq!(check_validity(&int_exp, 200), Err(ReasonCode::Expired));
+    assert!(check_validity(&int_exp, 199).is_ok());
+    let int_nbf: SdJwtClaims = serde_json::from_value(json!({ "nbf": 200 })).unwrap();
+    assert!(check_validity(&int_nbf, 200).is_ok());
+    assert_eq!(check_validity(&int_nbf, 199), Err(ReasonCode::Expired));
+}
+
+#[test]
+fn presented_claims_merges_clear_and_disclosed_excluding_machinery() {
+    // The FULL presented claim set (the DCQL gate's resolution input) is the issuer-signed CLEAR payload
+    // MERGED with the selectively-disclosed claims — distinct from the privacy-minimal DISCLOSED set.
+    let sd_jwt = mint_sd_jwt_with_clear_subject_claim(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+
+    let presented = presented_claims(&presentation);
+    // The CLEAR subject claim is present alongside the DISCLOSED one.
+    assert_eq!(
+        presented.get("given_name"),
+        Some(&AttributeValue::Text("Ada".into())),
+        "the clear given_name must be in the presented set"
+    );
+    assert_eq!(
+        presented.get("family_name"),
+        Some(&AttributeValue::Text("Lovelace".into())),
+        "the disclosed family_name must be in the presented set"
+    );
+    // Registered clear claims (e.g. `vct`) are "claims included in the presentation" and surfaced, but
+    // the SD-JWT machinery / holder-binding control keys are NEVER surfaced as claims.
+    assert!(presented.contains_key("vct"));
+    assert!(!presented.contains_key("_sd"));
+    assert!(!presented.contains_key("_sd_alg"));
+    assert!(!presented.contains_key("cnf"));
+
+    // The privacy-minimal disclosed set EXCLUDES the clear given_name — proving the two views differ.
+    let parsed = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    let disclosed = super::collect_disclosed_attributes(&parsed).unwrap();
+    assert!(
+        !disclosed.contains_key("given_name"),
+        "the disclosed-only view must omit the clear given_name"
+    );
+    assert!(disclosed.contains_key("family_name"));
 }
 
 #[test]

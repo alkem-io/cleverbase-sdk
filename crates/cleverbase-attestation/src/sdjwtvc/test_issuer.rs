@@ -143,8 +143,9 @@ pub(crate) const DEFAULT_VCT: &str = "https://credentials.example/identity_crede
 
 /// Mint an SD-JWT VC with caller-supplied `nbf`/`exp` JSON values — used to exercise
 /// [`super::check_validity`] / [`super::numeric_date`] across the spectrum: a canonical integer, a
-/// spec-valid FRACTIONAL number (RFC 7519 §2, floored), and a *non-canonical* bound (a JSON string or
-/// an out-of-`i64`-range integer) that must reject. A `null` value omits the claim (the absent case).
+/// spec-valid FRACTIONAL number (RFC 7519 §2; a validity bound rounds up — see `super::DateRounding`),
+/// and a *non-canonical* bound (a JSON string or an out-of-`i64`-range integer) that must reject. A
+/// `null` value omits the claim (the absent case).
 /// The bound is signed by the real issuer key, so the credential clears the signature/trust checks and
 /// reaches the validity check, exactly as a credential with that `exp` would.
 pub(crate) fn mint_sd_jwt_with_validity(
@@ -189,6 +190,39 @@ pub(crate) fn mint_sd_jwt_with_vct(issuer_pk8: &[u8], issuer_cert_der: &[u8], vc
         Some(vct),
         "dc+sd-jwt",
     )
+}
+
+/// Mint an SD-JWT VC carrying a **clear** subject claim alongside a **selectively-disclosable** one:
+/// `given_name = "Ada"` is left in the issuer-signed CLEAR payload (NOT made concealable) while
+/// `family_name = "Lovelace"` is concealable. Used by the DCQL clear-claim regression: a query for the
+/// clear `given_name` must resolve against the FULL presented claim set (clear + disclosed), exactly as
+/// one for the disclosed `family_name` does (OpenID4VP 1.0 §8.6 step 2.2 / §6.4). Everything else
+/// (trusted issuer signature + window + `cnf` holder binding) is sound, so it clears the always-on bar.
+pub(crate) fn mint_sd_jwt_with_clear_subject_claim(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": DEFAULT_VCT,
+        "given_name": "Ada",       // CLEAR — never made concealable, so it stays in the issuer payload.
+        "family_name": "Lovelace", // selectively disclosable (concealable below).
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
+            .make_concealable("/family_name")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
 }
 
 /// Mint an SD-JWT VC OMITTING the REQUIRED `vct` type claim — the missing-`vct` probe for the always-on

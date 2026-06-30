@@ -44,21 +44,28 @@
 //!
 //! It parses the DCQL query and, against a presentation the always-on bar already accepted, checks
 //! (a) **format**, (b) **meta** (SD-JWT VC `vct` ∈ `vct_values`; mdoc `docType` == `doctype_value`),
-//! (c) every requested **claim path** resolves in the verified **disclosed** attributes (honoring
-//! `claim_sets`), and (d) a claim's disclosed value ∈ its `values`. The set-level check (§"VP Token
-//! Validation" step 3 + §"Selecting Credentials") is [`crate::openid4vp::verify_vp_token`].
+//! (c) every requested **claim path** resolves in the **claims present in the verified presentation**
+//! (honoring `claim_sets`), and (d) a claim's presented value ∈ its `values`. The set-level check
+//! (§"VP Token Validation" step 3 + §"Selecting Credentials") is [`crate::openid4vp::verify_vp_token`].
 //!
 //! Value matching follows §6.3: for an ISO mdoc the CBOR value is matched after conversion to JSON
 //! (RFC 8949 §6.1) — the SDK's [`AttributeValue`] is already that decoded JSON-shaped value, so a
 //! `Text`/`Integer`/`Boolean` is matched against a string/integer/boolean respectively.
 //!
-//! Claim paths resolve against the **verified disclosed** attribute set
-//! ([`crate::types::VerificationResult::disclosed_attributes`]) — the privacy-minimal set the holder
-//! actually presented. A path targeting an always-visible (never-disclosed) registered scalar claim is
-//! treated as not-present (DCQL Claims Queries target subject claims, which are selectively
-//! disclosable). `trusted_authorities` (§6.1.1) is not evaluated here (issuer trust is the always-on
-//! bar's per-role anchoring); `require_cryptographic_holder_binding:false` is not honored (the SDK
-//! always requires holder binding — a documented secure default).
+//! Claim paths resolve against the **full set of claims present in the verified presentation** — the
+//! claims the holder actually presented, whether **selectively disclosed** OR carried in the **clear**
+//! (non-selectively-disclosable). Per OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2 a Verifier
+//! validates the query against the "Claims included in the presentation", and §6.4 notes a presentation
+//! legitimately carries non-selectively-disclosable claims — so a clear subject claim satisfies a query
+//! exactly as a disclosed one does. For SD-JWT VC this is the clear issuer-signed payload claims MERGED
+//! with the disclosed claims (the caller passes `crate::sdjwtvc::presented_claims`); for mdoc the
+//! namespace-grouped `disclosed_attributes` is already the full presented set (the `IssuerSignedItems`).
+//! This is broader than the privacy-minimal [`crate::types::VerificationResult::disclosed_attributes`]
+//! the verifier reports to the host, which omits the clear claims.
+//!
+//! `trusted_authorities` (§6.1.1) is not evaluated here (issuer trust is the always-on bar's per-role
+//! anchoring); `require_cryptographic_holder_binding:false` is not honored (the SDK always requires
+//! holder binding — a documented secure default).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -480,7 +487,7 @@ pub(crate) fn evaluate_single(
     query_json: &str,
     format: Format,
     credential_type: &CredentialType,
-    disclosed: &BTreeMap<String, AttributeValue>,
+    presented: &BTreeMap<String, AttributeValue>,
 ) -> DcqlGate {
     let Ok(query) = DcqlQuery::parse(query_json) else {
         return DcqlGate::Inactive;
@@ -491,7 +498,7 @@ pub(crate) fn evaluate_single(
     if query
         .credentials
         .iter()
-        .any(|candidate| query_satisfied_by(candidate, format, credential_type, disclosed))
+        .any(|candidate| query_satisfied_by(candidate, format, credential_type, presented))
     {
         DcqlGate::Satisfied
     } else {
@@ -501,13 +508,14 @@ pub(crate) fn evaluate_single(
 
 /// Whether a verified presentation satisfies one specific Credential Query: format + `meta` +
 /// `claims`/`claim_sets`/`values` (§6.1 / §6.3 / §"Selecting Claims"; §"VP Token Validation" step 2.2).
+/// `presented` is the full set of claims present in the verified presentation (clear + disclosed).
 pub(crate) fn query_satisfied_by(
     query: &CredentialQuery,
     format: Format,
     credential_type: &CredentialType,
-    disclosed: &BTreeMap<String, AttributeValue>,
+    presented: &BTreeMap<String, AttributeValue>,
 ) -> bool {
-    format_and_meta_match(query, format, credential_type) && claims_satisfied(query, disclosed)
+    format_and_meta_match(query, format, credential_type) && claims_satisfied(query, presented)
 }
 
 /// Whether the set of satisfied credential `id`s meets the request's set-level requirements
@@ -565,10 +573,10 @@ fn format_and_meta_match(
     }
 }
 
-/// Whether the query's requested claims are satisfied by the disclosed attributes (§"Selecting
-/// Claims"): no `claims` ⇒ trivially satisfied; `claims` without `claim_sets` ⇒ all must resolve; with
-/// `claim_sets` ⇒ at least one option's claims must all resolve.
-fn claims_satisfied(query: &CredentialQuery, disclosed: &BTreeMap<String, AttributeValue>) -> bool {
+/// Whether the query's requested claims are satisfied by the claims present in the verified
+/// presentation (§"Selecting Claims"): no `claims` ⇒ trivially satisfied; `claims` without `claim_sets`
+/// ⇒ all must resolve; with `claim_sets` ⇒ at least one option's claims must all resolve.
+fn claims_satisfied(query: &CredentialQuery, presented: &BTreeMap<String, AttributeValue>) -> bool {
     if query.claims.is_empty() {
         return true;
     }
@@ -576,7 +584,7 @@ fn claims_satisfied(query: &CredentialQuery, disclosed: &BTreeMap<String, Attrib
         return query
             .claims
             .iter()
-            .all(|claim| claim_resolves(claim, disclosed));
+            .all(|claim| claim_resolves(claim, presented));
     }
     let by_id: BTreeMap<&str, &ClaimsQuery> = query
         .claims
@@ -587,15 +595,15 @@ fn claims_satisfied(query: &CredentialQuery, disclosed: &BTreeMap<String, Attrib
         set.iter().all(|id| {
             by_id
                 .get(id.as_str())
-                .is_some_and(|claim| claim_resolves(claim, disclosed))
+                .is_some_and(|claim| claim_resolves(claim, presented))
         })
     })
 }
 
-/// Whether a single Claims Query resolves against the disclosed attributes: its `path` selects a
-/// non-empty set, and — if `values` is present (§6.3) — at least one selected value matches.
-fn claim_resolves(claim: &ClaimsQuery, disclosed: &BTreeMap<String, AttributeValue>) -> bool {
-    let selected = resolve_path(disclosed, &claim.path);
+/// Whether a single Claims Query resolves against the claims present in the presentation: its `path`
+/// selects a non-empty set, and — if `values` is present (§6.3) — at least one selected value matches.
+fn claim_resolves(claim: &ClaimsQuery, presented: &BTreeMap<String, AttributeValue>) -> bool {
+    let selected = resolve_path(presented, &claim.path);
     if selected.is_empty() {
         return false;
     }
@@ -606,13 +614,14 @@ fn claim_resolves(claim: &ClaimsQuery, disclosed: &BTreeMap<String, AttributeVal
         .is_none_or(|expected| selected.iter().any(|value| value_matches(value, expected)))
 }
 
-/// Process a Claims Path Pointer against the disclosed attribute object (§"Claims Path Pointer"
-/// processing), returning the selected values. The root is the disclosed-attributes object, so the
-/// first component MUST be a key (an object root). A type mismatch (a key into a non-object, an index /
-/// `null` into a non-array, or a missing key/index) drops that branch from the selection — the spec's
-/// "abort with error" and this "empty selection" are verdict-equivalent for the gate (both ⇒ the claim
-/// does not resolve). For an ISO mdoc the path is `[namespace, dataElementIdentifier]`, i.e. a key
-/// (the namespace) into the namespace-grouped result, then a key (the element identifier).
+/// Process a Claims Path Pointer against the presented-claims object (§"Claims Path Pointer"
+/// processing), returning the selected values. The root is the presented-claims object (clear +
+/// disclosed), so the first component MUST be a key (an object root). A type mismatch (a key into a
+/// non-object, an index / `null` into a non-array, or a missing key/index) drops that branch from the
+/// selection — the spec's "abort with error" and this "empty selection" are verdict-equivalent for the
+/// gate (both ⇒ the claim does not resolve). For an ISO mdoc the path is
+/// `[namespace, dataElementIdentifier]`, i.e. a key (the namespace) into the namespace-grouped result,
+/// then a key (the element identifier).
 fn resolve_path<'a>(
     root: &'a BTreeMap<String, AttributeValue>,
     path: &[PathComponent],

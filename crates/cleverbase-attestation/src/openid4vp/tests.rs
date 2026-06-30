@@ -15,8 +15,8 @@ use super::{
 };
 use crate::mdoc::test_issuer::MdocBuilder;
 use crate::sdjwtvc::test_issuer::{
-    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_vct, HOLDER_KEY_PK8, ISSUER_CERT_DER,
-    ISSUER_KEY_PK8, NOW,
+    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_clear_subject_claim, mint_sd_jwt_with_vct,
+    HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
@@ -702,6 +702,96 @@ fn sd_jwt_claim_value_match_and_mismatch() {
         StatusOutcome::NoStatus,
     );
     assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+}
+
+/// Run the single-presentation gate over the clear-claim fixture (CLEAR `given_name` + DISCLOSED
+/// `family_name`) with `dcql_json`.
+fn verify_clear_claim_with_dcql(dcql_json: &str) -> crate::types::VerificationResult {
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], dcql_json);
+    let sd_jwt = mint_sd_jwt_with_clear_subject_claim(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, &request.nonce_b64());
+    verify_response(
+        &VpToken::SdJwtVc(&presentation),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        StatusOutcome::NoStatus,
+    )
+}
+
+#[test]
+fn dcql_query_for_a_clear_sd_jwt_vc_claim_is_valid() {
+    // REGRESSION (wave-3): `given_name` is carried in the issuer-signed CLEAR payload (not selectively
+    // disclosed). OpenID4VP 1.0 §8.6 step 2.2 / §6.4: a claim PRESENT in the presentation satisfies the
+    // request whether disclosed OR clear. Before the fix the gate resolved a claims `path` only against
+    // the DISCLOSED set, so this same-credential query falsely rejected as QueryNotSatisfied.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["given_name"]}}]}}]}}"#
+    );
+    let result = verify_clear_claim_with_dcql(&dcql);
+    assert!(
+        result.valid,
+        "a DCQL query for a CLEAR subject claim must be VALID: {:?}",
+        result.reasons
+    );
+
+    // SAME-CREDENTIAL CONTROL: the identical credential with NO claims query (meta only) is VALID — so
+    // the clear-claim `path` is the sole variable and must not flip a sound credential to invalid.
+    let control = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}}}}]}}"#
+    );
+    assert!(
+        verify_clear_claim_with_dcql(&control).valid,
+        "the same credential with no claims query is VALID"
+    );
+}
+
+#[test]
+fn dcql_query_for_a_disclosed_sd_jwt_vc_claim_is_still_valid() {
+    // The disclosed `family_name` still resolves — the presented set is a SUPERSET of the disclosed set.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["family_name"]}}]}}]}}"#
+    );
+    assert!(
+        verify_clear_claim_with_dcql(&dcql).valid,
+        "a DCQL query for a DISCLOSED claim must still be VALID"
+    );
+}
+
+#[test]
+fn dcql_query_for_an_absent_sd_jwt_vc_claim_is_query_not_satisfied() {
+    // A claim genuinely ABSENT from the presentation (neither clear nor disclosed) must still reject —
+    // widening the resolution set to clear+disclosed does NOT make every path resolve (no weakening).
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["email_address"]}}]}}]}}"#
+    );
+    let result = verify_clear_claim_with_dcql(&dcql);
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
+}
+
+#[test]
+fn dcql_value_match_on_a_clear_sd_jwt_vc_claim_works() {
+    // A `values` restriction is evaluated against the CLEAR claim's value: "Ada" matches, "Bob" doesn't.
+    let matching = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["given_name"],"values":["Ada"]}}]}}]}}"#
+    );
+    assert!(
+        verify_clear_claim_with_dcql(&matching).valid,
+        "the clear given_name=Ada matches the requested value"
+    );
+
+    let mismatch = format!(
+        r#"{{"credentials":[{{"id":"pid","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}},"claims":[{{"path":["given_name"],"values":["Bob"]}}]}}]}}"#
+    );
+    let result = verify_clear_claim_with_dcql(&mismatch);
+    assert!(
+        !result.valid,
+        "a value mismatch on a clear claim must reject"
+    );
     assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
 }
 

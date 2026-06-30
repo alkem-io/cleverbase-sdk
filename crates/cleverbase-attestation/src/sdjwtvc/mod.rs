@@ -166,6 +166,31 @@ pub(crate) fn verified_vct(presentation: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The FULL set of claims a presented SD-JWT VC actually carries — the issuer-signed **clear** payload
+/// claims MERGED with the selectively-**disclosed** claims ([`collect_presented_claims`]) — for the
+/// in-core OpenID4VP DCQL Claims Query resolution ([`crate::dcql`]).
+///
+/// Unlike [`VerificationResult::disclosed_attributes`] (the privacy-minimal *disclosed* subset the
+/// verifier reports), this includes the always-present clear claims (e.g. a subject claim the issuer
+/// carried outside selective disclosure, plus registered claims), so a DCQL `path` targeting a clear
+/// claim resolves — OpenID4VP 1.0 §8.6 step 2.2 validates the query against the "Claims included in the
+/// presentation", and §6.4 recognises that a presentation legitimately carries non-selectively-
+/// disclosable claims. The SD-JWT machinery / holder-binding control keys (`_sd`, `_sd_alg`, `cnf`,
+/// `...`) are excluded.
+///
+/// The [`crate::openid4vp`] DCQL gate calls this **only after** [`verify_sd_jwt_vc`] returned `valid`
+/// (so the presentation parsed, every disclosure already matched an issuer-signed digest, and the SD
+/// machinery was already validated) — it is the gate's claim-resolution input, never an acceptance.
+/// Returns an empty map when the presentation does not parse or reconstruction fails (defensive; a VALID
+/// presentation always parses and reconstructs).
+#[must_use]
+pub(crate) fn presented_claims(presentation: &str) -> BTreeMap<String, AttributeValue> {
+    sd_jwt_payload::SdJwt::parse(presentation)
+        .ok()
+        .and_then(|sd_jwt| collect_presented_claims(&sd_jwt).ok())
+        .unwrap_or_default()
+}
+
 /// The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
 /// §4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
 /// to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
@@ -184,10 +209,14 @@ pub fn issuance_time_unix(presentation: &str) -> Option<i64> {
     let claims = sd_jwt.claims();
     // `iat` is the credential's issuance time; `nbf` (not-before) is the fallback relevant time. Only
     // a canonical NumericDate (a JSON integer that fits `i64`) is accepted; anything else → `None`.
-    numeric_date(claims.get("iat"))
+    numeric_date(claims.get("iat"), DateRounding::Down)
         .ok()
         .flatten()
-        .or_else(|| numeric_date(claims.get("nbf")).ok().flatten())
+        .or_else(|| {
+            numeric_date(claims.get("nbf"), DateRounding::Down)
+                .ok()
+                .flatten()
+        })
 }
 
 /// The verified, accepted view of a presentation, assembled once every always-on check has passed.
@@ -433,7 +462,9 @@ fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::Verifying
 /// Check the `nbf`/`exp` validity window against `now` (RFC 9901 carries the JWT `nbf`/`exp` claims).
 ///
 /// `nbf`/`exp` are JWT `NumericDate`s (RFC 7519 §2): a JSON number of seconds since the epoch (a
-/// fractional value is permitted and floored — see [`numeric_date`]). A **present** bound MUST be a
+/// fractional value is permitted and rounded **up** for both bounds — see [`DateRounding::Up`] — so the
+/// whole-second `now` comparison reflects the issuer's true sub-second window exactly). A **present**
+/// bound MUST be a
 /// NumericDate this verifier can evaluate; a present-but-unparseable bound (a JSON string `"200"`,
 /// `null`, or a magnitude outside `i64`) is NOT silently ignored — that would let an expired credential
 /// with a non-canonical `exp` be accepted as having unbounded validity (a false-accept). Instead it
@@ -467,8 +498,14 @@ fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::Verifying
 /// bug — a future refactor that "unifies" the two windows would silently change one format's accepted
 /// range, so the two sites cross-reference each other deliberately.
 fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Validity, ReasonCode> {
-    let not_before = numeric_date(claims.get("nbf"))?;
-    let not_after = numeric_date(claims.get("exp"))?;
+    // Both validity bounds round UP (`DateRounding::Up`): for the whole-second `now` clock this exactly
+    // reproduces RFC 7519 §4.1.4/§4.1.5's true sub-second comparisons (see [`DateRounding::Up`]) — a
+    // fractional `exp` is no longer clipped a sub-second early, and a fractional `nbf` is honored to its
+    // true instant. (Not flooring `nbf`: flooring it toward the past would accept a credential a
+    // sub-second BEFORE its issuer-asserted not-before — a §4.1.5 violation — whereas `ceil` keeps the
+    // not-yet-valid window exact.)
+    let not_before = numeric_date(claims.get("nbf"), DateRounding::Up)?;
+    let not_after = numeric_date(claims.get("exp"), DateRounding::Up)?;
     if let Some(nbf) = not_before {
         if now < nbf {
             return Err(ReasonCode::Expired);
@@ -537,38 +574,65 @@ fn is_collision_resistant_name(name: &str) -> bool {
     name.contains('.') && name.split('.').all(label_ok)
 }
 
+/// The rounding direction for a **fractional** NumericDate, chosen per the claim's role so that
+/// reducing a sub-second value to the whole-second `now` clock never falsely rejects a conformant
+/// credential at the boundary instant (RFC 7519 §2 permits non-integer NumericDates; `now` here is
+/// whole Unix seconds).
+#[derive(Clone, Copy)]
+enum DateRounding {
+    /// Round toward **+∞** (`ceil`) — the correct direction for a VALIDITY bound (`nbf`/`exp`) compared
+    /// against a whole-second `now`. For integer `now` and a real bound `b`, the spec comparisons
+    /// `now < exp` (RFC 7519 §4.1.4) and `now < nbf` → not-yet-valid (the negation of §4.1.5's
+    /// `now ≥ nbf`) are each *exactly equivalent* to the same comparison against `ceil(b)`: `now < b`
+    /// ⇔ `now < ceil(b)` and `now ≥ b` ⇔ `now ≥ ceil(b)` for integer `now`. So rounding **both** bounds
+    /// up reproduces the RFC's true sub-second window with whole-second arithmetic — a credential with
+    /// `exp = T.5` stays valid through second `T` (the false-reject this fixes) and `nbf = T.5` is
+    /// not-yet-valid at second `T`, while never accepting an instant strictly past the real bound. (The
+    /// `exp` upper bound stays EXCLUSIVE — `now >= exp` rejects — matching §4.1.4; see [`check_validity`]
+    /// for the documented mdoc divergence.)
+    Up,
+    /// Round toward **−∞** (`floor`, toward the past) — the conservative direction for the
+    /// issuance/relevant-time lookup ([`issuance_time_unix`]): the qualified-status gate reads the
+    /// issuer's status *at* issuance, so flooring `iat`/`nbf` never reads a later instant.
+    Down,
+}
+
 /// Read an optional JWT `NumericDate` claim (`nbf`/`exp`/`iat`), distinguishing **absent** from
 /// **present-but-malformed**, and accepting the spec's fractional form.
 ///
 /// - `None` (claim absent) → `Ok(None)`: the bound is optional and simply not asserted.
 /// - A JSON number → `Ok(Some(seconds))`: RFC 7519 §2 defines NumericDate as a JSON numeric value and
 ///   states "Non-integer values can be represented", so a FRACTIONAL value (e.g. `200.5`) is valid; it
-///   is floored to whole seconds (toward the past — the conservative direction for both a lower and an
-///   upper temporal bound). An integer that already fits `i64` is taken verbatim.
+///   is rounded to whole seconds in the `rounding` direction the caller selects per the claim's role
+///   (see [`DateRounding`]). An integer that already fits `i64` is taken verbatim (its `ceil`/`floor`
+///   are equal, so the direction is irrelevant for it).
 /// - A claim that is **present** but is not a JSON number (a string, `null`, a boolean, an object/
-///   array), is non-finite, or floors outside `i64` → `Err(MalformedCredential)`: the bound is
+///   array), is non-finite, or rounds outside `i64` → `Err(MalformedCredential)`: the bound is
 ///   uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential with a
 ///   non-canonical `exp` would read as having unbounded validity). We reject anything we cannot
 ///   evaluate against `now` rather than ignore it.
-fn numeric_date(claim: Option<&Value>) -> Result<Option<i64>, ReasonCode> {
+fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<i64>, ReasonCode> {
     let Some(value) = claim else { return Ok(None) };
     // A canonical integer NumericDate that already fits `i64` is taken verbatim.
     if let Some(int) = value.as_i64() {
         return Ok(Some(int));
     }
-    // RFC 7519 §2: "Non-integer values can be represented." Accept any JSON number and floor it to
-    // whole seconds; reject a non-number, or one that floors outside `i64` (a non-finite value is not
-    // in range either, so the range check below also rejects NaN/±∞).
+    // RFC 7519 §2: "Non-integer values can be represented." Accept any JSON number and round it to
+    // whole seconds in the role-appropriate direction; reject a non-number, or one that rounds outside
+    // `i64` (a non-finite value is not in range either, so the range check below also rejects NaN/±∞).
     let seconds = value.as_f64().ok_or(ReasonCode::MalformedCredential)?;
-    let floored = seconds.floor();
+    let rounded = match rounding {
+        DateRounding::Up => seconds.ceil(),
+        DateRounding::Down => seconds.floor(),
+    };
     // 2^63 is exactly representable in f64; bound the saturating f64→i64 cast against overflow without
     // an `i64::MAX as f64` cast (`cast_precision_loss`) or a 2^63 literal (`lossy_float_literal`). The
     // accepted range is `[-2^63, 2^63)` = `[i64::MIN, i64::MAX + 1)`.
     let limit = 2.0_f64.powi(63);
-    if !(-limit..limit).contains(&floored) {
+    if !(-limit..limit).contains(&rounded) {
         return Err(ReasonCode::MalformedCredential);
     }
-    Ok(Some(floored as i64))
+    Ok(Some(rounded as i64))
 }
 
 /// Verify the holder Key-Binding JWT (RFC 9901 §4.3), distinguishing what is checked **always** from
@@ -715,6 +779,16 @@ fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<()
         .map_err(|_| ())
 }
 
+/// The signature of a top-level claim walk shared by [`reconstruct_claim_set`]: given the issuer-signed
+/// payload object, the digest→disclosure index, and the running `used_digests` set, produce the claim
+/// map for that walk's view (disclosed-only or full presented set). [`disclosed_object`] and
+/// [`reconstruct_object`] both match it, so the two views share one validated preamble (DRY).
+type ClaimWalk = fn(
+    &serde_json::Map<String, Value>,
+    &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode>;
+
 /// Recompute the SD-JWT disclosure digests with `sha2`, match them against the issuer-signed `_sd`
 /// arrays, and reconstruct the **disclosed** claims preserving their nesting (RFC 9901 §7.1).
 ///
@@ -729,9 +803,49 @@ fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<()
 /// not a single collapsed `locality` (which both silently lost data *and*, when the leaf-keyed
 /// collision guard was added, false-rejected the legitimate EUDI PID shape as `DisclosureIntegrity`).
 /// Only the disclosed (selectively-disclosable) claims are surfaced; the always-visible registered
-/// claims (`iss`/`vct`/`nbf`/`exp`/…) are not "disclosed attributes" and are not returned here.
+/// claims (`iss`/`vct`/`nbf`/`exp`/…) are not "disclosed attributes" and are not returned here — this
+/// is the privacy-minimal set the verifier reports as [`VerificationResult::disclosed_attributes`]. The
+/// FULL set of claims actually present in the presentation (clear payload + disclosed) is
+/// [`collect_presented_claims`].
 fn collect_disclosed_attributes(
     sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    reconstruct_claim_set(sd_jwt, disclosed_object)
+}
+
+/// Reconstruct the **full set of claims actually present in the presentation** (RFC 9901 §7.1 recursive
+/// processing): the issuer-signed **clear** payload claims MERGED with the selectively-**disclosed**
+/// claims, excluding only the SD-JWT machinery / holder-binding control keys ([`is_sd_reserved_key`]:
+/// `_sd`, `_sd_alg`, `cnf`) and the `{"...": digest}` array-redaction placeholders. This is the
+/// "processed SD-JWT payload" a Verifier obtains after applying the disclosures.
+///
+/// It is a superset of [`collect_disclosed_attributes`] (it additionally keeps the clear, always-present
+/// claims — registered claims such as `iss`/`vct`/`iat`/`exp`/`nbf`/`status` and any clear subject
+/// claim the issuer carried outside selective disclosure). It is the claim set an OpenID4VP DCQL Claims
+/// Query resolves against (OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2: a Verifier validates that
+/// the Credential meets the query's criteria via the "Claims included in the presentation" — §6.4 notes
+/// a presentation legitimately carries non-selectively-disclosable claims), so a clear subject claim
+/// satisfies a query exactly as a disclosed one does. This view is NOT reported to the host (only the
+/// privacy-minimal `disclosed_attributes` is); it is the in-core DCQL gate's resolution input.
+///
+/// Shares the exact validated preamble + global integrity invariants of [`collect_disclosed_attributes`]
+/// via [`reconstruct_claim_set`]; only the top-level walk differs ([`reconstruct_object`] keeps clear
+/// properties, [`disclosed_object`] drops them).
+fn collect_presented_claims(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    reconstruct_claim_set(sd_jwt, reconstruct_object)
+}
+
+/// The validated preamble + global integrity invariants shared by [`collect_disclosed_attributes`] and
+/// [`collect_presented_claims`] (RFC 9901 §7.1): validate `_sd_alg`, index + digest every presented
+/// disclosure (rejecting a repeat), reject a nested `_sd_alg`, run the caller's top-level `walk`, then
+/// enforce the membership rule (every presented disclosure was substituted). The only difference between
+/// the two views is `walk` — both reach the SAME set of disclosures (they recurse into every clear
+/// child and substitute every `_sd`/redaction), so the membership/repeat invariants hold identically.
+fn reconstruct_claim_set(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+    walk: ClaimWalk,
 ) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
     // The `_sd_alg` MUST be sha-256 (the only registered alg we support); reject otherwise.
     if let Some(alg) = sd_jwt.claims()._sd_alg.as_deref() {
@@ -760,10 +874,10 @@ fn collect_disclosed_attributes(
         }
     }
 
-    // Reconstruct the disclosed subtree by substituting digests at their position in the issuer-signed
-    // structure (RFC 9901 §7.1): per-object claim-name uniqueness and the global "digest seen more than
-    // once" rule are enforced as we walk. `used_digests` records every digest we substitute, so a
-    // presented-but-unreferenced (forged) disclosure can be detected after the walk.
+    // Reconstruct by substituting digests at their position in the issuer-signed structure (RFC 9901
+    // §7.1): per-object claim-name uniqueness and the global "digest seen more than once" rule are
+    // enforced as we walk. `used_digests` records every digest we substitute, so a presented-but-
+    // unreferenced (forged) disclosure can be detected after the walk.
     let claims_value =
         serde_json::to_value(sd_jwt.claims()).map_err(|_| ReasonCode::MalformedCredential)?;
     // `SdJwtClaims` always serializes to a JSON object; a non-object is a serializer contract break.
@@ -781,14 +895,14 @@ fn collect_disclosed_attributes(
     }
 
     let mut used_digests = std::collections::BTreeSet::new();
-    let disclosed = disclosed_object(claims_object, &disclosures_by_digest, &mut used_digests)?;
+    let claims = walk(claims_object, &disclosures_by_digest, &mut used_digests)?;
 
     // Membership (FR-003): every presented disclosure's digest MUST appear in the issuer-signed
     // structure. Any digest we never substituted is a disclosure the issuer did not sign — forged.
     if used_digests.len() != disclosures_by_digest.len() {
         return Err(ReasonCode::DisclosureIntegrity);
     }
-    Ok(disclosed)
+    Ok(claims)
 }
 
 /// Reconstruct the **disclosed** claims of one object level (RFC 9901 §7.1), preserving nesting.

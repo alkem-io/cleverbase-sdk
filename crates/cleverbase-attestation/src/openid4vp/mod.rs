@@ -41,7 +41,9 @@ use crate::mdoc::{self, MdocVerifyMeta, MdocVerifyParams};
 use crate::sdjwtvc::{self, KeyBindingChallenge, SdJwtVcInput};
 use crate::status::StatusOutcome;
 use crate::trust::TrustAnchorSource;
-use crate::types::{Format, IssuerRole, ReasonCode, VerificationPolicy, VerificationResult};
+use crate::types::{
+    AttributeValue, Format, IssuerRole, ReasonCode, VerificationPolicy, VerificationResult,
+};
 
 /// A host-driven source of fresh entropy for the request `nonce` (keeps the core sans-IO — the
 /// entropy is host-provided, mirroring `cleverbase_core::HostContext.entropy`).
@@ -187,6 +189,29 @@ impl VpToken<'_> {
     }
 }
 
+/// The claim set a DCQL Claims Query resolves against for a VALID presentation — the FULL set of claims
+/// PRESENT in the presentation (OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2: the query is
+/// validated against the "Claims included in the presentation", which §6.4 notes legitimately includes
+/// non-selectively-disclosable claims). A claim present in the presentation satisfies the request
+/// whether it was selectively disclosed OR carried in the clear.
+///
+/// - **SD-JWT VC**: `disclosed_attributes` carries only the selectively-DISCLOSED subset, so a clear
+///   subject claim would never resolve. The resolution set is the FULL presented claim set — the clear
+///   issuer-signed claims MERGED with the disclosed claims ([`sdjwtvc::presented_claims`]).
+/// - **mdoc**: the namespace-grouped `disclosed_attributes` is already the full presented set (the
+///   `IssuerSignedItems` the holder released), so it is used as-is (cloned).
+///
+/// Computed only when `result.valid` (the only branch where the DCQL gate runs).
+fn dcql_resolution_set(
+    vp_token: &VpToken<'_>,
+    result: &VerificationResult,
+) -> BTreeMap<String, AttributeValue> {
+    match vp_token {
+        VpToken::SdJwtVc(presentation) => sdjwtvc::presented_claims(presentation),
+        VpToken::Mdoc(_) => result.disclosed_attributes.clone(),
+    }
+}
+
 /// Verify an OpenID4VP `vp_token` is cryptographically bound to an issued request, running the
 /// per-format always-on bar **plus** the nonce/audience binding (contracts/openid4vp-verifier.md).
 ///
@@ -271,15 +296,20 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     // sound, trusted, request-bound credential that does NOT satisfy the query (wrong `vct`/`docType`,
     // missing requested claim, or value mismatch) is rejected as `QueryNotSatisfied` (the credential is
     // sound but is not the one requested — distinct from `Tamper`/`UntrustedIssuer`/`HolderBinding`).
-    if result.valid
-        && crate::dcql::evaluate_single(
+    if result.valid {
+        // Resolve the DCQL claims against the FULL presented claim set (§8.6 step 2.2): for SD-JWT VC
+        // that is the clear issuer-signed claims merged with the disclosed claims — a clear subject claim
+        // must resolve, not only a selectively-disclosed one (see [`dcql_resolution_set`]).
+        let presented = dcql_resolution_set(vp_token, &result);
+        if crate::dcql::evaluate_single(
             &request.dcql.query_json,
             format,
             &credential_type,
-            &result.disclosed_attributes,
+            &presented,
         ) == crate::dcql::DcqlGate::NotSatisfied
-    {
-        result = VerificationResult::invalid(ReasonCode::QueryNotSatisfied);
+        {
+            result = VerificationResult::invalid(ReasonCode::QueryNotSatisfied);
+        }
     }
     (result, meta)
 }
@@ -565,11 +595,14 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
             let matches_query = result.valid
                 && credential_query.is_some_and(|candidate| {
                     let credential_type = credential_type_of(token, &result, meta.as_ref());
+                    // Resolve claims against the FULL presented claim set (§8.6 step 2.2 — clear +
+                    // disclosed for SD-JWT VC); see [`dcql_resolution_set`].
+                    let presented = dcql_resolution_set(token, &result);
                     crate::dcql::query_satisfied_by(
                         candidate,
                         token.format(),
                         &credential_type,
-                        &result.disclosed_attributes,
+                        &presented,
                     )
                 });
             if matches_query {
