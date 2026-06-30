@@ -222,6 +222,65 @@ CBOR envelope-shape change).
 - **Encrypted responses** (`direct_post.jwt`) and the **DC-API** handover remain out of scope (carried
   forward from the audit's documented cuts).
 
+### 1.5 ETSI trusted-list / qualified-status conformance (Theme 5 — `src/trust/{xml,engine}.rs`, `src/qualified/`)
+
+Conformance-audit **Theme 5** fixes, each verified **online** against the authoritative PDFs (ETSI
+TS 119 612 **V2.4.1** (2025-08), TS 119 615 **v1.4.1** (2026-05)) and the EU DSS reference
+(`github.com/esig/dss` `master`) — not training data. The trusted-list layer is **opt-in /
+experimental / pre-operational** (off by default).
+
+| Audit ID | Fix | §ref (verified online) | Module |
+|----------|-----|------------------------|--------|
+| **T5.1** (false-trust) | The always-on XML path now reads `<ServiceTypeIdentifier>` (§5.5.1) + `<ServiceStatus>` (§5.5.4) per `<TSPService>` and ingests a service's `<ServiceDigitalIdentity>` cert as an anchor **only when its status is `…/Svcstatus/granted`** (and, when the engine is configured with an expected type, only for that type). A **withdrawn** / suspended / absent-status service no longer anchors trust. | TS 119 612 V2.4.1 §5.5.1.1 (k) (`…/Svctype/EAA/Q`), §5.5.4 item i + Annex D.5 (`granted`/`withdrawn`) — <https://www.etsi.org/deliver/etsi_ts/119600_119699/119612/02.04.01_60/ts_119612v020401p.pdf> | `src/trust/xml.rs` (`commit_service`) |
+| **T5.2** (false-trust) | The qualified gate now enforces the **QEAA type-indication precondition**: the EAA must self-declare the qualified-EAA type via the URN `urn:etsi:esi:eaa:eu:qualified` before a `Qualified` verdict, else `Indeterminate`. The credential's declared type (SD-JWT VC `vct`) is threaded from `verify.rs`. | TS 119 615 v1.4.1 **PRO-4.12.4-03** (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) — <https://www.etsi.org/deliver/etsi_ts/119600_119699/119615/01.04.01_60/ts_119615v010401p.pdf> | `src/qualified/mod.rs`, `src/verify.rs` |
+| **T5.3** (false-trust if misused) | **Scope cut, hole closed.** The forgeable `chain_only=true` opt-in (a list accepted on its public, copyable signing-cert chain alone — no binding between signature and body) is **removed from production**: `XmlTrustList::authenticate` always **fails closed** (`SignatureUnverified`), and chain-only acceptance survives only behind a `#[cfg(test)]` seam. See the decision note below. | TS 119 612 V2.4.1 §5.7.1 (XAdES-B-B) + Annex B.1.0 (enveloped signature, two transforms, **exclusive C14N** `http://www.w3.org/2001/10/xml-exc-c14n#`); EN 319 132-1 | `src/trust/xml.rs`, `src/trust/engine.rs` |
+| **T5.4** (false-reject) | Cert↔service matching no longer requires byte-identical leaf DER. A credential leaf matches a service's Sdi by **exact X509Certificate DER**, **X509SKI** (`SubjectKeyIdentifier`), or the **issuing-CA relationship** (the Sdi lists the issuing CA → the leaf's `issuer` DN == the Sdi cert's `subject` DN, tightened by AKI==SKI when both present). `X509SubjectName` is **deliberately not** machine-matched. | TS 119 612 V2.4.1 §5.5.3 (X509SubjectName *"should not be used by applications in machine processable way"*); EU DSS `DigitalIdentityListTypeConverter` matches X509Certificate only — <https://github.com/esig/dss/blob/master/dss-tsl-validation/src/main/java/eu/europa/esig/dss/tsl/function/converter/DigitalIdentityListTypeConverter.java> | `src/qualified/mod.rs` (`ServiceEntry::matches_leaf`) |
+| **T5.5** (over-strict false-reject) | The always-on engine now distinguishes a **LOTL** from a **national / member-state TL**: a passed `NextUpdate` on a national TL is a **non-fatal WARNING** (the list stays usable; the engine records `NativeTrustEngine::warnings`), while a passed `NextUpdate` on the LOTL stays **fatal** (fail-closed). See the decision note below. | TS 119 615 v1.4.1 **PRO-4.2.4-10/12** (`WARNING_EUTL_NEXTUPDATE_PASSED`, national TL non-fatal) vs **PRO-4.1.4-13** (`LOTL_VERIFICATION_FAILED`, LOTL fatal); EU DSS `TLExpirationDetection` → configurable warning | `src/trust/engine.rs` |
+
+**Representative tests:** `trust::xml::tests::a_withdrawn_service_cert_does_not_anchor_trust_while_a_granted_one_does`,
+`the_service_type_filter_only_ingests_the_matching_type`, `authenticate_always_fails_closed_pending_full_xades`;
+`qualified::tests::granted_issuer_without_the_qualified_type_indication_is_indeterminate`,
+`granted_issuer_with_the_qualified_type_indication_is_qualified`, `qeaa_matched_by_issuing_ca_sdi_is_qualified`,
+`qeaa_matched_by_ski_sdi_is_qualified`; `trust::engine::tests::national_tl_past_next_update_is_a_warning_not_fatal_and_still_resolves`,
+`the_same_stale_list_as_a_lotl_is_fatal`, `xml_list_production_authentication_always_fails_closed`.
+
+**T5.2 version note (the `TS_119_615_VERSION` doc-nit reconciliation):** cl. 4.12 was introduced in
+TS 119 615 **v1.3.1** (2026-01) and retained in **v1.4.1** (2026-05). The QEAA self-declaration URN
+was **renamed between the two** — v1.3.1 `urn:etsi:eaa:eu:qualified` → v1.4.1
+`urn:etsi:esi:eaa:eu:qualified` (extra `esi:` segment). This implementation **pins v1.4.1**
+(`qualified::TS_119_615_VERSION = "1.4.1"`) and therefore uses the **v1.4.1 URN**; the module doc and the
+pinned constant are now consistent (the prior "v1.3.1" doc text was corrected to "introduced in v1.3.1,
+pinned at v1.4.1"). The SD-JWT VC `vct` is used as the available type-indication; a more exhaustive scan
+of arbitrary EAA content for the URN would require extending the SD-JWT VC layer (out of scope) and a
+miss is conservative (`Indeterminate`, never a false `Qualified`). ISO mdoc carries no cl. 4.12 URN
+construct (the URN is an SD-JWT-VC/JWT EAA-content type indication; TS 119 615 cl. 4.12 defines no mapping
+into mdoc `docType`/namespaces), so the mdoc path passes `None` and the precondition is not enforced for
+it — its qualified determination uses the cert→granted-`EAA/Q`-service status (§5.5.4).
+
+**T5.3 decision — why a scope cut, not a full XAdES implementation:** Annex B.1.0 fixes the TL
+signature as an **enveloped XAdES** whose `<ds:Reference>` carries an *enveloped-signature* transform
+**then exclusive canonicalization** (`xml-exc-c14n#`), with `<ds:CanonicalizationMethod>` over
+`<ds:SignedInfo>` also exclusive-C14N — so a faithful verification needs full XML **exclusive C14N** +
+`<ds:Reference>` digest recomputation + `SignatureValue` verification, with **no sound shortcut**. The
+in-tree `quick-xml` provides no canonicalization, and a hand-rolled exclusive-C14N (namespace
+propagation, attribute ordering, …) is a large, security-critical undertaking out of scope for this
+fix; a partial/incorrect C14N would be worse than an honest gap. The chosen fix therefore **closes the
+forgeable hole** rather than half-implementing the crypto: chain-only acceptance is gated `#[cfg(test)]`
+and the production XML path fails closed (`SignatureUnverified`). Implementing full XAdES verification
+(or vendoring a vetted XML-DSig/C14N crate) is the explicit remaining work. Until then the XML LOTL path
+is not usable in production — the offline JSON manifest (whose bytes the offline suite trusts) is.
+
+**T5.5 decision — spec behavior over the U1 fail-closed default, scoped to the always-on engine:** ETSI
+makes national-TL staleness a non-fatal WARNING (PRO-4.2.4-10/12) and only LOTL staleness fatal
+(PRO-4.1.4-13); EU DSS agrees (a configurable, default-log warning). The always-on engine now follows
+the spec: a list configured via `with_national_json_manifest` records a warning and stays usable past
+its `NextUpdate`, while a LOTL (`with_json_manifest` / `with_xml_list`) stays fatal-on-stale (the U1
+fail-closed default for the LOTL is preserved, so the `trust-anchor-source.md` U1 note remains accurate
+for the LOTL/default path). The **qualified-status gate (cl. 4.12)** deliberately keeps a **stricter**
+fail-closed staleness (a stale snapshot → `Indeterminate`): it must never assert `Qualified` from a
+stale or expired-signer trust snapshot (the now-vs-relevant-time SC-007 invariant), so it does not adopt
+the national-TL warning relaxation.
+
 ## 2. Crate version pins (the format/trust + crypto layers)
 
 The format/trust layers added for this feature are pinned to EXACT versions (`=x.y.z`) in the root

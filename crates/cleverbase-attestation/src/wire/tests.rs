@@ -9,7 +9,11 @@ use super::{
     WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
 };
 use crate::mdoc::test_issuer::{default_session_transcript, MdocBuilder};
-use crate::sdjwtvc::test_issuer::{mint_sd_jwt_with_validity, ISSUER_CERT_DER, ISSUER_KEY_PK8};
+use crate::qualified::EAA_EU_QUALIFIED_TYPE;
+use crate::sdjwtvc::test_issuer::{
+    block_on, holder_cnf, mint_sd_jwt_with_validity, Es256Signer, Sha2Hasher, ISSUER_CERT_DER,
+    ISSUER_KEY_PK8,
+};
 use crate::status::StatusOutcome;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
 
@@ -228,6 +232,36 @@ const WRONG_ISSUER: &[u8] =
 /// against the signer cert's window), so the gate test mints an in-window credential and runs here.
 const QUALIFIED_RELEVANT_GRANTED: i64 = IN_WINDOW_NOW; // 2026-09-01.
 
+/// Mint an SD-JWT VC whose `vct` IS the TS 119 615 v1.4.1 QEAA self-declaration URN
+/// ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03), with caller-chosen `nbf`/`exp`. The canonical
+/// `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both), so the
+/// qualified-gate wire test — which needs BOTH a self-declared QEAA type AND an in-window credential —
+/// builds it here from the shared test-issuer primitives.
+fn mint_qeaa_sd_jwt(nbf: i64, exp: i64) -> sd_jwt_payload::SdJwt {
+    use base64ct::{Base64, Encoding as _};
+    use sd_jwt_payload::SdJwtBuilder;
+    let cert_b64 = Base64::encode_string(ISSUER_CERT_DER);
+    let claims = serde_json::json!({
+        "iss": "https://issuer.example/cb",
+        "vct": EAA_EU_QUALIFIED_TYPE,
+        "nbf": nbf,
+        "exp": exp,
+        "given_name": "Ada",
+    });
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .expect("builder")
+            .header("x5c", serde_json::json!([cert_b64]))
+            .header("typ", serde_json::json!("dc+sd-jwt"))
+            .make_concealable("/given_name")
+            .expect("concealable")
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
 #[test]
 fn opt_in_gate_over_the_c_abi_populates_qualified_status_and_is_additive() {
     // T020: the wire envelope additively carries the gate flag, the national TL bytes, and the
@@ -237,11 +271,11 @@ fn opt_in_gate_over_the_c_abi_populates_qualified_status_and_is_additive() {
     // The credential + verification instant are in-window for both the leaf and the TL signer certs.
     let base = {
         let mut req = valid_sd_jwt_request();
-        let sd_jwt = mint_sd_jwt_with_validity(
-            ISSUER_KEY_PK8,
-            ISSUER_CERT_DER,
-            serde_json::json!(QUALIFIED_RELEVANT_GRANTED - 1_000),
-            serde_json::json!(QUALIFIED_RELEVANT_GRANTED + 1_000_000),
+        // The credential self-declares the QEAA type (vct = the TS 119 615 v1.4.1 URN) so the
+        // PRO-4.12.4-03 precondition is satisfied; in-window for both the leaf and the TL signer.
+        let sd_jwt = mint_qeaa_sd_jwt(
+            QUALIFIED_RELEVANT_GRANTED - 1_000,
+            QUALIFIED_RELEVANT_GRANTED + 1_000_000,
         );
         req.presentation = WirePresentation::SdJwtVc {
             presentation: sd_jwt.presentation(),

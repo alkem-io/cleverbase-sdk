@@ -8,22 +8,30 @@
 //! chain-
 //! validating the issuer's signing certificate ([`super::chain`]).
 //!
-//! ## Reachability / stale policy (U1, fail-closed by default)
+//! ## Reachability / stale policy (U1 — fail-closed for the LOTL; ETSI warning for a national TL)
 //!
-//! [`refresh`](NativeTrustEngine::refresh) is where the [`Reachability`] policy applies. Three outcomes are kept
-//! distinct (the contract's U1 requirement):
+//! [`refresh`](NativeTrustEngine::refresh) is where the [`Reachability`] policy applies. Outcomes are
+//! kept distinct (the contract's U1 requirement):
 //!
 //! - **Unreachable** — the [`TrustListFetcher`] could not return bytes ([`TrustError::Unreachable`]).
-//! - **Stale** — the fetched list parsed, but its `NextUpdate` is at/before the current clock
-//!   ([`TrustError::Stale`]).
-//! - **Authentication failure** — a fetched XML list's signing certificate did not chain to a
-//!   configured scheme anchor ([`TrustError::Authentication`]).
+//! - **Authentication failure** — a fetched XML list's signing certificate did not authenticate
+//!   ([`TrustError::Authentication`]). (Per the T5.3 scope cut the XML path fails closed by default —
+//!   see [`super::xml`].)
+//! - **Stale** — the fetched list parsed but its `NextUpdate` is at/before the current clock. **Staleness
+//!   is fatal only for a LOTL** (`ListKind::Lotl`): ETSI TS 119 615 v1.4.1 PRO-4.1.4-13 voids the LOTL
+//!   and **stops the process** when its `NextUpdate` has passed ([`TrustError::Stale`]). For a **national
+//!   / member-state TL** (`ListKind::National`) a passed `NextUpdate` is a **non-fatal WARNING**
+//!   (PRO-4.2.4-10/12, `WARNING_EUTL_NEXTUPDATE_PASSED`): the list still authenticates and remains usable,
+//!   and the engine records a warning ([`NativeTrustEngine::warnings`]) rather than failing. This aligns
+//!   with the EU DSS reference (`TLExpirationDetection` → a configurable, default-log **warning**).
+//!   Verified online against TS 119 615 v1.4.1 PRO-4.1.4-13 / PRO-4.2.4-10/12 and esig/dss `master`.
 //!
-//! Under [`Reachability::FailClosed`] (the default) any of these fails `refresh` **and** clears the
-//! cached anchors, so a subsequent `resolve` cannot serve stale/empty trust (no silent VALID). Under
-//! [`Reachability::BestEffort`] an unreachable/stale list keeps the last-known-good cache. All three
-//! are distinct from an **expired/withdrawn entry** (a present-but-out-of-window issuer leaf →
-//! `resolve` returns untrusted) and from the per-credential status endpoint
+//! Under [`Reachability::FailClosed`] (the default) an unreachable / authentication-failed / **LOTL**-stale
+//! refresh fails **and** clears the cached anchors, so a subsequent `resolve` cannot serve stale/empty
+//! trust (no silent VALID). Under [`Reachability::BestEffort`] an unreachable / LOTL-stale list keeps the
+//! last-known-good cache. A national-TL staleness is never a hard failure under either policy. All of
+//! these are distinct from an **expired/withdrawn entry** (a present-but-out-of-window issuer leaf, or a
+//! withdrawn TS 119 612 service → `resolve` returns untrusted) and from the per-credential status endpoint
 //! ([`crate::types::StatusReachability`]).
 
 use std::collections::BTreeMap;
@@ -50,22 +58,37 @@ pub trait TrustListFetcher {
 }
 
 /// The encoding of a configured trust list — selects the parse path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ListFormat {
     /// The offline JSON test manifest ([`TrustListManifest`]).
     JsonManifest,
-    /// A TS 119 612 trust-list XML ([`XmlTrustList`]); the `(role, format)` every service maps to,
-    /// and whether to authenticate on the signing-cert chain alone (the enveloped XML-DSig
-    /// `SignatureValue`/C14N check is the remaining production hardening — see [`super::xml`]).
+    /// A TS 119 612 trust-list XML ([`XmlTrustList`]); the `(role, format)` every ingested service maps
+    /// to, plus the optional expected `<ServiceTypeIdentifier>` (§5.5.1) filter (`None` = ingest any
+    /// `granted` service). The enveloped XAdES `SignatureValue`/exclusive-C14N check is a documented
+    /// scope cut, so the XML path fails closed in production — see [`super::xml`].
     Xml {
         role: IssuerRole,
         format: Format,
-        chain_only: bool,
+        service_type: Option<String>,
     },
 }
 
-/// One configured trust list: its logical name, encoding, and (for XML) the scheme-operator anchors
-/// that authenticate it.
+/// Whether a configured list is the **LOTL** (List of Trusted Lists) or a **national / member-state
+/// Trusted List** — which decides how a passed `NextUpdate` is handled (TS 119 615 v1.4.1):
+///
+/// - [`ListKind::Lotl`] — a passed `NextUpdate` is **fatal** (PRO-4.1.4-13: void the LOTL, stop).
+/// - [`ListKind::National`] — a passed `NextUpdate` is a **non-fatal WARNING** (PRO-4.2.4-10/12): the
+///   list still authenticates and remains usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    /// The List of Trusted Lists: a passed `NextUpdate` is fatal (TS 119 615 PRO-4.1.4-13).
+    Lotl,
+    /// A national / member-state TL: a passed `NextUpdate` is a non-fatal warning (PRO-4.2.4-10/12).
+    National,
+}
+
+/// One configured trust list: its logical name, encoding, kind (LOTL / national), and (for XML) the
+/// scheme-operator anchors that authenticate it.
 #[derive(Debug, Clone)]
 struct ConfiguredList {
     name: String,
@@ -73,16 +96,34 @@ struct ConfiguredList {
     /// The scheme-operator trust anchors (DER) that an XML list's signing cert must chain to. Empty
     /// for the JSON manifest (which carries no signature — the offline suite trusts its bytes).
     scheme_anchors_der: Vec<Vec<u8>>,
+    /// LOTL vs national — decides fatal-vs-warning staleness (TS 119 615 PRO-4.1.4-13 / 4.2.4-10).
+    kind: ListKind,
+    /// **Test-only seam**: when set, an XML list is authenticated on the signing-cert chain alone
+    /// (the `#[cfg(test)]` `XmlTrustList::authenticate_chain_only`) instead of the production
+    /// fail-closed [`XmlTrustList::authenticate`]. The full enveloped XAdES verification is a
+    /// documented scope cut (T5.3), so production XML authentication always fails closed; this seam
+    /// only keeps the parse → anchor-ingest wiring exercised by tests and is unreachable in production.
+    #[cfg(test)]
+    test_chain_only: bool,
 }
 
-/// The cached, authenticated anchors plus the earliest `NextUpdate` across the configured lists.
+/// The cached, authenticated anchors plus the LOTL freshness bound + any non-fatal refresh warnings.
 #[derive(Debug, Clone, Default)]
 struct Cache {
     /// Trusted anchor certificates (DER), keyed by `(role, format)`.
     anchors: BTreeMap<(IssuerRole, Format), Vec<Vec<u8>>>,
-    /// The earliest `NextUpdate` (Unix seconds) across all cached lists; `None` until first
-    /// refresh.
-    earliest_next_update: Option<i64>,
+    /// The earliest `NextUpdate` (Unix seconds) across the cached **LOTL** lists — the **fatal**
+    /// freshness bound that gates [`NativeTrustEngine::resolve`]. `None` when no (non-stale) LOTL list
+    /// is configured (e.g. a national-only engine), in which case staleness never blocks `resolve`
+    /// (national-TL staleness is a non-fatal warning — TS 119 615 PRO-4.2.4-10).
+    lotl_next_update: Option<i64>,
+    /// Whether a refresh has populated this cache (distinguishes "never refreshed" from "refreshed
+    /// with no LOTL freshness bound").
+    populated: bool,
+    /// Non-fatal warnings recorded during the last refresh (e.g. a national TL past its `NextUpdate`,
+    /// `WARNING_EUTL_NEXTUPDATE_PASSED` — TS 119 615 PRO-4.2.4-10). Surfaced via
+    /// [`NativeTrustEngine::warnings`].
+    warnings: Vec<String>,
 }
 
 impl Cache {
@@ -139,24 +180,60 @@ impl NativeTrustEngine {
         self.now_unix = now_unix;
     }
 
-    /// Configure the offline JSON manifest list under the given logical name (builder-style).
+    /// Append a configured list (the single push site, so the `#[cfg(test)]` `test_chain_only` field
+    /// is defaulted in one place).
+    fn push_list(
+        &mut self,
+        name: String,
+        format: ListFormat,
+        scheme_anchors_der: Vec<Vec<u8>>,
+        kind: ListKind,
+    ) {
+        self.lists.push(ConfiguredList {
+            name,
+            format,
+            scheme_anchors_der,
+            kind,
+            #[cfg(test)]
+            test_chain_only: false,
+        });
+    }
+
+    /// Configure the offline JSON manifest list under the given logical name, as the **LOTL** (a passed
+    /// `NextUpdate` is fatal — TS 119 615 PRO-4.1.4-13). Builder-style.
     #[must_use]
     pub fn with_json_manifest(mut self, name: impl Into<String>) -> Self {
-        self.lists.push(ConfiguredList {
-            name: name.into(),
-            format: ListFormat::JsonManifest,
-            scheme_anchors_der: Vec::new(),
-        });
+        self.push_list(
+            name.into(),
+            ListFormat::JsonManifest,
+            Vec::new(),
+            ListKind::Lotl,
+        );
         self
     }
 
-    /// Configure a TS 119 612 XML trust list under the given logical name, mapping every service it
-    /// carries to `(role, format)` and authenticating its signing cert against `scheme_anchors_der`
-    /// (builder-style).
+    /// Configure the offline JSON manifest list under the given logical name, as a **national /
+    /// member-state TL** (a passed `NextUpdate` is a non-fatal WARNING — TS 119 615 PRO-4.2.4-10/12;
+    /// the list stays usable). Builder-style.
+    #[must_use]
+    pub fn with_national_json_manifest(mut self, name: impl Into<String>) -> Self {
+        self.push_list(
+            name.into(),
+            ListFormat::JsonManifest,
+            Vec::new(),
+            ListKind::National,
+        );
+        self
+    }
+
+    /// Configure a TS 119 612 XML LOTL under the given logical name, mapping every **`granted`**
+    /// service it carries to `(role, format)` and authenticating its signing cert against
+    /// `scheme_anchors_der` (builder-style). `expected_service_type` optionally restricts ingestion to
+    /// `granted` services of one `<ServiceTypeIdentifier>` (§5.5.1; `None` = any granted service).
     ///
-    /// `chain_only` opts into authenticating on the signing-cert chain alone (the enveloped
-    /// XML-DSig `SignatureValue`/C14N check is the remaining production hardening — see
-    /// [`super::xml`]); with `false`, the list fails authentication closed by default.
+    /// The enveloped XAdES `SignatureValue`/exclusive-C14N verification is a documented scope cut
+    /// (T5.3 — see [`super::xml`]), so an XML list configured this way **fails authentication closed**
+    /// in production: a real LOTL is never trusted on the signing-cert chain alone.
     #[must_use]
     pub fn with_xml_list(
         mut self,
@@ -164,18 +241,79 @@ impl NativeTrustEngine {
         role: IssuerRole,
         format: Format,
         scheme_anchors_der: Vec<Vec<u8>>,
-        chain_only: bool,
+        expected_service_type: Option<String>,
+    ) -> Self {
+        self.push_list(
+            name.into(),
+            ListFormat::Xml {
+                role,
+                format,
+                service_type: expected_service_type,
+            },
+            scheme_anchors_der,
+            ListKind::Lotl,
+        );
+        self
+    }
+
+    /// **Test-only** seam: configure an XML list authenticated on the signing-cert chain alone (the
+    /// `#[cfg(test)]` `XmlTrustList::authenticate_chain_only`), so the parse → anchor-ingest wiring
+    /// stays exercised by tests. Production code cannot reach this (the full XAdES check is a scope
+    /// cut, so [`Self::with_xml_list`] always fails closed — T5.3).
+    #[cfg(test)]
+    pub(crate) fn with_xml_list_chain_only(
+        mut self,
+        name: impl Into<String>,
+        role: IssuerRole,
+        format: Format,
+        scheme_anchors_der: Vec<Vec<u8>>,
+        expected_service_type: Option<String>,
     ) -> Self {
         self.lists.push(ConfiguredList {
             name: name.into(),
             format: ListFormat::Xml {
                 role,
                 format,
-                chain_only,
+                service_type: expected_service_type,
             },
             scheme_anchors_der,
+            kind: ListKind::Lotl,
+            test_chain_only: true,
         });
         self
+    }
+
+    /// Non-fatal warnings recorded during the last successful refresh (e.g. a national TL past its
+    /// `NextUpdate`, `WARNING_EUTL_NEXTUPDATE_PASSED` — TS 119 615 PRO-4.2.4-10). Empty after a clean
+    /// refresh, and cleared when a fail-closed refresh drops the cache.
+    #[must_use]
+    pub fn warnings(&self) -> &[String] {
+        &self.cache.warnings
+    }
+
+    /// Authenticate a parsed XML list. **Production: fail-closed** ([`XmlTrustList::authenticate`] — the
+    /// full XAdES verification is a scope cut, T5.3). Under `#[cfg(test)]`, a list configured via
+    /// [`Self::with_xml_list_chain_only`] uses the chain-only seam so the ingest wiring is testable.
+    fn authenticate_xml(
+        &self,
+        parsed: &XmlTrustList,
+        list: &ConfiguredList,
+    ) -> Result<(), TrustError> {
+        let outcome = {
+            #[cfg(test)]
+            {
+                if list.test_chain_only {
+                    parsed.authenticate_chain_only(&list.scheme_anchors_der, self.now_unix)
+                } else {
+                    parsed.authenticate(&list.scheme_anchors_der, self.now_unix)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                parsed.authenticate(&list.scheme_anchors_der, self.now_unix)
+            }
+        };
+        outcome.map_err(|e| TrustError::Authentication(format!("{}: {e}", list.name)))
     }
 
     /// Fetch → parse → authenticate → cache every configured list, applying the reachability/stale
@@ -202,13 +340,14 @@ impl NativeTrustEngine {
                 ListFormat::Xml {
                     role,
                     format,
-                    chain_only,
+                    service_type,
                 } => {
-                    let parsed = XmlTrustList::parse(&bytes, *role, *format)
-                        .map_err(|e| TrustError::Authentication(format!("{}: {e}", list.name)))?;
-                    parsed
-                        .authenticate(&list.scheme_anchors_der, self.now_unix, *chain_only)
-                        .map_err(|e| TrustError::Authentication(format!("{}: {e}", list.name)))?;
+                    let parsed =
+                        XmlTrustList::parse(&bytes, *role, *format, service_type.as_deref())
+                            .map_err(|e| {
+                                TrustError::Authentication(format!("{}: {e}", list.name))
+                            })?;
+                    self.authenticate_xml(&parsed, list)?;
                     cache.add_anchors(
                         *role,
                         *format,
@@ -217,25 +356,44 @@ impl NativeTrustEngine {
                     parsed.next_update_unix()
                 }
             };
-            // Stale check (U1): a list at/after its NextUpdate is stale.
+            // Stale check (TS 119 612 cl. 5.3.15 NextUpdate). The handling is asymmetric by list kind
+            // (verified online against TS 119 615 v1.4.1):
+            // - LOTL (PRO-4.1.4-13): a passed NextUpdate is FATAL — void the LOTL and stop.
+            // - National TL (PRO-4.2.4-10/12): a passed NextUpdate is a non-fatal WARNING — the list
+            //   still authenticates and stays usable, so the engine records a warning and keeps the
+            //   anchors. (Mirrors EU DSS `TLExpirationDetection`'s configurable warning.)
             if self.now_unix >= next_update {
-                return Err(TrustError::Stale(list.name.clone()));
+                match list.kind {
+                    ListKind::Lotl => return Err(TrustError::Stale(list.name.clone())),
+                    ListKind::National => cache.warnings.push(format!(
+                        "national trusted list '{}' is past its NextUpdate \
+                         (non-fatal WARNING_EUTL_NEXTUPDATE_PASSED — TS 119 615 v1.4.1 PRO-4.2.4-10)",
+                        list.name
+                    )),
+                }
+            } else if matches!(list.kind, ListKind::Lotl) {
+                // Only a non-stale LOTL contributes the fatal freshness bound that gates `resolve`.
+                cache.lotl_next_update = Some(
+                    cache
+                        .lotl_next_update
+                        .map_or(next_update, |e| e.min(next_update)),
+                );
             }
-            cache.earliest_next_update = Some(
-                cache
-                    .earliest_next_update
-                    .map_or(next_update, |e| e.min(next_update)),
-            );
         }
+        cache.populated = true;
         Ok(cache)
     }
 
-    /// Whether the cache is currently fresh (a refresh succeeded and `now` is before the earliest
-    /// `NextUpdate`).
+    /// Whether the cache is currently usable: a refresh populated it AND no **LOTL** freshness bound has
+    /// passed (`now` before the earliest LOTL `NextUpdate`). A national-only cache (no LOTL bound) stays
+    /// usable past a national `NextUpdate` — that staleness is a non-fatal warning (TS 119 615
+    /// PRO-4.2.4-10), not a resolve-blocking condition.
     fn cache_is_fresh(&self) -> bool {
-        self.cache
-            .earliest_next_update
-            .is_some_and(|next| self.now_unix < next)
+        self.cache.populated
+            && self
+                .cache
+                .lotl_next_update
+                .is_none_or(|next| self.now_unix < next)
     }
 }
 
@@ -250,7 +408,8 @@ impl NativeTrustEngine {
     /// Returns [`TrustError::Unreachable`] / [`TrustError::Stale`] / [`TrustError::Authentication`]
     /// per the reachability/stale policy. Under [`Reachability::FailClosed`] the cache is cleared on
     /// any failure (no stale trust); under [`Reachability::BestEffort`] the last-known-good cache is
-    /// kept on an unreachable/stale list.
+    /// kept on an unreachable/LOTL-stale list. A national-TL staleness is never a failure (it is a
+    /// recorded warning — [`Self::warnings`]).
     pub fn refresh_with(&mut self, fetcher: &mut dyn TrustListFetcher) -> Result<(), TrustError> {
         match self.refresh_into_cache(fetcher) {
             Ok(cache) => {
@@ -284,8 +443,9 @@ impl TrustAnchorSource for NativeTrustEngine {
         supplied_intermediates: &[Vec<u8>],
         leaf_validity_time: Option<i64>,
     ) -> TrustDecision {
-        // Fail-closed at resolve time too: if the cache is stale (past NextUpdate at the current
-        // clock), do not serve it — an out-of-date list cannot anchor trust.
+        // Fail-closed at resolve time too: if the cache is not usable (never refreshed, or a LOTL
+        // freshness bound has passed at the current clock), do not serve it — an out-of-date LOTL
+        // cannot anchor trust.
         if !self.cache_is_fresh() {
             return TrustDecision::untrusted();
         }
@@ -322,6 +482,7 @@ mod tests {
     use super::{NativeTrustEngine, TrustListFetcher};
     use crate::trust::{Reachability, TrustAnchorSource, TrustError};
     use crate::types::{Format, IssuerRole};
+    use base64ct::{Base64, Encoding as _};
     use std::collections::HashMap;
 
     const TRUST_LIST_JSON: &[u8] =
@@ -496,12 +657,13 @@ mod tests {
         );
     }
 
-    // --- stale list (reachable, past NextUpdate) → fail-closed (distinct from unreachable) ----
+    // --- stale LOTL (reachable, past NextUpdate) → fail-closed (distinct from unreachable) ----
 
     #[test]
-    fn stale_list_fails_closed_even_when_reachable() {
+    fn stale_lotl_fails_closed_even_when_reachable() {
         // The list is reachable and parses, but `now` is past its 2036 NextUpdate → Stale, distinct
-        // from Unreachable and from an expired entry.
+        // from Unreachable and from an expired entry. It is configured as the LOTL (the default
+        // `with_json_manifest`), so a passed NextUpdate is FATAL (TS 119 615 PRO-4.1.4-13).
         let mut engine = json_engine(NOW_STALE, Reachability::FailClosed);
         let mut fetcher = MapFetcher::default().with("test-lotl", TRUST_LIST_JSON);
         let err = engine
@@ -541,9 +703,9 @@ mod tests {
     }
 
     #[test]
-    fn stale_best_effort_keeps_last_known_good_but_resolve_still_fails_closed() {
-        // Best-effort keeps the cache on a stale refresh, but resolve's own freshness gate (now >=
-        // earliest NextUpdate) still refuses to serve a stale cache → no silent trust.
+    fn stale_lotl_best_effort_keeps_last_known_good_but_resolve_still_fails_closed() {
+        // Best-effort keeps the cache on a stale LOTL refresh, but resolve's own freshness gate (now >=
+        // earliest LOTL NextUpdate) still refuses to serve a stale cache → no silent trust.
         let mut engine =
             NativeTrustEngine::new(Reachability::BestEffort, NOW).with_json_manifest("test-lotl");
         let mut fetcher = MapFetcher::default().with("test-lotl", TRUST_LIST_JSON);
@@ -568,17 +730,87 @@ mod tests {
         );
     }
 
+    // --- national-TL staleness = non-fatal WARNING (TS 119 615 PRO-4.2.4-10/12) — the T5.5 fix ----
+
+    /// Build an offline JSON manifest with a chosen `nextUpdate`, anchoring `ca-iaca` for
+    /// `(Qeaa, SdJwtVc)` — used to exercise the national-vs-LOTL staleness asymmetry.
+    fn manifest_json(next_update: &str) -> Vec<u8> {
+        format!(
+            r#"{{"nextUpdate":"{next_update}","anchors":[
+              {{"role":"Qeaa","format":"SdJwtVc","anchorCertDerB64":"{ca}"}}]}}"#,
+            ca = Base64::encode_string(CA_IACA),
+        )
+        .into_bytes()
+    }
+
+    // 2027-06-01: past a 2027-01 national NextUpdate, but the QEAA leaf (..2027-09-23) is still valid.
+    const NOW_2027_06: i64 = 1_811_808_000;
+    const STALE_2027_01: &str = "2027-01-01T00:00:00Z";
+
+    #[test]
+    fn national_tl_past_next_update_is_a_warning_not_fatal_and_still_resolves() {
+        // TS 119 615 PRO-4.2.4-10/12: a national TL past its NextUpdate is a NON-FATAL warning — the
+        // list still authenticates + stays usable. The refresh succeeds (no Stale error), records a
+        // warning, and `resolve` still serves the (still-valid) QEAA leaf.
+        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW_2027_06)
+            .with_national_json_manifest("nl-tl");
+        let mut fetcher = MapFetcher::default().with("nl-tl", &manifest_json(STALE_2027_01));
+        engine
+            .refresh_with(&mut fetcher)
+            .expect("a stale NATIONAL TL is a warning, not a fatal refresh failure");
+        assert!(
+            !engine.warnings().is_empty(),
+            "the passed national NextUpdate is recorded as a warning"
+        );
+        assert!(
+            engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, QEAA_ISSUER, &[], None)
+                .trusted,
+            "a stale national TL is still usable (PRO-4.2.4-12 EUTL_VERIFICATION_PASSED)"
+        );
+    }
+
+    #[test]
+    fn the_same_stale_list_as_a_lotl_is_fatal() {
+        // The asymmetry (PRO-4.1.4-13): the SAME stale list configured as the LOTL fails closed.
+        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW_2027_06)
+            .with_json_manifest("eu-lotl");
+        let mut fetcher = MapFetcher::default().with("eu-lotl", &manifest_json(STALE_2027_01));
+        assert!(matches!(
+            engine.refresh_with(&mut fetcher),
+            Err(TrustError::Stale(_))
+        ));
+        assert!(
+            !engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, QEAA_ISSUER, &[], None)
+                .trusted
+        );
+    }
+
+    #[test]
+    fn a_fresh_refresh_records_no_warnings() {
+        let mut engine = json_engine(NOW, Reachability::FailClosed);
+        let mut fetcher = MapFetcher::default().with("test-lotl", TRUST_LIST_JSON);
+        engine.refresh_with(&mut fetcher).unwrap();
+        assert!(
+            engine.warnings().is_empty(),
+            "a fresh LOTL records no warnings"
+        );
+    }
+
     // --- list-signature authentication (tampered/badly-signed list rejected) ------------------
 
-    /// Build a TS 119 612 XML list signed by `signer`, listing `service` as the anchor.
+    /// Build a TS 119 612 XML list with one `granted` EAA/Q service listing `service` as the anchor,
+    /// signed by `signer`.
     fn xml_list(service: &[u8], signer: &[u8], next_update: &str) -> Vec<u8> {
-        use base64ct::{Base64, Encoding as _};
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <TrustServiceStatusList xmlns="http://uri.etsi.org/02231/v2#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <SchemeInformation><NextUpdate><dateTime>{nu}</dateTime></NextUpdate></SchemeInformation>
   <TrustServiceProviderList><TrustServiceProvider><TSPServices><TSPService><ServiceInformation>
+    <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/EAA/Q</ServiceTypeIdentifier>
     <ServiceDigitalIdentity><DigitalId><X509Certificate>{svc}</X509Certificate></DigitalId></ServiceDigitalIdentity>
+    <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
   </ServiceInformation></TSPService></TSPServices></TrustServiceProvider></TrustServiceProviderList>
   <ds:Signature><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{sig}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>
 </TrustServiceStatusList>"#,
@@ -590,22 +822,24 @@ mod tests {
     }
 
     #[test]
-    fn xml_list_signed_by_trusted_scheme_anchor_is_accepted_and_anchors_issuers() {
-        // The XML LOTL is "signed" by the IACA root and lists sdjwt-issuer as a QEAA service anchor;
-        // the scheme anchor is the IACA root → chain-only authentication accepts the list.
+    fn xml_list_signed_by_trusted_scheme_anchor_is_accepted_and_anchors_granted_issuers() {
+        // The XML LOTL is "signed" by the IACA root and lists qc-qeaa-issuer as a GRANTED EAA/Q service
+        // anchor; the scheme anchor is the IACA root → the test-only chain-only seam accepts the list
+        // (production fails closed pending full XAdES — T5.3). The granted service anchor then anchors
+        // its own leaf directly (direct pin).
         let xml = xml_list(QEAA_ISSUER, CA_IACA, "2036-06-22T09:11:42Z");
-        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW).with_xml_list(
-            "eu-lotl",
-            IssuerRole::Qeaa,
-            Format::SdJwtVc,
-            vec![CA_IACA.to_vec()],
-            true, // chain_only opt-in (XML-DSig SignatureValue/C14N is the remaining hardening)
-        );
+        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW)
+            .with_xml_list_chain_only(
+                "eu-lotl",
+                IssuerRole::Qeaa,
+                Format::SdJwtVc,
+                vec![CA_IACA.to_vec()],
+                None,
+            );
         let mut fetcher = MapFetcher::default().with("eu-lotl", &xml);
         engine
             .refresh_with(&mut fetcher)
-            .expect("trusted-signer list authenticates");
-        // The listed service anchor (sdjwt-issuer) now anchors its own leaf directly (direct pin).
+            .expect("trusted-signer list authenticates via the test chain seam");
         assert!(
             engine
                 .resolve(IssuerRole::Qeaa, Format::SdJwtVc, QEAA_ISSUER, &[], None)
@@ -616,15 +850,16 @@ mod tests {
     #[test]
     fn xml_list_signed_by_untrusted_signer_is_rejected() {
         // Same list, but "signed" by the wrong-issuer (does not chain to the scheme anchor) →
-        // authentication fails, fail-closed clears the cache.
+        // authentication fails (even via the chain seam), fail-closed clears the cache.
         let xml = xml_list(QEAA_ISSUER, WRONG_ISSUER, "2036-06-22T09:11:42Z");
-        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW).with_xml_list(
-            "eu-lotl",
-            IssuerRole::Qeaa,
-            Format::SdJwtVc,
-            vec![CA_IACA.to_vec()],
-            true,
-        );
+        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW)
+            .with_xml_list_chain_only(
+                "eu-lotl",
+                IssuerRole::Qeaa,
+                Format::SdJwtVc,
+                vec![CA_IACA.to_vec()],
+                None,
+            );
         let mut fetcher = MapFetcher::default().with("eu-lotl", &xml);
         let err = engine
             .refresh_with(&mut fetcher)
@@ -638,22 +873,69 @@ mod tests {
     }
 
     #[test]
-    fn xml_list_default_authentication_fails_closed_without_chain_only_optin() {
-        // The default (chain_only = false) fails closed pending the full enveloped XML-DSig check,
-        // even when the signer chains — a real LOTL is never trusted on the chain alone by default.
+    fn xml_list_production_authentication_always_fails_closed() {
+        // T5.3: the PRODUCTION `with_xml_list` path fails authentication closed for EVERY XML list —
+        // even one whose signer chains to the scheme anchor — because the full enveloped XAdES
+        // SignatureValue/exclusive-C14N verification is a documented scope cut. A real LOTL is never
+        // trusted on the signing-cert chain alone.
         let xml = xml_list(QEAA_ISSUER, CA_IACA, "2036-06-22T09:11:42Z");
         let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW).with_xml_list(
             "eu-lotl",
             IssuerRole::Qeaa,
             Format::SdJwtVc,
             vec![CA_IACA.to_vec()],
-            false,
+            None,
         );
         let mut fetcher = MapFetcher::default().with("eu-lotl", &xml);
         assert!(matches!(
             engine.refresh_with(&mut fetcher),
             Err(TrustError::Authentication(_))
         ));
+        assert!(
+            !engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, QEAA_ISSUER, &[], None)
+                .trusted
+        );
+    }
+
+    #[test]
+    fn xml_list_withdrawn_service_does_not_anchor_via_the_chain_seam() {
+        // Even via the test chain seam, a WITHDRAWN service's cert must NOT anchor (T5.1): a list whose
+        // only EAA/Q service is `withdrawn` authenticates (signer ok) but carries no anchors → resolve
+        // is untrusted.
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<TrustServiceStatusList xmlns="http://uri.etsi.org/02231/v2#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+  <SchemeInformation><NextUpdate><dateTime>2036-06-22T09:11:42Z</dateTime></NextUpdate></SchemeInformation>
+  <TrustServiceProviderList><TrustServiceProvider><TSPServices><TSPService><ServiceInformation>
+    <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/EAA/Q</ServiceTypeIdentifier>
+    <ServiceDigitalIdentity><DigitalId><X509Certificate>{svc}</X509Certificate></DigitalId></ServiceDigitalIdentity>
+    <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn</ServiceStatus>
+  </ServiceInformation></TSPService></TSPServices></TrustServiceProvider></TrustServiceProviderList>
+  <ds:Signature><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{sig}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>
+</TrustServiceStatusList>"#,
+            svc = Base64::encode_string(QEAA_ISSUER),
+            sig = Base64::encode_string(CA_IACA),
+        )
+        .into_bytes();
+        let mut engine = NativeTrustEngine::new(Reachability::FailClosed, NOW)
+            .with_xml_list_chain_only(
+                "eu-lotl",
+                IssuerRole::Qeaa,
+                Format::SdJwtVc,
+                vec![CA_IACA.to_vec()],
+                None,
+            );
+        let mut fetcher = MapFetcher::default().with("eu-lotl", &xml);
+        engine
+            .refresh_with(&mut fetcher)
+            .expect("the list authenticates (signer ok) — it just carries no granted anchors");
+        assert!(
+            !engine
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, QEAA_ISSUER, &[], None)
+                .trusted,
+            "a withdrawn service must not anchor trust"
+        );
     }
 
     #[test]

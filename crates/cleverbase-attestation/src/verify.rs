@@ -348,7 +348,17 @@ fn qualified_status_for(
     // freshness `now >= NextUpdate` and the TL-signer's chain validity are "now" properties), while the
     // issuer's granted/withdrawn status is READ at the credential's OWN relevant time. A missing cert OR
     // a missing issuance time fails closed (Indeterminate) — the status is never read at "now".
-    let status_of = |cert: Option<Vec<u8>>, relevant_time: Option<i64>| -> QualifiedStatus {
+    //
+    // `type_indication` is the credential's self-declared type — the TS 119 615 v1.4.1 PRO-4.12.4-03
+    // QEAA self-declaration precondition (the URN `urn:etsi:esi:eaa:eu:qualified` must be present in the
+    // EAA content before a `Qualified` verdict, else `Indeterminate`). For SD-JWT VC it is the
+    // issuer-signed `vct`; for ISO mdoc it is `None` (cl. 4.12's URN is an SD-JWT-VC/JWT EAA-content
+    // construct with no defined mapping into mdoc content — the gate does not enforce it for mdoc; see
+    // `crate::qualified`).
+    let status_of = |cert: Option<Vec<u8>>,
+                     relevant_time: Option<i64>,
+                     type_indication: Option<&str>|
+     -> QualifiedStatus {
         match (cert, relevant_time) {
             (Some(cert_der), Some(relevant_time_unix)) => crate::qualified::qualified_status(
                 &cert_der,
@@ -356,16 +366,22 @@ fn qualified_status_for(
                 relevant_time_unix,
                 trust_list,
                 ctx.qualified_scheme_anchors,
+                type_indication,
             ),
             // No signing cert, or no issuance time to read the status at → undecidable, fail closed.
             _ => QualifiedStatus::Indeterminate,
         }
     };
     match presentation {
-        Presentation::SdJwtVc(p) => status_of(
-            sdjwtvc::issuer_signing_cert_der(p),
-            sdjwtvc::issuance_time_unix(p),
-        ),
+        Presentation::SdJwtVc(p) => {
+            // The SD-JWT VC `vct` is the credential's self-declared type-indication (PRO-4.12.4-03).
+            let vct = sdjwtvc::verified_vct(p);
+            status_of(
+                sdjwtvc::issuer_signing_cert_der(p),
+                sdjwtvc::issuance_time_unix(p),
+                vct.as_deref(),
+            )
+        }
         Presentation::Mdoc { .. } => {
             // Decide over EVERY document's issuer at that document's OWN issuance time; fold so
             // `Qualified` requires all to qualify. The gate runs only on a VALID credential, where the
@@ -376,11 +392,13 @@ fn qualified_status_for(
             // view. A `None` meta (no claimed issuers to fold) fails closed — empty fold →
             // `Indeterminate` — never a false "qualified".
             let claimed = mdoc_meta.map(|meta| meta.claimed_issuers.as_slice());
+            // ISO mdoc carries no cl. 4.12 URN type-indication construct → `None` (the precondition is
+            // not enforced for mdoc; its qualified determination uses the cert→granted-status path).
             fold_qualified(
                 claimed
                     .unwrap_or(&[])
                     .iter()
-                    .map(|(cert, issued)| status_of(Some(cert.clone()), Some(*issued))),
+                    .map(|(cert, issued)| status_of(Some(cert.clone()), Some(*issued), None)),
             )
         }
     }

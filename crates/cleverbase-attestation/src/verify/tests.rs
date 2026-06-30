@@ -9,10 +9,10 @@ use crate::mdoc::test_issuer::{
     default_session_transcript, mdoc_ds_cert_der, wrong_issuer_cert_der, MdocBuilder,
 };
 use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
-use crate::qualified::QualifiedTrustList;
+use crate::qualified::{QualifiedTrustList, EAA_EU_QUALIFIED_TYPE};
 use crate::sdjwtvc::test_issuer::{
-    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_validity, HOLDER_KEY_PK8, ISSUER_CERT_DER,
-    ISSUER_KEY_PK8, NOW, WRONG_ISSUER_KEY_PK8,
+    attach_kb_jwt, block_on, holder_cnf, mint_sd_jwt, mint_sd_jwt_with_validity, Es256Signer,
+    Sha2Hasher, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_KEY_PK8,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
@@ -499,6 +499,37 @@ fn qualified_trust_list_fixture() -> Option<QualifiedTrustList> {
     Some(QualifiedTrustList::parse(QUALIFIED_TRUST_LIST_JSON).expect("qualified TL fixture parses"))
 }
 
+/// Mint an SD-JWT VC whose `vct` IS the TS 119 615 v1.4.1 QEAA self-declaration URN
+/// ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03), with caller-chosen `nbf`/`exp`. The canonical
+/// `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both, and the
+/// `crate::sdjwtvc` test helpers must not be modified for this task), so the qualified-gate tests that
+/// need BOTH a self-declared QEAA type AND a specific issuance window build the credential here from the
+/// shared test-issuer primitives.
+fn mint_qeaa_sd_jwt(nbf: i64, exp: i64) -> sd_jwt_payload::SdJwt {
+    use base64ct::Encoding as _;
+    use sd_jwt_payload::SdJwtBuilder;
+    let cert_b64 = base64ct::Base64::encode_string(ISSUER_CERT_DER);
+    let claims = serde_json::json!({
+        "iss": "https://issuer.example/cb",
+        "vct": EAA_EU_QUALIFIED_TYPE,
+        "nbf": nbf,
+        "exp": exp,
+        "given_name": "Ada",
+    });
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .expect("builder")
+            .header("x5c", serde_json::json!([cert_b64]))
+            .header("typ", serde_json::json!("dc+sd-jwt"))
+            .make_concealable("/given_name")
+            .expect("concealable")
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
 #[test]
 fn single_document_mdoc_qualified_issuer_reports_qualified() {
     // Baseline: a SINGLE-document mdoc from the granted EAA/Q `mdoc-ds` issuer → Qualified (so the
@@ -712,12 +743,12 @@ fn qualified_status_uses_the_credentials_issuance_time_not_now() {
         return; // self-skip: fixture absent
     };
     // Minted with `nbf` BEFORE the grant; the always-on validity window still includes `now` so the
-    // credential is VALID and the gate runs (the gate only computes status for a VALID credential).
-    let sd_jwt = mint_sd_jwt_with_validity(
-        ISSUER_KEY_PK8,
-        ISSUER_CERT_DER,
-        serde_json::json!(RELEVANT_BEFORE_GRANTED), // nbf = issuance/relevant time, before the grant
-        serde_json::json!(RELEVANT_GRANTED + 1_000_000), // exp well after `now`
+    // credential is VALID and the gate runs (the gate only computes status for a VALID credential). The
+    // credential self-declares the QEAA type (vct = the URN) so PRO-4.12.4-03 is satisfied and the
+    // relevant-time read (not the URN precondition) is what decides NotQualified.
+    let sd_jwt = mint_qeaa_sd_jwt(
+        RELEVANT_BEFORE_GRANTED, // nbf = issuance/relevant time, before the grant
+        RELEVANT_GRANTED + 1_000_000, // exp well after `now`
     );
     let presentation = sd_jwt.presentation();
     let anchors = sd_jwt_anchors();
