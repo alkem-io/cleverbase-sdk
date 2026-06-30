@@ -190,6 +190,9 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         crate::types::Format::SdJwtVc,
         issuer_cert_der,
         supplied_intermediates,
+        // The SD-JWT VC issuer leaf has no distinct signing instant: its validity window is checked at
+        // the verification clock (`None` — the leaf is treated like every other chain certificate).
+        None,
     );
     if !decision.trusted {
         return Err(decision

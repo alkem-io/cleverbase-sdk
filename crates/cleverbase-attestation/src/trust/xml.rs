@@ -205,6 +205,8 @@ impl XmlTrustList {
             &[signer],
             scheme_anchors_der,
             now_unix,
+            // A trust-list signer has no distinct signing instant — its window is checked at `now_unix`.
+            None,
             crate::trust::chain::LeafPurpose::TrustListSigner,
         )
         .map_err(XmlTrustListError::SignerUntrusted)?;

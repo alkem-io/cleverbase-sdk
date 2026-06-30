@@ -294,10 +294,13 @@ impl PopJwtBuild {
     }
 }
 
-/// Build the OpenID4VCI **proof-of-possession** JWT signing input (`typ: openid4vci-proof+jwt`,
-/// draft OpenID4VCI 1.0 §8.2.1.1). Binds the credential-issuer `audience` and the issuer-supplied
-/// `c_nonce`; the holder public key travels in the `jwk` header so the issuer binds it as the
-/// credential's `cnf`.
+/// Build the OpenID4VCI **proof-of-possession** JWT signing input (the `jwt` proof type, OpenID4VCI
+/// 1.0 §F.1 `#jwt-proof-type`). The header carries `typ` (REQUIRED, `openid4vci-proof+jwt`), `alg`
+/// (REQUIRED, ES256), and the holder public key in the `jwk` header (so the issuer binds it as the
+/// credential's `cnf`); the body carries `aud` (REQUIRED, the Credential Issuer Identifier), `iat`
+/// (REQUIRED), and `nonce` (the `c_nonce` from the Nonce Endpoint, §7 `#nonce-endpoint`). `iss` is
+/// omitted: §F.1 requires it omitted "if the access token ... was obtained from a Pre-Authorized Code
+/// Flow through anonymous access to the token endpoint", which is this path.
 ///
 /// The host signs [`PopJwtBuild::input`] and [`PopJwtBuild::assemble`] splices the result.
 ///

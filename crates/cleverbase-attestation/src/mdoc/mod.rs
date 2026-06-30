@@ -656,6 +656,15 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     // Verify the IssuerAuth ES256 signature over the MSO with the DS certificate's key.
     verify_cose_sign1_es256(&issuer_auth, ds_cert_der)?;
 
+    // --- MSO validityInfo: parsed FIRST so its `signed` time is the DS-leaf validity instant. --------
+    // ISO/IEC 18013-5 §9.3.1 requires the Document Signer certificate's validity window to contain the
+    // MSO `signed` time (DS certs rotate ~monthly while mDLs live for years → checking the DS window at
+    // `now` would false-reject a conformant mDL once its DS cert expired). `signed` (== `issuance_time`)
+    // is also the credential's relevant time the qualified gate reads status at. (Parsing it here, ahead
+    // of the trust step, also runs its `signed`-not-in-future / `signed`-before-`validFrom` tamper
+    // checks before trust — both are reject paths, so the order does not change any VALID verdict.)
+    let (validity, issuance_time) = parse_validity_info(&mso, params.now_unix)?;
+
     // --- IssuerAuth trust: the DS leaf's certification path (leaf + supplied x5chain intermediates)
     //     must validate to the configured anchor for the role/format. -------------------------------
     let decision = anchors.resolve(
@@ -663,6 +672,10 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         crate::types::Format::Mdoc,
         ds_cert_der,
         supplied_intermediates,
+        // ISO 18013-5 §9.3.1: the DS leaf's window is checked against the MSO `signed` time, not `now`
+        // (the rest of the chain — intermediates → IACA anchor — stays at `now`). This is the seam that
+        // stops a conformant, in-window mDL from being false-rejected after its DS certificate expires.
+        Some(issuance_time),
     );
     if !decision.trusted {
         // A chain failure carries a coarse-but-accurate `TrustFailure`: an expired/not-yet-valid cert on
@@ -675,13 +688,10 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         ));
     }
 
-    // --- MSO digestAlgorithm + validityInfo. -------------------------------------------------------
+    // --- MSO digestAlgorithm + validity-window enforcement (at the verification instant `now`). -------
     let digest_alg_name = get_text(&mso, "digestAlgorithm").ok_or_else(VerifyFailure::malformed)?;
     let digest_alg =
         DigestAlgorithm::from_name(&digest_alg_name).ok_or_else(VerifyFailure::malformed)?;
-    // `signed` is the credential's issuance/relevant time (the qualified gate reads status AT it); it is
-    // mandatory here, so on this VALID path it is the value the gate would otherwise re-parse the MSO for.
-    let (validity, issuance_time) = parse_validity_info(&mso, params.now_unix)?;
     enforce_validity(&validity, params.now_unix)?;
 
     // --- Revocation / status (the T014 seam): the canonical outcome maps onto the bar. -------------

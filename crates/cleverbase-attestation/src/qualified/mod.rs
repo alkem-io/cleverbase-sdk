@@ -311,6 +311,8 @@ impl QualifiedTrustList {
             &[signer],
             scheme_anchors,
             now_unix,
+            // A trust-list signer has no distinct signing instant — its window is checked at `now_unix`.
+            None,
             crate::trust::chain::LeafPurpose::TrustListSigner,
         )
         .map_err(QualifiedTrustError::SignerNotTrusted)?;

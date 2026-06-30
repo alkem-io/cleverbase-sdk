@@ -57,12 +57,14 @@ fn an_offer(format: Format) -> CredentialOffer {
         pre_authorized_code: crate::secret::Secret::new("pre-auth"),
         credential_configuration_id: "cfg".to_owned(),
         format,
+        tx_code: None,
     }
 }
 fn reference_backend() -> IssuerBackend {
     IssuerBackend {
         kind: IssuerBackendKind::Reference,
         token_endpoint: "https://issuer.example/token".to_owned(),
+        nonce_endpoint: "https://issuer.example/nonce".to_owned(),
         credential_endpoint: "https://issuer.example/credential".to_owned(),
         credential_issuer: CREDENTIAL_ISSUER.to_owned(),
     }
@@ -136,8 +138,8 @@ fn obtain_round_trip_over_the_wire_yields_a_us1_verifiable_credential() {
     });
     let session = expect_obtain_http(out);
 
-    // token response → Sign effect.
-    let token = json!({ "access_token": "tok", "c_nonce": "cn" });
+    // token response (1.0: no c_nonce) → the Nonce-Endpoint HTTP effect (§7 `#nonce-endpoint`).
+    let token = json!({ "access_token": "tok", "token_type": "Bearer" });
     let out = drive(IssuanceOp::ResumeObtain {
         session,
         input: WireResumeObtain::Http {
@@ -145,8 +147,19 @@ fn obtain_round_trip_over_the_wire_yields_a_us1_verifiable_credential() {
             body: serde_json::to_vec(&token).unwrap(),
         },
     });
+    let session = expect_obtain_http(out);
+
+    // nonce response → Sign effect (the PoP bound to the Nonce-Endpoint c_nonce).
+    let out = drive(IssuanceOp::ResumeObtain {
+        session,
+        input: WireResumeObtain::Http {
+            status: 200,
+            body: serde_json::to_vec(&json!({ "c_nonce": "cn" })).unwrap(),
+        },
+    });
     let (session, input) = expect_obtain_sign(out);
     assert_eq!(input.audience(), CREDENTIAL_ISSUER);
+    assert_eq!(input.nonce(), "cn");
 
     // sign → credential HTTP effect.
     let signature = sign_with_holder(&input);
@@ -156,13 +169,15 @@ fn obtain_round_trip_over_the_wire_yields_a_us1_verifiable_credential() {
     });
     let session = expect_obtain_http(out);
 
-    // credential response (the in-test issuer double mints a real SD-JWT VC) → Obtained.
+    // credential response (the in-test issuer double mints a real SD-JWT VC, returned in the 1.0
+    // `credentials` array — §8.3 `#credential-response`) → Obtained.
     let minted = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER).presentation();
     let out = drive(IssuanceOp::ResumeObtain {
         session,
         input: WireResumeObtain::Http {
             status: 200,
-            body: serde_json::to_vec(&json!({ "credential": minted })).unwrap(),
+            body: serde_json::to_vec(&json!({ "credentials": [{ "credential": minted }] }))
+                .unwrap(),
         },
     });
     let held = expect_obtained(out);

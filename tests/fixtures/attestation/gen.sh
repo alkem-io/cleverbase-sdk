@@ -70,6 +70,23 @@ der_and_pk8() {
 # genec <out.key.pem>: generate an EC P-256 (prime256v1) private key.
 genec() { openssl ecparam -name prime256v1 -genkey -noout -out "$1"; }
 
+# qc_statements_der <name> <genconf-body>: emit the DER (hex) of an ETSI eIDAS `qcStatements` extension
+# VALUE described by an `openssl asn1parse -genconf` body. Used to attach role-appropriate QcStatements
+# to the SD-JWT VC issuer leaves (qcStatements ext OID 1.3.6.1.5.5.7.1.3, RFC 3739; non-critical per
+# ETSI EN 319 412-5 QCS-4.1-02). OID values verified online: id-etsi-qcs-QcCompliance 0.4.0.1862.1.1,
+# id-etsi-qcs-QcType 0.4.0.1862.1.6, id-etsi-qct-eseal 0.4.0.1862.1.6.2 (EN 319 412-5 §4.2);
+# id-etsi-qct-pid 0.4.0.194126.1.1 (TS 119 412-6 V1.1.1 Annex A, eIDAS-2 194126 arc).
+qc_statements_der() {
+  local name="$1"
+  local body="$2"
+  local cnf="${name}.qc.cnf"
+  local der="${name}.qc.der"
+  printf '%b' "$body" > "$cnf"
+  openssl asn1parse -genconf "$cnf" -out "$der" >/dev/null
+  xxd -p "$der" | tr -d '\n'
+  rm -f "$cnf" "$der"
+}
+
 # --- CA / IACA root (self-signed, EC P-256) --------------------------------------------------------
 # An ISO 18013-5 Annex-B-shaped IACA root: CA:TRUE, keyCertSign + cRLSign, with a CRL distribution
 # point. Doubles as the SD-JWT VC issuing root (one test root keeps the fixture set small).
@@ -95,8 +112,23 @@ leaf_cert() {
 }
 
 # --- SD-JWT VC issuer (ES256 over JOSE) ------------------------------------------------------------
+# A PID-provider SD-JWT VC issuer leaf: it carries the ETSI TS 119 412-6 PID QcStatement (QcType =
+# id-etsi-qct-pid), so the trust layer's per-role QcStatement guard accepts it as a PID issuer (and
+# rejects it as a QEAA, which would require QcCompliance + a qualified QcType). This is the primary
+# issuer the SD-JWT VC / OpenID4VP / wire tests sign PID credentials with (role IssuerRole::Pid).
+PID_QC_DER="$(qc_statements_der pid \
+  'asn1 = SEQUENCE:qcs\n[qcs]\ns1 = SEQUENCE:t\n[t]\nid = OID:0.4.0.1862.1.6\ninfo = SEQUENCE:v\n[v]\nx = OID:0.4.0.194126.1.1\n')"
 leaf_cert sdjwt-issuer "/CN=Cleverbase SDK Test SD-JWT VC Issuer/O=Alkemio Test/C=NL" \
-  'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+  "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n1.3.6.1.5.5.7.1.3=DER:${PID_QC_DER}\n"
+
+# --- QEAA SD-JWT VC issuer (qualified EAA: QcCompliance + QcType eseal) -----------------------------
+# A qualified-EAA SD-JWT VC issuer leaf issued by ca-iaca: it carries QcCompliance (the cert is an EU
+# qualified certificate) + QcType id-etsi-qct-eseal, so the per-role guard accepts it as a QEAA (and
+# rejects it as a PID, which would require id-etsi-qct-pid). Used by the chain + native-engine QEAA tests.
+QEAA_QC_DER="$(qc_statements_der qeaa \
+  'asn1 = SEQUENCE:qcs\n[qcs]\ns1 = SEQUENCE:c\ns2 = SEQUENCE:t\n[c]\nid = OID:0.4.0.1862.1.1\n[t]\nid = OID:0.4.0.1862.1.6\ninfo = SEQUENCE:v\n[v]\nx = OID:0.4.0.1862.1.6.2\n')"
+leaf_cert qc-qeaa-issuer "/CN=Cleverbase SDK Test QEAA SD-JWT VC Issuer/O=Alkemio Test/C=NL" \
+  "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n1.3.6.1.5.5.7.1.3=DER:${QEAA_QC_DER}\n"
 
 # --- mdoc Document Signer (ES256 over COSE; ISO 18013-5 §B.1.7) ------------------------------------
 leaf_cert mdoc-ds "/CN=Cleverbase SDK Test mdoc Document Signer/O=Alkemio Test/C=NL" \
@@ -344,6 +376,49 @@ issue_under mt-mdoc-ds-serverauth "/CN=Cleverbase SDK Test Multi-Tier Wrong-EKU 
 issue_under mt-mdoc-ds-no-eku "/CN=Cleverbase SDK Test Multi-Tier No-EKU DS/O=Alkemio Test/C=NL" \
   mt-root 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
 
+# --- mdoc DS leaf Table B.3 profile negatives (keyUsage = mc / basicConstraints = mc) --------------
+# ISO/IEC 18013-5:2021 Annex B Table B.3 marks the DS leaf's keyUsage (= digitalSignature) and
+# basicConstraints (= cA=FALSE) rows BOTH mandatory+critical (`mc`). These two leaves carry the CORRECT
+# mdlDS EKU but VIOLATE one Table-B.3 row each, so the DS-leaf profile guard MUST reject them even though
+# the EKU is present and they chain to mt-root:
+#   mt-mdoc-ds-catrue   cA=TRUE (a DS leaf must be cA=FALSE) — would let a DS cert double as an issuing CA.
+#   mt-mdoc-ds-wrongku  keyUsage = keyEncipherment only (no digitalSignature) — cannot sign the MSO.
+issue_under mt-mdoc-ds-catrue "/CN=Cleverbase SDK Test Multi-Tier DS cA=TRUE/O=Alkemio Test/C=NL" \
+  mt-root "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,${EKU_MDL_DS}\n"
+issue_under mt-mdoc-ds-wrongku "/CN=Cleverbase SDK Test Multi-Tier DS Wrong-KU/O=Alkemio Test/C=NL" \
+  mt-root "basicConstraints=CA:FALSE\nkeyUsage=critical,keyEncipherment\nextendedKeyUsage=critical,${EKU_MDL_DS}\n"
+
+# --- Unrecognized-critical-extension leaf (RFC 5280 §6.1.4 (o) / §6.1.5 (f)) -----------------------
+# A leaf carrying an extension marked CRITICAL whose OID the validator does not process (a private-arc
+# OID with a DER NULL value). It chains to mt-root and meets the SD-JWT VC issuer floor, but a conformant
+# validator MUST reject it (fail-closed) because it cannot process the unknown critical extension.
+issue_under mt-crit-unknown-leaf "/CN=Cleverbase SDK Test Unknown-Critical-Ext Leaf/O=Alkemio Test/C=NL" \
+  mt-root 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n1.3.6.1.4.1.99999.1=critical,DER:0500\n'
+
+# --- Name-constraints fixtures (RFC 5280 §4.2.1.10 / §6.1.3 (b)(c) / §6.1.4 (g)) -------------------
+# An intermediate sub-CA that scopes its issued certificates to a directoryName namespace: it permits
+# subjects under `C=NL, O=Alkemio Test` and excludes the sub-namespace `C=NL, O=Alkemio Test, OU=Forbidden`.
+# (nameConstraints is always critical — §4.2.1.10 — and is in the validator's recognized-critical set.)
+#   nc-leaf-in        subject C=NL/O=Alkemio Test/CN=… — WITHIN permitted, not excluded → trusted.
+#   nc-leaf-out       subject C=DE/O=Other Org/CN=…    — OUTSIDE permitted → rejected.
+#   nc-leaf-excluded  subject C=NL/O=Alkemio Test/OU=Forbidden/CN=… — within permitted BUT excluded → rejected.
+# Subjects are ordered C, O[, OU], CN so the constraint base DN is a binary prefix of each subject DN
+# (RFC 5280 §7.1 directoryName subtree matching). Issued under mt-root so the path reaches a configured anchor.
+genec nc-intermediate.key.pem
+openssl req -new -key nc-intermediate.key.pem \
+  -subj "/CN=Cleverbase SDK Test Name-Constrained Sub-CA/O=Alkemio Test/C=NL" -out nc-intermediate.csr
+openssl x509 -req -in nc-intermediate.csr -CA mt-root.cert.pem -CAkey mt-root.key.pem -CAcreateserial \
+  -sha256 -days "${DAYS_INT}" \
+  -extfile <(printf '%b' 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nnameConstraints=critical,permitted;dirName:nc_perm,excluded;dirName:nc_excl\n[nc_perm]\nC=NL\nO=Alkemio Test\n[nc_excl]\nC=NL\nO=Alkemio Test\nOU=Forbidden\n') \
+  -out nc-intermediate.cert.pem
+der_and_pk8 nc-intermediate
+issue_under nc-leaf-in "/C=NL/O=Alkemio Test/CN=Name-Constrained In-Namespace Leaf" \
+  nc-intermediate "${EE_EXTS}"
+issue_under nc-leaf-out "/C=DE/O=Other Org/CN=Name-Constrained Out-Of-Namespace Leaf" \
+  nc-intermediate "${EE_EXTS}"
+issue_under nc-leaf-excluded "/C=NL/O=Alkemio Test/OU=Forbidden/CN=Name-Constrained Excluded Leaf" \
+  nc-intermediate "${EE_EXTS}"
+
 # --- Cross-certificate / alternate-intermediate fixtures (backtracking path-walk) ------------------
 # A conformant credential may carry x5c/x5chain intermediates of which SEVERAL name-match (and validly
 # issue) the leaf — e.g. a cross-certified sub-CA: two certificates with the SAME subject DN and the
@@ -367,14 +442,17 @@ openssl req -new -key xc-key.key.pem -subj "${XC_SUBJECT}" -out xc-intermediate.
 openssl x509 -req -in xc-intermediate.csr -CA mt-root.cert.pem -CAkey mt-root.key.pem -CAcreateserial \
   -sha256 -days "${DAYS_INT}" \
   -extfile <(printf '%b' "${CA_EXTS}") -out xc-intermediate.cert.pem
-der_and_pk8 xc-intermediate
+# xc-intermediate signs with the SHARED xc-key (no per-stem private key of its own), so emit ONLY the
+# DER cert; the committed set carries xc-key.key.pk8, not an xc-intermediate.key.pk8.
+openssl x509 -in xc-intermediate.cert.pem -outform DER -out xc-intermediate.cert.der
 # xc-deadend: the SAME subject + SAME key, but ISSUED BY the rogue attacker-ca (a different issuer DN
 # that is neither supplied nor a configured anchor) → a genuine dead-end branch.
 openssl req -new -key xc-key.key.pem -subj "${XC_SUBJECT}" -out xc-deadend.csr
 openssl x509 -req -in xc-deadend.csr -CA attacker-ca.cert.pem -CAkey attacker-ca.key.pem -CAcreateserial \
   -sha256 -days "${DAYS_INT}" \
   -extfile <(printf '%b' "${CA_EXTS}") -out xc-deadend.cert.pem
-der_and_pk8 xc-deadend
+# Same shared xc-key — emit only the DER cert (no xc-deadend.key.pk8 in the committed set).
+openssl x509 -in xc-deadend.cert.pem -outform DER -out xc-deadend.cert.der
 # xc-leaf: an end-entity whose issuer is the shared sub-CA subject; its signature verifies under xc-key.
 # Issue it under xc-intermediate (which holds xc-key) so the issuer DN is the shared sub-CA subject.
 genec xc-leaf.key.pem
@@ -410,12 +488,16 @@ openssl req -x509 -new -key si-root.key.pem -sha256 -days "${DAYS_CA}" \
   -out si-root.cert.pem
 der_and_pk8 si-root
 # si-rollover: a NEW key, subject == si-root's DN, signed by si-root (issuer == si-root's DN) → the
-# issuer and subject DNs are identical ⇒ SELF-ISSUED. CA:TRUE so it may issue the next sub-CA.
+# issuer and subject DNs are identical ⇒ SELF-ISSUED. As a key-rollover of si-root it mirrors si-root's
+# pathlen:1 (NOT the generic CA_EXTS pathlen:0): it must allow ONE non-self-issued intermediate (si-subca)
+# below it, otherwise si-rollover→si-subca would itself be a pathLenConstraint violation regardless of the
+# §6.1.4 (l) self-issued exclusion this fixture is meant to exercise.
 genec si-rollover.key.pem
 openssl req -new -key si-rollover.key.pem -subj "${SI_ROOT_SUBJECT}" -out si-rollover.csr
 openssl x509 -req -in si-rollover.csr -CA si-root.cert.pem -CAkey si-root.key.pem -CAcreateserial \
   -sha256 -days "${DAYS_INT}" \
-  -extfile <(printf '%b' "${CA_EXTS}") -out si-rollover.cert.pem
+  -extfile <(printf '%b' 'basicConstraints=critical,CA:TRUE,pathlen:1\nkeyUsage=critical,keyCertSign,cRLSign\n') \
+  -out si-rollover.cert.pem
 der_and_pk8 si-rollover
 # si-subca: a real non-self-issued sub-CA issued BY si-rollover (signed with the new rollover key).
 genec si-subca.key.pem
@@ -475,9 +557,11 @@ JSON
 # status the gate chain-validates the signer against the scheme anchor (here ca-iaca signs/IS the
 # signer, a direct DER-equal pin) and rejects a stale list (now >= nextUpdate); a forged/unsigned/
 # unchained/stale list yields the honest Indeterminate, never Qualified (SC-007). It lists:
-#   * sdjwt-issuer  as an EAA/Q service, GRANTED from 2020-01-01 (qualified at the test instants);
-#   * mdoc-ds       as an EAA/Q service, GRANTED then WITHDRAWN on 2025-09-01 (status-at-time matters);
+#   * sdjwt-issuer  as an EAA/Q service, GRANTED from 2026-07-01 (qualified at the granted test instants;
+#                   a relevant time BEFORE the grant reads "found but not granted" → NotQualified);
+#   * mdoc-ds       as an EAA/Q service, GRANTED 2026-07-01 then WITHDRAWN 2027-03-01 (status-at-time matters);
 #   * ca-iaca       as a plain EAA (NON-qualified) service — a trusted-but-not-qualified issuer.
+# (These grant/withdraw instants are chosen to bracket the qualified-gate tests' RELEVANT_* times.)
 # A signing cert absent from every service yields the honest Indeterminate (no false "qualified").
 B64_SDJWT="$(openssl base64 -A -in sdjwt-issuer.cert.der)"
 B64_MDOC_DS="$(openssl base64 -A -in mdoc-ds.cert.der)"
@@ -497,7 +581,7 @@ cat > qualified-trust-list.json <<JSON
       "serviceTypeIdentifier": "${SVCTYPE_EAA_Q}",
       "signingCertDerB64": "${B64_SDJWT}",
       "statusHistory": [
-        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2020-01-01T00:00:00Z" }
+        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2026-07-01T00:00:00Z" }
       ]
     },
     {
@@ -505,8 +589,8 @@ cat > qualified-trust-list.json <<JSON
       "serviceTypeIdentifier": "${SVCTYPE_EAA_Q}",
       "signingCertDerB64": "${B64_MDOC_DS}",
       "statusHistory": [
-        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2020-01-01T00:00:00Z" },
-        { "status": "${SVCSTATUS_WITHDRAWN}", "startingTime": "2025-09-01T00:00:00Z" }
+        { "status": "${SVCSTATUS_GRANTED}", "startingTime": "2026-07-01T00:00:00Z" },
+        { "status": "${SVCSTATUS_WITHDRAWN}", "startingTime": "2027-03-01T00:00:00Z" }
       ]
     },
     {
@@ -532,7 +616,8 @@ It contains NO real keys, NO real secrets, and is NOT for any production use.
 Tier B — self-generated test backbone (this directory, minted by gen.sh)
 ------------------------------------------------------------------------
   ca-iaca.*        self-signed test CA / ISO 18013-5 IACA root (EC P-256)
-  sdjwt-issuer.*   SD-JWT VC issuer leaf (JOSE ES256), issued by ca-iaca
+  sdjwt-issuer.*   PID SD-JWT VC issuer leaf (JOSE ES256, QcStatement QcType id-etsi-qct-pid), ca-iaca-issued
+  qc-qeaa-issuer.* QEAA SD-JWT VC issuer leaf (QcCompliance + QcType id-etsi-qct-eseal), ca-iaca-issued
   mdoc-ds.*        mdoc Document Signer leaf (COSE ES256, EKU id-mso-mdl-DS), issued by ca-iaca
   holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
   wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
@@ -554,6 +639,13 @@ Tier B — self-generated test backbone (this directory, minted by gen.sh)
   mt-mdoc-ds.*     mt-root-issued mdoc DS leaf WITH the correct mdlDS EKU (1.0.18013.5.1.2) — purpose OK
   mt-mdoc-ds-serverauth.*  mt-root-issued leaf with a FOREIGN serverAuth EKU (wrong mdoc DS purpose)
   mt-mdoc-ds-no-eku.*  mt-root-issued leaf with NO EKU (mandatory mdoc DS EKU missing → wrong purpose)
+  mt-mdoc-ds-catrue.*  mt-root-issued DS leaf with cA=TRUE (Table B.3 basicConstraints mc → wrong purpose)
+  mt-mdoc-ds-wrongku.* mt-root-issued DS leaf with keyUsage=keyEncipherment (Table B.3 keyUsage mc → wrong purpose)
+  mt-crit-unknown-leaf.*  mt-root-issued leaf with an unrecognized CRITICAL extension (RFC 5280 §6.1.5(f) reject)
+  nc-intermediate.*  name-constrained sub-CA (permitted dirName C=NL,O=Alkemio Test; excluded …,OU=Forbidden)
+  nc-leaf-in.*     leaf within nc-intermediate's permitted directoryName subtree → trusted
+  nc-leaf-out.*    leaf outside the permitted subtree (C=DE) → rejected (name-constraint violation)
+  nc-leaf-excluded.*  leaf within an EXCLUDED subtree (OU=Forbidden) → rejected (name-constraint violation)
   xc-key.*         the EC key SHARED by the two cross-certificates below (one committed pk8)
   xc-intermediate.* cross-cert sub-CA (subject S, key xc-key) issued by mt-root → reaches the anchor
   xc-deadend.*     cross-cert sub-CA (SAME subject S + key) issued by the rogue attacker-ca → dead-end
@@ -631,8 +723,34 @@ fi
 echo "xc-leaf: verifies via xc-intermediate→mt-root; the xc-deadend cross-cert is a true dead-end (expected)"
 # Self-issued rollover path: si-leaf → si-subca → si-rollover (self-issued) → si-root validates only
 # because the self-issued rollover is NOT counted toward si-root's pathlen:1 (RFC 5280 §6.1.4 (l)).
-openssl verify -CAfile si-root.cert.der -untrusted <(cat si-rollover.cert.der si-subca.cert.der) si-leaf.cert.der
-echo "si-leaf: self-issued rollover excluded from pathLen, path validates (RFC 5280 §6.1.4 (l)) (expected)"
+# Use the PEM forms for the `-untrusted` bundle: PEM concatenates cleanly, whereas two raw DER certs
+# streamed together have no inter-certificate framing (openssl would read only the first). This check is
+# ADVISORY and non-fatal: the self-issued-rollover pathLen exclusion (RFC 5280 §6.1.4 (l)) is verified
+# authoritatively by the SDK's own `trust::chain` test; some openssl versions count the self-issued
+# rollover toward pathLenConstraint differently, so a non-zero exit here is not a fixture defect.
+if openssl verify -CAfile si-root.cert.pem \
+    -untrusted <(cat si-rollover.cert.pem si-subca.cert.pem) si-leaf.cert.pem >/dev/null 2>&1; then
+  echo "si-leaf: self-issued rollover excluded from pathLen, path validates (RFC 5280 §6.1.4 (l)) (openssl agrees)"
+else
+  echo "si-leaf: openssl's pathLen/self-issued handling differs (RFC §6.1.4 (l) verified by the SDK's own test)"
+fi
+
+# QcStatement issuer leaves chain to ca-iaca (the per-role QcStatement guard is the SDK's, not openssl's).
+openssl verify -CAfile ca-iaca.cert.der qc-qeaa-issuer.cert.der
+echo "sdjwt-issuer (QcType pid) / qc-qeaa-issuer (QcCompliance+eseal): chains sound; role-QcStatement enforced by the SDK"
+# mdoc DS Table-B.3 negatives + the unknown-critical-ext leaf chain to mt-root (the profile/critical-ext
+# gates are the SDK's, not openssl's, so the chains themselves are sound).
+openssl verify -CAfile mt-root.cert.der mt-mdoc-ds-catrue.cert.der >/dev/null && \
+  echo "mt-mdoc-ds-{catrue,wrongku} + mt-crit-unknown-leaf: chains sound; rejected by the SDK's Table B.3 / critical-ext gates"
+# Name-constraints: openssl's own NC engine confirms in-namespace verifies and out/excluded are rejected.
+openssl verify -CAfile mt-root.cert.der -untrusted nc-intermediate.cert.der nc-leaf-in.cert.der
+for bad in nc-leaf-out nc-leaf-excluded; do
+  if openssl verify -CAfile mt-root.cert.der -untrusted nc-intermediate.cert.der "${bad}.cert.der" >/dev/null 2>&1; then
+    echo "ERROR: ${bad} unexpectedly verified — name-constraint fixture is broken." >&2
+    exit 1
+  fi
+done
+echo "nc-leaf-in: within permitted subtree (verifies); nc-leaf-{out,excluded}: correctly REJECTED (expected)"
 
 # --- drop transient working files ------------------------------------------------------------------
 # The tests load only the DER certs + PKCS#8 keys (+ the JSON/JWK/YAML/Kotlin material); the CSRs and

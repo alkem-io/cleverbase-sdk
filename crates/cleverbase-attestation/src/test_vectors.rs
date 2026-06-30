@@ -95,6 +95,7 @@ pub fn skipped_issuance_request_cbor() -> Vec<u8> {
                 pre_authorized_code: crate::secret::Secret::new("pre-auth"),
                 credential_configuration_id: "eu.europa.ec.eudi.pid_vc_sd_jwt".to_owned(),
                 format: Format::SdJwtVc,
+                tx_code: None,
             },
             backend: IssuerBackend::none(),
             holder: HolderContext::new(jwk, "holder-handle"),

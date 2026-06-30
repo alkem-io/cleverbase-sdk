@@ -347,15 +347,17 @@ fn invalid_status_starting_time_is_rejected() {
 // =================================================================================================
 
 /// The PRODUCTION chain-validating trust source (the C-ABI semantics), trusting the issuing IACA root
-/// (`ca-iaca`) for `(QEAA, SD-JWT VC)` at the verification instant `now`. The credential leaf
-/// (`sdjwt-issuer`) chains to it, so this validates the FULL RFC 5280 §6.1 path (incl. each cert's
-/// validity window at `now`) — unlike the exact-DER pinning of `StaticTestAnchors` (which never checks
-/// notBefore/notAfter). Used by the end-to-end gate tests so the newly-added chain-validity hardening
-/// (`LeafExpired`/`AnchorExpired`) composes with the qualified gate through `verify()` at a COHERENT
-/// `now` — the bug the prior `now = NOW` (2025, before the leaf's 2026 notBefore) + exact-DER-pin tests
-/// silently skipped.
+/// (`ca-iaca`) for `(PID, SD-JWT VC)` at the verification instant `now`. The credential leaf
+/// (`sdjwt-issuer`, a PID SD-JWT VC issuer carrying the `id-etsi-qct-pid` QcStatement) chains to it, so
+/// this validates the FULL RFC 5280 §6.1 path (incl. each cert's validity window at `now` and the
+/// per-role QcStatement leaf check) — unlike the exact-DER pinning of `StaticTestAnchors` (which never
+/// checks notBefore/notAfter or the leaf profile). The role is PID because `sdjwt-issuer` is a PID cert;
+/// the qualified GATE is role-agnostic (it reads the EAA/Q service status by certificate, not by role),
+/// so the gate still determines qualified status for the same `sdjwt-issuer` service. Used by the
+/// end-to-end gate tests so the chain-validity hardening (`LeafExpired`/`AnchorExpired`) composes with
+/// the qualified gate through `verify()` at a COHERENT `now`.
 fn chain_validating_anchors(now: i64) -> crate::trust::ChainValidatingAnchors {
-    crate::trust::ChainValidatingAnchors::new(now).trust(IssuerRole::Qeaa, Format::SdJwtVc, CA_IACA)
+    crate::trust::ChainValidatingAnchors::new(now).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA)
 }
 
 /// Mint an SD-JWT VC whose `nbf`/`exp` window straddles `RELEVANT_GRANTED` (2026-09-01), so the
@@ -390,7 +392,7 @@ fn gate_disabled_leaves_the_always_on_verdict_unchanged_and_qualified_status_non
     // Reference run: gate off, no qualified TL at all.
     let baseline_ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         ..VerifyContext::default()
     };
     let baseline = verify(
@@ -409,7 +411,7 @@ fn gate_disabled_leaves_the_always_on_verdict_unchanged_and_qualified_status_non
     // Gate-off run that *does* carry a qualified TL but never enables the gate → must be identical.
     let gate_off_ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: false,
         qualified_trust_list: Some(&tl),
         ..VerifyContext::default()
@@ -452,7 +454,7 @@ fn gate_enabled_populates_qualified_status_qualified_for_a_qualified_issuer() {
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
@@ -484,7 +486,7 @@ fn gate_enabled_but_no_trust_list_is_indeterminate_never_qualified() {
     let anchors = chain_validating_anchors(RELEVANT_GRANTED);
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: None,
         ..VerifyContext::default()
@@ -521,7 +523,7 @@ fn policy_qualified_gate_flag_also_enables_the_gate() {
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED, // in-window for both the credential and the TL signer
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: false, // the context flag is OFF; the policy flag drives the gate
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
@@ -829,7 +831,7 @@ fn the_verify_gate_with_a_forged_trust_list_is_indeterminate_not_qualified() {
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: Some(&forged),
         qualified_scheme_anchors: &scheme,
@@ -893,7 +895,7 @@ fn the_verify_gate_with_an_expired_leaf_is_invalid_expired_and_has_no_qualified_
     let scheme = scheme_anchors();
     let ctx = VerifyContext {
         now_unix: NOW_LEAF_EXPIRED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
@@ -935,7 +937,7 @@ fn the_verify_gate_with_a_not_yet_valid_leaf_is_invalid_expired() {
     let anchors = chain_validating_anchors(NOW_BEFORE_NOT_BEFORE);
     let ctx = VerifyContext {
         now_unix: NOW_BEFORE_NOT_BEFORE,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: None,
         ..VerifyContext::default()
@@ -968,7 +970,7 @@ fn the_verify_gate_with_a_leaf_that_does_not_chain_is_invalid_untrusted_issuer()
     let anchors = chain_validating_anchors(RELEVANT_GRANTED);
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
-        role: IssuerRole::Qeaa,
+        role: IssuerRole::Pid,
         qualified_gate: true,
         qualified_trust_list: None,
         ..VerifyContext::default()

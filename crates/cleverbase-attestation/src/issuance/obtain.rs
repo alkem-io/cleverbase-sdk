@@ -17,10 +17,26 @@
 //!
 //! ## Flow (pre-authorized-code grant)
 //!
-//! `credential offer (pre-authorized_code)` → POST token endpoint → `Sign` the OpenID4VCI proof-JWT
-//! (PoP) via the signer-hook → POST credential endpoint with the proof → parse the issued SD-JWT VC /
-//! mdoc into a [`HeldAttestation`]. The pre-authorized-code grant is the self-contained flow the
-//! reference issuer supports without an interactive browser leg.
+//! `credential offer (pre-authorized_code)` → POST token endpoint → POST the **Nonce Endpoint** for a
+//! fresh `c_nonce` (OpenID4VCI 1.0 §7 `#nonce-endpoint`) → `Sign` the OpenID4VCI proof-JWT (PoP) via
+//! the signer-hook → POST credential endpoint with the `proofs` object → parse the issued SD-JWT VC /
+//! mdoc out of the `credentials` array into a [`HeldAttestation`]. The pre-authorized-code grant is
+//! the self-contained flow the reference issuer supports without an interactive browser leg.
+//!
+//! ## OpenID4VCI 1.0 wire shapes (verified online against the 1.0 final text)
+//!
+//! This path tracks **OpenID4VCI 1.0 final**
+//! (<https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html>; source
+//! `openid/OpenID4VCI` `1.0/openid-4-verifiable-credential-issuance-1_0.md`), which made three
+//! breaking changes over the early `~draft-13` shapes this code originally tracked:
+//!
+//! 1. **Credential Request** carries `proofs` — an object keyed by proof type whose value is a
+//!    **non-empty array** (`{"proofs":{"jwt":[<jwt>]}}`), replacing the draft singular
+//!    `proof`/`proof_type` (§8.2 `#credential-request`).
+//! 2. The one-time `c_nonce` is fetched from a dedicated **Nonce Endpoint** rather than read from the
+//!    Token Response (§7 `#nonce-endpoint`; the Token Response no longer carries `c_nonce`).
+//! 3. **Credential Response** returns `credentials` — an array of objects, each with a `credential`
+//!    member — replacing the draft top-level `credential` string (§8.3 `#credential-response`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,6 +95,12 @@ pub struct IssuerBackend {
     pub kind: IssuerBackendKind,
     /// The OpenID4VCI **token** endpoint (the pre-authorized-code grant is exchanged here).
     pub token_endpoint: String,
+    /// The OpenID4VCI **Nonce Endpoint** (`nonce_endpoint` Credential Issuer Metadata, OpenID4VCI 1.0
+    /// §7 `#nonce-endpoint`). 1.0 moved the one-time `c_nonce` out of the Token Response: the flow
+    /// POSTs here (unauthenticated, empty body) for a fresh `c_nonce` before building the PoP proof. A
+    /// Credential Issuer that requires `c_nonce` values in the proof MUST offer this endpoint
+    /// (`#nonce-endpoint`); the EUDI reference issuer does.
+    pub nonce_endpoint: String,
     /// The OpenID4VCI **credential** endpoint (the credential request — with the PoP proof — is POSTed
     /// here).
     pub credential_endpoint: String,
@@ -93,6 +115,7 @@ impl IssuerBackend {
         Self {
             kind: IssuerBackendKind::None,
             token_endpoint: String::new(),
+            nonce_endpoint: String::new(),
             credential_endpoint: String::new(),
             credential_issuer: String::new(),
         }
@@ -114,6 +137,15 @@ pub struct CredentialOffer {
     pub credential_configuration_id: String,
     /// The format of the credential this configuration issues (so the SDK parses the right shape).
     pub format: Format,
+    /// The End-User-supplied **Transaction Code** value to send in the Token Request, present only
+    /// when the offer's pre-authorized-code grant carried a `tx_code` object (OpenID4VCI 1.0 §6.1 +
+    /// §Token-Request `#token-request`: "This value MUST be present if a `tx_code` object was present
+    /// in the Credential Offer"). It is a low-entropy one-time code (typically a PIN delivered out of
+    /// band), so it is held as a redacting [`Secret`] (never in `Debug`/log output — FR-010) yet
+    /// (de)serializes transparently so the offer round-trips and the token-request site percent-encodes
+    /// the live value. `None` when the offer carried no `tx_code` object (the default).
+    #[serde(default)]
+    pub tx_code: Option<Secret>,
 }
 
 /// The next host effect (or terminal outcome) of an `obtain` step — mirrors the signing core's
@@ -158,9 +190,20 @@ pub enum ObtainError {
     /// The token endpoint returned a non-success status or an unparseable body.
     #[error("token request failed: {0}")]
     TokenRequest(String),
+    /// The Nonce Endpoint (OpenID4VCI 1.0 §7 `#nonce-endpoint`) returned a non-success status or a
+    /// body without the REQUIRED `c_nonce`.
+    #[error("nonce request failed: {0}")]
+    NonceRequest(String),
     /// The credential endpoint returned a non-success status or an unparseable body.
     #[error("credential request failed: {0}")]
     CredentialRequest(String),
+    /// The issuer returned a **deferred** Credential Response (HTTP 202 + a `transaction_id`,
+    /// OpenID4VCI 1.0 §8.3 `#credential-response`). Deferred issuance — polling the Deferred Credential
+    /// Endpoint (§9 `#deferred-credential-issuance`) — is a documented scope cut (see
+    /// `standards-conformance.md`), so it is surfaced as a clear, distinct terminal failure rather than
+    /// a confusing "missing credentials" parse error.
+    #[error("issuer deferred credential issuance (transaction_id {0:?}); the deferred endpoint is not supported")]
+    Deferred(String),
     /// The PoP-JWT signing input could not be built.
     #[error("failed to build the proof-of-possession JWT: {0}")]
     Proof(String),
@@ -185,6 +228,9 @@ pub enum ResumeObtain {
 enum ObtainPhase {
     /// Awaiting the token-endpoint response.
     TokenPending,
+    /// Awaiting the Nonce-Endpoint response (the fresh `c_nonce` for the PoP proof — OpenID4VCI 1.0 §7
+    /// `#nonce-endpoint`).
+    NoncePending,
     /// Awaiting the holder PoP signature (the `Sign` effect).
     ProofPending,
     /// Awaiting the credential-endpoint response.
@@ -208,9 +254,9 @@ pub struct ObtainSession {
     /// the host still receives it on the wire when the session is CBOR-serialized (by design in the
     /// sans-IO model — only the `Debug` exposure was the leak).
     access_token: Option<Secret>,
-    /// The issuer `c_nonce` the PoP-JWT must echo (carried from the token response to the `Sign`
-    /// resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in). Held as
-    /// a redacting [`Secret`] so the one-time nonce never appears in `Debug`/log output.
+    /// The issuer `c_nonce` the PoP-JWT must echo (carried from the **Nonce Endpoint** response to the
+    /// `Sign` resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in).
+    /// Held as a redacting [`Secret`] so the one-time nonce never appears in `Debug`/log output.
     pending_c_nonce: Option<Secret>,
     /// The compact PoP-JWT spliced after the holder signed its input (set after the `Sign` step).
     proof_jwt: Option<String>,
@@ -268,26 +314,45 @@ pub fn resume_obtain(
                     ObtainError::TokenRequest(format!("status {status}")),
                 ));
             }
-            let token = match parse_token_response(&body) {
+            let access_token = match parse_token_response(&body) {
                 Ok(t) => t,
                 Err(e) => return Ok(fail(session, ObtainError::TokenRequest(e))),
             };
-            session.access_token = Some(Secret::new(token.access_token));
-            // Build the PoP-JWT signing input bound to the credential-issuer `aud` + the issuer
+            session.access_token = Some(Secret::new(access_token));
+            // OpenID4VCI 1.0 moved the one-time `c_nonce` out of the Token Response into a dedicated
+            // Nonce Endpoint (§7 `#nonce-endpoint`). Fetch a fresh `c_nonce` next — before building the
+            // PoP proof — via an unauthenticated POST to the Nonce Endpoint.
+            session.phase = ObtainPhase::NoncePending;
+            let effect = nonce_request(&session.backend);
+            Ok((session, ObtainStep::PerformHttp(effect)))
+        }
+        ObtainPhase::NoncePending => {
+            let (status, body) = require_http(input)?;
+            if !(200..300).contains(&status) {
+                return Ok(fail(
+                    session,
+                    ObtainError::NonceRequest(format!("status {status}")),
+                ));
+            }
+            let c_nonce = match parse_nonce_response(&body) {
+                Ok(n) => n,
+                Err(e) => return Ok(fail(session, ObtainError::NonceRequest(e))),
+            };
+            // Build the PoP-JWT signing input bound to the credential-issuer `aud` + the fresh
             // `c_nonce`; the host signs it next (the signer-hook effect). The build is deterministic,
-            // so the `Sign` arm re-derives the identical PoP-JWT and splices the returned signature —
-            // we carry only the `c_nonce` (no private material) across the effect.
+            // so the `ProofPending` arm re-derives the identical PoP-JWT and splices the returned
+            // signature — we carry only the `c_nonce` (no private material) across the effect.
             let pop = match super::signer::build_pop_jwt(
                 &session.holder,
                 &session.backend.credential_issuer,
-                &token.c_nonce,
+                &c_nonce,
                 session.now_unix,
             ) {
                 Ok(p) => p,
                 Err(e) => return Ok(fail(session, ObtainError::Proof(e.to_string()))),
             };
             session.phase = ObtainPhase::ProofPending;
-            session.pending_c_nonce = Some(Secret::new(token.c_nonce));
+            session.pending_c_nonce = Some(Secret::new(c_nonce));
             Ok((session, ObtainStep::Sign(pop.input)))
         }
         ObtainPhase::ProofPending => {
@@ -328,10 +393,13 @@ pub fn resume_obtain(
                     ObtainError::CredentialRequest(format!("status {status}")),
                 ));
             }
-            match parse_credential_response(&body, session.offer.format) {
-                Ok(held) => {
+            match parse_credential_response(&body, session.offer.format, status) {
+                Ok(CredentialResponse::Immediate(held)) => {
                     session.phase = ObtainPhase::Terminal;
                     Ok((session, ObtainStep::Obtained(held)))
+                }
+                Ok(CredentialResponse::Deferred(transaction_id)) => {
+                    Ok(fail(session, ObtainError::Deferred(transaction_id)))
                 }
                 Err(e) => Ok(fail(session, ObtainError::CredentialRequest(e))),
             }
@@ -361,12 +429,22 @@ fn require_signature(input: ResumeObtain) -> Result<Vec<u8>, ObtainError> {
 }
 
 /// Build the OpenID4VCI token-endpoint request (the pre-authorized-code grant, form-encoded).
+///
+/// When the offer carried a `tx_code` object, the End-User-supplied Transaction Code is appended as
+/// the `tx_code` parameter — OpenID4VCI 1.0 §Token-Request (`#token-request`): "This value MUST be
+/// present if a `tx_code` object was present in the Credential Offer ... This parameter MUST only be
+/// used if the `grant_type` is `urn:ietf:params:oauth:grant-type:pre-authorized_code`" (which it
+/// always is on this path).
 fn token_request(backend: &IssuerBackend, offer: &CredentialOffer) -> HttpEffect {
-    let body = format!(
+    let mut body = format!(
         "grant_type={}&pre-authorized_code={}",
         percent_encode("urn:ietf:params:oauth:grant-type:pre-authorized_code"),
         percent_encode(offer.pre_authorized_code.expose()),
     );
+    if let Some(tx_code) = &offer.tx_code {
+        body.push_str("&tx_code=");
+        body.push_str(&percent_encode(tx_code.expose()));
+    }
     HttpEffect {
         method: HttpMethod::Post,
         url: backend.token_endpoint.clone(),
@@ -378,8 +456,16 @@ fn token_request(backend: &IssuerBackend, offer: &CredentialOffer) -> HttpEffect
     }
 }
 
-/// Build the OpenID4VCI credential-endpoint request: the credential configuration id + the holder
-/// `jwt` proof, as JSON, with the access token as the Bearer.
+/// Build the OpenID4VCI credential-endpoint request: the `credential_configuration_id` + the holder
+/// PoP in the `proofs` object, as JSON, with the access token as the Bearer.
+///
+/// OpenID4VCI 1.0 §8.2 (`#credential-request`): `proofs` is "an object [that] contains exactly one
+/// parameter named as the proof type ... the value set for this parameter is a **non-empty array**" —
+/// here `{"proofs":{"jwt":[<jwt>]}}`, replacing the early-draft singular `proof`/`proof_type`. We send
+/// the `credential_configuration_id` (never `credential_identifier`): §8.2 requires the two be
+/// mutually exclusive ("When this parameter is used, the `credential_identifier` MUST NOT be
+/// present"), which we satisfy by construction (the `credential_identifier`/`authorization_details`
+/// request path is a documented scope cut — see `standards-conformance.md`).
 ///
 /// # Errors
 ///
@@ -397,7 +483,7 @@ fn credential_request(
 ) -> Result<HttpEffect, ObtainError> {
     let body = serde_json::json!({
         "credential_configuration_id": offer.credential_configuration_id,
-        "proof": { "proof_type": "jwt", "jwt": proof_jwt },
+        "proofs": { "jwt": [proof_jwt] },
     });
     let body_bytes = serde_json::to_vec(&body).map_err(|e| {
         ObtainError::CredentialRequest(format!("failed to serialize request body: {e}"))
@@ -413,53 +499,93 @@ fn credential_request(
     })
 }
 
-/// The parsed OpenID4VCI token response (`access_token` + the `c_nonce` the PoP-JWT must echo).
-struct TokenResponse {
-    access_token: String,
-    c_nonce: String,
+/// Parse the OpenID4VCI Token Response, returning the `access_token`.
+///
+/// OpenID4VCI 1.0 §Token-Response (`#token-response`) no longer carries `c_nonce` (it moved to the
+/// Nonce Endpoint, §7 `#nonce-endpoint`), so this reads only the REQUIRED `access_token`. The
+/// `token_type` (always `Bearer` on this path) and DPoP are documented scope cuts — see
+/// `standards-conformance.md`.
+fn parse_token_response(body: &[u8]) -> Result<String, String> {
+    let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    json.get("access_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "missing access_token".to_owned())
 }
 
-/// Parse the OpenID4VCI token-endpoint JSON response.
-fn parse_token_response(body: &[u8]) -> Result<TokenResponse, String> {
-    let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    let access_token = json
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing access_token".to_owned())?
-        .to_owned();
-    // The `c_nonce` may be returned at the token endpoint (OpenID4VCI 1.0) or via a nonce endpoint;
-    // the reference issuer returns it at the token endpoint. Default to empty if absent (the issuer
-    // then rejects the proof, surfacing as a credential-request failure — never a silent accept).
-    let c_nonce = json
-        .get("c_nonce")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Ok(TokenResponse {
-        access_token,
-        c_nonce,
-    })
+/// Build the OpenID4VCI Nonce-Endpoint request (OpenID4VCI 1.0 §7.1 `#nonce-request`): an HTTP POST
+/// with an **empty body** and **no access token** — "The Nonce Endpoint is not a protected resource,
+/// meaning the Wallet does not need to supply an access token to access it."
+fn nonce_request(backend: &IssuerBackend) -> HttpEffect {
+    HttpEffect {
+        method: HttpMethod::Post,
+        url: backend.nonce_endpoint.clone(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    }
 }
 
-/// Parse the OpenID4VCI credential-endpoint response into a [`HeldAttestation`]. The credential is
-/// carried in the `credential` member (a compact SD-JWT VC string, or base64url mdoc CBOR).
-fn parse_credential_response(body: &[u8], format: Format) -> Result<HeldAttestation, String> {
+/// Parse the OpenID4VCI Nonce Response (OpenID4VCI 1.0 §7.2 `#nonce-response`): a JSON object carrying
+/// the REQUIRED top-level `c_nonce` string.
+fn parse_nonce_response(body: &[u8]) -> Result<String, String> {
     let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    json.get("c_nonce")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "missing c_nonce".to_owned())
+}
+
+/// The parsed outcome of an OpenID4VCI Credential Response: an immediately-issued credential, or a
+/// deferred-issuance signal we surface as a distinct terminal failure (see [`ObtainError::Deferred`]).
+enum CredentialResponse {
+    /// An immediately-issued credential (HTTP 200 + a `credentials` array).
+    Immediate(HeldAttestation),
+    /// A deferred Credential Response (HTTP 202 + a `transaction_id`); carries the `transaction_id`
+    /// (or empty if the issuer omitted it) for the failure detail.
+    Deferred(String),
+}
+
+/// Parse the OpenID4VCI Credential Response (OpenID4VCI 1.0 §8.3 `#credential-response`).
+///
+/// 1.0 returns `credentials` — "an array of one or more issued Credentials ... The elements of the
+/// array MUST be objects ... `credential`: REQUIRED. Contains one issued Credential" — replacing the
+/// early-draft top-level `credential` string. The credential is taken from `credentials[0].credential`
+/// (this path requests a single proof, so the issuer binds at most one credential). A deferred
+/// response (HTTP 202, or a top-level `transaction_id`) is reported as [`CredentialResponse::Deferred`]
+/// rather than mis-parsed as a malformed body (RCA: a clear, distinct outcome — never a silent accept).
+fn parse_credential_response(
+    body: &[u8],
+    format: Format,
+    status: u16,
+) -> Result<CredentialResponse, String> {
+    let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    // Deferred issuance: HTTP 202 + a `transaction_id` (§8.3). Detect either signal so a deferred
+    // response is surfaced as `Deferred`, not as a confusing "missing credentials" parse error.
+    let transaction_id = json.get("transaction_id").and_then(Value::as_str);
+    if status == 202 || transaction_id.is_some() {
+        return Ok(CredentialResponse::Deferred(
+            transaction_id.unwrap_or_default().to_owned(),
+        ));
+    }
     let credential = json
-        .get("credential")
+        .get("credentials")
+        .and_then(Value::as_array)
+        .and_then(|credentials| credentials.first())
+        .and_then(|first| first.get("credential"))
         .and_then(Value::as_str)
-        .ok_or_else(|| "missing credential".to_owned())?;
-    match format {
-        Format::SdJwtVc => Ok(HeldAttestation::SdJwtVc {
+        .ok_or_else(|| "missing credentials[0].credential".to_owned())?;
+    let held = match format {
+        Format::SdJwtVc => HeldAttestation::SdJwtVc {
             issued: credential.to_owned(),
-        }),
+        },
         Format::Mdoc => {
             use base64ct::{Base64UrlUnpadded, Encoding as _};
             let device_response = Base64UrlUnpadded::decode_vec(credential)
                 .map_err(|e| format!("mdoc credential base64url: {e}"))?;
-            Ok(HeldAttestation::Mdoc { device_response })
+            HeldAttestation::Mdoc { device_response }
         }
-    }
+    };
+    Ok(CredentialResponse::Immediate(held))
 }
 
 /// Percent-encode a value for a URL query / form body (RFC 3986 unreserved set kept literal).

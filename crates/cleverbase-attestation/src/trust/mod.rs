@@ -209,6 +209,7 @@ fn resolve_chain(
     issuer_cert_der: &[u8],
     supplied_intermediates: &[Vec<u8>],
     now_unix: i64,
+    leaf_validity_time: Option<i64>,
 ) -> TrustDecision {
     let Some(anchors) = anchors_for_key else {
         return TrustDecision::untrusted();
@@ -219,15 +220,16 @@ fn resolve_chain(
     let mut chain: Vec<&[u8]> = Vec::with_capacity(1 + supplied_intermediates.len());
     chain.push(issuer_cert_der);
     chain.extend(supplied_intermediates.iter().map(Vec::as_slice));
-    // The credential's format fixes the role/format-appropriate leaf key purpose the chain validator
-    // enforces on the signing leaf (mdoc DS EKU id-mso-mdl-DS; SD-JWT VC issuer not-a-CA + signing
-    // keyUsage) — a genuinely-chained-but-WRONG-PURPOSE leaf is rejected (no "right chain, wrong
-    // purpose" false-accept).
+    // The credential's format + role fix the leaf key purpose the chain validator enforces on the
+    // signing leaf (mdoc → the ISO 18013-5 Annex B Table B.3 DS profile; SD-JWT VC → the EN 319 412-2/-3
+    // base floor + the per-role eIDAS QcStatement keyed by `role`) — a genuinely-chained-but-WRONG-
+    // PURPOSE leaf is rejected (no "right chain, wrong purpose" false-accept). `leaf_validity_time`
+    // (Some for the mdoc DS leaf at the MSO `signed` time, None elsewhere) is the seam for ISO §9.3.1.
     let leaf_purpose = match format {
         Format::Mdoc => LeafPurpose::MdocDocumentSigner,
-        Format::SdJwtVc => LeafPurpose::SdJwtVcIssuer,
+        Format::SdJwtVc => LeafPurpose::SdJwtVcIssuer(role),
     };
-    match verify_chain(&chain, anchors, now_unix, leaf_purpose) {
+    match verify_chain(&chain, anchors, now_unix, leaf_validity_time, leaf_purpose) {
         Ok(()) => TrustDecision::trusted(TrustListEntry {
             role,
             format,
@@ -314,6 +316,7 @@ impl TrustAnchorSource for ChainValidatingAnchors {
         format: Format,
         issuer_cert_der: &[u8],
         supplied_intermediates: &[Vec<u8>],
+        leaf_validity_time: Option<i64>,
     ) -> TrustDecision {
         // Validate the credential's signing path (leaf + supplied intermediates) against the
         // host-supplied anchors for its role/format (the shared, single-source resolve body — DRY).
@@ -324,6 +327,7 @@ impl TrustAnchorSource for ChainValidatingAnchors {
             issuer_cert_der,
             supplied_intermediates,
             self.now_unix,
+            leaf_validity_time,
         )
     }
 
@@ -366,12 +370,21 @@ pub trait TrustAnchorSource {
     /// A chain-validating source builds the RFC 5280 §6.1 path `leaf → intermediate₁ → … → anchor`; the
     /// supplied intermediates are untrusted path-building material, so the path is trusted only if it
     /// reaches a configured anchor. An exact-match source ignores the intermediates (it pins the leaf).
+    ///
+    /// `leaf_validity_time` is the instant the **leaf's own** validity window is checked at (the
+    /// chain-authentication validity stays at the source's verification clock). It is `None` for the
+    /// SD-JWT VC issuer and the trust-list signer (no distinct signing instant — the leaf is checked at
+    /// "now"); the mdoc verifier passes `Some(mso.validityInfo.signed)` so the Document Signer
+    /// certificate's window is checked against the MSO signing time per ISO/IEC 18013-5 §9.3.1 (DS certs
+    /// rotate while mDLs live for years — a conformant mDL must not be false-rejected once its DS cert
+    /// expires). An exact-match source ignores it.
     fn resolve(
         &self,
         role: IssuerRole,
         format: Format,
         issuer_cert_der: &[u8],
         supplied_intermediates: &[Vec<u8>],
+        leaf_validity_time: Option<i64>,
     ) -> TrustDecision;
 
     /// Fetch and cache the signed trust lists (host-driven, **not** per-verification). The native
@@ -434,9 +447,11 @@ impl TrustAnchorSource for StaticTestAnchors {
         format: Format,
         issuer_cert_der: &[u8],
         _supplied_intermediates: &[Vec<u8>],
+        _leaf_validity_time: Option<i64>,
     ) -> TrustDecision {
-        // Exact-DER-equality pinning of the leaf — the supplied intermediates are not consulted (an
-        // offline test seam that lists the leaf certificate itself, not a chain-to-root source).
+        // Exact-DER-equality pinning of the leaf — the supplied intermediates and leaf-validity time are
+        // not consulted (an offline test seam that lists the leaf certificate itself, not a
+        // chain-to-root source; it performs no validity-window check at all).
         if self.is_trusted(role, format, issuer_cert_der) {
             TrustDecision::trusted(TrustListEntry {
                 role,
@@ -470,7 +485,7 @@ mod tests {
     #[test]
     fn configured_issuer_is_trusted_for_its_role_and_format() {
         let anchors = StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A);
-        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[]);
+        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[], None);
         assert!(decision.trusted);
         let entry = decision.entry.expect("trusted decision carries an entry");
         assert_eq!(entry.role, IssuerRole::Qeaa);
@@ -481,7 +496,7 @@ mod tests {
     #[test]
     fn unconfigured_issuer_is_untrusted() {
         let anchors = StaticTestAnchors::new().trust(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A);
-        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_B, &[]);
+        let decision = anchors.resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_B, &[], None);
         assert!(!decision.trusted);
         assert!(decision.entry.is_none());
     }
@@ -493,19 +508,19 @@ mod tests {
         // Same cert, different role → untrusted (per-role anchoring).
         assert!(
             !anchors
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[])
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, ISSUER_A, &[], None)
                 .trusted
         );
         // Same cert + role, different format → untrusted (per-format anchoring).
         assert!(
             !anchors
-                .resolve(IssuerRole::Pid, Format::Mdoc, ISSUER_A, &[])
+                .resolve(IssuerRole::Pid, Format::Mdoc, ISSUER_A, &[], None)
                 .trusted
         );
         // Exact role+format → trusted.
         assert!(
             anchors
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, ISSUER_A, &[])
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, ISSUER_A, &[], None)
                 .trusted
         );
     }
@@ -531,8 +546,14 @@ mod tests {
     /// A self-signed leaf that does NOT chain to `ca-iaca`.
     const WRONG_ISSUER: &[u8] =
         include_bytes!("../../../../tests/fixtures/attestation/wrong-issuer.cert.der");
-    /// A time inside every fixture leaf's validity window (2026-06-25 .. 2027-09-23).
+    /// An mdoc Document Signer leaf signed by `ca-iaca` (mdlDS EKU + digitalSignature + cA=FALSE).
+    const MDOC_DS: &[u8] =
+        include_bytes!("../../../../tests/fixtures/attestation/mdoc-ds.cert.der");
+    /// A time inside every fixture leaf's validity window.
     const IN_WINDOW: i64 = 1_788_220_800; // 2026-09-01.
+    /// A time past the ~15-month leaf `notAfter` but inside the `ca-iaca` root window (notAfter 2036) —
+    /// the seam scenario: the DS leaf has expired at "now" but the issuing root is still valid.
+    const NOW_AFTER_LEAF: i64 = 1_893_456_000; // 2030-01-01.
     /// A time long past every fixture leaf's `notAfter` (≈2096).
     const EXPIRED: i64 = 4_000_000_000;
 
@@ -542,7 +563,7 @@ mod tests {
         // credential whose leaf chains to it (where exact-leaf-match would reject every real one).
         let anchors =
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
-        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[]);
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[], None);
         assert!(decision.trusted, "leaf chains to the passed CA root");
         let entry = decision.entry.expect("trusted decision carries an entry");
         assert_eq!(entry.role, IssuerRole::Pid);
@@ -561,7 +582,7 @@ mod tests {
             Format::SdJwtVc,
             SDJWT_ISSUER, // pin the leaf directly
         );
-        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[]);
+        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[], None);
         assert!(
             !decision.trusted,
             "an expired pinned leaf must be untrusted, not accepted"
@@ -585,10 +606,21 @@ mod tests {
         // untrusted, even in-window. This is a genuine absence of trust (no path to an anchor), so the
         // failure category is `NotTrusted` → the verifier reports `UntrustedIssuer` (NOT `Expired`). The
         // failure also CARRIES the source `ChainError::IssuerMismatch` (the path reaches no name-matching
-        // anchor) so a debugging integrator can drill into the precise no-trust cause.
-        let anchors =
-            ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
-        let decision = anchors.resolve(IssuerRole::Pid, Format::SdJwtVc, WRONG_ISSUER, &[]);
+        // anchor) so a debugging integrator can drill into the precise no-trust cause. The role is
+        // NonQualifiedEaa (no QcStatement requirement) so the leaf-purpose floor passes and the failure
+        // is the path-build IssuerMismatch, not a wrong-purpose reject before the walk.
+        let anchors = ChainValidatingAnchors::new(IN_WINDOW).trust(
+            IssuerRole::NonQualifiedEaa,
+            Format::SdJwtVc,
+            CA_IACA,
+        );
+        let decision = anchors.resolve(
+            IssuerRole::NonQualifiedEaa,
+            Format::SdJwtVc,
+            WRONG_ISSUER,
+            &[],
+            None,
+        );
         assert!(!decision.trusted);
         assert_eq!(
             decision.failure,
@@ -611,19 +643,19 @@ mod tests {
             ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA);
         assert!(
             !anchors
-                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[])
+                .resolve(IssuerRole::Qeaa, Format::SdJwtVc, SDJWT_ISSUER, &[], None)
                 .trusted
         );
         assert!(
             !anchors
-                .resolve(IssuerRole::Pid, Format::Mdoc, SDJWT_ISSUER, &[])
+                .resolve(IssuerRole::Pid, Format::Mdoc, SDJWT_ISSUER, &[], None)
                 .trusted
         );
         // No anchor configured at all → untrusted (fail-closed).
         let empty = ChainValidatingAnchors::new(IN_WINDOW);
         assert!(
             !empty
-                .resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[])
+                .resolve(IssuerRole::Pid, Format::SdJwtVc, SDJWT_ISSUER, &[], None)
                 .trusted
         );
     }
@@ -633,5 +665,47 @@ mod tests {
         // The host resolved the anchors out-of-process; the core's refresh is a sans-IO no-op.
         let mut anchors = ChainValidatingAnchors::new(IN_WINDOW);
         assert!(anchors.refresh().is_ok());
+    }
+
+    #[test]
+    fn resolve_threads_the_leaf_validity_time_seam_for_the_mdoc_ds_leaf() {
+        // ISO/IEC 18013-5 §9.3.1 through the trait seam: a host trusts the IACA root for (PID, mdoc) at a
+        // verification instant (2030) PAST the DS leaf's window but inside the root's. With
+        // `leaf_validity_time = Some(signed)` inside the leaf window, the DS leaf is checked at its
+        // signing time → trusted (the conformant-mDL false-reject the seam fixes); with `None` the leaf
+        // is checked at "now" (2030, expired) → untrusted with the `Expired` failure category.
+        let anchors = ChainValidatingAnchors::new(NOW_AFTER_LEAF).trust(
+            IssuerRole::Pid,
+            Format::Mdoc,
+            CA_IACA,
+        );
+        let trusted = anchors.resolve(IssuerRole::Pid, Format::Mdoc, MDOC_DS, &[], Some(IN_WINDOW));
+        assert!(
+            trusted.trusted,
+            "a DS leaf expired at now but valid at the MSO signed time must be trusted (§9.3.1)"
+        );
+        let rejected = anchors.resolve(IssuerRole::Pid, Format::Mdoc, MDOC_DS, &[], None);
+        assert!(!rejected.trusted);
+        assert_eq!(
+            rejected.failure,
+            Some(TrustFailure::Expired),
+            "checked at now (None), the expired DS leaf surfaces as Expired"
+        );
+        // The other direction: a signing time OUTSIDE the leaf window is rejected even at an in-window
+        // verification instant (the DS cert was not valid when it claims to have signed).
+        let bad_signed =
+            ChainValidatingAnchors::new(IN_WINDOW).trust(IssuerRole::Pid, Format::Mdoc, CA_IACA);
+        let d = bad_signed.resolve(
+            IssuerRole::Pid,
+            Format::Mdoc,
+            MDOC_DS,
+            &[],
+            Some(NOW_AFTER_LEAF),
+        );
+        assert!(
+            !d.trusted,
+            "a DS cert not valid at the signing time is rejected"
+        );
+        assert_eq!(d.failure, Some(TrustFailure::Expired));
     }
 }

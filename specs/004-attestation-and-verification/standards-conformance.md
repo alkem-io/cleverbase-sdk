@@ -22,7 +22,7 @@ Test names are the in-crate `#[cfg(test)]` cases (run with `cargo test -p clever
 | **SD-JWT VC** — `draft-ietf-oauth-sd-jwt-vc` + **SD-JWT** RFC 9901 | draft-16 / RFC 9901 | T011 | `src/sdjwtvc/` | `sdjwtvc::tests::valid_credential_from_trusted_issuer_is_accepted_with_disclosed_attributes`, `selective_disclosure_reveals_only_the_presented_subset`, `tampered_issuer_signature_is_rejected_as_tamper` |
 | **ISO/IEC 18013-5** — mdoc (`DeviceResponse`, MSO `valueDigests`/`validityInfo`, `DeviceAuth`) | 18013-5:2021 | T012 | `src/mdoc/` | `mdoc::tests::valid_mdoc_verifies_and_returns_disclosed_attributes`, `value_digest_mismatch_is_rejected_as_disclosure_integrity`, `expired_validity_info_is_rejected_as_expired` |
 | **OpenID4VP** — request build (DCQL + fresh nonce + audience) + `vp_token` binding verify | 1.0 (DCQL) | T015 | `src/openid4vp/` | `openid4vp::tests::build_request_draws_a_fresh_nonce_each_call`, `sd_jwt_bound_to_the_issued_request_is_valid`, `sd_jwt_replayed_with_a_stale_nonce_is_replay` |
-| **OpenID4VCI** — pre-authorized-code `obtain` (sans-IO state machine + signer-hook PoP) | 1.0 | T025 | `src/issuance/obtain.rs`, `src/issuance/signer.rs` | `issuance::obtain::tests::*` (skip-when-`None`, reference round-trip), `issuance::signer::tests::*` |
+| **OpenID4VCI** — pre-authorized-code `obtain` (sans-IO state machine + signer-hook PoP) | **1.0 final** (see §1.3) | T025 | `src/issuance/obtain.rs`, `src/issuance/signer.rs` | `issuance::obtain::tests::*` (skip-when-`None`, reference round-trip, `proofs` array, Nonce-Endpoint, `credentials` array, `tx_code`, deferred-202), `issuance::signer::tests::*` |
 | **ETSI TS 119 612** — Trusted Lists (LOTL / national TL, TLv6) | v2.4.1 / TLv6 | T013 | `src/trust/xml.rs`, `src/trust/engine.rs`, `src/trust/chain.rs` | `trust::engine::tests::*` (present/absent/expired-entry/unreachable→fail-closed/stale→fail-closed), `trust::xml::tests::*`, `trust::chain::tests::*` |
 | **ETSI TS 119 602** — Lists of Trusted Entities (LoTE) data model the TL reader follows | v1.x | T013 | `src/trust/xml.rs`, `src/trust/manifest.rs` | `trust::xml::tests::*`, `trust::manifest::tests::*` |
 | **ETSI TS 119 615** — qualified-status determination, **cl. 4.12** | v1.4.1 (`qualified::TS_119_615_VERSION = "1.4.1"`) | T019 | `src/qualified/` | `qualified::tests::the_implementation_is_pinned_to_ts_119_615_v1_4_1`, `issuer_absent_from_the_trust_list_is_indeterminate`, `withdrawn_eaa_q_is_qualified_before_and_not_qualified_after_the_withdrawal` |
@@ -43,19 +43,22 @@ Notes:
 certificate (the `LeafPurpose` parameter), so a genuinely-chained-but-WRONG-PURPOSE leaf is rejected
 (closing the "right chain, wrong purpose" false-accept — e.g. a TLS `serverAuth` cert issued under the
 same trusted root, or an mdoc-DS cert presented as the SD-JWT VC issuer leaf). The purpose is threaded
-from the credential's `Format` by `resolve_chain`; the trust-list-signer authentication paths
+from the credential's `Format` **and `IssuerRole`** by `resolve_chain` (the SD-JWT VC issuer's per-role
+QcStatement requirement is keyed by the role); the trust-list-signer authentication paths
 (`trust::xml`, `qualified`) pass `TrustListSigner`, which imposes no credential-leaf purpose (a TL
 signer is governed by a separate ETSI profile).
 
 | Leaf role/format | Enforced leaf-purpose rule | Standard (verified online) |
 |------------------|----------------------------|----------------------------|
-| **mdoc Document Signer** (`Format::Mdoc`) | `extendedKeyUsage` MUST be present and contain `id-mso-mdl-DS` = **`1.0.18013.5.1.2`**. Absent EKU, or an EKU not listing the OID (e.g. only `serverAuth`), is rejected (`WrongLeafPurpose`). Criticality is **not** required: ISO marks the EKU row mandatory-but-not-critical (field type `m`, not `mc`), and RFC 5280 §4.2.1.12 leaves EKU criticality at the issuer's option. | **ISO/IEC 18013-5:2021 Annex B, Table B.3** (mDL document signer certificate). OID cross-checked at the OID registry. Criticality per **RFC 5280 §4.2.1.12**. |
-| **SD-JWT VC issuer** (`Format::SdJwtVc`) | **No EKU is mandated by any governing spec.** Enforced floor: the leaf **MUST NOT be a CA** (`basicConstraints cA=TRUE` ⇒ rejected — a CA cert must not double as an end-entity signer); and **if** `keyUsage` is present it MUST assert a signing bit (`digitalSignature` or `nonRepudiation`/content-commitment — ETSI EN 319 412-2 issuer Types A/B/C). Absent `keyUsage` is permitted. No EKU is required (an EKU, if present, is not rejected). | IETF **`draft-ietf-oauth-sd-jwt-vc`** §2.5 + **RFC 9901** (silent on EKU/keyUsage); **OpenID4VC HAIP 1.0** §6.1.1 (chain-to-anchor only, no EKU); **EUDI ARF** / Commission IRs (issuer distinguished by **QcStatement** OIDs `0.4.0.194126.1.x`, **not** an EKU); **ETSI TS 119 412-6** / **EN 319 412-2** (keyUsage Types A/B/C/F mandated; §4.3.10 forbids marking EKU critical and assigns no EKU). |
+| **mdoc Document Signer** (`Format::Mdoc`) | The full **Table B.3 DS-leaf profile**: (a) `extendedKeyUsage` MUST be present and contain `id-mso-mdl-DS` = **`1.0.18013.5.1.2`** (row `m`; criticality **not** required per RFC 5280 §4.2.1.12 / ISO row `m`, not `mc`); (b) `keyUsage` MUST assert **`digitalSignature`** (row `mc`); (c) `basicConstraints` MUST be **`cA=FALSE`** (row `mc`). Absent/foreign EKU (e.g. only `serverAuth`), a `keyUsage` lacking `digitalSignature`, or `cA=TRUE` is rejected (`WrongLeafPurpose`) — so a DS leaf can no longer double as an issuing CA. | **ISO/IEC 18013-5:2021 Annex B, Table B.3** (mDL document signer certificate; keyUsage & basicConstraints rows `mc`). OID cross-checked at the OID registry; reference-verifier cross-check (auth0-lab/mdl, spruceid/isomdl). Criticality per **RFC 5280 §4.2.1.12**. |
+| **SD-JWT VC issuer** (`Format::SdJwtVc`, keyed by `IssuerRole`) | **No EKU is mandated by any governing spec.** Two layered checks: **(1) base floor (every role)** — the leaf **MUST NOT be a CA** (`basicConstraints cA=TRUE` ⇒ rejected) and `keyUsage` **MUST be present** and assert a signing bit (`digitalSignature` or `nonRepudiation`/content-commitment). ETSI EN 319 412-2 §4.3.2 (`NAT-4.3.2-1`) / EN 319 412-3 §4.3.1 (`LEG-4.3.1-2`) make keyUsage **SHALL-present** and a content/seal-signing cert Type A/B/F (all carry a signing bit), so an **absent** keyUsage is now rejected (tightened from the prior "absent allowed"). **(2) per-role eIDAS QcStatement** (`qcStatements` ext `1.3.6.1.5.5.7.1.3`, non-critical): **PID** → `QcType` with `id-etsi-qct-pid` **`0.4.0.194126.1.1`** (TS 119 412-6 PID-4.5-01); **QEAA** → `QcCompliance` **`0.4.0.1862.1.1`** + `QcType` `id-etsi-qct-esign`/`-eseal` **`0.4.0.1862.1.6.{1,2}`** (EN 319 412-5 §4.2 + TS 119 412-6 QEA-7.1); **PuB-EAA** → `QcPSB` **`0.4.0.1862.1.10`** (PSB-8.3-01); **NonQualifiedEAA** → no Qc requirement. This is the in-band guard closing the chain-to-root false-trust where a plain eSeal/EAA cert sharing a QTSP root would be trusted as PID/QEAA (audit **T1.3**). | IETF **`draft-ietf-oauth-sd-jwt-vc`** §2.5 + **RFC 9901** (silent on EKU/keyUsage); **OpenID4VC HAIP 1.0** §6.1.1 (chain-to-anchor only); **ETSI EN 319 412-2** §4.3.2 / **EN 319 412-3** §4.3.1 (keyUsage SHALL-present, Types A/B/F; §4.3.10 forbids critical EKU); **EN 319 412-5** §4.2 + **TS 119 412-6** V1.1.1 Annex A (QcStatement OIDs, verified online). |
 | **Trust-list signer** (`TrustListSigner`) | No credential-leaf key-purpose constraint (the signer is authenticated solely by chaining to a configured scheme-operator anchor). | n/a — TL signer governed by a separate ETSI profile, not the credential-leaf profiles above. |
 
-Fail-closed throughout: a malformed or duplicate `extendedKeyUsage` / `keyUsage` / `basicConstraints`
-extension is rejected (a leaf whose purpose cannot be decoded is not trusted to act in that role), using
-`x509-cert`'s typed `ExtendedKeyUsage` / `KeyUsage` / `BasicConstraints` decoders (no hand-rolled ASN.1).
+Fail-closed throughout: a malformed or duplicate `extendedKeyUsage` / `keyUsage` / `basicConstraints` /
+`qcStatements` extension is rejected (a leaf whose purpose cannot be decoded is not trusted to act in
+that role), using `x509-cert`'s typed `ExtendedKeyUsage` / `KeyUsage` / `BasicConstraints` decoders and
+a `der`-typed `QCStatement` (`SEQUENCE { statementId OID, statementInfo ANY }`) decode — no hand-rolled
+ASN.1.
 
 Source URLs: ISO 18013-5 DS profile (Table B.3) — https://www.iso.org/standard/69084.html (DS EKU
 `1.0.18013.5.1.2`, https://oid-base.com/get/1.0.18013.5.1.2); RFC 5280 §4.2.1.9 (pathLenConstraint
@@ -74,9 +77,110 @@ is unwound so an alternate is explored. A conformant credential that reaches a c
 **some** valid path is therefore accepted (no false-reject from a greedy first-match commit). Two path
 counters are threaded distinctly per **RFC 5280**: `pathLenConstraint` counts only **non-self-issued**
 intermediates (§4.2.1.9 / §6.1.4 (l): a self-issued — subject DN == issuer DN — key-rollover cert "is
-not counted when evaluating path length"), while the `MAX_PATH_LEN` denial-of-service cap counts every
-hop (so a self-issued-cert flood cannot evade it). Source: https://www.rfc-editor.org/rfc/rfc5280
-§4.2.1.9, §6.1, §6.1.4.
+not counted when evaluating path length"), while the `MAX_PATH_LEN` denial-of-service cap (the leaf plus
+up to **8** promoted intermediates; the terminating anchor is the §6.1.1 trust-anchor input and is not a
+hop) counts every hop (so a self-issued-cert flood cannot evade it). Source:
+https://www.rfc-editor.org/rfc/rfc5280 §4.2.1.9, §6.1, §6.1.4.
+
+Beyond name-chaining/signature/validity/CA-constraint, `verify_chain` now enforces (all verified online
+against RFC 5280, sources below):
+
+- **Unrecognized critical extensions are rejected** (§6.1.4 (o) / §6.1.5 (f); §4.2 / §6 "a
+  certificate-using system MUST reject the certificate if it encounters a critical extension it does not
+  recognize"). After the typed checks, every **processed** certificate (the leaf + each intermediate;
+  **not** the trust anchor, a §6.1.1 input) is scanned and rejected (`UnsupportedCriticalExtension`) if it
+  carries a critical extension whose OID the validator does not process. The recognized critical set is
+  `basicConstraints`, `keyUsage`, `extendedKeyUsage`, `nameConstraints`, `subjectAltName`. (Closes audit
+  **T1.1** — previously a critical `nameConstraints`/unknown OID was silently accepted.)
+- **Name constraints are processed** (§4.2.1.10, §6.1.3 (b)(c), §6.1.4 (g)). Once a path reaches an
+  anchor, the certificates are walked top-down building `permitted_subtrees` (intersected per CA) and
+  `excluded_subtrees` (unioned); each non-self-issued certificate's subject DN and `subjectAltName` must
+  lie within all permitted and outside all excluded subtrees (self-issued non-final certs are skipped per
+  §6.1.3 (b)(c)). `directoryName` (binary-prefix RDN match per §7.1) and `dNSName` (add-labels-on-the-left
+  per §4.2.1.10) subtrees are enforced; a constraint on any other `GeneralName` form, or a non-default
+  `minimum`/`maximum` `BaseDistance`, is treated as unsupported and **fails closed**
+  (`NameConstraintViolation`). Typed `x509-cert::ext::pkix::NameConstraints` decoding (no hand-rolled
+  ASN.1). (Closes audit **T1.2** — a CA scoping a sub-CA's namespace is no longer ignored.)
+- **Inner/outer signatureAlgorithm consistency** (§4.1.1.2 / §4.1.2.3): each processed certificate's outer
+  `signatureAlgorithm` MUST equal its inner `tbsCertificate.signature` AlgorithmIdentifier (the unsigned
+  outer field must not be substituted); a mismatch is `SignatureAlgorithmMismatch`. (Closes audit
+  **T1.7**.)
+
+### 1.2.1 DS-certificate validity at the MSO signing time (ISO/IEC 18013-5 §9.3.1 — the trust seam)
+
+`verify_chain` (and `TrustAnchorSource::resolve` / `resolve_chain`) take an optional
+**`leaf_validity_time`**: the instant the **leaf's own** validity window is checked at, while the rest of
+the chain authentication (intermediates → anchor validity, name constraints, …) stays at `now_unix`. The
+mdoc verifier passes `Some(mso.validityInfo.signed)` so the **Document Signer** certificate's window is
+checked against the MSO signing time per **ISO/IEC 18013-5 §9.3.1**, not "now" — DS certs rotate
+(~monthly) while mDLs live for years, so checking the DS window at `now` would **false-reject** a
+conformant mDL once its DS cert expired (audit **T3.1**, the one HIGH false-reject). SD-JWT VC issuer and
+trust-list-signer paths pass `None` (the leaf is checked at `now`, as before). Cross-checked online
+against auth0-lab/mdl `Verifier.ts`, which checks the DS window against `validityInfo.signed` and the
+MSO's own `validFrom`/`validUntil` against the verification clock separately.
+
+Sources: RFC 5280 §4.1.1.2/§4.1.2.3, §4.2.1.9 (basicConstraints "MUST … mark this extension as critical"
+is the **issuance** requirement of §4.2.1.9, distinct from the §6.1.4 (k) validation-side CA check),
+§4.2.1.10, §6.1.3, §6.1.4, §6.1.5, §7.1 — https://www.rfc-editor.org/rfc/rfc5280; ISO/IEC 18013-5 §9.3.1
+— https://www.iso.org/standard/69084.html (DS-vs-`signed` rule cross-checked at
+https://github.com/auth0-lab/mdl `src/mdoc/Verifier.ts`).
+
+### 1.3 OpenID4VCI **1.0 final** wire alignment + scope cuts (`src/issuance/obtain.rs`)
+
+The gated `obtain` path (default `IssuerBackend::None`; Cleverbase ships no issuer API today) is
+implemented against **OpenID4VCI 1.0 final** — verified online against the normative text, not training
+data: the published spec
+(<https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html>) and the
+`openid/OpenID4VCI` source `1.0/openid-4-verifiable-credential-issuance-1_0.md`. 1.0 made three breaking
+changes over the early `~draft-13` shapes this code originally tracked; all three are now implemented
+(closing conformance-audit Theme 8 T8.1–T8.3):
+
+| 1.0 requirement (§ref + anchor) | Old draft-13 shape | Implemented 1.0 shape |
+|---------------------------------|--------------------|-----------------------|
+| **Credential Request** — §8.2 `#credential-request`: "`proofs` ... contains exactly one parameter named as the proof type ... the value set for this parameter is a **non-empty array**" | singular `proof: { proof_type:"jwt", jwt:<string> }` | `proofs: { jwt: [<jwt>] }`; the `proof_type` field is gone (`credential_request`) |
+| **Nonce Endpoint** — §7 `#nonce-endpoint` / §7.2 `#nonce-response`: a dedicated endpoint returns a fresh `c_nonce`; the Token Response no longer carries one | `c_nonce` read from the Token Response | unauthenticated `POST {nonce_endpoint}` (empty body) → `{ "c_nonce": … }`, performed **before** building the PoP; `nonce_endpoint` added to `IssuerBackend` (`nonce_request`/`parse_nonce_response`, `NoncePending` phase) |
+| **Credential Response** — §8.3 `#credential-response`: "`credentials` ... an array ... The elements of the array MUST be objects ... `credential`: REQUIRED" | top-level `credential` string | `credentials[0].credential` (string SD-JWT VC, or base64url mdoc CBOR) (`parse_credential_response`) |
+
+The PoP-JWT itself was already conformant with **§F.1 `#jwt-proof-type`** (`typ:openid4vci-proof+jwt`,
+`alg:ES256`, public-only `jwk` header, `aud`=Credential Issuer Identifier, `iat`, `iss` omitted for the
+anonymous pre-authorized-code flow); only the `nonce` **source** changed (now the Nonce Endpoint). Per
+§F.1 the `nonce` claim "MUST be present when the issuer has a Nonce Endpoint", which this path always
+drives.
+
+Also implemented (T8.4, partial):
+
+- **`tx_code`** (§6.1 `#token-request`): when the offer carries a `tx_code` object, the End-User-supplied
+  Transaction Code is sent in the Token Request ("This value MUST be present if a `tx_code` object was
+  present in the Credential Offer"). Modeled as `CredentialOffer.tx_code: Option<Secret>` (a redacting
+  `Secret`, never in `Debug`/log output — FR-010); percent-encoded into the form body when present.
+- **Deferred (HTTP 202) detection** (§8.3): a deferred Credential Response (status 202 and/or a
+  `transaction_id`) is surfaced as a distinct `ObtainError::Deferred` terminal failure rather than
+  mis-parsed as a malformed body — non-silent, never a false accept. Polling the **Deferred Credential
+  Endpoint** itself (§9 `#deferred-credential-issuance`) is a scope cut (below).
+
+**Stated OpenID4VCI scope cuts** (record, don't silently omit — closing the audit's "docs claim plain
+1.0" gap):
+
+- **`credential_identifier` / `authorization_details` request path** (§8.2; §6.1.1 Token Response
+  `credential_identifiers`). This path always sends `credential_configuration_id` and **never**
+  `credential_identifier`, satisfying §8.2's mutual-exclusion MUST ("When this parameter is used, the
+  `credential_identifier` MUST NOT be present") by construction. The full `authorization_details`
+  negotiation (multi-configuration offers) is **out of scope** for the gated forward-looking path; the
+  pre-authorized-code + `credential_configuration_id` flow is what the EUDI reference issuer uses.
+- **Deferred Credential Endpoint** (§9 `#deferred-credential-issuance`): the deferred-issuance polling
+  loop (`transaction_id` → `POST {deferred_endpoint}` → `interval` backoff) is **out of scope**; a
+  deferred (202) response is detected and surfaced as the explicit `ObtainError::Deferred` failure
+  rather than supported.
+- **`token_type` / DPoP** (§6.1 `#token-response`; [@RFC9449]): the access token is used as a plain
+  `Bearer` (the EUDI baseline / reference issuer). DPoP-bound tokens and the DPoP nonce are **out of
+  scope**.
+- **Encrypted Credential Requests/Responses** (§10 `#encrypted-messages`,
+  `credential_response_encryption`) and **`notification_id`/Notification Endpoint** (§11) are **out of
+  scope** (the integrator-supplied transport is plain JSON over the host's TLS).
+
+These cuts keep the *implemented* flow interop-correct with a real 1.0 issuer (and the in-test double,
+which speaks the 1.0 shapes); the deferred / `authorization_details` legs are reasoned omissions, not
+silent gaps.
 
 ## 2. Crate version pins (the format/trust + crypto layers)
 
