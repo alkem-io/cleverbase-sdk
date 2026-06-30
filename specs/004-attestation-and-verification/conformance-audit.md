@@ -121,3 +121,34 @@ verbatim-bytes/digestID-uniqueness/all-documents-loop/§B.2.6-handover; OpenID4V
 (both formats)/handover byte-reproduced against the spec example; qualified gate now-vs-relevant-time split;
 per-role `(role,format)` anchoring; the JWT-NumericDate vs mdoc-RFC3339 two-parser split; PoP-JWT
 typ/alg/aud/iat/no-private-key/cnf-binding.
+
+---
+
+## D. Remediation disposition (2026-06-26)
+
+The audit was remediated in 4 commits on `feature/004-attestation-and-verification` (test count 410 → 484,
+all gates green throughout). User decisions: full DCQL in-core · OpenID4VCI → 1.0 final · full RFC 5280 incl.
+name constraints · fix-all-the-rest.
+
+| Theme | Disposition | Commit |
+|-------|-------------|--------|
+| 1 — X.509 cert-profile completeness | **Fixed**: reject-unknown-critical-ext, full name constraints, per-role QcStatement, mdoc DS keyUsage+cA=FALSE, SD-JWT issuer keyUsage, inner/outer sig-alg | wave 1 `7d000ba` |
+| 3 — DS-cert validity at signing time | **Fixed**: `resolve()` leaf-validity-time seam; mdoc checks DS leaf at MSO `signed` | wave 1 `7d000ba` |
+| 8 — OpenID4VCI draft-13 → 1.0 | **Fixed**: `proofs[]`, Nonce Endpoint, `credentials[]`, tx_code, 202-detect | wave 1 `7d000ba` |
+| 2 — `crit` (COSE + JOSE) | **Fixed**: unknown critical header rejected on both layers | wave 2 `f5e9f7c` |
+| 6 — SD-JWT robustness MUSTs | **Fixed**: issuer `typ`, `vct` CRN, `_sd`/`...` reject, KB `iat` window, nested `_sd_alg`, §9.7 note | wave 2 `f5e9f7c` |
+| 7 — over-strict + CBOR | **Fixed**: fractional NumericDate accepted, indefinite-CBOR rejected, documentErrors tolerant, version checks | wave 2 `f5e9f7c` |
+| 4 — DCQL / "did I get what I requested" | **Fixed**: full in-core DCQL eval + `verify_vp_token` set-level + role derivation (`QueryNotSatisfied`/`RoleMismatch`) | wave 3 `e799a69` |
+| 5 — ETSI TL / qualified | **Fixed**: XML status/type gating, `urn:etsi:esi:eaa:eu:qualified` precondition (v1.4.1), cert↔service SKI/CA matching, national-TL staleness=warning | wave 4 `85a76de` |
+
+**Remaining documented scope cuts** (recorded in `standards-conformance.md` §1.x, each with §ref + rationale):
+full XAdES TL signature C14N/Reference-digest verification (fail-closed default; `chain_only` is `#[cfg(test)]`
+only); DeviceMac (N/A for OID4VP-redirect); DC-API handover + encrypted responses; LOTL/OJEU fetch +
+LOTL→national-TL pointer discovery (sans-IO; host-supplied anchors); JWT VC Issuer Metadata key discovery +
+`vct#integrity`/Type-Metadata fetch (network); ES384/512/PSS/EdDSA (ES256 is the EUDI baseline); RP access
+certificates + wallet/key attestation; `require_cryptographic_holder_binding:false` (always-bind secure default);
+OpenID4VCI deferred-endpoint polling / `credential_identifier` path / DPoP.
+
+**No unconditional false-accept existed at audit time, and none was introduced.** The cryptographic core was
+ratified conformant by the audit (see §C); the remediation closed the conditional false-trust, the HIGH
+false-reject (DS-validity), the over-strict false-rejects, and the robustness/forward-compat MUSTs.

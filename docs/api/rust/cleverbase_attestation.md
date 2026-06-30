@@ -73,6 +73,241 @@ No date crate: the civil-date math is the public-domain `days_from_civil` algori
 Hinnant) — the same self-contained algorithm `chrono`/`time` use — keeping the verifier
 pure-Rust / WASM-able with no extra dependency.
 
+## Module `dcql`
+
+In-core OpenID4VP 1.0 **DCQL** (Digital Credentials Query Language) model + evaluator.
+
+This module is the "did I get what I requested" gate the verifier was missing (conformance-audit
+Theme 4 / T4.1): the always-on bar proves a presentation is cryptographically sound, trusted, and
+request-bound, but it never checked that the credential **matches the DCQL request** — so a
+trusted, freshly-bound credential of the **wrong** `vct`/`docType`, or one missing a requested
+claim, used to pass as VALID (a false-trust). The DCQL is no longer carried opaquely: it is parsed
+and evaluated **in-core** (the explicit product decision — full DCQL evaluation in-core, not
+delegated to the wallet, per OpenID4VP 1.0 §"Security Checks on the Returned Credentials and
+Presentations": *"the Verifier MUST NOT rely on the Wallet to enforce these constraints"*).
+
+## Specification (verified online, not from training data)
+
+OpenID4VP **1.0** — <https://openid.net/specs/openid-4-verifiable-presentations-1_0.html>; source
+`openid/OpenID4VP` `1.0/openid-4-verifiable-presentations-1_0.md`:
+
+- **§6 Digital Credentials Query Language (DCQL)** — top-level `credentials` (REQUIRED, non-empty
+  array of Credential Queries) + `credential_sets` (OPTIONAL); *"Implementations MUST ignore any
+  unknown properties."*
+- **§6.1 Credential Query** — `id` (REQUIRED), `format` (REQUIRED), `multiple` (default `false`),
+  `meta` (REQUIRED; format-specific), `claims` (OPTIONAL), `claim_sets` (OPTIONAL),
+  `require_cryptographic_holder_binding` (default `true`).
+- **§6.2 Credential Set Query** — `options` (REQUIRED, array of arrays of credential `id`s),
+  `required` (default `true`).
+- **§6.3 Claims Query** — `id` (REQUIRED iff `claim_sets` present), `path` (REQUIRED, a Claims Path
+  Pointer), `values` (OPTIONAL, non-empty array of strings/integers/booleans).
+- **§"Claims Path Pointer"** — a non-empty array of strings (object key), non-negative integers
+  (array index), and `null` (all array elements) for JSON-based credentials (SD-JWT VC); exactly two
+  string components `[namespace, dataElementIdentifier]` for ISO mdoc credentials.
+- **§"Selecting Claims"** — `claims` absent ⇒ no SD claims requested; `claims` present and
+  `claim_sets` absent ⇒ all listed claims requested; both present ⇒ one `claim_sets` option (the
+  first satisfiable); `claim_sets` MUST NOT be present if `claims` is absent.
+- **§"Selecting Credentials"** — no `credential_sets` ⇒ all `credentials` requested; otherwise all
+  `required` (or `required`-omitted) Credential Set Queries + optionally any non-required ones.
+- **§"VP Token Validation"** — step 2.2: *"Validate that the returned Credential(s) meet all
+  criteria defined in the query in the Authorization Request (e.g., Claims included in the
+  presentation)."*; step 3: *"Check that the set of Presentations returned satisfies all
+  requirements defined in the Verifier's request as described in [Selecting Claims and
+  Credentials]."*
+- Format meta — SD-JWT VC `vct_values` (§"Parameter in the `meta` parameter ... `vct_values`"); mdoc
+  `doctype_value` (§"Parameter in the `meta` parameter ... `doctype_value`").
+
+## What this module enforces (and what it deliberately does not)
+
+It parses the DCQL query and, against a presentation the always-on bar already accepted, checks
+(a) **format**, (b) **meta** (SD-JWT VC `vct` ∈ `vct_values`; mdoc `docType` == `doctype_value`),
+(c) every requested **claim path** resolves in the verified **disclosed** attributes (honoring
+`claim_sets`), and (d) a claim's disclosed value ∈ its `values`. The set-level check (§"VP Token
+Validation" step 3 + §"Selecting Credentials") is [`crate::openid4vp::verify_vp_token`].
+
+Value matching follows §6.3: for an ISO mdoc the CBOR value is matched after conversion to JSON
+(RFC 8949 §6.1) — the SDK's [`AttributeValue`] is already that decoded JSON-shaped value, so a
+`Text`/`Integer`/`Boolean` is matched against a string/integer/boolean respectively.
+
+Claim paths resolve against the **verified disclosed** attribute set
+([`crate::types::VerificationResult::disclosed_attributes`]) — the privacy-minimal set the holder
+actually presented. A path targeting an always-visible (never-disclosed) registered scalar claim is
+treated as not-present (DCQL Claims Queries target subject claims, which are selectively
+disclosable). `trusted_authorities` (§6.1.1) is not evaluated here (issuer trust is the always-on
+bar's per-role anchoring); `require_cryptographic_holder_binding:false` is not honored (the SDK
+always requires holder binding — a documented secure default).
+
+### Structs
+
+#### struct `ClaimsQuery`
+
+```rust
+struct ClaimsQuery
+```
+
+One OpenID4VP 1.0 Claims Query (§6.3).
+
+##### Fields
+
+- `id: Option<String>`
+  - The claim `id` (REQUIRED iff the owning query has `claim_sets`; OPTIONAL otherwise).
+- `path: Vec<PathComponent>`
+  - The Claims Path Pointer to the claim (§"Claims Path Pointer"); always non-empty.
+- `values: Option<Vec<ClaimValue>>`
+  - The expected values (§6.3 `values`): a present, non-empty set the disclosed value must be in.
+
+#### struct `CredentialQuery`
+
+```rust
+struct CredentialQuery
+```
+
+One OpenID4VP 1.0 Credential Query (§6.1): a request for a presentation of a matching credential.
+
+##### Fields
+
+- `id: String`
+  - The `id` identifying this credential in the `vp_token` response and in `credential_sets`.
+- `format: Format`
+  - The requested credential format.
+- `meta: CredentialMeta`
+  - The format-specific `meta` constraint (SD-JWT VC `vct_values`; mdoc `doctype_value`).
+- `claims: Vec<ClaimsQuery>`
+  - The requested claims (§6.3); empty when the query lists no selectively-disclosable claims.
+- `claim_sets: Vec<Vec<String>>`
+  - The `claim_sets`: alternative combinations of claim `id`s, in Verifier preference order. Empty
+when absent (then all of [`Self::claims`] are requested — §"Selecting Claims").
+- `multiple: bool`
+  - Whether more than one Presentation may be returned for this query (§6.1 `multiple`, default
+`false`).
+
+#### struct `CredentialSetQuery`
+
+```rust
+struct CredentialSetQuery
+```
+
+One OpenID4VP 1.0 Credential Set Query (§6.2).
+
+##### Fields
+
+- `options: Vec<Vec<String>>`
+  - The `options`: each is a set of credential `id`s that satisfies this use case (§6.2). One option
+is satisfied iff every credential `id` it lists is satisfied.
+- `required: bool`
+  - Whether this set is required to satisfy the request (§6.2 `required`, default `true`).
+
+#### struct `DcqlQuery`
+
+```rust
+struct DcqlQuery
+```
+
+A parsed OpenID4VP 1.0 DCQL query (§6). Carries only the credential/claim/set constraints this SDK
+evaluates; unknown top-level and per-object properties are ignored (§6 *"Implementations MUST ignore
+any unknown properties"*).
+
+[`parse`](Self::parse) is **lenient**: a Credential Query whose `format` this SDK does not support,
+or that is structurally malformed, is dropped from [`Self::credentials`] (it cannot be satisfied by
+either supported format, so it imposes no enforceable in-core constraint) rather than failing the
+whole parse — a single bad entry never disables the gate for the rest. `parse` errors only on a
+non-JSON or non-object input.
+
+##### Fields
+
+- `credentials: Vec<CredentialQuery>`
+  - The Credential Queries this SDK can evaluate (supported format + well-formed), in request order.
+- `credential_sets: Vec<CredentialSetQuery>`
+  - The Credential Set Queries (§6.2) constraining which combinations of credentials are required.
+
+##### Methods
+
+```rust
+fn parse(json: &str) -> Result<Self, DcqlError>
+```
+
+Parse a DCQL query from its JSON text (§6).
+
+Lenient by contract (see the type docs): unsupported-format or malformed Credential Queries /
+Credential Set Queries are dropped rather than failing the whole parse, so one bad entry never
+disables enforcement for the rest. Errors only on a non-JSON / non-object input.
+
+# Errors
+
+[`DcqlError::Json`] if the text is not JSON; [`DcqlError::NotAnObject`] if it is not a JSON
+object.
+
+### Enums
+
+#### enum `ClaimValue`
+
+```rust
+enum ClaimValue
+```
+
+An expected claim value (§6.3 `values`: *"an array of strings, integers or boolean values"*).
+
+##### Variants
+
+- `Text(String)`
+  - A string value.
+- `Integer(i64)`
+  - An integer value.
+- `Boolean(bool)`
+  - A boolean value.
+
+#### enum `CredentialMeta`
+
+```rust
+enum CredentialMeta
+```
+
+The format-specific `meta` constraint of a [`CredentialQuery`] (§6.1 `meta`). A `None` constraint
+means the `meta` placed no type restriction (`meta` absent/empty — §6.1 *"If empty, no specific
+constraints are placed on the metadata"*).
+
+##### Variants
+
+- `SdJwtVc { vct_values: Option<Vec<String>> }`
+  - SD-JWT VC `meta.vct_values` (§"... `vct_values`"): the allowed `vct` values. `None` ⇒ no `vct`
+constraint.
+- `Mdoc { doctype_value: Option<String> }`
+  - ISO mdoc `meta.doctype_value` (§"... `doctype_value`"): the allowed `docType`. `None` ⇒ no
+`docType` constraint.
+
+#### enum `DcqlError`
+
+```rust
+enum DcqlError
+```
+
+A failure parsing the DCQL JSON into a [`DcqlQuery`]. Only a truly unusable input (non-JSON, or a
+JSON value that is not an object) errors; malformed/unsupported sub-entries are dropped leniently.
+
+##### Variants
+
+- `Json`
+  - The query text is not valid JSON.
+- `NotAnObject`
+  - The query is valid JSON but not a JSON object (§6: a DCQL query is a JSON object).
+
+#### enum `PathComponent`
+
+```rust
+enum PathComponent
+```
+
+One component of a Claims Path Pointer (§"Claims Path Pointer").
+
+##### Variants
+
+- `Key(String)`
+  - A string component: select the value at this object key.
+- `Index(u64)`
+  - A non-negative-integer component: select this 0-based index of an array.
+- `AllElements`
+  - A `null` component: select all elements of the currently selected array(s).
+
 ## Module `issuance`
 
 Forward-looking, **gated** issuance + holder presentation (OpenID4VCI / OpenID4VP) — US2.
@@ -210,10 +445,26 @@ endpoints differ — so a future Cleverbase issuer needs no rework of the holder
 
 ## Flow (pre-authorized-code grant)
 
-`credential offer (pre-authorized_code)` → POST token endpoint → `Sign` the OpenID4VCI proof-JWT
-(PoP) via the signer-hook → POST credential endpoint with the proof → parse the issued SD-JWT VC /
-mdoc into a [`HeldAttestation`]. The pre-authorized-code grant is the self-contained flow the
-reference issuer supports without an interactive browser leg.
+`credential offer (pre-authorized_code)` → POST token endpoint → POST the **Nonce Endpoint** for a
+fresh `c_nonce` (OpenID4VCI 1.0 §7 `#nonce-endpoint`) → `Sign` the OpenID4VCI proof-JWT (PoP) via
+the signer-hook → POST credential endpoint with the `proofs` object → parse the issued SD-JWT VC /
+mdoc out of the `credentials` array into a [`HeldAttestation`]. The pre-authorized-code grant is
+the self-contained flow the reference issuer supports without an interactive browser leg.
+
+## OpenID4VCI 1.0 wire shapes (verified online against the 1.0 final text)
+
+This path tracks **OpenID4VCI 1.0 final**
+(<https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html>; source
+`openid/OpenID4VCI` `1.0/openid-4-verifiable-credential-issuance-1_0.md`), which made three
+breaking changes over the early `~draft-13` shapes this code originally tracked:
+
+1. **Credential Request** carries `proofs` — an object keyed by proof type whose value is a
+   **non-empty array** (`{"proofs":{"jwt":[<jwt>]}}`), replacing the draft singular
+   `proof`/`proof_type` (§8.2 `#credential-request`).
+2. The one-time `c_nonce` is fetched from a dedicated **Nonce Endpoint** rather than read from the
+   Token Response (§7 `#nonce-endpoint`; the Token Response no longer carries `c_nonce`).
+3. **Credential Response** returns `credentials` — an array of objects, each with a `credential`
+   member — replacing the draft top-level `credential` string (§8.3 `#credential-response`).
 
 #### Structs
 
@@ -239,6 +490,14 @@ live value (only the `Debug` exposure was the leak).
   - The credential configuration id to request (e.g. `eu.europa.ec.eudi.pid_vc_sd_jwt`).
 - `format: Format`
   - The format of the credential this configuration issues (so the SDK parses the right shape).
+- `tx_code: Option<Secret>`
+  - The End-User-supplied **Transaction Code** value to send in the Token Request, present only
+when the offer's pre-authorized-code grant carried a `tx_code` object (OpenID4VCI 1.0 §6.1 +
+§Token-Request `#token-request`: "This value MUST be present if a `tx_code` object was present
+in the Credential Offer"). It is a low-entropy one-time code (typically a PIN delivered out of
+band), so it is held as a redacting [`Secret`] (never in `Debug`/log output — FR-010) yet
+(de)serializes transparently so the offer round-trips and the token-request site percent-encodes
+the live value. `None` when the offer carried no `tx_code` object (the default).
 
 ##### struct `HttpEffect`
 
@@ -276,6 +535,12 @@ flow drives (ignored when `kind = None`).
   - Which issuer API this backend targets.
 - `token_endpoint: String`
   - The OpenID4VCI **token** endpoint (the pre-authorized-code grant is exchanged here).
+- `nonce_endpoint: String`
+  - The OpenID4VCI **Nonce Endpoint** (`nonce_endpoint` Credential Issuer Metadata, OpenID4VCI 1.0
+§7 `#nonce-endpoint`). 1.0 moved the one-time `c_nonce` out of the Token Response: the flow
+POSTs here (unauthenticated, empty body) for a fresh `c_nonce` before building the PoP proof. A
+Credential Issuer that requires `c_nonce` values in the proof MUST offer this endpoint
+(`#nonce-endpoint`); the EUDI reference issuer does.
 - `credential_endpoint: String`
   - The OpenID4VCI **credential** endpoint (the credential request — with the PoP proof — is POSTed
 here).
@@ -352,8 +617,17 @@ outcome, which carries this).
   - The session was resumed past a terminal phase.
 - `TokenRequest(String)`
   - The token endpoint returned a non-success status or an unparseable body.
+- `NonceRequest(String)`
+  - The Nonce Endpoint (OpenID4VCI 1.0 §7 `#nonce-endpoint`) returned a non-success status or a
+body without the REQUIRED `c_nonce`.
 - `CredentialRequest(String)`
   - The credential endpoint returned a non-success status or an unparseable body.
+- `Deferred(String)`
+  - The issuer returned a **deferred** Credential Response (HTTP 202 + a `transaction_id`,
+OpenID4VCI 1.0 §8.3 `#credential-response`). Deferred issuance — polling the Deferred Credential
+Endpoint (§9 `#deferred-credential-issuance`) — is a documented scope cut (see
+`standards-conformance.md`), so it is surfaced as a clear, distinct terminal failure rather than
+a confusing "missing credentials" parse error.
 - `Proof(String)`
   - The PoP-JWT signing input could not be built.
 
@@ -584,7 +858,7 @@ building the ceremony envelope fails.
 ##### fn `present`
 
 ```rust
-fn present<S: Signer>(held: &HeldAttestation, request: &PresentationRequest, _holder: &HolderContext, disclose: &BTreeSet<String>, signer: &S, iat: i64) -> Result<HolderPresentation, PresentError> where <S>::Error: Display
+fn present<S: Signer>(held: &HeldAttestation, request: &PresentationRequest, holder: &HolderContext, disclose: &BTreeSet<String>, signer: &S, iat: i64) -> Result<HolderPresentation, PresentError> where <S>::Error: Display
 ```
 
 Build an OpenID4VP `vp_token` for the held attestation, disclosing only `disclose`, bound to the
@@ -916,10 +1190,13 @@ and [`KbJwtBuild::assemble`] produces the compact KB-JWT to append after the pre
 fn build_pop_jwt(holder: &HolderContext, audience: &str, c_nonce: &str, iat: i64) -> Result<PopJwtBuild, SignerError>
 ```
 
-Build the OpenID4VCI **proof-of-possession** JWT signing input (`typ: openid4vci-proof+jwt`,
-draft OpenID4VCI 1.0 §8.2.1.1). Binds the credential-issuer `audience` and the issuer-supplied
-`c_nonce`; the holder public key travels in the `jwk` header so the issuer binds it as the
-credential's `cnf`.
+Build the OpenID4VCI **proof-of-possession** JWT signing input (the `jwt` proof type, OpenID4VCI
+1.0 §F.1 `#jwt-proof-type`). The header carries `typ` (REQUIRED, `openid4vci-proof+jwt`), `alg`
+(REQUIRED, ES256), and the holder public key in the `jwk` header (so the issuer binds it as the
+credential's `cnf`); the body carries `aud` (REQUIRED, the Credential Issuer Identifier), `iat`
+(REQUIRED), and `nonce` (the `c_nonce` from the Nonce Endpoint, §7 `#nonce-endpoint`). `iss` is
+omitted: §F.1 requires it omitted "if the access token ... was obtained from a Pre-Authorized Code
+Flow through anonymous access to the token endpoint", which is this path.
 
 The host signs [`PopJwtBuild::input`] and [`PopJwtBuild::assemble`] splices the result.
 
@@ -1129,6 +1406,69 @@ crypto) and `ciborium` (CBOR) — no hand-rolled crypto (Principle IV).
 
 ### Structs
 
+#### struct `MdocVerifyMeta`
+
+```rust
+struct MdocVerifyMeta
+```
+
+Verify a presented ISO/IEC 18013-5 mdoc `DeviceResponse`.
+
+Runs the mdoc always-on bar — `IssuerAuth` signature + DS trust, in-house `valueDigests`
+integrity, MSO `validityInfo` (including the `signed` consistency check), and the `DeviceAuth`
+holder binding — over **every** document in the response (and enforces the top-level
+`DeviceResponse.status`). Returns a [`VerificationResult`]: `valid = true` with the disclosed
+attributes only when every document clears every check, or `valid = false` carrying a single
+specific [`ReasonCode`] on the first failure (no false-accept — SC-002). Verifying every document
+is essential: a verdict that covered only `documents[0]` would let a forged second document ride
+inside a VALID result unverified.
+
+## Disclosed-attributes shape (mdoc: namespace-grouped)
+
+[`VerificationResult::disclosed_attributes`] for an mdoc is GROUPED BY NAMESPACE: each top-level key
+is an ISO/IEC 18013-5 namespace, and its value is an [`AttributeValue::Map`] of that namespace's
+`{ elementIdentifier: elementValue }` — i.e. `{ "org.iso.18013.5.1": Map({ "given_name": … }), … }`.
+`elementIdentifier`s are unique only WITHIN a namespace, so a presentation MAY legitimately carry the
+SAME id (e.g. `given_name`) in two namespaces with different values; grouping by namespace keeps
+those distinct (never a false `DisclosureIntegrity` reject) and preserves the namespace provenance a
+consumer needs. Across multiple documents the namespaces merge, with a same-`(namespace, id)`
+conflicting value rejected as `DisclosureIntegrity` (an identical re-disclosure merges cleanly).
+The byproducts the single always-on-bar pass already computed about a `DeviceResponse`, surfaced
+alongside the [`VerificationResult`] so the callers that would otherwise RE-DECODE the same response
+(the OpenID4VP replay classifier and the opt-in qualified gate) read these cached results instead.
+
+Every field is derived from the ONE `ciborium` decode + per-document parse [`verify_with_meta`]
+already performs; nothing here changes the verdict (it is the same `VerificationResult`
+[`verify_with_meta`] returns) — it only avoids the duplicate decodes those callers used to trigger
+(an attacker-multipliable soft-DoS lever: documents × IssuerAuth/MSO size).
+
+##### Fields
+
+- `document_count: usize`
+  - The `documents` array length (`0` when the response is too malformed to read it). The OpenID4VP
+replay classifier bounds its `Replay` re-attribution to the single-document case via this count,
+read from the bar's own decode (no separate `DeviceResponse` re-decode).
+- `claimed_issuers: Vec<(Vec<u8>, i64)>`
+  - Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix)` — the Document Signer leaf
+(DER) from `IssuerAuth.x5chain` PAIRED with the MSO `validityInfo.signed` — collected during a
+VALID bar pass (and EMPTY on any INVALID verdict). The opt-in [`crate::qualified`] gate folds
+these (it runs only on a VALID credential), reading EACH document's already-extracted cert + its
+issuance/relevant time rather than re-decoding the response. On a VALID credential `signed` is
+mandatory (the bar requires it), so this is the single source the gate folds — the per-document
+`(leaf, signed)` already paired by the bar pass.
+- `doc_types: Vec<String>`
+  - Per-document verified `docType` (the signed MSO `docType`, one per document), collected during a
+VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL gate
+([`crate::dcql`]) matches these against the query's `meta.doctype_value` (mdoc `docType` ==
+`doctype_value`), reading the bar's already-decoded `docType` rather than re-decoding the
+response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
+it), so this is the authoritative type view for the "did I get what I requested" check.
+- `binding_machinery: Option<DeviceBindingMachinery>`
+  - The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
+when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
+classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
+(no second `DeviceResponse` decode), and identical to the standalone [`device_binding_machinery`].
+
 #### struct `MdocVerifyParams`
 
 ```rust
@@ -1140,9 +1480,14 @@ The verification instant and the optional session transcript needed to verify an
 `now_unix` is the time (Unix seconds) at which the MSO `validityInfo` window is enforced — passed
 in (sans-IO) rather than read from the system clock so verification is deterministic and testable.
 `session_transcript` is the CBOR-encoded `SessionTranscript` the holder's `DeviceSignature` is
-computed over; it is supplied by the transport/OpenID4VP layer. When `None`, the verifier treats
-the holder binding as bound to an empty transcript (the value the test issuer and a transport-less
-presentation agree on).
+computed over; it is supplied by the transport/OpenID4VP layer. ISO/IEC 18013-5 §9.1.5
+`DeviceAuthentication` is **always** computed over a real `SessionTranscript` (the device-retrieval
+transcript, or the OpenID4VP handover), so when a document asserts holder binding (carries a
+`DeviceSignature`) and `session_transcript` is `None`, the verifier CANNOT confirm that binding and
+MUST NOT fabricate a transcript to "pass" it. The verifier therefore rejects such a document with
+[`ReasonCode::MissingRequestBinding`] rather than silently no-op the binding — the caller must
+supply the explicit `SessionTranscript` (or, for OpenID4VP, the reconstructed handover via
+[`crate::openid4vp`]).
 
 ##### Fields
 
@@ -1168,7 +1513,7 @@ enum DeviceBindingMachinery
 
 Whether a presented mdoc's `DeviceAuth` holder-binding **machinery** is structurally sound — used
 to tell a fresh-nonce/transcript mismatch apart from a genuine holder-binding fault when a
-[`verify`] run returns [`ReasonCode::HolderBinding`].
+[`verify_with_meta`] run returns [`ReasonCode::HolderBinding`].
 
 A nonce/transcript mismatch (a replayed presentation) fails the `DeviceSignature` check **only**
 because the verifier rebuilds `DeviceAuthentication` over a different transcript than the holder
@@ -1206,76 +1551,28 @@ the signature bytes form a well-formed ES256 signature — it deliberately does 
 signature against any payload, so it isolates a genuine binding fault (which fails for every
 transcript) from a fresh-nonce mismatch (which fails only because the rebuilt transcript differs).
 
-Used only to refine the failure attribution when [`verify`] already returned
+Used only to refine the failure attribution when [`verify_with_meta`] already returned
 [`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
 holder-binding fault is never silently downgraded to a replay).
 
-#### fn `issuer_signing_cert_der`
+This is the standalone (bytes-in) entry; [`verify_with_meta`] surfaces the SAME classification from
+its own already-decoded `documents` (no second decode) via [`MdocVerifyMeta::binding_machinery`], so
+the OpenID4VP replay classifier reads that cached value instead of calling this. Both route through
+the shared `classify_binding_machinery` core, so the bytes-in and decoded-in answers are identical.
+
+#### fn `verify_with_meta`
 
 ```rust
-fn issuer_signing_cert_der(device_response: &[u8]) -> Option<Vec<u8>>
+fn verify_with_meta<A: TrustAnchorSource + ?Sized>(device_response: &[u8], anchors: &A, params: &MdocVerifyParams<'_>) -> (VerificationResult, MdocVerifyMeta)
 ```
 
-Extract the Document Signer signing certificate (DER) a presented mdoc claims in its `IssuerAuth`
-`x5chain`, without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf
-against the national Trusted List's `EAA/Q` service entries).
-
-Returns `None` when the `DeviceResponse` does not parse or carries no `x5chain` leaf. The value is
-*claimed* (its trust + signature are decided by the always-on bar in [`verify`]); this read is
-only the gate's cert-matching input, never an acceptance.
-
-#### fn `issuer_signing_certs_with_issuance_der`
-
-```rust
-fn issuer_signing_certs_with_issuance_der(device_response: &[u8]) -> Option<Vec<ClaimedIssuer>>
-```
-
-Extract, per document in a `DeviceResponse`, the claimed Document Signer leaf certificate (DER)
-**paired with** that document's claimed issuance/relevant time (Unix seconds) — the input the
-opt-in [`crate::qualified`] gate folds across every document so the determination uses EACH
-issuer's own issuance time (the credential's relevant time, NOT "now").
-
-Each [`ClaimedIssuer`] entry is `(claimed_cert, claimed_issuance_time)`: the leaf from the
-document's `IssuerAuth` `x5chain` and the MSO `validityInfo.signed` (fallback `validFrom`). Either
-element is `None` when that field cannot be read; a per-document `None` issuance time fails the
-gate closed for that document ([`crate::types::QualifiedStatus::Indeterminate`]) rather than
-substituting "now".
-
-Returns `None` when the `DeviceResponse` does not parse or carries no `documents` array. Like
-[`issuer_signing_cert_der`], the certs/times are *claimed* (trust + signature are decided by the
-always-on bar in [`verify`]); this read is only the gate's input, never an acceptance.
-
-#### fn `verify`
-
-```rust
-fn verify<A: TrustAnchorSource + ?Sized>(device_response: &[u8], anchors: &A, params: &MdocVerifyParams<'_>) -> VerificationResult
-```
-
-Verify a presented ISO/IEC 18013-5 mdoc `DeviceResponse`.
-
-Runs the mdoc always-on bar — `IssuerAuth` signature + DS trust, in-house `valueDigests`
-integrity, MSO `validityInfo` (including the `signed` consistency check), and the `DeviceAuth`
-holder binding — over **every** document in the response (and enforces the top-level
-`DeviceResponse.status`). Returns a [`VerificationResult`]: `valid = true` with the disclosed
-attributes only when every document clears every check, or `valid = false` carrying a single
-specific [`ReasonCode`] on the first failure (no false-accept — SC-002). Verifying every document
-is essential: a verdict that covered only `documents[0]` would let a forged second document ride
-inside a VALID result unverified.
-
-`anchors` is the configured trust-anchor source (the IACA root for mdoc); `params` carries the
-verification instant, the session transcript for the holder binding, and the issuer role.
-
-### Type aliases
-
-#### type `ClaimedIssuer`
-
-```rust
-type ClaimedIssuer = (Option<Vec<u8>>, Option<i64>)
-```
-
-One document's *claimed* qualified-gate input: its Document Signer leaf certificate (DER) and its
-issuance/relevant time (Unix seconds), each `None` when that field cannot be read. The values are
-claimed (read-only, unverified); trust + signature are decided by the always-on bar.
+Verify a presented mdoc `DeviceResponse` against the always-on bar (the IACA-rooted issuer chain,
+the MSO `validityInfo` window, selective-disclosure integrity, and the `DeviceAuth` holder binding)
+AND surface the [`MdocVerifyMeta`] the single bar pass already computed — the per-document claimed
+issuer `(cert, issuance_time)`, the document count, and (on a `HolderBinding` failure) the
+holder-binding-machinery soundness — so the OpenID4VP binding verifier and the qualified gate read
+these cached results instead of re-decoding the response. This is the canonical mdoc entry point;
+callers that do not need the meta simply take the [`VerificationResult`] (`.0`).
 
 ## Module `openid4vp`
 
@@ -1315,19 +1612,45 @@ the full cryptographic bar runs.
 
 ### Structs
 
+#### struct `CredentialVerification`
+
+```rust
+struct CredentialVerification
+```
+
+The per-credential outcome within a [`verify_vp_token`] evaluation.
+
+`presentations` carries the [`VerificationResult`] of EACH Presentation returned under this
+Credential Query `id` (in input order); `satisfied` is whether this Credential Query is fulfilled —
+at least one returned Presentation both verified (always-on bar + binding) AND matched this query
+(format + `meta` + claims), honoring the `multiple` cardinality (a `multiple:false` query MUST carry
+at most one Presentation — OpenID4VP 1.0 §"Response Parameters").
+
+##### Fields
+
+- `presentations: Vec<VerificationResult>`
+  - The verification result of each Presentation returned under this Credential Query `id`.
+- `satisfied: bool`
+  - Whether this Credential Query is satisfied (≥1 verified-and-matching Presentation; cardinality
+respected).
+
 #### struct `Dcql`
 
 ```rust
 struct Dcql
 ```
 
-A DCQL (Digital Credentials Query Language — OpenID4VP 1.0) query.
+A DCQL (Digital Credentials Query Language — OpenID4VP 1.0 §6) query.
 
 OpenID4VP 1.0 removed Presentation-Exchange `presentation_definition`; the query is **DCQL**. The
-binding verifier does not interpret the query's selection semantics (that is the holder/wallet's
-job when building the presentation) — it carries the query opaquely as its canonical JSON so the
-issued request is reproducible and auditable. Carrying it as a structured-but-opaque value keeps
-the wire contract explicit without re-implementing DCQL evaluation in the verifier.
+query is carried on the wire as its canonical JSON text (so the issued request stays reproducible
+and auditable) AND is now **evaluated in-core** ([`parse`](Self::parse) → [`crate::dcql::DcqlQuery`]):
+the verifier no longer treats it opaquely — after the always-on bar accepts a presentation it checks
+the credential SATISFIES the query (correct `vct`/`docType`, requested claims present, values
+matched) per OpenID4VP 1.0 §"VP Token Validation" step 2.2, closing the "did I get what I requested"
+gap (conformance-audit T4.1). This was the explicit product decision — full DCQL evaluation in-core,
+not delegated to the wallet (§"Security Checks on the Returned Credentials and Presentations":
+*"the Verifier MUST NOT rely on the Wallet to enforce these constraints"*).
 
 ##### Fields
 
@@ -1341,6 +1664,17 @@ fn from_json<impl Into<String>: Into<String>>(query_json: impl Into<String>) -> 
 ```
 
 Wrap a DCQL query given as JSON text.
+
+```rust
+fn parse(&self) -> Result<DcqlQuery, DcqlError>
+```
+
+Parse this query into the structured [`crate::dcql::DcqlQuery`] the in-core evaluator uses
+(OpenID4VP 1.0 §6). See [`crate::dcql::DcqlQuery::parse`] for the (lenient) parsing contract.
+
+# Errors
+
+[`crate::dcql::DcqlError`] when the query text is not JSON or not a JSON object.
 
 #### struct `MdocVpToken`
 
@@ -1401,6 +1735,28 @@ fn nonce_b64(&self) -> String
 
 The request `nonce` as a base64url-unpadded string (the form an SD-JWT VC KB-JWT echoes).
 
+#### struct `VpTokenVerification`
+
+```rust
+struct VpTokenVerification
+```
+
+The outcome of evaluating a whole OpenID4VP `vp_token` against its DCQL query (OpenID4VP 1.0 §"VP
+Token Validation" steps 2 + 3): the per-credential results plus the set-level verdict.
+
+`satisfied` is the overall set-level decision (§"VP Token Validation" step 3 + §"Selecting
+Credentials"): with no `credential_sets`, EVERY Credential Query in `credentials` must be satisfied;
+otherwise EVERY **required** Credential Set Query must have at least one fully-satisfied `option`
+(non-required sets are optional).
+
+##### Fields
+
+- `satisfied: bool`
+  - Whether the returned set of Presentations satisfies the request's set-level requirements.
+- `credentials: BTreeMap<String, CredentialVerification>`
+  - The per-credential outcomes, keyed by the Credential Query `id` the Presentations were returned
+under.
+
 ### Enums
 
 #### enum `VpToken`
@@ -1419,9 +1775,17 @@ verifier never guesses (an unrecognized shape would be [`ReasonCode::Unsupported
 ##### Variants
 
 - `SdJwtVc(&'a str)`
-  - A compact SD-JWT VC presentation (`<issuer-JWS>~<D>…~<KB-JWT>`).
+  - A compact SD-JWT VC presentation (`<issuer-JWS>…~<KB-JWT>`).
 - `Mdoc(MdocVpToken)`
   - An mdoc `DeviceResponse` plus its addressed audience.
+
+##### Methods
+
+```rust
+const fn format(&self) -> Format
+```
+
+The credential format this `vp_token` carries.
 
 ### Traits
 
@@ -1526,35 +1890,107 @@ public entry honors the gate even when a native caller invokes it directly (not 
 [`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`status` are the remaining per-format-bar
 inputs (the validity instant, the trust-anchor role, and the resolved status outcome).
 
+#### fn `verify_vp_token`
+
+```rust
+fn verify_vp_token<A: TrustAnchorSource + ?Sized>(request: &PresentationRequest, vp_token: &BTreeMap<String, Vec<VpToken<'_>>>, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, status: StatusOutcome) -> VpTokenVerification
+```
+
+Evaluate a full OpenID4VP `vp_token` (the `{ credential_id: [presentations] }` shape — OpenID4VP 1.0
+§"Response Parameters") against the DCQL query carried in `request`, enforcing the complete
+§"VP Token Validation" + §6 DCQL semantics **in-core** (the explicit product decision — not delegated
+to the wallet, §"Security Checks on the Returned Credentials and Presentations").
+
+For EACH `(credential_id, presentations)` entry it runs, per Presentation, the always-on bar + the
+request binding ([`verify_response`]) AND the per-query DCQL match (format + `meta` + claims/values),
+then folds the per-credential satisfaction into the set-level verdict (the [`crate::dcql`] set fold):
+step 3 — every required Credential Set Query has a fully-satisfied option (or, with no
+`credential_sets`, every Credential Query is satisfied).
+
+The per-credential trust-anchoring **role** is derived from the matching Credential Query's expected
+type (`meta`) when it names a EUDI PID type (conformance-audit T4.3 — the verifier's own query states
+the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
+validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
+[`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
+for the response, mirroring the single-credential [`verify_response`]).
+
 ## Module `qualified`
 
 Opt-in eIDAS qualified-status determination (ETSI TS 119 615 v1.4.1 cl. 4.12) — T019.
 
 Over the always-on bar (which is never replaced by this), an **opt-in**, version-pinned
 determination of whether an attestation issuer is a **qualified** EAA provider: authenticate the
-LOTL → select the national Trusted List → match the issuer's signing certificate against a
-trust-service entry of type [`EAA_Q_SERVICE_TYPE`] (`…/Svctype/EAA/Q`) → read the
+LOTL → select the national Trusted List → confirm the attestation self-declares the qualified-EAA
+type ([`EAA_EU_QUALIFIED_TYPE`], TS 119 615 PRO-4.12.4-03) → match the issuer's signing certificate
+against a trust-service entry of type [`EAA_Q_SERVICE_TYPE`] (`…/Svctype/EAA/Q`) → read the
 `granted`/`withdrawn` service status **at the relevant time** (the credential's issuance/relevant
 time, NOT "now"). The reusable trust-list primitives ([`crate::trust`]) anchor the same PKI (DRY).
 
 ## Outcome conditions (pinned — tasks T018/T019, analyze A1)
 
-- [`QualifiedStatus::Qualified`] — the issuer's `EAA/Q` service entry is **`granted`** at the
-  relevant time.
+- [`QualifiedStatus::Qualified`] — the attestation self-declares the qualified-EAA type AND the
+  issuer's `EAA/Q` service entry is **`granted`** at the relevant time.
 - [`QualifiedStatus::NotQualified`] — the entry is **found but not granted** (its status at the
   relevant time is withdrawn/suspended, the grant had not yet begun, or the issuer is on the TL
-  only under a non-`EAA/Q` service type).
+  only under a non-`EAA/Q` service type), with the self-declaration present.
 - [`QualifiedStatus::Indeterminate`] — the trust-list data needed to decide is **absent,
-  ambiguous, or unreachable** (the issuer is on no service entry, or there is no TL at all). The
-  gate **never assumes qualified** (no false "qualified" — SC-007).
+  ambiguous, or unreachable** (the issuer is on no service entry, or there is no TL at all), the
+  TL fails authentication, **or the attestation does not self-declare the qualified-EAA type**
+  (PRO-4.12.4-03). The gate **never assumes qualified** (no false "qualified" — SC-007).
+
+## QEAA type-indication precondition (TS 119 615 v1.4.1 PRO-4.12.4-03 — the T5.2 false-trust fix)
+
+Before the issuer's `EAA/Q` service status is read, the determination requires the **EAA content
+to self-declare the qualified-EAA type**. PRO-4.12.4-03 (verified online against the v1.4.1 PDF)
+mandates: *"check whether the URN `'urn:etsi:esi:eaa:eu:qualified'` is present within the content
+of EAA and if this URN is not present"* → set the result to `Indeterminate`
+(`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) and **stop**. So an attestation whose declared type
+does not carry [`EAA_EU_QUALIFIED_TYPE`] is `Indeterminate`, **never** `Qualified`, even if its
+issuer is a granted `EAA/Q` QTSP. The type indication is threaded from
+[`verify`](crate::verify()) as `type_indication`:
+
+- **SD-JWT VC** — the issuer-signed `vct` (the credential's type claim). When it is not
+  [`EAA_EU_QUALIFIED_TYPE`] the determination is `Indeterminate`.
+- **ISO mdoc** — `None`: cl. 4.12's URN is an EAA-content (SD-JWT VC / JWT-VC `vct`/`type`)
+  construct, and TS 119 615 cl. 4.12 defines **no** mapping of this URN into ISO 18013-5 mdoc
+  content (an mdoc declares its type via `docType`, a reverse-domain ISO identifier). The mdoc
+  path therefore passes `None` and the precondition is **not enforced** for it; its qualified
+  determination uses the cert→granted-`EAA/Q`-service status (TS 119 612 §5.5.4). A non-`None`
+  indication that is not the URN always fails closed to `Indeterminate` (conservative — never a
+  false "qualified").
+
+**Version note (the doc-nit reconciliation):** cl. 4.12 was introduced in TS 119 615 **v1.3.1**
+(2026-01) and is retained in the pinned **v1.4.1** (2026-05). The QEAA self-declaration URN was
+**renamed between the two**: v1.3.1 used `urn:etsi:eaa:eu:qualified`; v1.4.1 inserts an `esi:`
+segment → `urn:etsi:esi:eaa:eu:qualified`. This implementation pins [`TS_119_615_VERSION`]
+(`1.4.1`) and therefore uses the v1.4.1 URN (verified online against the v1.4.1 PDF —
+not training data).
 
 ## Experimental + version-pinned
 
-cl. 4.12 (QEAA qualified-status determination) was newly standardized (TS 119 615 v1.3.1, Jan
-2026) and is **pre-operational**: national Trusted Lists are only beginning to carry `EAA/Q`
-entries (post CIR (EU) 2025/1569). This implementation is pinned to [`TS_119_615_VERSION`]
-(`1.4.1`) and is **off by default** ([`crate::verify::VerifyContext::qualified_gate`]) — enabling
-it is opt-in, and absent fixtures honestly yield `Indeterminate`.
+cl. 4.12 (QEAA qualified-status determination) is **pre-operational**: national Trusted Lists are
+only beginning to carry `EAA/Q` entries (post CIR (EU) 2025/1569). This implementation is pinned to
+[`TS_119_615_VERSION`] (`1.4.1`) and is **off by default** ([`crate::verify::VerifyContext::qualified_gate`])
+— enabling it is opt-in, and absent fixtures honestly yield `Indeterminate`.
+
+## Service-digital-identity matching (TS 119 612 V2.4.1 §5.5.3 — the T5.4 false-reject fix)
+
+A credential's signing leaf is matched against a trust-service's digital identity (Sdi) by any of
+(verified online against TS 119 612 V2.4.1 §5.5.3 + the EU DSS `DigitalIdentityListTypeConverter`):
+
+1. **Exact X509Certificate DER** — the mandatory, machine-processable Sdi form (DSS matches on this
+   alone);
+2. **X509SKI** — the leaf shares the Sdi's `SubjectKeyIdentifier` (a renewed/re-encoded cert with
+   the same key); §5.5.3 lists X509SKI as an optional machine-usable identifier;
+3. **Issuing-CA** — the Sdi lists the **issuing CA** (the common national-TL shape — the Sdi is the
+   CA, not the byte-identical leaf), matched by the leaf's `issuer` DN == the Sdi cert's `subject`
+   DN, tightened by the leaf's AKI == the Sdi's SKI when both are present.
+
+`X509SubjectName` (a bare Distinguished Name) is **deliberately not** machine-matched: §5.5.3 states
+it *"should not be used by applications in machine processable way"*, and EU DSS does not consume it.
+(The issuing-CA rule compares the leaf's `issuer` field to the Sdi **certificate's** subject — a
+chain relationship — not a bare X509SubjectName element.) This closes the false-reject where a valid
+QEAA whose Sdi lists the issuing CA / its SKI (not the exact leaf) was reported `Indeterminate`.
 
 ## Trust-list authentication (fail-closed — SC-007)
 
@@ -1570,9 +2006,16 @@ returns [`QualifiedStatus::Indeterminate`] (NEVER [`QualifiedStatus::Qualified`]
 and the spec-003 pattern. A forged / attacker-supplied / unsigned TL can therefore never make an
 unchained issuer report `Qualified`.
 
-The full enveloped XML-DSig `SignatureValue`/C14N check is the always-on engine's remaining
-production hardening ([`crate::trust::xml`]); the offline JSON form here carries the signer cert
-so the gate exercises the same chain-authentication seam against the same X.509 stack.
+Staleness in this cl. 4.12 determination is **fail-closed** (a stale snapshot → `Indeterminate`),
+which is intentionally stricter than the general national-TL staleness handling (a non-fatal
+warning, TS 119 615 PRO-4.2.4-10, applied in [`crate::trust::engine`]): the qualified-status
+determination must never assert `Qualified` from a stale or expired-signer trust snapshot (the
+now-vs-relevant-time SC-007 invariant below), so it does not relax staleness the way the always-on
+membership engine does for a national TL.
+
+The full enveloped XAdES `SignatureValue`/C14N check is a documented scope cut
+([`crate::trust::xml`], `standards-conformance.md`); the offline JSON form here carries the signer
+cert so the gate exercises the same chain-authentication seam against the same X.509 stack.
 
 ### Structs
 
@@ -1582,9 +2025,8 @@ so the gate exercises the same chain-authentication seam against the same X.509 
 struct QualifiedTrustList
 ```
 
-A parsed national Trusted List for the qualified-status gate: the per-issuer-cert trust-service
-entries (keyed by signing-cert DER, since a cert may appear under several services), the embedded
-signer certificate (for chain-authentication), and the `nextUpdate` instant.
+A parsed national Trusted List for the qualified-status gate: the trust-service entries, the
+embedded signer certificate (for chain-authentication), and the `nextUpdate` instant.
 
 Carries only issuer-public certificate data (no secret), so deriving `Debug` is safe.
 
@@ -1607,8 +2049,9 @@ Authentication has two parts, both mandatory:
    chain fails. When `scheme_anchors` is empty the list cannot be authenticated at all
    ([`QualifiedTrustError::NoSchemeAnchor`]).
 2. **Freshness** — the list must not be **stale**: `now_unix` must be strictly before its
-   `NextUpdate` (a list with an absent/zero `NextUpdate` is treated as stale). This mirrors the
-   always-on engine's `now >= NextUpdate ⇒ stale` policy ([`crate::trust::engine`]).
+   `NextUpdate` (a list with an absent/zero `NextUpdate` is treated as stale). For this cl. 4.12
+   determination staleness is **fail-closed** (stricter than the general national-TL warning of
+   PRO-4.2.4-10 — see the module docs): a stale snapshot must never assert `Qualified`.
 
 # Errors
 
@@ -1637,8 +2080,8 @@ Parse a qualified-status national Trusted List from its raw JSON bytes.
 
 # Errors
 
-Returns [`QualifiedTrustListError`] when the JSON is malformed, a certificate body is not
-valid base64 DER, or a `nextUpdate` / status `startingTime` is not an RFC 3339 UTC timestamp.
+Returns [`QualifiedTrustListError`] when the JSON is malformed, a certificate/SKI body is not
+valid base64, or a `nextUpdate` / status `startingTime` is not an RFC 3339 UTC timestamp.
 
 ```rust
 fn signer_cert_der(&self) -> Option<&[u8]>
@@ -1685,7 +2128,7 @@ An error parsing the qualified-status national Trusted List.
 - `Json(Error)`
   - The bytes were not valid JSON of the expected national-TL shape.
 - `Base64(String)`
-  - A signing/signer certificate body was not valid base64 DER.
+  - A signing/signer/SKI value was not valid base64.
 - `Time(String)`
   - A `nextUpdate` or status `startingTime` was not an RFC 3339 UTC timestamp.
 
@@ -1694,7 +2137,7 @@ An error parsing the qualified-status national Trusted List.
 #### fn `qualified_status`
 
 ```rust
-fn qualified_status(issuer_cert_der: &[u8], now_unix: i64, relevant_time_unix: i64, trust_list: &QualifiedTrustList, scheme_anchors: &[Vec<u8>]) -> QualifiedStatus
+fn qualified_status(issuer_cert_der: &[u8], now_unix: i64, relevant_time_unix: i64, trust_list: &QualifiedTrustList, scheme_anchors: &[Vec<u8>], type_indication: Option<&str>) -> QualifiedStatus
 ```
 
 Determine the eIDAS qualified status of an attestation issuer at a relevant time (TS 119 615
@@ -1724,46 +2167,44 @@ real `now` (stale) but in the future relative to an old credential's issuance ti
 fresh, yielding a false `Qualified` from a stale/withdrawn-since trust snapshot. Authentication MUST
 use `now_unix`; only the status read uses `relevant_time_unix`.
 
-**Authenticates the national TL first** ([`QualifiedTrustList::authenticate`] against the
-host-configured scheme-operator `scheme_anchors`, at `now_unix`): an unsigned / forged / unchained /
-stale list yields [`QualifiedStatus::Indeterminate`] before any status is read (fail-closed — a
-forged TL can never make an unchained issuer report `Qualified`, SC-007). Only an authenticated list
-is consulted.
+## QEAA type-indication precondition (PRO-4.12.4-03)
 
-On an authenticated list it then matches `issuer_cert_der` (the credential's signing certificate)
-against the trust-service entries and reads the effective service status **at
-`relevant_time_unix`** (the credential's issuance/relevant time, NOT "now"):
+`type_indication` is the credential's self-declared type (SD-JWT VC `vct`; `None` for ISO mdoc —
+see the module docs). Per PRO-4.12.4-03 the EAA must self-declare the qualified-EAA type
+([`EAA_EU_QUALIFIED_TYPE`]) before a `Qualified` verdict: a `Some` indication that is **not** that
+URN yields [`QualifiedStatus::Indeterminate`] (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`),
+**before** any service status is read; `None` (a format with no cl. 4.12 URN construct, i.e. mdoc)
+does not enforce it.
+
+## Flow
+
+**Authenticates the national TL first** (against `scheme_anchors` at `now_unix`): an unsigned /
+forged / unchained / stale list yields [`QualifiedStatus::Indeterminate`] (fail-closed). Then it
+enforces the type-indication precondition. Only then does it match `issuer_cert_der` against the
+trust-service entries (§5.5.3 Sdi matching) and read the effective service status **at
+`relevant_time_unix`**:
 
 - [`QualifiedStatus::Qualified`] — some matched [`EAA_Q_SERVICE_TYPE`] service is
   [`SERVICE_STATUS_GRANTED`] at the relevant time.
 - [`QualifiedStatus::NotQualified`] — the issuer is **found** on the TL, but no `EAA/Q` service is
-  granted at the relevant time (it is withdrawn/suspended, the grant had not begun, or the only
-  matched service is non-`EAA/Q`).
-- [`QualifiedStatus::Indeterminate`] — the TL did not authenticate, **or** the issuer is on **no**
-  service entry (the data needed to decide is absent/unreachable). Never assumes qualified (no
-  false "qualified" — SC-007).
+  granted at the relevant time.
+- [`QualifiedStatus::Indeterminate`] — the TL did not authenticate, the type indication is absent
+  (PRO-4.12.4-03), **or** the issuer is on **no** matching service entry. Never assumes qualified
+  (no false "qualified" — SC-007).
 
 ### Constants
 
-#### const `EAA_Q_SERVICE_TYPE`
+#### const `EAA_EU_QUALIFIED_TYPE`
 
 ```rust
-const EAA_Q_SERVICE_TYPE: &str = "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q"
+const EAA_EU_QUALIFIED_TYPE: &str = "urn:etsi:esi:eaa:eu:qualified"
 ```
 
-The TS 119 612 trust-service **type** URI for a *qualified* electronic attestation of attributes
-(QEAA) issuing service. Only a service of this exact type can make an issuer
-[`QualifiedStatus::Qualified`] (a plain `…/Svctype/EAA` — non-qualified EAA — never does).
-
-#### const `SERVICE_STATUS_GRANTED`
-
-```rust
-const SERVICE_STATUS_GRANTED: &str = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted"
-```
-
-The TS 119 612 trust-service **status** URI for a `granted` service (in force). An `EAA/Q` service
-whose effective status at the relevant time is `granted` makes its issuer
-[`QualifiedStatus::Qualified`].
+The TS 119 615 **v1.4.1** PRO-4.12.4-03 QEAA self-declaration URN: the URN that MUST be present
+within the EAA content for the attestation to be a *qualified* EAA. (v1.3.1 used the shorter
+`urn:etsi:eaa:eu:qualified`; v1.4.1 — the pinned version — inserts the `esi:` segment. Verified
+online against the v1.4.1 PDF.) When the credential's type indication is not this URN, the
+determination is [`QualifiedStatus::Indeterminate`], never `Qualified`.
 
 #### const `TS_119_615_VERSION`
 
@@ -2117,7 +2558,8 @@ and is the point at which the [`Reachability`] policy applies.
 
 ### Module `chain`
 
-X.509 chain validation against trusted anchors (research D5, no hand-rolled crypto).
+X.509 certification-path validation against trusted anchors (RFC 5280 §6.1; research D5, no
+hand-rolled crypto).
 
 Trust anchoring asks one question: does the credential's signing certificate (the mdoc
 `IssuerAuth` x5chain leaf or the SD-JWT VC JWS `x5c` leaf) **chain to** a certificate that the
@@ -2125,15 +2567,42 @@ configured trust anchor lists for the credential's role/format? This module answ
 reusing the SDK's vetted X.509 stack — `x509-cert` for parsing, `p256`/`ecdsa` + `rsa` for the
 signature math, `sha2` for the digest — and never hand-rolls crypto (Principle IV / research D1).
 
-The validation is intentionally a **direct-issuer** check sized for the EUDI trust model: an
-issuer leaf is trusted iff it is signed by (or *is*) an anchor certificate, the leaf's `issuer`
-name matches the anchor's `subject` name, and the leaf is within its validity window at the
-relevant time. ISO 18013-5 IACA hierarchies and the eIDAS trusted lists are one-level (root →
-document-signer / service); a configured anchor *is* the root, so a one-hop chain is the
-production shape. The matcher also accepts an exact DER-equal leaf (a self-issued anchor that is
-itself the listed entry), which covers a trusted-list entry that pins the leaf directly — but
-even that direct-pin path still enforces the leaf's validity window, so an expired pinned leaf
-is rejected rather than trusted.
+## Multi-tier path validation (RFC 5280 §6.1)
+
+A credential carries its full signing chain leaf-first: `x5c` / `x5chain = [leaf, intermediate₁,
+…]`. eIDAS QTSP / EUDI issuer PKIs commonly issue the leaf from an **intermediate sub-CA** that
+itself chains to the trust-list-pinned root (RFC 5280 permits a path length > 1; ETSI EN 319
+411), so a one-hop "anchor must directly issue the leaf" check would **false-reject** a conformant
+credential. [`verify_chain`] therefore builds and validates a certification path
+`leaf → intermediate₁ → … → a CONFIGURED ANCHOR` over the **supplied** chain plus the configured
+anchors, enforcing the §6.1 rules at every hop:
+
+- **name chaining (§6.1.3 (a)(4))** — each certificate's `issuer` equals the next-up certificate's
+  `subject`;
+- **signature (§6.1.3 (a)(1))** — each certificate's signature verifies under the next-up
+  certificate's subject public key;
+- **validity (§6.1.3 (a)(2))** — **every** certificate on the path (leaf, each intermediate, and
+  the terminating anchor) is within its own `notBefore..notAfter` window at the relevant time;
+- **CA constraints (§6.1.4 (k)/(n), §4.2.1.9, §4.2.1.3)** — every certificate that **issues** the
+  next one down (each intermediate and the anchor) is a CA: `basicConstraints` present, **marked
+  critical**, `cA=TRUE`, and (when `keyUsage` is present) the `keyCertSign` bit set;
+- **path length (§6.1.4 (m), §4.2.1.9)** — an issuing CA's `pathLenConstraint`, when present,
+  bounds the number of intermediates that may follow it toward the leaf.
+
+The supplied intermediates are **attacker-controlled** path-building material: they are honoured
+only as candidate issuers and the path is trusted **iff it terminates at a configured anchor**.
+An attacker who supplies arbitrary intermediates that never reach a trusted anchor is rejected
+([`ChainError::IssuerMismatch`] / `SignatureInvalid`), so an attacker cannot manufacture trust by
+presenting their own chain. The path length is also capped ([`MAX_PATH_LEN`]) so an absurdly long
+supplied chain cannot turn validation into a denial-of-service.
+
+## Direct pin
+
+The matcher also accepts an exact DER-equal certificate (a trusted-list entry that pins a specific
+certificate — the leaf, or one of the supplied certs — directly). The direct-pin path still
+enforces that pinned certificate's validity window (an expired pinned cert is rejected, never
+trusted) but is deliberately **exempt from the CA constraint**: pinning a specific end-entity
+certificate as trusted is an intentional, distinct trust model.
 
 #### Enums
 
@@ -2145,45 +2614,264 @@ enum ChainError
 
 Why a candidate issuer certificate failed to chain to a trusted anchor.
 
-Every rejection carries a specific reason so an untrusted verdict is never opaque (the engine
-maps these onto [`crate::types::ReasonCode::UntrustedIssuer`] / `Expired`).
+Every rejection carries a specific reason so an untrusted verdict is never opaque. `resolve_chain`
+folds these to a coarse-but-accurate [`crate::trust::TrustFailure`] on the [`crate::trust::TrustDecision`],
+which the verifier maps to a [`crate::types::ReasonCode`]: [`Self::LeafExpired`]/[`Self::AnchorExpired`]
+(a cert outside its validity window) → [`crate::types::ReasonCode::Expired`]; every other variant (no
+path, bad signature, non-CA, wrong leaf purpose, unsupported algorithm, malformed, over-long) →
+[`crate::types::ReasonCode::UntrustedIssuer`].
 
 ###### Variants
 
 - `Malformed(String)`
-  - A certificate (leaf or anchor) could not be parsed as DER X.509.
+  - A certificate (leaf, supplied intermediate, or anchor) could not be parsed as DER X.509.
 - `IssuerMismatch`
-  - The leaf's issuer name does not match any candidate anchor's subject name.
+  - No path could be built: at some hop the current certificate's `issuer` name matched no
+candidate issuer's `subject` (neither a supplied intermediate nor a configured anchor), so the
+path does not reach a trusted anchor. Also returned when the supplied chain is empty.
 - `SignatureInvalid`
-  - The leaf's signature did not verify under any name-matching anchor's public key.
+  - A certificate's signature did not verify under the name-matching candidate issuer's public key
+at some hop on the path (a supplied intermediate or a configured anchor whose subject matched
+but whose key did not produce the signature).
+- `PathTooLong`
+  - The supplied certification path is longer than [`MAX_PATH_LEN`] hops — rejected to bound the
+validation work an attacker-supplied chain can demand (a denial-of-service guard).
 - `UnsupportedAlgorithm(String)`
-  - The leaf carries a signature algorithm the SDK does not implement (outside the EUDI
-baseline: ES256/384/512 + RSA-PKCS#1v1.5 over SHA-256/384/512).
+  - A certificate on the path carries a signature algorithm the SDK does not implement (outside the
+EUDI baseline: ES256/384/512 + RSA-PKCS#1v1.5 over SHA-256/384/512).
 - `LeafExpired`
   - The leaf is outside its own validity window at the relevant time.
+- `AnchorExpired`
+  - An issuing certificate on the path (an intermediate sub-CA or the terminating anchor) is itself
+outside its own validity window at the relevant time. Per RFC 5280 §6.1.3 (a)(2) **every**
+certificate in the path — each issuing CA included — must be valid at the validation time, so
+an expired (or not-yet-valid) intermediate/anchor cannot vouch for an otherwise-in-window
+certificate below it.
+- `NotACa`
+  - An issuing certificate on the path (an intermediate sub-CA or the terminating anchor) does not
+assert the CA constraints required to issue certificates: per RFC 5280 §6.1.4 (k)/(n) and
+§4.2.1.9 an issuer MUST carry `basicConstraints` **marked critical** with `cA=TRUE`, (when
+`keyUsage` is present) the `keyCertSign` bit, and a `pathLenConstraint` (if present) wide enough
+for the intermediates that follow it. This closes the "any cert is a CA" gap — a non-CA
+(end-entity) certificate cannot act as a path intermediate or anchor. (The direct-pin path,
+where the configured anchor *is* the pinned certificate, is exempt: pinning a specific
+end-entity certificate as trusted is an intentional, distinct model.)
+- `WrongLeafPurpose`
+  - The leaf (the credential's signing certificate) does not carry the role/format-appropriate
+**key purpose** required by [`LeafPurpose`], so it is genuinely chained to a trusted anchor but
+**not fit for the purpose presented**:
+
+- an **mdoc Document Signer** leaf lacking the mdlDS EKU (`1.0.18013.5.1.2`), carrying a foreign
+  purpose (e.g. TLS `serverAuth`), lacking the `digitalSignature` keyUsage, or asserting
+  `cA=TRUE` (ISO/IEC 18013-5:2021 Annex B Table B.3, the `mc` keyUsage / basicConstraints rows);
+- an **SD-JWT VC issuer** leaf that is a CA, that has no (or a non-signing) `keyUsage` (ETSI EN
+  319 412-2/-3 require keyUsage present asserting a signing bit), or that lacks the per-role
+  eIDAS **QcStatement** its [`IssuerRole`] requires (PID → `id-etsi-qct-pid`; QEAA →
+  `QcCompliance` + a qualified `QcType`; PuB-EAA → `QcPSB`) — the in-band guard that closes the
+  chain-to-root false-trust where a plain eSeal/EAA cert sharing a QTSP root would be trusted as
+  PID/QEAA (conformance-audit T1.3).
+
+This closes the "right chain, wrong purpose" false-accept. Fail-closed on a malformed/duplicate
+`extendedKeyUsage` / `keyUsage` / `basicConstraints` / `qcStatements` extension.
+- `UnsupportedCriticalExtension(String)`
+  - A certificate on the processed path (the leaf or an intermediate — never the trust anchor itself,
+which RFC 5280 §6.1.1 treats as an input, not a path certificate) carries an extension marked
+**critical** whose OID this validator does not recognize/process, so per RFC 5280 §6.1.4 (o) /
+§6.1.5 (f) (and the §4.2 / §6 "MUST reject the certificate if it encounters a critical extension
+it does not recognize") the path is rejected fail-closed. The recognized critical extensions are
+`basicConstraints`, `keyUsage`, `extendedKeyUsage`, `nameConstraints`, and `subjectAltName`;
+carries the offending OID for diagnostics.
+- `NameConstraintViolation`
+  - A certificate on the processed path violates the RFC 5280 §4.2.1.10 **name constraints** imposed
+by a CA above it: its subject DN (or a `subjectAltName` entry) falls outside the accumulated
+`permitted_subtrees`, or inside an `excluded_subtrees` (§6.1.3 (b)/(c), §6.1.4 (g)). Also returned
+fail-closed when a CA imposes a name-constraint on a `GeneralName` type this validator does not
+enforce (only `directoryName` and `dNSName` subtrees are processed; any other constraint type, or
+a non-default `minimum`/`maximum` `BaseDistance`, is treated as unsupported → reject).
+- `SignatureAlgorithmMismatch`
+  - A certificate's outer `signatureAlgorithm` (RFC 5280 §4.1.1.2) does not equal the inner
+`tbsCertificate.signature` algorithm identifier (§4.1.2.3) it is required to match — a malformed
+or tampered certificate (the unsigned outer field was substituted), rejected fail-closed.
+
+##### enum `LeafPurpose`
+
+```rust
+enum LeafPurpose
+```
+
+The role/format-appropriate **key purpose** the leaf (the credential's signing certificate) must
+carry — enforced once, on the leaf, before the path walk, so a genuinely-chained-but-WRONG-PURPOSE
+leaf is rejected (e.g. a TLS `serverAuth` cert issued under the same trusted root, or an mdoc DS
+cert presented as the SD-JWT VC issuer leaf).
+
+A chain that validates structurally (name/signature/CA/validity) is **not** sufficient: RFC 5280
+and the format profiles constrain *what the leaf may be used for*. The verifier threads the
+credential's format here (mdoc → [`Self::MdocDocumentSigner`], SD-JWT VC →
+[`Self::SdJwtVcIssuer`]); the trust-list-signer-authentication call sites (the LOTL / national-TL
+signer in `trust::xml` and `qualified`) pass [`Self::TrustListSigner`], which imposes no
+credential-leaf purpose (a TL signer is governed by a different ETSI profile, not the credential
+leaf profiles below).
+
+###### Variants
+
+- `MdocDocumentSigner`
+  - **ISO/IEC 18013-5:2021 Annex B (Table B.3, mDL document signer certificate).** The Document
+Signer leaf MUST satisfy the full Table B.3 leaf profile (verified online against the ISO DIS
+Table B.3 text + the auth0-lab/mdl and spruceid/isomdl reference verifiers):
+
+- `extendedKeyUsage` (Table B.3 row `m`, RFC 5280 §4.2.1.12) MUST include the mDL-DS key-purpose
+  OID `id-mso-mdl-DS` = `1.0.18013.5.1.2` ([`OID_MDL_DS`]). ISO marks the EKU row `m` (not `mc`),
+  and §4.2.1.12 leaves EKU criticality at the issuer's option, so criticality is not asserted —
+  only the OID's presence;
+- `keyUsage` (Table B.3 row **`mc`** = mandatory + critical) MUST assert `digitalSignature`. ISO
+  fixes the DS keyUsage to `digitalSignature` only; this guard requires the `digitalSignature`
+  bit (a `keyUsage` without it — present or absent — is rejected);
+- `basicConstraints` (Table B.3 row **`mc`**, §4.2.1.9) MUST be `cA=FALSE`. A DS leaf that asserts
+  `cA=TRUE` (so it could double as an issuing CA) is rejected even when it carries the mdlDS EKU.
+
+A DS leaf lacking the mdlDS EKU (or carrying only a foreign purpose such as `serverAuth`),
+lacking the `digitalSignature` keyUsage, or asserting `cA=TRUE`, is rejected
+([`ChainError::WrongLeafPurpose`]). (No eIDAS QcStatement is required of an mdoc DS leaf — that is
+an ETSI/eIDAS concept for the SD-JWT VC issuer cert, see [`Self::SdJwtVcIssuer`].)
+- `SdJwtVcIssuer(IssuerRole)`
+  - **SD-JWT VC issuer (PID / (Q)EAA) leaf**, keyed by the credential's [`IssuerRole`]. No governing
+specification mandates a specific EKU for the SD-JWT VC issuer certificate referenced by the JWS
+`x5c` (verified online: IETF `draft-ietf-oauth-sd-jwt-vc` §2.5 / RFC 9901 are silent on
+EKU/keyUsage; OpenID4VC HAIP 1.0 §6.1.1 mandates only chain-to-anchor structure; the EUDI ARF /
+Commission IRs distinguish issuer certs by **QcStatement** OIDs and `keyUsage`, never by an EKU;
+ETSI EN 319 412-2 §4.3.10 even forbids marking EKU critical and assigns no EKU value). The
+enforced policy is therefore two layered checks:
+
+1. **The EN 319 412-2/-3 base-profile floor (every role).** The leaf **MUST NOT be a CA**
+   (`basicConstraints cA=TRUE` is rejected — a CA certificate must not double as an end-entity
+   signer), and a `keyUsage` extension **MUST be present** and assert a signing bit
+   (`digitalSignature` or `nonRepudiation`/content-commitment). ETSI EN 319 412-2 §4.3.2
+   (`NAT-4.3.2-1`) / EN 319 412-3 §4.3.1 (`LEG-4.3.1-2`, pulling in 412-2 §4.3.2 ¶1 + Table 1)
+   make keyUsage **SHALL-present**, and a content/seal-signing certificate is limited to keyUsage
+   Type A/B/F — each of which asserts a signing bit (verified online against the ETSI PDFs). So an
+   **absent** keyUsage is now rejected (tightened from the prior "absent allowed"), as is a present
+   keyUsage asserting only unrelated bits (e.g. `keyEncipherment` only). No EKU is required.
+2. **The per-role eIDAS QcStatement check** (`leaf_has_required_qc_statements`). Under
+   chain-to-root anchoring, a plain eSeal/EAA certificate sharing a QTSP root would otherwise be
+   trusted as a PID/QEAA (conformance-audit T1.3); the in-band guard requires the role-appropriate
+   ETSI `qcStatements` (RFC 3739 ext OID `1.3.6.1.5.5.7.1.3`): **PID** → the `QcType` statement
+   carrying `id-etsi-qct-pid` (`0.4.0.194126.1.1`, ETSI TS 119 412-6 PID-4.5-01); **QEAA** →
+   `QcCompliance` (`0.4.0.1862.1.1`) **and** a `QcType` carrying `id-etsi-qct-esign`/`-eseal`
+   (`0.4.0.1862.1.6.{1,2}`, EN 319 412-5 §4.2 + TS 119 412-6 QEA-7.1); **PuB-EAA** → the `QcPSB`
+   statement (`id-etsi-qcs-QcPSB`, TS 119 412-6 PSB-8.3-01); **NonQualifiedEAA** → no Qc
+   requirement (EAA-6.x impose none). A leaf lacking the role's required statement is
+   [`ChainError::WrongLeafPurpose`]. (mdoc DS leaves are NOT subject to this — they follow the ISO
+   18013-5 Annex B profile, which assigns no QcStatement; see [`Self::MdocDocumentSigner`].)
+- `TrustListSigner`
+  - **Trust-list signer authentication** (the LOTL / national Trusted List signer, not a credential
+leaf). Imposes no credential-leaf key-purpose constraint — the only requirement is that the
+signer chains to a configured scheme-operator anchor (the structural §6.1 path). Used by
+`trust::xml` and `qualified` when authenticating a signed trust list.
 
 #### Functions
 
 ##### fn `verify_chain`
 
 ```rust
-fn verify_chain(leaf_cert_der: &[u8], anchor_certs_der: &[Vec<u8>], now_unix: i64) -> Result<(), ChainError>
+fn verify_chain(supplied_chain: &[&[u8]], anchor_certs_der: &[Vec<u8>], now_unix: i64, leaf_validity_time: Option<i64>, leaf_purpose: LeafPurpose) -> Result<(), ChainError>
 ```
 
-Whether `leaf_cert_der` chains to **any** of the trusted `anchor_certs_der`, valid at
-`now_unix`.
+Whether the supplied certification path `supplied_chain` (leaf-first: `[leaf, intermediate₁, …]`)
+builds a valid RFC 5280 §6.1 path to **any** of the trusted `anchor_certs_der`, with the leaf
+carrying the `leaf_purpose`-appropriate key purpose.
 
-This is the trust-anchoring primitive: a leaf is trusted iff some anchor either (a) is DER-equal
-to the leaf (the anchor pins the leaf directly), or (b) issued the leaf — the leaf's `issuer`
-name equals the anchor's `subject` name **and** the leaf's signature verifies under the anchor's
-public key. In **both** cases the leaf must be within its own validity window at `now_unix` (an
-expired directly-pinned leaf is rejected as [`ChainError::LeafExpired`], never trusted). Returns
-the first specific [`ChainError`] when no anchor matches.
+## Two validation times — the DS-validity-at-signing-time seam (ISO/IEC 18013-5 §9.3.1)
+
+`now_unix` is the verification instant the **chain authentication** is checked at (each intermediate
+and the terminating anchor must be within its own validity window at `now_unix` — RFC 5280 §6.1.3
+(a)(2)). `leaf_validity_time` is the (optional) instant the **leaf's own** validity window is checked
+at:
+
+- **`None`** — the leaf window is checked at `now_unix` (the SD-JWT VC issuer leaf, the trust-list
+  signer: there is no distinct signing instant, so "now" is the right time);
+- **`Some(t)`** — the leaf window is checked at `t` while the rest of the chain stays at `now_unix`.
+  ISO/IEC 18013-5 §9.3.1 requires the mdoc **Document Signer** certificate window to contain the MSO
+  `validityInfo.signed` time, not "now": DS certs rotate (~monthly) while mDLs live for years, so a
+  conformant mDL would be **false-rejected** at `now` once its DS cert expired even though it was
+  valid when it signed. The mdoc verifier passes `Some(mso.validityInfo.signed)` here (confirmed
+  online against auth0-lab/mdl `Verifier.ts`, which checks the DS window against `validityInfo.signed`
+  and the MSO's own `validFrom`/`validUntil` against the verification clock separately).
+
+## What is enforced
+
+A path is trusted iff, starting from the leaf (`supplied_chain[0]`), it can be walked up — through
+zero or more of the supplied intermediates — to a certificate that **is** a configured anchor (a
+direct DER-equal pin) or is **issued by** a configured anchor, enforcing:
+
+- **leaf key purpose** — the leaf carries the role/format-appropriate purpose required by
+  [`LeafPurpose`] (mdoc DS Table B.3 profile; SD-JWT VC issuer base floor + per-role QcStatement),
+  else [`ChainError::WrongLeafPurpose`]. Checked once, on the leaf, before the walk;
+- **direct pin** — a cert byte-equal to a configured anchor terminates the path as trusted, still
+  subject to that cert's own validity window (an expired pinned cert is [`ChainError::LeafExpired`],
+  never trusted), but exempt from the CA / key-purpose / name-constraint / critical-extension checks
+  (pinning a specific certificate is a deliberate trust model, and a configured anchor is an RFC 5280
+  §6.1.1 trust-anchor input, not a processed path certificate);
+- **issued-by** — the child's `issuer` equals the issuer's `subject`, the child's outer/inner
+  signature algorithms agree ([`ChainError::SignatureAlgorithmMismatch`]), the child's signature
+  verifies under the issuer's subject public key, the issuer is a CA ([`ChainError::NotACa`]
+  otherwise), and the issuer is within its validity window at `now_unix`
+  ([`ChainError::AnchorExpired`] otherwise);
+- **name constraints + critical extensions** (`enforce_path_constraints`) — once a path reaches an
+  anchor, the processed certificates (leaf + intermediates, **not** the trust anchor) are walked
+  top-down: each is rejected if it carries an unrecognized **critical** extension
+  ([`ChainError::UnsupportedCriticalExtension`], RFC 5280 §6.1.4 (o) / §6.1.5 (f)), and each subject
+  DN / SAN is checked against the `permitted`/`excluded` name-constraint subtrees imposed by the CAs
+  above it ([`ChainError::NameConstraintViolation`], §4.2.1.10 / §6.1.3 (b)(c) / §6.1.4 (g)).
+
+The walk is a **bounded depth-first search that backtracks** over candidate issuers: when several
+supplied intermediates name-match the current certificate (e.g. a cross-certificate or an alternate
+sub-CA), each is tried in turn, and a branch that dead-ends is unwound so an alternate is explored.
+A conformant credential whose chain reaches a configured anchor via **some** valid path is therefore
+accepted, even when a greedy first-match would have committed to a dead-end branch. Per RFC 5280
+§6.1.4 (l) / §4.2.1.9 a **self-issued** intermediate (subject DN == issuer DN, e.g. a key-rollover
+cert) does not consume path-length budget, so it is not counted toward a CA's `pathLenConstraint`.
+
+The supplied intermediates are **attacker-controlled**: they are honoured only as candidate
+issuers, never as trust roots, so a path that never reaches a configured anchor is rejected. The
+path length is capped at [`MAX_PATH_LEN`] ([`ChainError::PathTooLong`]) to bound the work an
+attacker-supplied chain can demand. Returns the most specific [`ChainError`] when no path validates.
 
 # Errors
 
-Returns [`ChainError`] when the leaf is malformed, no anchor's subject matches the leaf's issuer,
-the signature does not verify, the algorithm is unsupported, or the leaf is expired.
+Returns [`ChainError`] when the supplied chain is empty or a certificate is malformed, the leaf has
+the wrong key purpose ([`ChainError::WrongLeafPurpose`]), the path reaches no configured anchor
+([`ChainError::IssuerMismatch`]), a signature does not verify or its algorithms disagree, an
+algorithm is unsupported, an issuing certificate is not a CA or is outside its validity window, the
+leaf is outside its validity window at `leaf_validity_time`, a processed certificate carries an
+unrecognized critical extension or violates a name constraint, or the path exceeds [`MAX_PATH_LEN`].
+
+#### Constants
+
+##### const `MAX_PATH_LEN`
+
+```rust
+const MAX_PATH_LEN: usize = 8
+```
+
+The maximum certification-path length [`verify_chain`] will validate, expressed as the cap on the
+per-branch `hops` counter: a branch may promote at most `MAX_PATH_LEN` = **8** intermediate
+certificates between the leaf and the terminating anchor. The anchor is reached at the head of a
+`walk` frame (the direct-pin / issued-by-anchor termination) and is **not** counted as a hop, so the
+longest path this admits is `leaf → up to 8 intermediates → anchor`. RFC 5280 places no hard ceiling
+on path length, but the EUDI / eIDAS PKIs in scope are shallow (root → at most a small handful of
+sub-CAs → leaf), so this small cap rejects an absurdly long **attacker-supplied** chain — bounding
+the validation work it can demand — without rejecting any conformant credential.
+
+##### const `OID_MDL_DS`
+
+```rust
+const OID_MDL_DS: &str = "1.0.18013.5.1.2"
+```
+
+The ISO/IEC 18013-5 mDL Document Signer extended-key-usage OID `id-mso-mdl-DS`
+(`{iso(1) standard(0) driving-licence(18013) part-5(5) kp(1) mdlDS(2)}`). A conformant mdoc DS leaf
+MUST list this OID in its `extendedKeyUsage` (ISO/IEC 18013-5:2021 Annex B, Table B.3); it is the
+purpose [`LeafPurpose::MdocDocumentSigner`] enforces.
 
 ### Module `engine`
 
@@ -2197,22 +2885,30 @@ now; a TS 119 612 XML LOTL / national TL via [`super::xml`]), and a pure, sans-I
 chain-
 validating the issuer's signing certificate ([`super::chain`]).
 
-## Reachability / stale policy (U1, fail-closed by default)
+## Reachability / stale policy (U1 — fail-closed for the LOTL; ETSI warning for a national TL)
 
-[`refresh`](NativeTrustEngine::refresh) is where the [`Reachability`] policy applies. Three outcomes are kept
-distinct (the contract's U1 requirement):
+[`refresh`](NativeTrustEngine::refresh) is where the [`Reachability`] policy applies. Outcomes are
+kept distinct (the contract's U1 requirement):
 
 - **Unreachable** — the [`TrustListFetcher`] could not return bytes ([`TrustError::Unreachable`]).
-- **Stale** — the fetched list parsed, but its `NextUpdate` is at/before the current clock
-  ([`TrustError::Stale`]).
-- **Authentication failure** — a fetched XML list's signing certificate did not chain to a
-  configured scheme anchor ([`TrustError::Authentication`]).
+- **Authentication failure** — a fetched XML list's signing certificate did not authenticate
+  ([`TrustError::Authentication`]). (Per the T5.3 scope cut the XML path fails closed by default —
+  see [`super::xml`].)
+- **Stale** — the fetched list parsed but its `NextUpdate` is at/before the current clock. **Staleness
+  is fatal only for a LOTL** (`ListKind::Lotl`): ETSI TS 119 615 v1.4.1 PRO-4.1.4-13 voids the LOTL
+  and **stops the process** when its `NextUpdate` has passed ([`TrustError::Stale`]). For a **national
+  / member-state TL** (`ListKind::National`) a passed `NextUpdate` is a **non-fatal WARNING**
+  (PRO-4.2.4-10/12, `WARNING_EUTL_NEXTUPDATE_PASSED`): the list still authenticates and remains usable,
+  and the engine records a warning ([`NativeTrustEngine::warnings`]) rather than failing. This aligns
+  with the EU DSS reference (`TLExpirationDetection` → a configurable, default-log **warning**).
+  Verified online against TS 119 615 v1.4.1 PRO-4.1.4-13 / PRO-4.2.4-10/12 and esig/dss `master`.
 
-Under [`Reachability::FailClosed`] (the default) any of these fails `refresh` **and** clears the
-cached anchors, so a subsequent `resolve` cannot serve stale/empty trust (no silent VALID). Under
-[`Reachability::BestEffort`] an unreachable/stale list keeps the last-known-good cache. All three
-are distinct from an **expired/withdrawn entry** (a present-but-out-of-window issuer leaf →
-`resolve` returns untrusted) and from the per-credential status endpoint
+Under [`Reachability::FailClosed`] (the default) an unreachable / authentication-failed / **LOTL**-stale
+refresh fails **and** clears the cached anchors, so a subsequent `resolve` cannot serve stale/empty
+trust (no silent VALID). Under [`Reachability::BestEffort`] an unreachable / LOTL-stale list keeps the
+last-known-good cache. A national-TL staleness is never a hard failure under either policy. All of
+these are distinct from an **expired/withdrawn entry** (a present-but-out-of-window issuer leaf, or a
+withdrawn TS 119 612 service → `resolve` returns untrusted) and from the per-credential status endpoint
 ([`crate::types::StatusReachability`]).
 
 #### Structs
@@ -2242,12 +2938,6 @@ The clock is an explicit input (the seam) so validity/staleness are deterministi
 advances it via [`Self::set_now`] before each refresh in production.
 
 ```rust
-const fn now_unix(&self) -> i64
-```
-
-The current engine clock (Unix seconds).
-
-```rust
 fn refresh_with(&mut self, fetcher: &mut dyn TrustListFetcher) -> Result<(), TrustError>
 ```
 
@@ -2261,7 +2951,8 @@ no fetcher (it is the sans-IO seam), so the host calls this with its own fetcher
 Returns [`TrustError::Unreachable`] / [`TrustError::Stale`] / [`TrustError::Authentication`]
 per the reachability/stale policy. Under [`Reachability::FailClosed`] the cache is cleared on
 any failure (no stale trust); under [`Reachability::BestEffort`] the last-known-good cache is
-kept on an unreachable/stale list.
+kept on an unreachable/LOTL-stale list. A national-TL staleness is never a failure (it is a
+recorded warning — [`Self::warnings`]).
 
 ```rust
 fn set_now(&mut self, now_unix: i64)
@@ -2270,22 +2961,40 @@ fn set_now(&mut self, now_unix: i64)
 Set the engine clock (Unix seconds) — the deterministic clock seam (U1 staleness).
 
 ```rust
+fn warnings(&self) -> &[String]
+```
+
+Non-fatal warnings recorded during the last successful refresh (e.g. a national TL past its
+`NextUpdate`, `WARNING_EUTL_NEXTUPDATE_PASSED` — TS 119 615 PRO-4.2.4-10). Empty after a clean
+refresh, and cleared when a fail-closed refresh drops the cache.
+
+```rust
 fn with_json_manifest<impl Into<String>: Into<String>>(self, name: impl Into<String>) -> Self
 ```
 
-Configure the offline JSON manifest list under the given logical name (builder-style).
+Configure the offline JSON manifest list under the given logical name, as the **LOTL** (a passed
+`NextUpdate` is fatal — TS 119 615 PRO-4.1.4-13). Builder-style.
 
 ```rust
-fn with_xml_list<impl Into<String>: Into<String>>(self, name: impl Into<String>, role: IssuerRole, format: Format, scheme_anchors_der: Vec<Vec<u8>>, chain_only: bool) -> Self
+fn with_national_json_manifest<impl Into<String>: Into<String>>(self, name: impl Into<String>) -> Self
 ```
 
-Configure a TS 119 612 XML trust list under the given logical name, mapping every service it
-carries to `(role, format)` and authenticating its signing cert against `scheme_anchors_der`
-(builder-style).
+Configure the offline JSON manifest list under the given logical name, as a **national /
+member-state TL** (a passed `NextUpdate` is a non-fatal WARNING — TS 119 615 PRO-4.2.4-10/12;
+the list stays usable). Builder-style.
 
-`chain_only` opts into authenticating on the signing-cert chain alone (the enveloped
-XML-DSig `SignatureValue`/C14N check is the remaining production hardening — see
-[`super::xml`]); with `false`, the list fails authentication closed by default.
+```rust
+fn with_xml_list<impl Into<String>: Into<String>>(self, name: impl Into<String>, role: IssuerRole, format: Format, scheme_anchors_der: Vec<Vec<u8>>, expected_service_type: Option<String>) -> Self
+```
+
+Configure a TS 119 612 XML LOTL under the given logical name, mapping every **`granted`**
+service it carries to `(role, format)` and authenticating its signing cert against
+`scheme_anchors_der` (builder-style). `expected_service_type` optionally restricts ingestion to
+`granted` services of one `<ServiceTypeIdentifier>` (§5.5.1; `None` = any granted service).
+
+The enveloped XAdES `SignatureValue`/exclusive-C14N verification is a documented scope cut
+(T5.3 — see [`super::xml`]), so an XML list configured this way **fails authentication closed**
+in production: a real LOTL is never trusted on the signing-cert chain alone.
 
 #### Traits
 
@@ -2393,28 +3102,44 @@ An error parsing the JSON trust-list manifest.
 TS 119 612 trust-list XML parsing + signature-authentication path (`quick-xml`, research D5).
 
 The production EU trust model is a **signed XML** LOTL / national Trusted List (ETSI TS 119 612
-v2.4.1 / TLv6): a `<TrustServiceStatusList>` whose `<SchemeInformation>` carries a
-`<NextUpdate>`, whose `<TrustServiceProviderList>` carries per-service
-`<ServiceDigitalIdentity>` → `<X509Certificate>` anchor certificates, and which is sealed with an
-enveloped XML-DSig `<ds:Signature>` whose `<X509Certificate>` is the trust-list operator's
-signing certificate. This module parses that structure with `quick-xml` and exposes the per-list
-anchor certificates + `NextUpdate` to the engine, and **authenticates** the list by chain-
-validating its embedded signing certificate against a configured scheme-operator trust anchor
-(the SDK's X.509 stack — [`super::chain`]).
+V2.4.1 / TLv6): a `<TrustServiceStatusList>` whose `<SchemeInformation>` carries a
+`<NextUpdate>`, whose `<TrustServiceProviderList>` carries per-`<TSPService>`
+`<ServiceInformation>` blocks — each with a `<ServiceTypeIdentifier>` (cl. 5.5.1), a
+`<ServiceDigitalIdentity>` → `<X509Certificate>` anchor (cl. 5.5.3), and a `<ServiceStatus>`
+(cl. 5.5.4) — and which is sealed with an enveloped XAdES `<ds:Signature>` whose
+`<X509Certificate>` is the trust-list operator's signing certificate. This module parses that
+structure with `quick-xml` and exposes the per-list anchor certificates + `NextUpdate` to the
+engine.
 
-## What is complete vs. remaining production hardening (honest scope — research D5 caveat)
+## Service status + type gating (cl. 5.5.1 / 5.5.4 — the T5.1 false-trust fix)
 
-- **Complete now**: the `quick-xml` parse path (anchor certs per service + `NextUpdate`), and the
-  X.509 **chain** authentication of the list's embedded signing certificate against a configured
-  scheme-operator anchor. A list whose signing certificate does not chain to a configured anchor
-  is **rejected** (`SignerUntrusted`).
-- **Remaining production hardening** (deliberately not yet done — and it **fails closed**): the
-  full enveloped XML-DSig cryptographic check — exclusive C14N (XML-EXC-C14N), `<Reference>`
-  digest recomputation over the canonicalised `SignedInfo`/document, and the RSA/ECDSA
-  `SignatureValue` verification. Until that lands, [`XmlTrustList::authenticate`] requires the
-  caller to opt in to "chain-only" authentication explicitly; the default path returns
-  [`XmlTrustListError::SignatureUnverified`] so a real LOTL is **not silently trusted** on the
-  chain alone. This matches the fail-closed default the contract mandates.
+A trust service's `<X509Certificate>` is ingested as a trust anchor **only when its
+`<ServiceStatus>` is `…/Svcstatus/granted`** ([`SVCSTATUS_GRANTED`], TS 119 612 V2.4.1 §5.5.4
+item i / Annex D.5) — a **withdrawn**/suspended/absent-status service MUST NOT anchor trust (a
+withdrawn QTSP cert is no longer a trust root). When the engine configures a specific expected
+service type (e.g. [`SVCTYPE_EAA_Q`], §5.5.1.1), only `granted` services **of that type** are
+ingested. (Verified online against the TS 119 612 V2.4.1 PDF, §5.5.1.1 (k) / §5.5.4 / Annex D.5.)
+
+## Trust-list signature authentication (the T5.3 scope cut — fail-closed)
+
+TS 119 612 V2.4.1 §5.7.1 requires the list to be sealed with a **XAdES-B-B** enveloped signature
+(EN 319 132-1), and Annex B.1.0 fixes its profile: a `<ds:Signature>` enveloped in
+`<TrustServiceStatusList>` whose data-object `<ds:Reference>` carries an *enveloped-signature*
+transform **then exclusive canonicalization** (`http://www.w3.org/2001/10/xml-exc-c14n#`), with
+`<ds:CanonicalizationMethod>` over `<ds:SignedInfo>` also exclusive-C14N. A faithful verification
+therefore needs full XML **exclusive canonicalization** + `<ds:Reference>` digest recomputation +
+`SignatureValue` verification — there is **no shortcut** (Annex B.1.0). Implementing exclusive
+C14N correctly is a large, security-critical undertaking that the in-tree `quick-xml` does not
+provide, so it is a **documented scope cut** (see `standards-conformance.md` §1.5).
+
+Until full XAdES verification lands, [`XmlTrustList::authenticate`] **fails closed**: it returns
+[`XmlTrustListError::SignatureUnverified`] for every list, even one whose embedded signing
+certificate chains to a configured scheme anchor. Accepting a list on the signing-cert **chain
+alone** is unsound — the signing certificate is public and copyable, so there is no binding
+between the (unverified) signature and the list body, and a forged body would be accepted. That
+chain-only acceptance is therefore **not reachable in production**: it exists only behind a
+`#[cfg(test)]` seam (`XmlTrustList::authenticate_chain_only`) so the parse/anchor wiring stays
+exercised by tests, while the production engine path is always fail-closed.
 
 #### Structs
 
@@ -2438,24 +3163,25 @@ fn anchors_for(&self, role: IssuerRole, format: Format) -> &[Vec<u8>]
 The anchor certificates (DER) the parsed list carries for a `(role, format)`.
 
 ```rust
-fn authenticate(&self, scheme_anchors_der: &[Vec<u8>], now_unix: i64, chain_only: bool) -> Result<(), XmlTrustListError>
+fn authenticate(&self, scheme_anchors_der: &[Vec<u8>], now_unix: i64) -> Result<(), XmlTrustListError>
 ```
 
-Authenticate the trust list: chain-validate its embedded signing certificate against a
-configured scheme-operator trust anchor.
+Authenticate the trust list. **Production: fail-closed.**
 
-`chain_only` is the explicit opt-in to authenticate on the signing-cert chain **alone**
-(the enveloped XML-DSig `SignatureValue`/C14N digest check is the remaining production
-hardening — see the module docs). When `chain_only` is `false`, this fails closed with
-[`XmlTrustListError::SignatureUnverified`] so a real LOTL is never trusted on the chain
-alone by default.
+The full enveloped XAdES verification (exclusive C14N + `<ds:Reference>` digest recomputation +
+`SignatureValue` check) required by TS 119 612 V2.4.1 §5.7 / Annex B.1.0 (EN 319 132-1) is a
+documented scope cut (no XML-C14N is available in-tree, and there is no sound shortcut — Annex
+B.1.0). This method therefore surfaces the specific [`XmlTrustListError::Unsigned`] /
+[`XmlTrustListError::SignerUntrusted`] reason when applicable and then **always** returns
+[`XmlTrustListError::SignatureUnverified`]: a list is **never** trusted on its signing-cert
+chain alone (the signing cert is public and copyable; a forged body would otherwise be
+accepted). See the module docs + `standards-conformance.md`.
 
 # Errors
 
 Returns [`XmlTrustListError::Unsigned`] if the list carried no `<ds:Signature>`,
 [`XmlTrustListError::SignerUntrusted`] if its signing certificate does not chain to a
-configured scheme anchor, or [`XmlTrustListError::SignatureUnverified`] when `chain_only` is
-`false`.
+configured scheme anchor, otherwise [`XmlTrustListError::SignatureUnverified`] (fail-closed).
 
 ```rust
 const fn next_update_unix(&self) -> i64
@@ -2464,24 +3190,22 @@ const fn next_update_unix(&self) -> i64
 The list's `NextUpdate` instant (Unix seconds); at or after it the list is stale.
 
 ```rust
-fn parse(bytes: &[u8], role: IssuerRole, format: Format) -> Result<Self, XmlTrustListError>
+fn parse(bytes: &[u8], role: IssuerRole, format: Format, expected_service_type: Option<&str>) -> Result<Self, XmlTrustListError>
 ```
 
-Parse a TS 119 612 trust-list XML from its raw bytes, with the role/format every service maps
-to supplied by the caller (the production engine derives this from the service `ServiceType`
-URIs — `…/Svctype/EAA/Q` etc.; the parse path collects every service anchor under the given
-role/format so the engine can anchor against them).
+Parse a TS 119 612 trust-list XML from its raw bytes. Every service whose `<ServiceStatus>` is
+[`SVCSTATUS_GRANTED`] (cl. 5.5.4) — and, when `expected_service_type` is `Some`, whose
+`<ServiceTypeIdentifier>` (cl. 5.5.1) matches it — contributes its `<ServiceDigitalIdentity>`
+certificate(s) as anchors for the caller-supplied `(role, format)`. A **withdrawn** / suspended
+/ absent-status service is parsed but **never** anchors trust (the T5.1 false-trust fix).
+
+`expected_service_type` is the optional service-type filter (e.g. [`SVCTYPE_EAA_Q`]); `None`
+ingests every `granted` service regardless of type.
 
 # Errors
 
 Returns [`XmlTrustListError`] when the XML is malformed, a certificate body is not valid
 base64, or `<NextUpdate>` is missing/invalid.
-
-```rust
-fn signer_cert_der(&self) -> Option<&[u8]>
-```
-
-The list's own signing certificate (DER) from the enveloped `<ds:Signature>`, if signed.
 
 #### Enums
 
@@ -2506,8 +3230,44 @@ An error parsing or authenticating a TS 119 612 trust-list XML.
 - `SignerUntrusted(ChainError)`
   - The trust-list signing certificate did not chain to a configured scheme-operator anchor.
 - `SignatureUnverified`
-  - The full enveloped XML-DSig cryptographic check is not yet implemented; authenticating on the
-chain alone must be explicitly opted into (fail-closed default — see the module docs).
+  - The full enveloped XAdES `SignatureValue` / exclusive-C14N / `<ds:Reference>`-digest check is
+a documented scope cut (TS 119 612 V2.4.1 §5.7 / Annex B.1.0; EN 319 132-1), so the XML
+trust-list path **fails closed**: a list is never trusted on its signing-cert chain alone (a
+public signer cert + forged body would otherwise be accepted). See the module docs +
+`standards-conformance.md`.
+
+#### Constants
+
+##### const `SVCSTATUS_GRANTED`
+
+```rust
+const SVCSTATUS_GRANTED: &str = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted"
+```
+
+TS 119 612 V2.4.1 §5.5.4 item i / Annex D.5 — the URI of a trust service whose current status is
+**`granted`** (the qualified status is in force). Only a `granted` service anchors trust
+(cl. 5.5.4); a `withdrawn` / suspended / absent status MUST NOT. Authoritative source for the
+TS 119 612 status/type URIs across the crate (DRY — re-exported by [`crate::qualified`]).
+
+##### const `SVCSTATUS_WITHDRAWN`
+
+```rust
+const SVCSTATUS_WITHDRAWN: &str = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn"
+```
+
+TS 119 612 V2.4.1 §5.5.4 item i / Annex D.5 — the URI of a **`withdrawn`** trust service (the
+qualified status was never granted, or has been withdrawn). A withdrawn service MUST NOT anchor
+trust (the T5.1 false-trust fix).
+
+##### const `SVCTYPE_EAA_Q`
+
+```rust
+const SVCTYPE_EAA_Q: &str = "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q"
+```
+
+TS 119 612 V2.4.1 §5.5.1.1 (k) — the trust-service **type** URI for a *qualified* electronic
+attestation of attributes (QEAA) issuing service. The qualified-status gate ([`crate::qualified`])
+re-exports this as `EAA_Q_SERVICE_TYPE`.
 
 ### Structs
 
@@ -2535,7 +3295,9 @@ equality only, an offline test seam):
   (the EUDI chain-to-root model), where exact-leaf-match would reject every real credential.
 - The leaf's **validity window** (and a directly-pinned anchor's) is enforced at the verification
   instant, so an expired/withdrawn pinned issuer leaf is rejected ([`crate::trust::chain::ChainError::LeafExpired`]),
-  not silently accepted.
+  not silently accepted. An expiry-driven chain failure carries [`TrustFailure::Expired`] on the
+  [`TrustDecision`] (so the verifier reports `Expired`, not `UntrustedIssuer`); every other path
+  failure carries [`TrustFailure::NotTrusted`].
 
 The verification instant `now_unix` (the relevant time the leaf-validity window is checked at) is
 carried on the source because [`TrustAnchorSource::resolve`] is sans-clock; the C-ABI builds one
@@ -2608,7 +3370,9 @@ The outcome of resolving an issuer against the configured anchors
 (contracts/trust-anchor-source.md).
 
 `trusted` is the always-on-bar trust decision; `entry` carries the matched [`TrustListEntry`] when
-`trusted` is `true` (it is `None` for an untrusted issuer).
+`trusted` is `true` (it is `None` for an untrusted issuer). `failure` carries the coarse-but-accurate
+[`TrustFailure`] category when `trusted` is `false` (so the verifier attributes `Expired` vs
+`UntrustedIssuer`); it is `None` for a trusted decision.
 
 ##### Fields
 
@@ -2616,6 +3380,8 @@ The outcome of resolving an issuer against the configured anchors
   - Whether the issuer is on the configured trust anchor for its role/format.
 - `entry: Option<TrustListEntry>`
   - The matched trust-list entry, present iff `trusted`.
+- `failure: Option<TrustFailure>`
+  - The untrusted-failure category, present iff `!trusted` (so the reason is never opaque).
 
 ##### Methods
 
@@ -2629,7 +3395,16 @@ A trusted decision carrying its matched entry.
 const fn untrusted() -> Self
 ```
 
-An untrusted decision (no matched entry).
+An untrusted decision with no specific category (the exact-DER-pin miss / fail-closed default):
+the signer is simply not among the configured anchors → [`TrustFailure::not_trusted`] (no source
+[`crate::trust::chain::ChainError`]).
+
+```rust
+const fn untrusted_because(failure: TrustFailure) -> Self
+```
+
+An untrusted decision (no matched entry), carrying the [`TrustFailure`] category so the verifier
+can attribute a precise reason.
 
 #### struct `TrustListEntry`
 
@@ -2697,6 +3472,73 @@ surfaces the fail-closed outcomes. The offline [`StaticTestAnchors`] never fails
 - `Authentication(String)`
   - A fetched trust list failed signature authentication.
 
+#### enum `TrustFailure`
+
+```rust
+enum TrustFailure
+```
+
+Why an issuer resolved as **untrusted** — a coarse-but-accurate category so the verifier attributes
+a precise [`crate::types::ReasonCode`] (the verdict is identically INVALID either way).
+
+A chain-validating source ([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) gets a specific
+[`crate::trust::chain::ChainError`] back from [`crate::trust::chain::verify_chain`]; collapsing it to
+a bare `trusted: false` would mislabel an EXPIRED (but otherwise trusted) signing cert as
+"untrusted issuer". This enum preserves the load-bearing distinction the verifier needs:
+
+- [`TrustFailure::Expired`] — the path failed **only** because a certificate on it (the leaf, an
+  intermediate, or the anchor) was outside its validity window at the verification instant
+  ([`ChainError::LeafExpired`]/[`ChainError::AnchorExpired`]). The credential's signer would
+  otherwise chain to a trusted anchor — it is an expiry, not an absence of trust → the verifier maps
+  it to [`crate::types::ReasonCode::Expired`].
+- [`TrustFailure::NotTrusted`] — every other reason the path does not reach a configured anchor (no
+  matching issuer, bad signature, a non-CA on the path, an unsupported algorithm, a malformed cert,
+  an over-long chain, an exact-pin miss, or a stale cache) → [`crate::types::ReasonCode::UntrustedIssuer`].
+  It carries the **source** [`ChainError`] (`Some`) when a chain-validating source produced one, so a
+  debugging integrator can drill into the precise no-trust cause (signature-invalid vs not-a-CA vs
+  wrong-leaf-purpose vs issuer-mismatch vs …) WITHOUT changing the coarse verdict mapping — closing the
+  asymmetry with the qualified gate, which already keeps the full [`ChainError`] on
+  [`crate::qualified::QualifiedTrustError::SignerNotTrusted`]. It is `None` for a no-trust that is NOT a
+  chain-validation failure: an exact-DER-pin miss ([`StaticTestAnchors`]), an empty/absent anchor set, or
+  a stale-cache fail-closed default.
+
+[`ChainError`]: crate::trust::chain::ChainError
+[`ChainError::LeafExpired`]: crate::trust::chain::ChainError::LeafExpired
+[`ChainError::AnchorExpired`]: crate::trust::chain::ChainError::AnchorExpired
+
+##### Variants
+
+- `Expired`
+  - A certificate on the signing path is outside its validity window (expired / not-yet-valid),
+distinct from an absence of trust — surfaced as [`crate::types::ReasonCode::Expired`].
+- `NotTrusted(Option<ChainError>)`
+  - The signer does not chain to any configured anchor for the role/format (or the cache is stale)
+— surfaced as [`crate::types::ReasonCode::UntrustedIssuer`]. Carries the source
+[`crate::trust::chain::ChainError`] (`Some`) when a chain-validating source produced one, so the
+reason can be drilled into for diagnostics; `None` for a non-chain no-trust (exact-pin miss /
+empty anchors / fail-closed default). The verdict mapping stays coarse either way.
+
+##### Methods
+
+```rust
+const fn not_trusted() -> Self
+```
+
+A no-trust failure that is NOT a chain-validation result (an exact-DER-pin miss, an empty/absent
+anchor set, or a fail-closed default): [`TrustFailure::NotTrusted`] with no source
+[`crate::trust::chain::ChainError`]. The single authoritative constructor for the sourceless
+no-trust case (DRY) — every fail-closed default routes through it.
+
+```rust
+const fn reason_code(&self) -> ReasonCode
+```
+
+The [`crate::types::ReasonCode`] this untrusted-failure category maps to — the **one**
+authoritative mapping (DRY — Principle III), shared by both per-format bars so an expired
+signing cert reports `Expired` and a genuine no-trust reports `UntrustedIssuer` identically.
+The carried [`crate::trust::chain::ChainError`] on `NotTrusted` is diagnostic only — it never
+changes the coarse `UntrustedIssuer` verdict.
+
 ### Traits
 
 #### trait `TrustAnchorSource`
@@ -2711,14 +3553,27 @@ Implementations range from the offline [`StaticTestAnchors`] to the native EU tr
 (task T013). `resolve` MUST be pure (sans-IO) — it works on cached, in-memory anchors only.
 
 ```rust
-fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8]) -> TrustDecision
+fn resolve(&self, role: IssuerRole, format: Format, issuer_cert_der: &[u8], supplied_intermediates: &[Vec<u8>], leaf_validity_time: Option<i64>) -> TrustDecision
 ```
 
-Resolve whether an issuer is trusted for a given role/format, matching its DER-encoded signing
-certificate against the configured anchors. **Pure / sans-IO** — never performs I/O.
+Resolve whether an issuer is trusted for a given role/format, validating the credential's
+signing certification path against the configured anchors. **Pure / sans-IO** — never performs
+I/O.
 
-`issuer_cert_der` is the credential's signing certificate (the mdoc `IssuerAuth` x5chain leaf,
-or the SD-JWT VC JWS `x5c` leaf).
+`issuer_cert_der` is the credential's signing leaf (the mdoc `IssuerAuth` x5chain leaf, or the
+SD-JWT VC JWS `x5c` leaf) and `supplied_intermediates` are the remaining `x5c` / `x5chain`
+certificates the credential carries (leaf-first order overall: leaf, then intermediate sub-CAs).
+A chain-validating source builds the RFC 5280 §6.1 path `leaf → intermediate₁ → … → anchor`; the
+supplied intermediates are untrusted path-building material, so the path is trusted only if it
+reaches a configured anchor. An exact-match source ignores the intermediates (it pins the leaf).
+
+`leaf_validity_time` is the instant the **leaf's own** validity window is checked at (the
+chain-authentication validity stays at the source's verification clock). It is `None` for the
+SD-JWT VC issuer and the trust-list signer (no distinct signing instant — the leaf is checked at
+"now"); the mdoc verifier passes `Some(mso.validityInfo.signed)` so the Document Signer
+certificate's window is checked against the MSO signing time per ISO/IEC 18013-5 §9.3.1 (DS certs
+rotate while mDLs live for years — a conformant mDL must not be false-rejected once its DS cert
+expires). An exact-match source ignores it.
 
 ```rust
 fn refresh(&mut self) -> Result<(), TrustError>
@@ -2958,8 +3813,42 @@ fail-closed (never a silent VALID).
 - `MalformedCredential`
   - The credential or presentation was structurally malformed and could not be parsed.
 - `MissingRequestBinding`
-  - The request binding was required (an OpenID4VP request was supplied) but is missing from the
-presentation.
+  - The request binding was required but the presentation carries no material to bind it. This one
+code intentionally covers **three** distinct "the binding cannot be evaluated" conditions
+(deliberately NOT split into separate codes — the verdict is identically INVALID and an
+integrator's response is the same: the holder must re-present with a request-bound token):
+
+1. **mdoc under an OpenID4VP request, no addressed audience** — the `Presentation::Mdoc` carried
+   `audience: None`, so there is no `client_id` to bind the response to and the OpenID4VP handover
+   cannot be reconstructed ([`mod@crate::verify`]).
+2. **mdoc without an OpenID4VP request, no `SessionTranscript`** — a `DeviceSignature` is always
+   computed over a real `SessionTranscript` (ISO/IEC 18013-5 §9.1.5); with neither a request nor a
+   supplied transcript the holder binding cannot be verified, and the verifier MUST NOT fabricate a
+   `[null,null,null]` transcript and "pass" it ([`crate::mdoc`]).
+3. **SD-JWT VC under an OpenID4VP request, no KB-JWT** — the presentation has no Key Binding JWT, so
+   there is nothing carrying the request `aud`/`nonce` to verify ([`crate::openid4vp`]).
+
+All three are "the binding material is absent" — distinct from [`Self::HolderBinding`] (binding
+material is present but its signature did not verify) and [`Self::Replay`]/[`Self::WrongAudience`]
+(binding present and valid, but bound to the wrong `nonce`/`audience`).
+- `QueryNotSatisfied`
+  - The presentation verified cryptographically (signature + trust + binding + disclosure integrity)
+but does **not** satisfy the OpenID4VP 1.0 DCQL Credential Query it was requested under — the
+verifier did **not** get what it asked for. This closes the "did I get what I requested" gap
+(conformance-audit T4.1): a trusted, freshly-bound credential of the **wrong** `vct`/`docType`,
+missing a requested claim, or carrying a claim value outside the query's `values`, is rejected
+rather than waved through as VALID (OpenID4VP 1.0 §"VP Token Validation" step 2.2; §6 DCQL —
+<https://openid.net/specs/openid-4-verifiable-presentations-1_0.html>). It is attributed AFTER
+the always-on crypto/trust bar passes, so it is distinct from [`Self::Tamper`] /
+[`Self::UntrustedIssuer`] / [`Self::HolderBinding`] (those are the credential being unsound) — the
+credential is sound, it is simply not the one the DCQL query requested.
+- `RoleMismatch`
+  - The caller-supplied [`crate::types::IssuerRole`] is inconsistent with the credential's claimed
+type — e.g. a credential whose `vct`/`docType` is a EUDI **PID** type presented under a non-PID
+trust-anchoring role (conformance-audit T4.3: per-role trust anchoring is only as good as the
+role input, so the role is derived from / validated against the credential's claimed type and a
+contradiction is rejected rather than silently anchoring under the wrong per-role list). A type
+with no standardized role mapping keeps the caller-supplied role (no mismatch).
 
 #### enum `StatusReachability`
 
