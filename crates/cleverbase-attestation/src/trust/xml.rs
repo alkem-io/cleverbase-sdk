@@ -415,7 +415,7 @@ fn handle_text_event(
             // Take the first non-empty timestamp body seen inside NextUpdate (a bare
             // `<NextUpdate>ts</NextUpdate>` or a `<dateTime>` child).
             if next_update_unix.is_none() {
-                *next_update_unix = super::manifest::parse_rfc3339_utc_pub(body.trim());
+                *next_update_unix = crate::datetime::parse_rfc3339_utc(body.trim());
             }
         }
         _ => {}

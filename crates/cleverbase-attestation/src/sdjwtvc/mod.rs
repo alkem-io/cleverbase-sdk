@@ -119,12 +119,15 @@ pub fn verify_sd_jwt_vc<A: TrustAnchorSource + ?Sized>(
 /// (the [`crate::openid4vp`] layer uses this to attribute a request-binding failure to the specific
 /// [`ReasonCode::Replay`] / [`ReasonCode::WrongAudience`] before delegating to the full bar).
 ///
-/// Returns `None` when the presentation does not parse or carries no KB-JWT. The values are *claimed*
+/// Returns `None` when the (already-parsed) presentation carries no KB-JWT. The values are *claimed*
 /// (their cryptographic verification is the always-on holder-binding check in [`verify_sd_jwt_vc`]);
 /// this read is only for failure attribution, never for acceptance.
+///
+/// Takes the presentation ALREADY parsed (`&sd_jwt_payload::SdJwt`): the caller parses ONCE and threads
+/// the handle, so a single verify parses the presentation as few times as possible. Crate-internal
+/// (`pub(crate)`) so the parsed-`SdJwt` coupling is never exposed in the public API.
 #[must_use]
-pub fn kb_jwt_aud_nonce(presentation: &str) -> Option<(String, String)> {
-    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+pub(crate) fn kb_jwt_aud_nonce(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<(String, String)> {
     let kb = sd_jwt.key_binding_jwt()?;
     let claims = kb.claims();
     Some((claims.aud.clone(), claims.nonce.clone()))
@@ -134,12 +137,14 @@ pub fn kb_jwt_aud_nonce(presentation: &str) -> Option<(String, String)> {
 /// without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf against the
 /// national Trusted List's `EAA/Q` service entries).
 ///
-/// Returns `None` when the presentation does not parse or carries no `x5c` leaf. The value is
+/// Returns `None` when the (already-parsed) presentation carries no `x5c` leaf. The value is
 /// *claimed* (its trust + signature are decided by the always-on bar in [`verify_sd_jwt_vc`]); this
 /// read is only the gate's cert-matching input, never an acceptance.
+///
+/// Takes the presentation ALREADY parsed (`&sd_jwt_payload::SdJwt`): the caller parses ONCE and threads
+/// the handle. Crate-internal (`pub(crate)`) so the parsed-`SdJwt` coupling stays out of the public API.
 #[must_use]
-pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
-    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+pub(crate) fn issuer_signing_cert_der(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<Vec<u8>> {
     // The issuer JWS is the first `~`-separated segment of the re-serialized presentation.
     let presentation = sd_jwt.presentation();
     let jws = presentation.split('~').next()?;
@@ -150,14 +155,13 @@ pub fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>> {
 /// Extract the issuer-signed `vct` (Verifiable Credential Type) a presented SD-JWT VC asserts, for the
 /// in-core OpenID4VP DCQL type match (SD-JWT VC `vct` ∈ DCQL `meta.vct_values` — [`crate::dcql`]).
 ///
-/// Returns `None` when the presentation does not parse or carries no string `vct`. The value is read
+/// Returns `None` when the (already-parsed) presentation carries no string `vct`. The value is read
 /// from the issuer-signed clear payload; the [`crate::openid4vp`] DCQL gate calls this **only after**
 /// [`verify_sd_jwt_vc`] returned `valid` (so the same `vct` has already been signature-verified,
 /// trusted, and shape-validated by [`check_vct`]) — this re-read of the same claim is the type-match
-/// input, never an acceptance.
+/// input, never an acceptance. Takes the presentation ALREADY parsed (the caller parses ONCE).
 #[must_use]
-pub(crate) fn verified_vct(presentation: &str) -> Option<String> {
-    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+pub(crate) fn verified_vct(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
     sd_jwt
         .claims()
         .get("vct")
@@ -171,10 +175,10 @@ pub(crate) fn verified_vct(presentation: &str) -> Option<String> {
 /// opt-in qualified gate ([`crate::qualified`]) checks — NOT `vct` (which is the credential-TYPE
 /// identifier, e.g. `urn:eudi:pid:1`, and never the qualified URN). Read from the issuer-signed clear
 /// payload (a QEAA declares its category in the clear), only after the always-on bar accepted the
-/// presentation. Returns `None` when absent / not a string / unparseable.
+/// presentation. Returns `None` when absent / not a string. Takes the presentation ALREADY parsed
+/// (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
 #[must_use]
-pub(crate) fn issuer_category(presentation: &str) -> Option<String> {
-    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+pub(crate) fn issuer_category(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
     sd_jwt
         .claims()
         .get("category")
@@ -197,14 +201,11 @@ pub(crate) fn issuer_category(presentation: &str) -> Option<String> {
 /// The [`crate::openid4vp`] DCQL gate calls this **only after** [`verify_sd_jwt_vc`] returned `valid`
 /// (so the presentation parsed, every disclosure already matched an issuer-signed digest, and the SD
 /// machinery was already validated) — it is the gate's claim-resolution input, never an acceptance.
-/// Returns an empty map when the presentation does not parse or reconstruction fails (defensive; a VALID
-/// presentation always parses and reconstructs).
+/// Returns an empty map when reconstruction fails (defensive; a VALID presentation always reconstructs).
+/// Takes the presentation ALREADY parsed (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
 #[must_use]
-pub(crate) fn presented_claims(presentation: &str) -> BTreeMap<String, AttributeValue> {
-    sd_jwt_payload::SdJwt::parse(presentation)
-        .ok()
-        .and_then(|sd_jwt| collect_presented_claims(&sd_jwt).ok())
-        .unwrap_or_default()
+pub(crate) fn presented_claims(sd_jwt: &sd_jwt_payload::SdJwt) -> BTreeMap<String, AttributeValue> {
+    collect_presented_claims(sd_jwt).unwrap_or_default()
 }
 
 /// The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
@@ -212,16 +213,16 @@ pub(crate) fn presented_claims(presentation: &str) -> BTreeMap<String, Attribute
 /// to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
 /// credential is in force, the closest available proxy for the relevant time).
 ///
-/// Returns `None` when the presentation does not parse or carries **neither** `iat` nor `nbf` — the
+/// Returns `None` when the (already-parsed) presentation carries **neither** `iat` nor `nbf` — the
 /// opt-in [`crate::qualified`] gate then fails closed ([`crate::types::QualifiedStatus::Indeterminate`])
 /// rather than read the issuer's status at the verification instant ("now"), which would falsely report
 /// `Qualified` for an issuer granted only AFTER it signed the credential (contracts/qualified-status-
 /// gate.md: the status is read **at the credential's issuance/relevant time, NOT "now"**). A present-
 /// but-non-canonical `iat`/`nbf` (RFC 7519 NumericDate must be a JSON number that fits `i64`) is
-/// likewise treated as absent — the gate must not assert qualification off an unreadable instant.
+/// likewise treated as absent — the gate must not assert qualification off an unreadable instant. Takes
+/// the presentation ALREADY parsed (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
 #[must_use]
-pub fn issuance_time_unix(presentation: &str) -> Option<i64> {
-    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+pub(crate) fn issuance_time_unix(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<i64> {
     let claims = sd_jwt.claims();
     // `iat` is the credential's issuance time; `nbf` (not-before) is the fallback relevant time. Only
     // a canonical NumericDate (a JSON integer that fits `i64`) is accepted; anything else → `None`.
@@ -349,11 +350,9 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
         .split('~')
         .next()
         .ok_or(ReasonCode::MalformedCredential)?;
-    let mut parts = jws.split('.');
-    let _header_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
-    let _payload_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
-    let _sig_b64 = parts.next().ok_or(ReasonCode::MalformedCredential)?;
-    if parts.next().is_some() {
+    // Exactly three dot-segments (header.payload.signature); the real segments are re-split downstream
+    // by `decode_jws_protected_header` + `verify_compact_es256`, so here only the framing is checked.
+    if jws.split('.').count() != 3 {
         return Err(ReasonCode::MalformedCredential);
     }
 

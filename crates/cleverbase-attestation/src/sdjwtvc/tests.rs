@@ -370,8 +370,10 @@ fn presented_claims_merges_clear_and_disclosed_excluding_machinery() {
     // MERGED with the selectively-disclosed claims — distinct from the privacy-minimal DISCLOSED set.
     let sd_jwt = mint_sd_jwt_with_clear_subject_claim(ISSUER_KEY_PK8, ISSUER_CERT_DER);
     let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE);
+    // `presented_claims` now takes the presentation ALREADY parsed (the caller parses once).
+    let parsed = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
 
-    let presented = presented_claims(&presentation);
+    let presented = presented_claims(&parsed);
     // The CLEAR subject claim is present alongside the DISCLOSED one.
     assert_eq!(
         presented.get("given_name"),
@@ -390,8 +392,8 @@ fn presented_claims_merges_clear_and_disclosed_excluding_machinery() {
     assert!(!presented.contains_key("_sd_alg"));
     assert!(!presented.contains_key("cnf"));
 
-    // The privacy-minimal disclosed set EXCLUDES the clear given_name — proving the two views differ.
-    let parsed = sd_jwt_payload::SdJwt::parse(&presentation).unwrap();
+    // The privacy-minimal disclosed set EXCLUDES the clear given_name — proving the two views differ
+    // (reusing the single parse above — the disclosed-only walk over the same handle).
     let disclosed = super::collect_disclosed_attributes(&parsed).unwrap();
     assert!(
         !disclosed.contains_key("given_name"),
@@ -1629,11 +1631,12 @@ fn a_clear_array_element_nesting_a_disclosed_claim_is_reconstructed() {
 #[test]
 fn issuance_time_unix_prefers_iat_then_nbf_then_none() {
     use super::issuance_time_unix;
-    // Build a parseable issuer-only presentation (`<jws>~`) over a chosen payload, to exercise the
-    // qualified-gate relevant-time reader directly.
-    let present = |payload: &Value| -> String {
+    // Build a parseable issuer-only presentation (`<jws>~`) over a chosen payload, ALREADY parsed — the
+    // reader now takes `&sd_jwt_payload::SdJwt` (the caller parses once), so this exercises the
+    // qualified-gate relevant-time reader directly over the parsed handle.
+    let present = |payload: &Value| -> sd_jwt_payload::SdJwt {
         let jws = sign_issuer_jws(ISSUER_KEY_PK8, ISSUER_CERT_DER, payload);
-        format!("{jws}~")
+        sd_jwt_payload::SdJwt::parse(&format!("{jws}~")).unwrap()
     };
     // `iat` is the credential's issuance time and takes precedence over `nbf`.
     let both =
@@ -1649,6 +1652,7 @@ fn issuance_time_unix_prefers_iat_then_nbf_then_none() {
     // a canonical `nbf` is used instead — never asserting qualification off an unreadable instant.
     let bad_iat = present(&json!({ "iss": "x", "vct": "y", "iat": "soon", "nbf": 1_640_000_000 }));
     assert_eq!(issuance_time_unix(&bad_iat), Some(1_640_000_000));
-    // Unparseable input → `None` (read-only and total).
-    assert_eq!(issuance_time_unix("not-a-sd-jwt"), None);
+    // An unparseable presentation is now rejected at the parse boundary (the caller's parse), so the
+    // reader is only ever handed a valid parsed handle — the fail-closed path lives at the call site.
+    assert!(sd_jwt_payload::SdJwt::parse("not-a-sd-jwt").is_err());
 }

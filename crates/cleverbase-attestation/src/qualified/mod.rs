@@ -111,7 +111,7 @@ use serde::Deserialize;
 use x509_cert::ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier};
 use x509_cert::Certificate;
 
-use crate::trust::manifest::parse_rfc3339_utc_pub;
+use crate::datetime::parse_rfc3339_utc;
 use crate::types::QualifiedStatus;
 
 /// The pinned TS 119 615 version this determination implements (research D6 — experimental,
@@ -386,7 +386,7 @@ impl QualifiedTrustList {
     /// valid base64, or a `nextUpdate` / status `startingTime` is not an RFC 3339 UTC timestamp.
     pub fn parse(bytes: &[u8]) -> Result<Self, QualifiedTrustListError> {
         let raw: RawList = serde_json::from_slice(bytes)?;
-        let next_update_unix = parse_rfc3339_utc_pub(raw.next_update.trim())
+        let next_update_unix = parse_rfc3339_utc(raw.next_update.trim())
             .ok_or_else(|| QualifiedTrustListError::Time(raw.next_update.clone()))?;
         let signer_cert_der = match raw.signer_cert_der_b64 {
             Some(b64) => Some(decode_b64_cert(&b64)?),
@@ -412,7 +412,7 @@ impl QualifiedTrustList {
 
             let mut status_history = Vec::with_capacity(svc.status_history.len());
             for st in svc.status_history {
-                let starting_time_unix = parse_rfc3339_utc_pub(st.starting_time.trim())
+                let starting_time_unix = parse_rfc3339_utc(st.starting_time.trim())
                     .ok_or_else(|| QualifiedTrustListError::Time(st.starting_time.clone()))?;
                 status_history.push(StatusRecord {
                     status: st.status,

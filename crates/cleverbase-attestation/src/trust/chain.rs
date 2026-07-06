@@ -1143,41 +1143,41 @@ fn check_subject_within_constraints(
     Ok(())
 }
 
-/// Check one `directoryName` value against the permitted/excluded `directoryName` subtrees.
-fn check_dn_within(
-    name: &x509_cert::name::Name,
-    nc: &NameConstraintState,
+/// Check one name value against permitted/excluded subtrees of its form (RFC 5280 §6.1.3 (b)(c)):
+/// it must lie within ≥1 base of EVERY permitted set (the (g)(1) intersection) and within NO excluded
+/// base ((g)(2)), else [`ChainError::NameConstraintViolation`]. The per-form `within` subtree predicate
+/// (`dn_within_subtree` / `dns_within_subtree`, which hold the §7.1 DN / trailing-dot-dNSName
+/// normalization) is passed in; the permitted/excluded control flow lives here once (DRY).
+fn check_within<B, N: ?Sized>(
+    permitted: &[Vec<B>],
+    excluded: &[B],
+    name: &N,
+    within: impl Fn(&B, &N) -> bool,
 ) -> Result<(), ChainError> {
-    for set in &nc.permitted_dn {
-        if !set.iter().any(|base| dn_within_subtree(base, name)) {
+    for set in permitted {
+        if !set.iter().any(|base| within(base, name)) {
             return Err(ChainError::NameConstraintViolation);
         }
     }
-    if nc
-        .excluded_dn
-        .iter()
-        .any(|base| dn_within_subtree(base, name))
-    {
+    if excluded.iter().any(|base| within(base, name)) {
         return Err(ChainError::NameConstraintViolation);
     }
     Ok(())
 }
 
+/// Check one `directoryName` value against the permitted/excluded `directoryName` subtrees.
+fn check_dn_within(
+    name: &x509_cert::name::Name,
+    nc: &NameConstraintState,
+) -> Result<(), ChainError> {
+    check_within(&nc.permitted_dn, &nc.excluded_dn, name, dn_within_subtree)
+}
+
 /// Check one `dNSName` value against the permitted/excluded `dNSName` subtrees.
 fn check_dns_within(name: &str, nc: &NameConstraintState) -> Result<(), ChainError> {
-    for set in &nc.permitted_dns {
-        if !set.iter().any(|base| dns_within_subtree(base, name)) {
-            return Err(ChainError::NameConstraintViolation);
-        }
-    }
-    if nc
-        .excluded_dns
-        .iter()
-        .any(|base| dns_within_subtree(base, name))
-    {
-        return Err(ChainError::NameConstraintViolation);
-    }
-    Ok(())
+    check_within(&nc.permitted_dns, &nc.excluded_dns, name, |base, n| {
+        dns_within_subtree(base, n)
+    })
 }
 
 /// Absorb a certificate's `nameConstraints` extension into the state (§6.1.4 (g)): permitted subtrees

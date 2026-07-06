@@ -198,20 +198,53 @@ pub struct VerifyResponse {
     pub outcome: VerifyOutcome,
 }
 
+/// A versioned CBOR wire envelope carrying its own `schema_version`, so the shared
+/// [`decode_versioned`] guard can read the version generically. Implemented by [`VerifyRequest`] and
+/// the issuance [`IssuanceRequest`](crate::issuance::wire::IssuanceRequest) (DRY — Principle III: one
+/// CBOR-decode + version-guard body for both envelopes).
+pub(crate) trait HasSchemaVersion {
+    /// The envelope's declared wire schema version.
+    fn schema_version(&self) -> u32;
+}
+
+impl HasSchemaVersion for VerifyRequest {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+/// Decode a versioned CBOR wire envelope, rejecting an unrecognized schema version.
+///
+/// Shared by [`decode_verify_request`] and the issuance
+/// [`decode_issuance_request`](crate::issuance::wire::decode_issuance_request) (DRY — Principle III):
+/// the CBOR-decode + `schema_version` guard body is identical bar the envelope type, the expected
+/// version, and the `domain` word in the mismatch message.
+///
+/// # Errors
+///
+/// Returns the CBOR decode error (or a schema-version mismatch message) as a `String`.
+pub(crate) fn decode_versioned<T: serde::de::DeserializeOwned + HasSchemaVersion>(
+    bytes: &[u8],
+    expected: u32,
+    domain: &str,
+) -> Result<T, String> {
+    let req: T = ciborium::from_reader(bytes).map_err(|e| e.to_string())?;
+    if req.schema_version() != expected {
+        return Err(format!(
+            "unsupported {domain} schema_version {} (this core speaks {expected})",
+            req.schema_version()
+        ));
+    }
+    Ok(req)
+}
+
 /// Decode a `verify` request envelope, rejecting unknown schema versions.
 ///
 /// # Errors
 ///
 /// Returns the decode error (or a schema-version mismatch message) as a `String`.
 pub fn decode_verify_request(bytes: &[u8]) -> Result<VerifyRequest, String> {
-    let req: VerifyRequest = ciborium::from_reader(bytes).map_err(|e| e.to_string())?;
-    if req.schema_version != ATTESTATION_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported attestation schema_version {} (this core speaks {ATTESTATION_SCHEMA_VERSION})",
-            req.schema_version
-        ));
-    }
-    Ok(req)
+    decode_versioned(bytes, ATTESTATION_SCHEMA_VERSION, "attestation")
 }
 
 /// Encode a `verify` response envelope at the current schema version.

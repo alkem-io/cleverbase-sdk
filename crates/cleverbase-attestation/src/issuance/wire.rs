@@ -23,6 +23,7 @@ use super::obtain::{
 use super::present::{prepare_present, HeldAttestation, HolderPresentation, PreparedPresentation};
 use super::signer::{HolderContext, SigningInput};
 use crate::openid4vp::PresentationRequest;
+use crate::wire::{decode_versioned, HasSchemaVersion};
 
 /// Wire schema version of the **issuance** envelope (independent of the `verify` envelope's
 /// `ATTESTATION_SCHEMA_VERSION` and the signing core's `SCHEMA_VERSION`). Version 1 is the initial
@@ -176,6 +177,12 @@ pub struct IssuanceRequest {
     pub op: IssuanceOp,
 }
 
+impl HasSchemaVersion for IssuanceRequest {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
 /// An issuance response envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuanceResponse {
@@ -191,14 +198,7 @@ pub struct IssuanceResponse {
 ///
 /// Returns the decode error (or a schema-version mismatch message) as a `String`.
 pub fn decode_issuance_request(bytes: &[u8]) -> Result<IssuanceRequest, String> {
-    let req: IssuanceRequest = ciborium::from_reader(bytes).map_err(|e| e.to_string())?;
-    if req.schema_version != ISSUANCE_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported issuance schema_version {} (this core speaks {ISSUANCE_SCHEMA_VERSION})",
-            req.schema_version
-        ));
-    }
-    Ok(req)
+    decode_versioned(bytes, ISSUANCE_SCHEMA_VERSION, "issuance")
 }
 
 /// Encode an issuance response envelope at the current schema version.

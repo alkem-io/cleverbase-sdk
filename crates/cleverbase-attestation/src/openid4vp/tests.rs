@@ -192,21 +192,23 @@ fn sd_jwt_without_a_kb_jwt_is_missing_request_binding() {
 // mdoc binding.
 // =================================================================================================
 
-/// Mint an mdoc `vp_token` whose `DeviceAuth` is bound to the OID4VP handover for `(aud, nonce)` and
-/// that declares it was addressed to `addressed_audience`.
-fn mdoc_vp_token(addressed_audience: &str, handover_aud: &str, nonce: &[u8]) -> MdocVpToken {
+/// Mint the CBOR `DeviceResponse` bytes for an mdoc `vp_token` whose `DeviceAuth` is bound to the
+/// OID4VP handover for `(handover_aud, nonce)`. [`MdocVpToken`] now borrows its `device_response`,
+/// so the caller keeps these bytes in a local that outlives the token and supplies the addressed
+/// audience it already has as the `audience` field.
+fn mdoc_vp_parts(handover_aud: &str, nonce: &[u8]) -> Vec<u8> {
     let transcript = oid4vp_handover_transcript(handover_aud, nonce, RESPONSE_URI);
-    let device_response = MdocBuilder::new().session_transcript(transcript).build();
-    MdocVpToken {
-        audience: addressed_audience.to_owned(),
-        device_response,
-    }
+    MdocBuilder::new().session_transcript(transcript).build()
 }
 
 #[test]
 fn mdoc_bound_to_the_issued_request_is_valid() {
     let request = request_with(AUDIENCE, &[3u8; 16]);
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let device_response = mdoc_vp_parts(AUDIENCE, &request.nonce);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let anchors = anchors_mdoc();
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -237,7 +239,12 @@ fn mdoc_bound_to_the_issued_request_is_valid() {
 fn mdoc_replayed_with_a_stale_nonce_is_replay() {
     // The holder signed the handover over an OLD nonce; the verifier issued a FRESH one (same aud).
     let request = request_with(AUDIENCE, &[0x11u8; 16]);
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &[0x22u8; 16]); // handover nonce ≠ request nonce
+    // handover nonce ≠ request nonce
+    let device_response = mdoc_vp_parts(AUDIENCE, &[0x22u8; 16]);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let anchors = anchors_mdoc();
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -256,7 +263,11 @@ fn mdoc_replayed_with_a_stale_nonce_is_replay() {
 fn mdoc_built_for_a_different_audience_is_wrong_audience() {
     // The response was addressed to a different verifier (observable cleartext audience).
     let request = request_with(AUDIENCE, &[5u8; 16]);
-    let token = mdoc_vp_token(WRONG_AUDIENCE, WRONG_AUDIENCE, &request.nonce);
+    let device_response = mdoc_vp_parts(WRONG_AUDIENCE, &request.nonce);
+    let token = MdocVpToken {
+        audience: WRONG_AUDIENCE,
+        device_response: &device_response,
+    };
     let anchors = anchors_mdoc();
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -282,8 +293,8 @@ fn mdoc_binding_failure_other_than_holder_binding_passes_through() {
         .session_transcript(transcript)
         .build();
     let token = MdocVpToken {
-        audience: AUDIENCE.to_owned(),
-        device_response,
+        audience: AUDIENCE,
+        device_response: &device_response,
     };
     let anchors = anchors_mdoc(); // trusts the real DS, not the wrong issuer
     let result = verify_response(
@@ -307,7 +318,11 @@ fn verify_response_rejects_a_format_the_policy_excludes() {
 
     // mdoc presented, but the policy accepts SD-JWT VC only → UnsupportedFormat.
     let request = request_with(AUDIENCE, &[3u8; 16]);
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let device_response = mdoc_vp_parts(AUDIENCE, &request.nonce);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let sd_jwt_only = VerificationPolicy {
         formats: vec![Format::SdJwtVc],
         ..VerificationPolicy::default()
@@ -345,7 +360,11 @@ fn verify_response_rejects_a_format_the_policy_excludes() {
 
     // Control: the SAME mdoc under a policy that DOES accept mdoc verifies (so the rejection above is
     // the format gate, not some other failure).
-    let ok_token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let ok_device_response = mdoc_vp_parts(AUDIENCE, &request.nonce);
+    let ok_token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &ok_device_response,
+    };
     let mdoc_ok = VerificationPolicy {
         formats: vec![Format::Mdoc],
         ..VerificationPolicy::default()
@@ -382,8 +401,8 @@ fn mdoc_bound_presentation_with_a_corrupt_device_signature_is_holder_binding_not
         .mangle_device_signature()
         .build();
     let token = MdocVpToken {
-        audience: AUDIENCE.to_owned(),
-        device_response,
+        audience: AUDIENCE,
+        device_response: &device_response,
     };
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -425,8 +444,8 @@ fn multi_document_wrong_key_device_signature_is_holder_binding_not_replay() {
         .append_wrong_key_document("nationality", CborValue::Text("NL".to_owned()))
         .build();
     let token = MdocVpToken {
-        audience: AUDIENCE.to_owned(),
-        device_response,
+        audience: AUDIENCE,
+        device_response: &device_response,
     };
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -803,7 +822,11 @@ fn mdoc_matching_doctype_is_valid_and_wrong_doctype_is_query_not_satisfied() {
         let dcql = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"},"claims":[{"path":["org.iso.18013.5.1","given_name"]}]}]}"#;
         request_with_dcql(AUDIENCE, &[3u8; 16], dcql)
     };
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request_match.nonce);
+    let device_response = mdoc_vp_parts(AUDIENCE, &request_match.nonce);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let result = verify_response(
         &VpToken::Mdoc(token),
         &request_match,
@@ -822,7 +845,11 @@ fn mdoc_matching_doctype_is_valid_and_wrong_doctype_is_query_not_satisfied() {
     // Wrong doctype_value → QueryNotSatisfied (a sound, trusted, bound mdoc of the wrong type).
     let dcql_wrong = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.other"}}]}"#;
     let request_wrong = request_with_dcql(AUDIENCE, &[3u8; 16], dcql_wrong);
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request_wrong.nonce);
+    let device_response = mdoc_vp_parts(AUDIENCE, &request_wrong.nonce);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let result = verify_response(
         &VpToken::Mdoc(token),
         &request_wrong,
@@ -896,8 +923,8 @@ fn pid_typed_mdoc_under_a_non_pid_role_is_role_mismatch() {
         .session_transcript(transcript)
         .build();
     let token = MdocVpToken {
-        audience: AUDIENCE.to_owned(),
-        device_response,
+        audience: AUDIENCE,
+        device_response: &device_response,
     };
     let result = verify_response(
         &VpToken::Mdoc(token),
@@ -1152,7 +1179,11 @@ fn verify_vp_token_multiple_false_rejects_two_presentations() {
 fn verify_vp_token_mdoc_credential_is_satisfied() {
     let dcql = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}"#;
     let request = request_with_dcql(AUDIENCE, &[3u8; 16], dcql);
-    let token = mdoc_vp_token(AUDIENCE, AUDIENCE, &request.nonce);
+    let device_response = mdoc_vp_parts(AUDIENCE, &request.nonce);
+    let token = MdocVpToken {
+        audience: AUDIENCE,
+        device_response: &device_response,
+    };
     let mut vp_token = BTreeMap::new();
     vp_token.insert("mdl".to_owned(), vec![VpToken::Mdoc(token)]);
     let outcome = verify_vp_token(

@@ -322,8 +322,8 @@ fn device_signature_built_via_signer_hook_verifies_under_us1_openid4vp() {
     let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
     let result = verify_response(
         &VpToken::Mdoc(MdocVpToken {
-            audience: AUDIENCE.to_owned(),
-            device_response,
+            audience: AUDIENCE,
+            device_response: &device_response,
         }),
         &request,
         &VerificationPolicy::default(),

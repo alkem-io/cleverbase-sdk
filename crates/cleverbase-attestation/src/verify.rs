@@ -163,7 +163,8 @@ fn looks_like_sd_jwt_vc(text: &str) -> bool {
     let Some((jws, _rest)) = text.split_once('~') else {
         return false;
     };
-    jws.split('.').count() == 3 && !jws.starts_with('.') && !jws.contains('~')
+    // `jws` is the segment BEFORE the first `~`, so it cannot contain a `~` (no redundant re-check).
+    jws.split('.').count() == 3 && !jws.starts_with('.')
 }
 
 /// Whether `bytes` decode as a CBOR `DeviceResponse` (a map with a `documents` entry).
@@ -253,8 +254,10 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                 };
                 openid4vp::verify_response_with_meta(
                     &VpToken::Mdoc(MdocVpToken {
-                        audience: (*audience).to_owned(),
-                        device_response: (*device_response).to_vec(),
+                        // Borrowed, not cloned: `device_response` is an attacker-sized buffer, and the
+                        // verifier only reads it.
+                        audience,
+                        device_response,
                     }),
                     req,
                     policy,
@@ -415,12 +418,19 @@ fn qualified_status_for(
     };
     match presentation {
         Presentation::SdJwtVc(p) => {
+            // Parse the presentation ONCE (the `category`/cert/issuance-time reads previously each
+            // re-parsed the same string — 3 parses → 1). An unparseable presentation here fails closed
+            // (`Indeterminate`), matching the helpers' prior `None`/absent behavior; this arm runs only
+            // on a VALID credential, which always parses.
+            let Ok(sd_jwt) = sd_jwt_payload::SdJwt::parse(p) else {
+                return QualifiedStatus::Indeterminate;
+            };
             // The SD-JWT VC issuer-signed `category` claim is the type indication (PRO-4.12.4-03) — NOT
             // the `vct` (the credential-type id). `None` (no category) fails the precondition closed.
-            let category = sdjwtvc::issuer_category(p);
+            let category = sdjwtvc::issuer_category(&sd_jwt);
             status_of(
-                sdjwtvc::issuer_signing_cert_der(p),
-                sdjwtvc::issuance_time_unix(p),
+                sdjwtvc::issuer_signing_cert_der(&sd_jwt),
+                sdjwtvc::issuance_time_unix(&sd_jwt),
                 category.as_deref(),
             )
         }

@@ -58,8 +58,9 @@ impl HolderPresentation {
                 audience,
                 device_response,
             } => VpToken::Mdoc(MdocVpToken {
-                audience: audience.clone(),
-                device_response: device_response.clone(),
+                // Borrow from `self` (the `VpToken<'_>` lifetime is tied to `&self`) — no clone.
+                audience: audience.as_str(),
+                device_response: device_response.as_slice(),
             }),
         }
     }

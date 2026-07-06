@@ -418,3 +418,40 @@ assert the request's **set-level completeness** — `credential_sets` (required 
 (not exposed over the wire). An integrator combining several presentations against a `credential_sets`
 request MUST evaluate set-level completeness itself (or via `verify_vp_token`); a C-ABI `valid = true`
 per presentation does not imply "the whole DCQL request is satisfied".
+
+## §3 — Second full-PR unbiased-review remediation (RCA record)
+
+A second unsteered, max-effort review (10 finder angles over the whole PR — this time including the §2
+remediation **and** the go/python/node bindings — adversarial per-finding verification, gap sweep)
+surfaced defects the §2 pass missed, concentrated in the holder **`present`** seam (masked by
+flat-claim / empty-`disclose` tests) and the DCQL / multi-credential edges the §2 per-document status
+fix left incomplete. The always-on crypto/trust core was re-confirmed sound (no new false-accept
+there). Each verified finding fixed at root cause, test-first.
+
+| # | Defect (RCA) | Fix | Test |
+|---|--------------|-----|------|
+| 1 | **SD-JWT `present` concealed nested SD claims by a root `/{leaf}` pointer** → the flagship nested EUDI ARF PID was UNPRESENTABLE (`sd_jwt_payload` `InvalidPath`), and same-leaf siblings across parents (`locality` in both `address` and `place_of_birth`) collided → over-disclosure. Masked because present tests used only flat claims. | Conceal by the FULL JSON path, built by walking the issuer `_sd` tree (mirroring the array-element path walk). Fixes both the unpresentability and the collision. | `issuance::present::tests::sd_jwt_vc_present_nested_pid_discloses_one_branch_without_leaking_its_sibling_leaf` |
+| 2 | **mdoc `present` ignored the `disclose` subset** → the full `issuerSigned.nameSpaces` rode on the wire regardless of the requested subset (privacy breach, FR-007); a garbage `disclose` was silently accepted. | Thread `disclose` into `prepare_mdoc`; prune `issuerSigned.nameSpaces` to the disclosed `elementIdentifier`s (kept items' on-wire bytes preserved; MSO/IssuerAuth untouched — the verifier checks only disclosed items against `valueDigests`); reject an unknown claim (`UndisclosableClaim`). | `issuance::present::tests::mdoc_present_discloses_only_the_requested_element_and_prunes_the_rest`, `…_rejects_a_non_disclosable_element` |
+| 3 | **`verify_vp_token` reused ONE status for the whole multi-credential vp_token** — the §2 per-document fix made status per-document within one `DeviceResponse` but left the set-level evaluator applying one outcome to every CREDENTIAL → a revoked credential among several could satisfy a required set (SC-002 false-accept). Native-Rust-only (no C-ABI reach), so latent. | Per-credential/per-document statuses (`&BTreeMap<id, Vec<Vec<StatusOutcome>>>`); a missing id/token/document fails closed to `Unavailable`. | `openid4vp::tests::verify_vp_token_revoked_credential_does_not_satisfy_a_required_set` |
+| 4 | **DCQL `parse_claim_value` used `as_i64()`** → a spec-valid `>i64` (or float) `values` entry silently dropped the whole Credential Query → `evaluate_single` returned `Inactive` → the "did I get what I requested" claims gate was silently DISABLED (fail-open) on the primary path. The multi-credential path failed closed on the same input — the asymmetry proved it a defect. | Retain a non-`i64` number as `ClaimValue::Unrepresentable` (never-matching), so the query stays enforceable → `NotSatisfied` (fail closed). | `dcql::tests::an_unrepresentable_values_entry_keeps_the_query_enforceable_and_not_satisfied` |
+| 5 | **`evaluate_single` fail-open on a malformed non-empty query** + **duplicate DCQL credential ids silently last-wins** (§6.1 requires unique ids; the `by_id` map would apply one query's constraints to another credential). | A non-empty query that fails to parse → `NotSatisfied` (not `Inactive`); duplicate `id` → `DcqlError::DuplicateCredentialId` (hard reject). | `dcql::tests::a_malformed_nonempty_query_fails_closed_not_inactive` |
+| 6 | **QEAA type indication read `vct`, exempting mdoc** (PRO-4.12.4-03). Per **ETSI TS 119 472-1** (online-confirmed) the URN `urn:etsi:esi:eaa:eu:qualified` is carried in the issuer-signed **`category`** (SD-JWT VC claim / mdoc data element in ns `org.etsi.01947201.010101`), NOT `vct` — so the SD-JWT gate was mechanically dead (a real QEAA's `vct` is its credential type) and the mdoc precondition was skipped. | Read `category` for BOTH formats (new `sdjwtvc::issuer_category`; per-document `MdocVerifyMeta.categories`); require the URN present (absent ⇒ Indeterminate, fail closed — enforced for mdoc too). | `qualified::tests::an_absent_type_indication_is_indeterminate`, `verify::tests::single_document_mdoc_without_the_category_element_is_indeterminate` |
+| 7 | **Request-binding footgun** — `VerifyRequest.request` is `#[serde(default)]`, so a MISSPELLED `request` key silently dropped to the request-LESS path (no replay/audience/freshness) with `valid = true` and no signal. Verifier-side footgun (holder can't influence `request`). | `deny_unknown_fields` on `VerifyRequest`/`WireContext` (a typo'd key is a hard decode error); a new `VerificationResult.request_bound` signal lets a caller assert binding actually ran. | `wire::tests::a_misspelled_request_key_fails_closed_not_silently_bare`, `…request_bound_signal_reflects_whether_a_request_was_supplied` |
+| 8 | **Qualified gate re-authenticated the national TL once per mdoc document** (invariant across documents) — an attacker-multipliable soft-DoS on `documents[]` count when the gate is enabled. | Authenticate once before the per-document fold (`read_status_authenticated` reads status against the already-authenticated list). | covered by the multi-document qualified fold tests |
+
+**Host obligations documented** (`contracts/verifier.md`, not code defects): the host MUST authenticate
+the signed status-list token before returning a `StatusOutcome`, and MUST build the per-document
+`statuses[]` slice in the wire `documents[]` order (a misaligned same-length slice is a host error, not
+a core-inducible false-accept — a correct host derives the order from the same ordered CBOR array the
+core iterates).
+
+**Cleanup in the same waves** (no behavior change): dead `device_auth_payload` field; `PopJwtBuild`/
+`KbJwtBuild.prefix` duplication of `to_be_signed`; `ProofPending` PoP-JWT rebuild; `parse_token_response`
+/`parse_nonce_response` and `decode_verify_request`/`decode_issuance_request` dedup; `parse_rfc3339_utc_pub`
+forwarding wrapper removed; `credential_type_of` inline duplication; `check_dn_within`/`check_dns_within`
+unified; tautological `!jws.contains('~')`; the SD-JWT presentation parsed once per verify rather than
+4–7×; `MdocVpToken` borrows the `DeviceResponse` rather than cloning it.
+
+**Determined NOT a defect (with reason):** `credential_sets` with EVERY set `required:false` ⇒ satisfied
+with nothing matched — this is intended DCQL semantics (`required` defaults to `true`, so all-optional is
+a deliberate "nothing required"), pinned by a test, not a vacuous-truth bug.

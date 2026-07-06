@@ -156,12 +156,13 @@ pub fn build_request<N: NonceSource + ?Sized>(
 /// over. This envelope makes that explicit on the wire: `audience` is compared to the request
 /// (→ [`ReasonCode::WrongAudience`]); the `device_response` is verified against the handover the
 /// verifier reconstructs from the request `nonce` (a mismatch → [`ReasonCode::Replay`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MdocVpToken {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MdocVpToken<'a> {
     /// The audience (`client_id`) the response was addressed to.
-    pub audience: String,
-    /// The CBOR-encoded ISO 18013-5 `DeviceResponse`.
-    pub device_response: Vec<u8>,
+    pub audience: &'a str,
+    /// The CBOR-encoded ISO 18013-5 `DeviceResponse` — borrowed (not owned), so a multi-KB attacker-
+    /// sized `DeviceResponse` is never cloned to build the token (the verifier only reads it).
+    pub device_response: &'a [u8],
 }
 
 /// The presented credential, in the format carried by an OpenID4VP `vp_token`.
@@ -175,7 +176,7 @@ pub enum VpToken<'a> {
     /// A compact SD-JWT VC presentation (`<issuer-JWS>…~<KB-JWT>`).
     SdJwtVc(&'a str),
     /// An mdoc `DeviceResponse` plus its addressed audience.
-    Mdoc(MdocVpToken),
+    Mdoc(MdocVpToken<'a>),
 }
 
 impl VpToken<'_> {
@@ -205,13 +206,20 @@ impl VpToken<'_> {
 /// Returned as a [`Cow`](std::borrow::Cow) so the mdoc path avoids deep-cloning the whole
 /// namespace-grouped map (the SD-JWT VC path owns the freshly-merged clear+disclosed set).
 /// Computed only when `result.valid` (the only branch where the DCQL gate runs).
+///
+/// The SD-JWT VC presentation is passed ALREADY parsed (`Option<&sd_jwt_payload::SdJwt>` — `None` for
+/// the mdoc arm, which reads its byproducts from `result`): the caller parses ONCE per token and threads
+/// the handle, so the DCQL type/claims reads never re-parse. A `None` handle on the SD-JWT arm (an
+/// unparseable presentation) yields the empty set — but this runs only for a VALID presentation, which
+/// always parses.
 fn dcql_resolution_set<'a>(
     vp_token: &VpToken<'_>,
+    sd_jwt: Option<&sd_jwt_payload::SdJwt>,
     result: &'a VerificationResult,
 ) -> std::borrow::Cow<'a, BTreeMap<String, AttributeValue>> {
     match vp_token {
-        VpToken::SdJwtVc(presentation) => {
-            std::borrow::Cow::Owned(sdjwtvc::presented_claims(presentation))
+        VpToken::SdJwtVc(_) => {
+            std::borrow::Cow::Owned(sd_jwt.map(sdjwtvc::presented_claims).unwrap_or_default())
         }
         VpToken::Mdoc(_) => std::borrow::Cow::Borrowed(&result.disclosed_attributes),
     }
@@ -277,9 +285,19 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
         );
     }
 
-    // Run the per-format always-on bar + request binding, and surface the verified credential type the
-    // DCQL gate keys on (SD-JWT VC `vct`; mdoc `docType`s) from what the bar already produced.
-    let (mut result, meta, credential_type) = match vp_token {
+    // Parse the SD-JWT VC presentation ONCE for the whole SD-JWT path — the binding attribution
+    // (`kb_jwt_aud_nonce`) AND the post-bar DCQL type/claims reads (`verified_vct`/`presented_claims`)
+    // all share this single handle, so the redundant per-helper re-parses are gone (the always-on bar
+    // still parses once more internally — the separate request-agnostic bar entry). The mdoc arm carries
+    // no SD-JWT (`None`); an unparseable SD-JWT (`None`) fails closed downstream (`MissingRequestBinding`
+    // in the bound bar, empty type/claims reads).
+    let sd_jwt = match vp_token {
+        VpToken::SdJwtVc(presentation) => sd_jwt_payload::SdJwt::parse(presentation).ok(),
+        VpToken::Mdoc(_) => None,
+    };
+
+    // Run the per-format always-on bar + request binding.
+    let (mut result, meta) = match vp_token {
         VpToken::SdJwtVc(presentation) => {
             // SD-JWT VC is a single credential — its one status is `statuses[0]` (fail closed on an
             // empty slice).
@@ -287,27 +305,27 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
                 .first()
                 .copied()
                 .unwrap_or(StatusOutcome::Unavailable);
-            let result =
-                verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status);
-            // Read the verified `vct` only on a VALID presentation (the bar has signature-verified +
-            // trusted + shape-validated it); on an INVALID one there is nothing to match.
-            let vct = result
-                .valid
-                .then(|| sdjwtvc::verified_vct(presentation))
-                .flatten();
-            (result, None, crate::dcql::CredentialType::Vct(vct))
+            let result = verify_sd_jwt_vc_bound(
+                presentation,
+                sd_jwt.as_ref(),
+                request,
+                anchors,
+                now_unix,
+                role,
+                status,
+            );
+            (result, None)
         }
         VpToken::Mdoc(token) => {
             let (result, meta) =
                 verify_mdoc_bound(token, request, anchors, now_unix, role, statuses);
-            let doc_types = meta.doc_types.clone();
-            (
-                result,
-                Some(meta),
-                crate::dcql::CredentialType::DocTypes(doc_types),
-            )
+            (result, Some(meta))
         }
     };
+    // Surface the verified credential type the DCQL gate keys on (SD-JWT VC `vct`; mdoc `docType`s)
+    // from what the bar already produced — via the single [`credential_type_of`] helper (DRY; no inline
+    // copy that could drift from the multi-credential caller's).
+    let credential_type = credential_type_of(vp_token, sd_jwt.as_ref(), &result, meta.as_ref());
 
     // DCQL "did I get what I requested" gate (OpenID4VP 1.0 §"VP Token Validation" step 2.2 + §6 DCQL).
     // Runs ONLY on a presentation the always-on bar already accepted, and ONLY when the request carries
@@ -319,7 +337,7 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
         // Resolve the DCQL claims against the FULL presented claim set (§8.6 step 2.2): for SD-JWT VC
         // that is the clear issuer-signed claims merged with the disclosed claims — a clear subject claim
         // must resolve, not only a selectively-disclosed one (see [`dcql_resolution_set`]).
-        let presented = dcql_resolution_set(vp_token, &result);
+        let presented = dcql_resolution_set(vp_token, sd_jwt.as_ref(), &result);
         if crate::dcql::evaluate_single(
             &request.dcql.query_json,
             format,
@@ -340,8 +358,15 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
 
 /// SD-JWT VC binding: attribute a nonce/audience mismatch precisely (from the KB-JWT), then run the
 /// full always-on bar with the request as the holder-binding challenge.
+///
+/// `sd_jwt` is the presentation parsed ONCE by the caller ([`verify_response_with_meta`]) — `None` when
+/// the presentation did not parse, which carries no KB-JWT `aud`/`nonce` to bind → `MissingRequestBinding`
+/// (identical to the prior `kb_jwt_aud_nonce` returning `None` on an unparseable presentation). The
+/// original `presentation` string is still passed for the always-on bar's own input (it parses once more
+/// internally — the request-agnostic bar entry).
 fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
     presentation: &str,
+    sd_jwt: Option<&sd_jwt_payload::SdJwt>,
     request: &PresentationRequest,
     anchors: &A,
     now_unix: i64,
@@ -351,11 +376,12 @@ fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
     let expected_nonce = request.nonce_b64();
 
     // Read the KB-JWT's claimed aud/nonce for precise failure attribution. A presentation with no
-    // KB-JWT carries no `aud`/`nonce` to bind to a request → MissingRequestBinding. This is
-    // `MissingRequestBinding` condition (3) — the SD-JWT-VC-no-KB-JWT case (see the `ReasonCode`
-    // rustdoc; one of three distinct "binding material absent" conditions the code intentionally
-    // covers — distinct from a present-but-mismatched binding, which is `WrongAudience`/`Replay`).
-    let Some((aud, nonce)) = sdjwtvc::kb_jwt_aud_nonce(presentation) else {
+    // KB-JWT (or one that did not parse → `sd_jwt` is `None`) carries no `aud`/`nonce` to bind to a
+    // request → MissingRequestBinding. This is `MissingRequestBinding` condition (3) — the
+    // SD-JWT-VC-no-KB-JWT case (see the `ReasonCode` rustdoc; one of three distinct "binding material
+    // absent" conditions the code intentionally covers — distinct from a present-but-mismatched
+    // binding, which is `WrongAudience`/`Replay`).
+    let Some((aud, nonce)) = sd_jwt.and_then(sdjwtvc::kb_jwt_aud_nonce) else {
         return VerificationResult::invalid(ReasonCode::MissingRequestBinding);
     };
     // Audience first (a wrong-audience presentation was never meant for us), then nonce (replay).
@@ -394,7 +420,7 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     role: IssuerRole,
     statuses: &[StatusOutcome],
 ) -> (VerificationResult, MdocVerifyMeta) {
-    if token.audience != request.audience {
+    if token.audience != request.audience.as_str() {
         return (
             VerificationResult::invalid(ReasonCode::WrongAudience),
             MdocVerifyMeta::default(),
@@ -416,7 +442,7 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     };
     // Run the bar ONCE and read the byproducts it already computed (document count + binding-machinery
     // soundness) from the returned meta — no second `DeviceResponse` decode for the replay classifier.
-    let (result, meta) = mdoc::verify_with_meta(&token.device_response, anchors, &params);
+    let (result, meta) = mdoc::verify_with_meta(token.device_response, anchors, &params);
     // A holder-binding failure here is AMBIGUOUS: it can be the fresh-nonce mismatch we want to
     // surface as Replay (the verifier rebuilt `DeviceAuthentication` over a different transcript than
     // the holder signed — the audience already matched in cleartext above), OR a genuine
@@ -638,10 +664,20 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
             // this specific query (by id) — format + `meta` + claims/`claim_sets`/`values`.
             let matches_query = result.valid
                 && credential_query.is_some_and(|candidate| {
-                    let credential_type = credential_type_of(token, &result, meta.as_ref());
+                    // Parse the SD-JWT presentation ONCE for this token's DCQL type/claims reads (the
+                    // mdoc arm is `None`) — reached only when the always-on bar already accepted it and
+                    // a matching Credential Query exists, so no wasted parse on rejected/unqueried tokens.
+                    let token_sd_jwt = match token {
+                        VpToken::SdJwtVc(presentation) => {
+                            sd_jwt_payload::SdJwt::parse(presentation).ok()
+                        }
+                        VpToken::Mdoc(_) => None,
+                    };
+                    let credential_type =
+                        credential_type_of(token, token_sd_jwt.as_ref(), &result, meta.as_ref());
                     // Resolve claims against the FULL presented claim set (§8.6 step 2.2 — clear +
                     // disclosed for SD-JWT VC); see [`dcql_resolution_set`].
-                    let presented = dcql_resolution_set(token, &result);
+                    let presented = dcql_resolution_set(token, token_sd_jwt.as_ref(), &result);
                     crate::dcql::query_satisfied_by(
                         candidate,
                         token.format(),
@@ -679,16 +715,21 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
 /// The verified credential type the DCQL `meta` match keys on, read from what the always-on bar already
 /// produced: the SD-JWT VC `vct` (re-read from the now-verified presentation) or the mdoc `docType`s
 /// (from the bar's [`MdocVerifyMeta`]). Empty/`None` on an INVALID presentation (nothing verified).
+///
+/// The SD-JWT VC presentation is passed ALREADY parsed (`Option<&sd_jwt_payload::SdJwt>` — `None` for the
+/// mdoc arm, which reads `doc_types` from `meta`): the caller parses ONCE per token and threads the
+/// handle, so the `vct` re-read never re-parses.
 fn credential_type_of(
     token: &VpToken<'_>,
+    sd_jwt: Option<&sd_jwt_payload::SdJwt>,
     result: &VerificationResult,
     meta: Option<&MdocVerifyMeta>,
 ) -> crate::dcql::CredentialType {
     match token {
-        VpToken::SdJwtVc(presentation) => crate::dcql::CredentialType::Vct(
+        VpToken::SdJwtVc(_) => crate::dcql::CredentialType::Vct(
             result
                 .valid
-                .then(|| sdjwtvc::verified_vct(presentation))
+                .then(|| sd_jwt.and_then(sdjwtvc::verified_vct))
                 .flatten(),
         ),
         VpToken::Mdoc(_) => crate::dcql::CredentialType::DocTypes(

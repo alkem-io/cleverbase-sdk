@@ -1707,7 +1707,7 @@ Parse this query into the structured [`crate::dcql::DcqlQuery`] the in-core eval
 #### struct `MdocVpToken`
 
 ```rust
-struct MdocVpToken
+struct MdocVpToken<'a>
 ```
 
 An mdoc OpenID4VP `vp_token` envelope: the ISO 18013-5 `DeviceResponse` plus the audience the
@@ -1722,10 +1722,11 @@ verifier reconstructs from the request `nonce` (a mismatch → [`ReasonCode::Rep
 
 ##### Fields
 
-- `audience: String`
+- `audience: &'a str`
   - The audience (`client_id`) the response was addressed to.
-- `device_response: Vec<u8>`
-  - The CBOR-encoded ISO 18013-5 `DeviceResponse`.
+- `device_response: &'a [u8]`
+  - The CBOR-encoded ISO 18013-5 `DeviceResponse` — borrowed (not owned), so a multi-KB attacker-
+sized `DeviceResponse` is never cloned to build the token (the verifier only reads it).
 
 #### struct `PresentationRequest`
 
@@ -1804,7 +1805,7 @@ verifier never guesses (an unrecognized shape would be [`ReasonCode::Unsupported
 
 - `SdJwtVc(&'a str)`
   - A compact SD-JWT VC presentation (`<issuer-JWS>…~<KB-JWT>`).
-- `Mdoc(MdocVpToken)`
+- `Mdoc(MdocVpToken<'a>)`
   - An mdoc `DeviceResponse` plus its addressed audience.
 
 ##### Methods
@@ -2341,53 +2342,6 @@ or `None` to accept a presentation without holder binding (e.g. an issuer-only c
   - The revocation/status outcome (the T014 seam).
 
 ### Functions
-
-#### fn `issuance_time_unix`
-
-```rust
-fn issuance_time_unix(presentation: &str) -> Option<i64>
-```
-
-The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
-§4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
-to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
-credential is in force, the closest available proxy for the relevant time).
-
-Returns `None` when the presentation does not parse or carries **neither** `iat` nor `nbf` — the
-opt-in [`crate::qualified`] gate then fails closed ([`crate::types::QualifiedStatus::Indeterminate`])
-rather than read the issuer's status at the verification instant ("now"), which would falsely report
-`Qualified` for an issuer granted only AFTER it signed the credential (contracts/qualified-status-
-gate.md: the status is read **at the credential's issuance/relevant time, NOT "now"**). A present-
-but-non-canonical `iat`/`nbf` (RFC 7519 NumericDate must be a JSON number that fits `i64`) is
-likewise treated as absent — the gate must not assert qualification off an unreadable instant.
-
-#### fn `issuer_signing_cert_der`
-
-```rust
-fn issuer_signing_cert_der(presentation: &str) -> Option<Vec<u8>>
-```
-
-Extract the issuer signing certificate (DER) a presented SD-JWT VC claims in its JWS `x5c` header,
-without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf against the
-national Trusted List's `EAA/Q` service entries).
-
-Returns `None` when the presentation does not parse or carries no `x5c` leaf. The value is
-*claimed* (its trust + signature are decided by the always-on bar in [`verify_sd_jwt_vc`]); this
-read is only the gate's cert-matching input, never an acceptance.
-
-#### fn `kb_jwt_aud_nonce`
-
-```rust
-fn kb_jwt_aud_nonce(presentation: &str) -> Option<(String, String)>
-```
-
-Extract the `aud` and `nonce` a presented SD-JWT VC's KB-JWT echoes, without verifying anything
-(the [`crate::openid4vp`] layer uses this to attribute a request-binding failure to the specific
-[`ReasonCode::Replay`] / [`ReasonCode::WrongAudience`] before delegating to the full bar).
-
-Returns `None` when the presentation does not parse or carries no KB-JWT. The values are *claimed*
-(their cryptographic verification is the always-on holder-binding check in [`verify_sd_jwt_vc`]);
-this read is only for failure attribution, never for acceptance.
 
 #### fn `verify_sd_jwt_vc`
 
