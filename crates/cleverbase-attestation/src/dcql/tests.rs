@@ -452,6 +452,51 @@ fn claim_sets_satisfied_when_one_option_fully_resolves() {
 }
 
 #[test]
+fn empty_claim_set_option_is_not_vacuously_satisfied() {
+    // A `claim_sets` whose only option is the EMPTY array (`[[]]`) requests zero claims: `[].all()` is
+    // vacuously true, so the bug accepts a presentation that disclosed NONE of the requested claims.
+    // This is reachable on the PRIMARY single-presentation C-ABI path
+    // (`verify` → `evaluate_single` → `claims_satisfied`). Fail closed: an empty combination is not
+    // satisfiable, so the credential — which discloses nothing here — is NotSatisfied.
+    let json = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},
+        "claims":[{"id":"fn","path":["family_name"]}],"claim_sets":[[]]}]}"#;
+    assert_eq!(
+        evaluate_single(
+            json,
+            Format::SdJwtVc,
+            &CredentialType::Vct(Some("urn:eudi:pid:1".to_owned())),
+            &BTreeMap::new()
+        ),
+        DcqlGate::NotSatisfied
+    );
+}
+
+#[test]
+fn empty_credential_set_option_is_not_vacuously_satisfied() {
+    // A required Credential Set Query whose option is the EMPTY array (`"options":[[]]`) must NOT be
+    // satisfied by zero presented credentials — `[].all()` would be vacuously true.
+    let json = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}],
+        "credential_sets":[{"options":[[]],"required":true}]}"#;
+    let query = DcqlQuery::parse(json).expect("parses");
+    assert!(
+        !credential_sets_satisfied(&query, &BTreeSet::new()),
+        "an empty required option must not be vacuously satisfied"
+    );
+}
+
+#[test]
+fn empty_query_is_not_set_level_satisfied() {
+    // An empty / unparseable DCQL (no credentials, no credential_sets — the `unwrap_or_default()` a
+    // parse error yields in `verify_vp_token`, or a query whose every entry was dropped as
+    // unsupported-format) has nothing enforceable and MUST NOT read as satisfied:
+    // `credentials.iter().all()` over an empty list would be vacuously true.
+    assert!(
+        !credential_sets_satisfied(&DcqlQuery::default(), &BTreeSet::new()),
+        "an empty query satisfies nothing"
+    );
+}
+
+#[test]
 fn mdoc_doctype_match_and_namespaced_claim_path() {
     let disclosed = mdoc_disclosed();
     let json = r#"{"credentials":[{"id":"c","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"},
@@ -571,6 +616,33 @@ fn role_from_meta_reads_the_expected_type() {
             doctype_value: Some("org.iso.18013.5.1.mDL".to_owned())
         }),
         None
+    );
+}
+
+#[test]
+fn role_from_meta_is_ambiguous_for_a_heterogeneous_vct_list() {
+    // A `vct_values` mixing a PID vct with a non-PID type is AMBIGUOUS: the presented credential could
+    // be either, so the anchoring role MUST NOT be forced to PID off the single PID member — that would
+    // trust-anchor a presented non-PID credential under the PID anchor set (conformance-audit T4.3).
+    // Ambiguous ⇒ None ⇒ the caller's default role.
+    assert_eq!(
+        role_from_meta(&CredentialMeta::SdJwtVc {
+            vct_values: Some(vec![
+                "urn:eudi:pid:1".to_owned(),
+                "https://example.com/other-type".to_owned(),
+            ])
+        }),
+        None
+    );
+    // A homogeneous list (every entry maps to PID) still derives the PID role.
+    assert_eq!(
+        role_from_meta(&CredentialMeta::SdJwtVc {
+            vct_values: Some(vec![
+                "urn:eudi:pid:1".to_owned(),
+                "urn:eudi:pid:1".to_owned()
+            ])
+        }),
+        Some(IssuerRole::Pid)
     );
 }
 

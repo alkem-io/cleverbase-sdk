@@ -405,6 +405,14 @@ pub trait TrustAnchorSource {
 /// offline suite needs no network and no EU lists. It is **not** a production trust source.
 ///
 /// Carries only issuer-public certificates (no secret), so deriving `Debug` is safe.
+///
+/// **⚠ Not a production trust source.** Its [`resolve`](TrustAnchorSource::resolve) does **exact-DER
+/// pinning ONLY** — NO certificate validity-window check, NO path building, and it ignores the supplied
+/// intermediates and `leaf_validity_time`. It is therefore strictly WEAKER than the production
+/// [`ChainValidatingAnchors`]/[`NativeTrustEngine`], which reject an expired/withdrawn pinned leaf for
+/// the same `resolve` call. Wiring this into a production verifier would trust a pinned-but-expired
+/// issuer certificate (a trust false-accept). Use it only for the offline test suite / conformance
+/// vectors; a production integrator MUST use [`ChainValidatingAnchors`] or [`NativeTrustEngine`].
 #[derive(Debug, Clone, Default)]
 pub struct StaticTestAnchors {
     /// The trusted issuer certificates, keyed by `(role, format)` → set of DER-encoded certs.

@@ -470,10 +470,20 @@ pub(crate) fn reconcile_role(
 /// [`IssuerRole::Pid`]. `None` when no PID mapping applies (the caller's default role is used).
 pub(crate) fn role_from_meta(meta: &CredentialMeta) -> Option<IssuerRole> {
     match meta {
-        CredentialMeta::SdJwtVc { vct_values } => vct_values
-            .as_ref()?
-            .iter()
-            .find_map(|vct| role_from_type(Format::SdJwtVc, vct)),
+        CredentialMeta::SdJwtVc { vct_values } => {
+            // Derive a role only when EVERY listed `vct` maps to the SAME role. A heterogeneous list
+            // (e.g. one PID vct plus an unmapped/other type) is AMBIGUOUS — the presented credential
+            // could be either — so a `find_map` that fires on the first PID member would anchor a
+            // presented non-PID credential under `IssuerRole::Pid` (conformance-audit T4.3). Ambiguous
+            // (or all-unmapped) ⇒ `None` ⇒ the caller's default role. `vct_values` is parser-guaranteed
+            // non-empty, so `next()` yields the first entry's mapping.
+            let mut roles = vct_values
+                .as_ref()?
+                .iter()
+                .map(|vct| role_from_type(Format::SdJwtVc, vct));
+            let first = roles.next()?;
+            roles.all(|role| role == first).then_some(first).flatten()
+        }
         CredentialMeta::Mdoc { doctype_value } => {
             role_from_type(Format::Mdoc, doctype_value.as_deref()?)
         }
@@ -524,19 +534,27 @@ pub(crate) fn query_satisfied_by(
 /// least one fully-satisfied `option` (non-required sets are optional).
 pub(crate) fn credential_sets_satisfied(query: &DcqlQuery, satisfied: &BTreeSet<&str>) -> bool {
     if query.credential_sets.is_empty() {
-        return query
-            .credentials
-            .iter()
-            .all(|candidate| satisfied.contains(candidate.id.as_str()));
+        // No `credential_sets`: every listed Credential Query must be satisfied. An EMPTY `credentials`
+        // list has nothing to satisfy, but "nothing requested" MUST NOT read as "request satisfied":
+        // `[].all()` is vacuously true, so an unparseable/empty DCQL (the `unwrap_or_default()` a parse
+        // error yields), or one whose every query was dropped as unsupported-format, would otherwise be
+        // reported satisfied for any (even empty) vp_token. Fail closed — no credentials ⇒ not satisfied.
+        return !query.credentials.is_empty()
+            && query
+                .credentials
+                .iter()
+                .all(|candidate| satisfied.contains(candidate.id.as_str()));
     }
     query
         .credential_sets
         .iter()
         .filter(|set| set.required)
         .all(|set| {
-            set.options
-                .iter()
-                .any(|option| option.iter().all(|id| satisfied.contains(id.as_str())))
+            set.options.iter().any(|option| {
+                // An EMPTY option ("combination") requests zero credentials — `[].all()` is vacuously
+                // true, which would satisfy a required set with nothing presented. Fail closed.
+                !option.is_empty() && option.iter().all(|id| satisfied.contains(id.as_str()))
+            })
         })
 }
 
@@ -592,11 +610,14 @@ fn claims_satisfied(query: &CredentialQuery, presented: &BTreeMap<String, Attrib
         .filter_map(|claim| claim.id.as_deref().map(|id| (id, claim)))
         .collect();
     query.claim_sets.iter().any(|set| {
-        set.iter().all(|id| {
-            by_id
-                .get(id.as_str())
-                .is_some_and(|claim| claim_resolves(claim, presented))
-        })
+        // An EMPTY claim-set option requests zero claims — `[].all()` is vacuously true, which would
+        // satisfy the claims requirement with NONE of the requested claims disclosed. Fail closed.
+        !set.is_empty()
+            && set.iter().all(|id| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|claim| claim_resolves(claim, presented))
+            })
     })
 }
 

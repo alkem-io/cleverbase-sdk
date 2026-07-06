@@ -198,15 +198,13 @@ impl PreparedPresentation {
                 let response: CborValue = ciborium::from_reader(device_response.as_slice())
                     .map_err(|e| PresentError::Malformed(e.to_string()))?;
                 let rebuilt = replace_device_signature(&response, &device_signature_cbor)?;
-                let mut buf = Vec::new();
-                ciborium::into_writer(&rebuilt, &mut buf)
-                    .map_err(|e| PresentError::Build(e.to_string()))?;
                 Ok(HolderPresentation::Mdoc {
                     // The addressed audience is the verifier `aud` the prepared signing input already
                     // carries (the `DeviceSignature` ceremony binds it) — derive it there rather than
                     // duplicate it as a struct field (DRY).
                     audience: build.input.audience().to_owned(),
-                    device_response: buf,
+                    // The rebuilt `DeviceResponse` re-encode is infallible (`crate::cbor_to_vec`).
+                    device_response: crate::cbor_to_vec(&rebuilt),
                 })
             }
         }
@@ -515,7 +513,7 @@ fn first_device_name_spaces_bytes(response: &CborValue) -> Result<Vec<u8>, Prese
         .and_then(|doc| get_map_entry(doc, "deviceSigned"))
         .and_then(|ds| get_map_entry(ds, "nameSpaces"));
     device_name_spaces.map_or_else(
-        || empty_device_name_spaces_bytes().map_err(|e| PresentError::Build(e.to_string())),
+        || Ok(empty_device_name_spaces_bytes()),
         reencode_device_name_spaces,
     )
 }
@@ -539,10 +537,13 @@ fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentErro
 /// Replace the `deviceSigned.deviceAuth.deviceSignature` with `device_signature` (the fresh,
 /// request-bound holder signature), returning the rebuilt `DeviceResponse` value.
 ///
-/// [`prepare_mdoc`] rejects a multi-document held response (the present seam signs ONE signature), so
-/// the `documents` array carries exactly one document here; the per-document map below is kept simply
-/// to mirror the `DeviceResponse` shape (it would splice the single signature wherever a document
-/// appears, never a same-signature-over-different-documents token, which the guard makes unreachable).
+/// [`prepare_mdoc`] rejects a multi-document held response (the present seam signs ONE signature), and
+/// this splice **re-checks** that invariant rather than assuming it: [`PreparedPresentation`] is
+/// `Deserialize` and carried verbatim across the C-ABI (`FinishPresent`), so a caller could hand
+/// [`finish`] a `PreparedKind::Mdoc` whose `device_response` was never vetted by [`prepare_mdoc`].
+/// Splicing the single holder signature into every document would emit `documents[1..]` each carrying a
+/// `DeviceSignature` computed over `documents[0]` — a silently-invalid token; so a `documents` array
+/// with more than one entry is rejected here too (same [`PresentError::MultiDocumentMdoc`]).
 fn replace_device_signature(
     response: &CborValue,
     device_signature_cbor: &[u8],
@@ -556,6 +557,12 @@ fn replace_device_signature(
         let documents = documents
             .as_array()
             .ok_or_else(|| PresentError::Malformed("documents is not an array".to_owned()))?;
+        // Mirror prepare_mdoc's single-document invariant at the splice site (defense-in-depth against a
+        // wire-injected multi-document PreparedKind::Mdoc): one holder signature cannot authenticate more
+        // than one document, so reject rather than emit a token whose extra documents are mis-signed.
+        if documents.len() > 1 {
+            return Err(PresentError::MultiDocumentMdoc(documents.len()));
+        }
         let rebuilt_docs = documents
             .iter()
             .map(|doc| {

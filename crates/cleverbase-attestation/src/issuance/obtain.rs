@@ -258,8 +258,6 @@ pub struct ObtainSession {
     /// `Sign` resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in).
     /// Held as a redacting [`Secret`] so the one-time nonce never appears in `Debug`/log output.
     pending_c_nonce: Option<Secret>,
-    /// The compact PoP-JWT spliced after the holder signed its input (set after the `Sign` step).
-    proof_jwt: Option<String>,
 }
 
 /// Begin an OpenID4VCI `obtain` flow.
@@ -282,7 +280,6 @@ pub fn begin_obtain(
         now_unix,
         access_token: None,
         pending_c_nonce: None,
-        proof_jwt: None,
     };
     if backend.kind == IssuerBackendKind::None {
         // Gated: no issuer API configured → skip cleanly (the verification suite is unaffected).
@@ -373,7 +370,6 @@ pub fn resume_obtain(
             let proof_jwt = pop
                 .assemble(&signature)
                 .map_err(|e| ObtainError::Proof(e.to_string()))?;
-            session.proof_jwt = Some(proof_jwt.clone());
             session.phase = ObtainPhase::CredentialPending;
             let access_token = session
                 .access_token

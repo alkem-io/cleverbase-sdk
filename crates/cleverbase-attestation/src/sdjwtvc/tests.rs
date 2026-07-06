@@ -1023,6 +1023,28 @@ fn kb_jwt_iat_within_the_acceptable_window_is_accepted() {
 }
 
 #[test]
+fn request_less_kb_jwt_with_an_old_iat_is_accepted() {
+    // NO-FALSE-REJECT: the KB-JWT `iat` freshness window binds the presentation to a verifier REQUEST
+    // (RFC 9901 §7.3 step 5.e is nested under step 5 "If Key Binding is required" — the challenge
+    // context). On the request-less path (no challenge) there is no freshness requirement, so a genuine,
+    // holder-signed KB-JWT minted long ago (offline re-verification / batch / audit / clock skew) MUST
+    // still verify — its signature + `sd_hash` prove holder possession. Enforcing the fixed window here
+    // would false-reject an otherwise-valid stored presentation.
+    let sd_jwt = mint_sd_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER);
+    let presentation =
+        attach_kb_jwt_with_iat(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, NONCE, NOW - 10_000_000);
+    let anchors = trusted_anchors();
+    let mut inp = input(&presentation, &anchors);
+    inp.key_binding = None; // request-less ⇒ no freshness requirement, so the old iat must not reject.
+    let result = verify_sd_jwt_vc(&inp);
+    assert!(
+        result.valid,
+        "a request-less KB-JWT with an old iat must verify; reasons {:?}",
+        result.reasons
+    );
+}
+
+#[test]
 fn a_disclosure_named_sd_or_ellipsis_is_rejected() {
     // RFC 9901 §7.1 step 3.c.ii: a disclosure whose claim name is `_sd` or `...` MUST invalidate the
     // SD-JWT (those are SD-JWT machinery names, never legitimate object-property claim names).

@@ -62,7 +62,7 @@ pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
         context: WireContext {
             now_unix: SMOKE_NOW,
             role: IssuerRole::Pid,
-            status: crate::status::StatusOutcome::NoStatus,
+            statuses: vec![crate::status::StatusOutcome::NoStatus],
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,

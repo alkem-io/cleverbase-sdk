@@ -29,7 +29,6 @@
 use std::collections::BTreeMap;
 
 use base64ct::{Base64UrlUnpadded, Encoding as _};
-use p256::ecdsa::signature::Verifier as _;
 use serde_json::Value;
 
 use crate::trust::TrustAnchorSource;
@@ -644,11 +643,13 @@ fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<
 ///   verified). A present-but-forged/tampered KB-JWT is therefore rejected on the request-less path too,
 ///   not waved through (the false-accept this guards: a structurally-present KB-JWT whose signature or
 ///   `sd_hash` does not hold must never read as `valid` just because no challenge was supplied).
-/// - **The KB-JWT `iat` freshness window is ALWAYS checked** against `now` (RFC 9901 §7.3 step 5.e) for
-///   a present KB-JWT — it is a property of the holder's signature instant, independent of a challenge.
-/// - **`aud`/`nonce` are checked ONLY when a `challenge` is supplied** — they bind the presentation to a
-///   specific verifier request (replay/audience protection), which has no meaning without a request. A
-///   request-less verify thus gives no replay/audience protection but still proves holder possession.
+/// - **`aud`/`nonce` AND the KB-JWT `iat` freshness window are checked ONLY when a `challenge` is
+///   supplied** — all three bind the presentation to a specific verifier request. RFC 9901 §7.3 nests
+///   the `iat` acceptable-window check (step 5.e) under step 5 "If Key Binding is required" (the
+///   challenge context); a request-less re-verification (offline / batch / audit / stored presentation)
+///   has no freshness requirement, so enforcing a fixed window there would false-reject an otherwise
+///   valid presentation. A request-less verify thus gives no replay/audience/freshness protection but
+///   still proves holder possession via the always-verified signature + `sd_hash`.
 /// - **A KB-JWT that is ABSENT** is required only when a `challenge` is supplied (holder binding was
 ///   demanded → `HolderBinding`); with no challenge an issuer-only presentation is accepted.
 fn check_holder_binding(
@@ -667,23 +668,23 @@ fn check_holder_binding(
     };
     let claims = kb.claims();
 
-    // RFC 9901 §7.3 step 5.e: a PRESENT KB-JWT's `iat` (its creation time) MUST be within an acceptable
-    // window of the verification time — checked for every present KB-JWT, independent of a challenge (a
-    // freshness property of the holder's signature, not of the request binding). `iat` is typed `i64`
-    // and required-present by the pinned `sd_jwt_payload` parser; this adds the window bound the dep
-    // does not enforce. A KB-JWT minted far in the future (skewed/forged clock) or absurdly old (stale/
-    // replayed) is rejected. `abs_diff` avoids any `i64` subtraction overflow at the timeline extremes.
-    if claims.iat.abs_diff(now) > KB_JWT_IAT_ACCEPTABLE_SKEW_SECS {
-        return Err(ReasonCode::HolderBinding);
-    }
-
-    // `aud`/`nonce` bind the presentation to a verifier's request — checked ONLY when a challenge is
-    // supplied (no challenge ⇒ no request to bind to, so no replay/audience check). The signature and
-    // `sd_hash` below run regardless: a PRESENT KB-JWT is always cryptographically verified. Both the
-    // KB-JWT `aud` AND `nonce` must equal the challenge's (compared as a pair so the guard is one
-    // expression and `clippy::nursery`'s field-name heuristic doesn't misread the cross-struct compare).
+    // `aud`/`nonce` AND the `iat` freshness window bind the presentation to a verifier's REQUEST —
+    // checked ONLY when a challenge is supplied (no challenge ⇒ no request to bind to, so no
+    // replay/audience/freshness check). The signature and `sd_hash` below run regardless: a PRESENT
+    // KB-JWT is always cryptographically verified (holder possession), whether or not a request is given.
     if let Some(challenge) = challenge {
+        // Both the KB-JWT `aud` AND `nonce` must equal the challenge's (compared as a pair so the guard
+        // is one expression and `clippy::nursery`'s field-name heuristic doesn't misread the compare).
         if (claims.aud.as_str(), claims.nonce.as_str()) != (challenge.audience, challenge.nonce) {
+            return Err(ReasonCode::HolderBinding);
+        }
+        // RFC 9901 §7.3 step 5.e (nested under step 5 "If Key Binding is required"): the KB-JWT `iat`
+        // (its creation time) MUST be within an acceptable window of the verification time — a freshness
+        // bound on the request binding. `iat` is typed `i64` and required-present by the pinned
+        // `sd_jwt_payload` parser; this adds the window bound the dep does not enforce. A KB-JWT minted
+        // far in the future (skewed/forged clock) or absurdly old (stale/replayed) relative to the
+        // request is rejected. `abs_diff` avoids any `i64` subtraction overflow at the timeline extremes.
+        if claims.iat.abs_diff(now) > KB_JWT_IAT_ACCEPTABLE_SKEW_SECS {
             return Err(ReasonCode::HolderBinding);
         }
     }
@@ -773,10 +774,10 @@ fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<()
         return Err(());
     }
     let sig_bytes = Base64UrlUnpadded::decode_vec(sig_b64).map_err(|_| ())?;
-    let signature = p256::ecdsa::Signature::from_slice(&sig_bytes).map_err(|_| ())?;
     let signing_input = format!("{header_b64}.{payload_b64}");
-    key.verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| ())
+    // The raw-`r‖s`-only ES256 parse + verify is the shared [`crate::crypto::p256_verify_es256`]
+    // kernel (DRY — Principle III; the same body the mdoc COSE_Sign1 verifiers use).
+    crate::crypto::p256_verify_es256(key, signing_input.as_bytes(), &sig_bytes)
 }
 
 /// The signature of a top-level claim walk shared by [`reconstruct_claim_set`]: given the issuer-signed

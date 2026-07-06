@@ -121,21 +121,28 @@ OpenID4VP **1.0** — <https://openid.net/specs/openid-4-verifiable-presentation
 
 It parses the DCQL query and, against a presentation the always-on bar already accepted, checks
 (a) **format**, (b) **meta** (SD-JWT VC `vct` ∈ `vct_values`; mdoc `docType` == `doctype_value`),
-(c) every requested **claim path** resolves in the verified **disclosed** attributes (honoring
-`claim_sets`), and (d) a claim's disclosed value ∈ its `values`. The set-level check (§"VP Token
-Validation" step 3 + §"Selecting Credentials") is [`crate::openid4vp::verify_vp_token`].
+(c) every requested **claim path** resolves in the **claims present in the verified presentation**
+(honoring `claim_sets`), and (d) a claim's presented value ∈ its `values`. The set-level check
+(§"VP Token Validation" step 3 + §"Selecting Credentials") is [`crate::openid4vp::verify_vp_token`].
 
 Value matching follows §6.3: for an ISO mdoc the CBOR value is matched after conversion to JSON
 (RFC 8949 §6.1) — the SDK's [`AttributeValue`] is already that decoded JSON-shaped value, so a
 `Text`/`Integer`/`Boolean` is matched against a string/integer/boolean respectively.
 
-Claim paths resolve against the **verified disclosed** attribute set
-([`crate::types::VerificationResult::disclosed_attributes`]) — the privacy-minimal set the holder
-actually presented. A path targeting an always-visible (never-disclosed) registered scalar claim is
-treated as not-present (DCQL Claims Queries target subject claims, which are selectively
-disclosable). `trusted_authorities` (§6.1.1) is not evaluated here (issuer trust is the always-on
-bar's per-role anchoring); `require_cryptographic_holder_binding:false` is not honored (the SDK
-always requires holder binding — a documented secure default).
+Claim paths resolve against the **full set of claims present in the verified presentation** — the
+claims the holder actually presented, whether **selectively disclosed** OR carried in the **clear**
+(non-selectively-disclosable). Per OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2 a Verifier
+validates the query against the "Claims included in the presentation", and §6.4 notes a presentation
+legitimately carries non-selectively-disclosable claims — so a clear subject claim satisfies a query
+exactly as a disclosed one does. For SD-JWT VC this is the clear issuer-signed payload claims MERGED
+with the disclosed claims (the caller passes `crate::sdjwtvc::presented_claims`); for mdoc the
+namespace-grouped `disclosed_attributes` is already the full presented set (the `IssuerSignedItems`).
+This is broader than the privacy-minimal [`crate::types::VerificationResult::disclosed_attributes`]
+the verifier reports to the host, which omits the clear claims.
+
+`trusted_authorities` (§6.1.1) is not evaluated here (issuer trust is the always-on bar's per-role
+anchoring); `require_cryptographic_holder_binding:false` is not honored (the SDK always requires
+holder binding — a documented secure default).
 
 ### Structs
 
@@ -414,15 +421,12 @@ malformed `session_transcript` / `device_name_spaces_bytes` (not decodable CBOR)
 ##### fn `empty_device_name_spaces_bytes`
 
 ```rust
-fn empty_device_name_spaces_bytes() -> Result<Vec<u8>, SignerError>
+fn empty_device_name_spaces_bytes() -> Vec<u8>
 ```
 
 The `DeviceNameSpacesBytes` for an empty device-disclosed namespace map (`#6.24(bstr .cbor {})`)
-— the bytes to sign over when the device discloses no extra namespaces.
-
-# Errors
-
-[`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value.
+— the bytes to sign over when the device discloses no extra namespaces. Infallible (the encode is
+the crate's infallible `cbor_to_vec`).
 
 ### Module `obtain`
 
@@ -1498,10 +1502,14 @@ supply the explicit `SessionTranscript` (or, for OpenID4VP, the reconstructed ha
 - `role: IssuerRole`
   - The issuer role under which DS trust is resolved against the anchors (mdoc anchors to an IACA
 root; the role selects the per-role/format anchor set).
-- `status: StatusOutcome`
-  - The revocation/status outcome (the T014 seam) — the canonical [`StatusOutcome`] the
-[`verify()`](crate::verify()) entry point resolves through the host status source. Mirrors the SD-JWT VC
-status seam so the always-on bar's revocation check covers both formats.
+- `statuses: &'a [StatusOutcome]`
+  - The revocation/status outcomes (the T014 seam) — one canonical [`StatusOutcome`] **per document**,
+positional (index `i` is `documents[i]`'s status), resolved by the host through the status source.
+A `DeviceResponse` MAY carry MORE THAN ONE document, each with its OWN status-list pointer, so a
+single outcome cannot cover them (applying one to all would let a revoked second document ride
+inside a VALID verdict — SC-002). A document whose index is not covered by `statuses` fails closed
+to [`StatusOutcome::Unavailable`] (never a silent VALID). Mirrors the SD-JWT VC status seam (which
+carries a single credential's single outcome).
 
 ### Enums
 
@@ -1871,7 +1879,7 @@ Per OpenID4VP 1.0 §B.2.6 the four `OpenID4VPHandoverInfo` elements map to the S
 #### fn `verify_response`
 
 ```rust
-fn verify_response<A: TrustAnchorSource + ?Sized>(vp_token: &VpToken<'_>, request: &PresentationRequest, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, status: StatusOutcome) -> VerificationResult
+fn verify_response<A: TrustAnchorSource + ?Sized>(vp_token: &VpToken<'_>, request: &PresentationRequest, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, statuses: &[StatusOutcome]) -> VerificationResult
 ```
 
 Verify an OpenID4VP `vp_token` is cryptographically bound to an issued request, running the
@@ -1887,8 +1895,15 @@ per-format always-on bar **plus** the nonce/audience binding (contracts/openid4v
 `policy` carries the accepted-format restriction (`policy.formats`); a `vp_token` whose format the
 policy excludes is rejected with [`ReasonCode::UnsupportedFormat`] BEFORE any bar runs, so this
 public entry honors the gate even when a native caller invokes it directly (not only via the
-[`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`status` are the remaining per-format-bar
-inputs (the validity instant, the trust-anchor role, and the resolved status outcome).
+[`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`statuses` are the remaining
+per-format-bar inputs (the validity instant, the trust-anchor role, and the per-document resolved
+status outcomes — SD-JWT VC reads index 0; an mdoc `DeviceResponse` checks `documents[i]` against
+`statuses[i]`).
+
+**Qualified-status gate:** this entry NEVER populates `VerificationResult.qualified_status`,
+regardless of `policy.qualified_gate`. The opt-in eIDAS qualified gate (TS 119 615 cl. 4.12) runs
+ONLY via the [`crate::verify::verify()`] entry point, which carries the `qualified_trust_list` +
+`qualified_scheme_anchors` inputs this function does not receive; `None` here is the honest value.
 
 #### fn `verify_vp_token`
 
@@ -1912,7 +1927,15 @@ type (`meta`) when it names a EUDI PID type (conformance-audit T4.3 — the veri
 the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
 validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
 [`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
-for the response, mirroring the single-credential [`verify_response`]).
+per credential query — it covers each token's `documents[0]`; a multi-document `DeviceResponse`'s
+`documents[1..]` then fail closed, mirroring the single-credential [`verify_response`]).
+
+This is the ONLY entry that enforces the **set-level** DCQL semantics (`credential_sets` required
+option-sets + `multiple` cardinality); the single-presentation [`verify_response`] / the C-ABI
+`verify()` surface enforce only the per-presentation single-query match. It is native-Rust-only (no
+C-ABI wire shape carries the multi-credential `{credential_id: [presentations]}` map). Like
+[`verify_response`], it NEVER populates `qualified_status` — the opt-in qualified gate runs only via
+[`crate::verify::verify()`].
 
 ## Module `qualified`
 
@@ -2493,6 +2516,14 @@ fetches the referenced status document (network, transport caching) and returns 
 or `None` when it is unreachable. A `None` under [`StatusReachability::FailClosed`] is the
 fail-closed reject; under [`StatusReachability::BestEffort`] it is tolerated.
 
+**Host obligation — authenticate the status document.** A Token Status List (or CRL) is a *signed*
+artifact (draft-ietf-oauth-status-list: a JWT/CWT signed by the status provider). This seam receives
+the ALREADY-AUTHENTICATED, unpacked status array — the host MUST verify the status-list token's
+signature (and that its signer is the credential's authorized status provider) BEFORE unpacking and
+returning the bytes. The core does not receive the signed token and therefore cannot check it; a
+host that returns an unauthenticated (e.g. attacker-served) status document would defeat revocation.
+This mirrors the trust-list seam, where the host/engine authenticates each fetched list before use.
+
 ```rust
 fn fetch_status_list(&self, uri: &str) -> Option<Vec<u8>>
 ```
@@ -2533,6 +2564,22 @@ fail-closed reachability policy.
   [`StatusReachability::BestEffort`] (the credential is not failed on reachability alone).
 
 Sans-IO: the status documents are supplied through `source`; this performs no network I/O.
+
+### Constants
+
+#### const `DEFAULT_STATUSES`
+
+```rust
+const DEFAULT_STATUSES: &[StatusOutcome] = _
+```
+
+The default per-document/per-credential status seam: a single [`StatusOutcome::NoStatus`] entry.
+
+Used as the offline-suite / single-credential default for the positional `statuses` seam
+([`crate::verify::VerifyContext::statuses`], [`crate::mdoc`]'s params). It covers exactly ONE
+document: an mdoc `DeviceResponse` carrying MORE than one document needs one [`StatusOutcome`] per
+document (the per-document revocation check is positional), so an under-supplied multi-document
+response fails closed to [`StatusOutcome::Unavailable`] rather than reusing one outcome for all.
 
 ## Module `trust`
 
@@ -3337,6 +3384,14 @@ offline suite needs no network and no EU lists. It is **not** a production trust
 
 Carries only issuer-public certificates (no secret), so deriving `Debug` is safe.
 
+**⚠ Not a production trust source.** Its [`resolve`](TrustAnchorSource::resolve) does **exact-DER
+pinning ONLY** — NO certificate validity-window check, NO path building, and it ignores the supplied
+intermediates and `leaf_validity_time`. It is therefore strictly WEAKER than the production
+[`ChainValidatingAnchors`]/[`NativeTrustEngine`], which reject an expired/withdrawn pinned leaf for
+the same `resolve` call. Wiring this into a production verifier would trust a pinned-but-expired
+issuer certificate (a trust false-accept). Use it only for the offline test suite / conformance
+vectors; a production integrator MUST use [`ChainValidatingAnchors`] or [`NativeTrustEngine`].
+
 ##### Methods
 
 ```rust
@@ -3948,8 +4003,13 @@ presentation (an OpenID4VP `request` overrides it with the reconstructed handove
   - The verification instant (Unix seconds) the validity window is checked against.
 - `role: IssuerRole`
   - The issuer role under which trust is anchored.
-- `status: StatusOutcome`
-  - The revocation/status outcome resolved by the host (via [`crate::status::check_status`]).
+- `statuses: &'a [StatusOutcome]`
+  - The revocation/status outcomes resolved by the host (via [`crate::status::check_status`]), one
+**per presented document**, positional. SD-JWT VC carries a single credential (index `0`); an mdoc
+`DeviceResponse` MAY carry more than one document, each with its own status pointer, so `statuses[i]`
+is `documents[i]`'s outcome. A document with no covering entry fails closed to
+[`StatusOutcome::Unavailable`] — one outcome is never silently reused across documents (SC-002). The
+default [`crate::status::DEFAULT_STATUSES`] covers exactly one document.
 - `session_transcript: Option<&'a [u8]>`
   - The mdoc `SessionTranscript` the `DeviceAuth` is bound to, for a presentation **without** an
 OpenID4VP request (with a request, the handover is reconstructed from the request instead).
@@ -4033,6 +4093,15 @@ Detects the format (rejecting an unsupported one, or one the `policy` does not e
 configured `anchors`, and — when `request` is supplied — the OpenID4VP binding (nonce + audience).
 Returns a [`VerificationResult`] that is `valid = true` only when every check passed, else
 `valid = false` with a specific [`ReasonCode`] (no false-accept — SC-002).
+
+**DCQL scope (single presentation).** When `request` carries a DCQL query, this enforces it at the
+single-Credential-Query level: `valid = true` means the presentation matched **at least one**
+Credential Query of its format (format + `meta` + `claims`/`claim_sets`/`values`). It does NOT
+assert the request's **set-level completeness** — `credential_sets` (required option-sets) and
+`multiple` cardinality — which is the job of the native [`crate::openid4vp::verify_vp_token`] over a
+multi-presentation `vp_token`. An integrator answering a `credential_sets` request across several
+presentations MUST fold set-level completeness itself; a per-presentation `valid = true` does not
+mean "the whole DCQL request is satisfied".
 
 ## Module `wire`
 
@@ -4136,8 +4205,11 @@ The verification context carried on the wire (the CBOR mirror of [`VerifyContext
   - The verification instant (Unix seconds).
 - `role: IssuerRole`
   - The issuer role under which trust is anchored.
-- `status: StatusOutcome`
-  - The host-resolved revocation/status outcome.
+- `statuses: Vec<StatusOutcome>`
+  - The host-resolved revocation/status outcomes, one **per presented document**, positional (SD-JWT
+VC uses index `0`; a multi-document mdoc `DeviceResponse` needs one per document). A document with
+no covering entry fails closed to [`StatusOutcome::Unavailable`] — never a silent reuse of one
+outcome across documents (SC-002).
 - `session_transcript: Option<Vec<u8>>`
   - The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
 - `qualified_gate: bool`

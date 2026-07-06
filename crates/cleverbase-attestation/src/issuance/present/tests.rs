@@ -98,7 +98,7 @@ fn sd_jwt_vc_present_discloses_only_the_subset_and_verifies_under_us1() {
         &anchors,
         crate::sdjwtvc::test_issuer::NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -137,7 +137,7 @@ fn sd_jwt_vc_present_full_disclosure_verifies_with_all_attributes() {
         &anchors,
         crate::sdjwtvc::test_issuer::NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(result.valid, "reasons {:?}", result.reasons);
     assert_eq!(result.disclosed_attributes.len(), 3);
@@ -187,7 +187,7 @@ fn sd_jwt_vc_present_wrong_nonce_is_rejected_by_the_verifier() {
         &anchors,
         crate::sdjwtvc::test_issuer::NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(!result.valid, "a replayed presentation must be rejected");
     assert_eq!(result.reasons, vec![crate::types::ReasonCode::Replay]);
@@ -250,7 +250,7 @@ fn sd_jwt_vc_present_conceals_array_element_disclosures_outside_the_subset() {
         &anchors,
         crate::sdjwtvc::test_issuer::NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -369,7 +369,7 @@ fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
         &anchors,
         1_700_000_000,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -418,7 +418,7 @@ fn mdoc_present_with_non_empty_device_namespaces_verifies_under_us1() {
         &anchors,
         1_700_000_000,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -511,7 +511,7 @@ fn mdoc_present_wrong_audience_is_rejected_by_the_verifier() {
         &anchors,
         1_700_000_000,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(
@@ -681,7 +681,7 @@ fn present_threads_the_holder_key_handle_to_the_signer() {
         &anchors,
         crate::sdjwtvc::test_issuer::NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(result.valid, "reasons {:?}", result.reasons);
 }
@@ -812,7 +812,7 @@ fn first_device_name_spaces_bytes_defaults_to_empty_when_absent() {
     )]);
     assert_eq!(
         first_device_name_spaces_bytes(&response).expect("default"),
-        empty_device_name_spaces_bytes().expect("empty")
+        empty_device_name_spaces_bytes()
     );
 }
 
@@ -892,5 +892,27 @@ fn array_element_paths_recurse_through_nested_and_non_redaction_items() {
             .iter()
             .any(|v| v == "alpha"),
         "selecting the nested parent claim must disclose its array element"
+    );
+}
+
+#[test]
+fn finish_rejects_a_wire_injected_multi_document_prepared_mdoc() {
+    // DEFENSE-IN-DEPTH (holder-side robustness): prepare_mdoc rejects a multi-document held response,
+    // but PreparedKind::Mdoc is Deserialize and carried verbatim across the C-ABI in FinishPresent, so a
+    // caller could inject a 2+-document `device_response` straight into finish() → replace_device_signature,
+    // bypassing the prepare-time guard and emitting documents[1..] with a DeviceSignature scoped to
+    // documents[0]. The splice site must re-check and reject with MultiDocumentMdoc.
+    use ciborium::value::Value as CborValue;
+    let two_docs = CborValue::Map(vec![(
+        CborValue::Text("documents".to_owned()),
+        CborValue::Array(vec![CborValue::Map(Vec::new()), CborValue::Map(Vec::new())]),
+    )]);
+    let mut device_signature_cbor = Vec::new();
+    ciborium::into_writer(&CborValue::Null, &mut device_signature_cbor).expect("encode");
+    let err = super::replace_device_signature(&two_docs, &device_signature_cbor)
+        .expect_err("a multi-document prepared mdoc must be rejected at the splice site");
+    assert!(
+        matches!(err, PresentError::MultiDocumentMdoc(2)),
+        "expected MultiDocumentMdoc(2), got {err:?}"
     );
 }

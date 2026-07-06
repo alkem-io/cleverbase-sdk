@@ -17,7 +17,7 @@ use coset::{
     iana, CborSerializable as _, CoseSign1Builder, HeaderBuilder, ProtectedHeader, SignatureContext,
 };
 
-use super::signer::{SignatureAlgorithm, SignerError, SigningInput};
+use super::signer::{SignerError, SigningInput};
 
 /// A built mdoc `DeviceSignature` input, plus the splice context (the protected header + payload) to
 /// reconstruct the detached COSE_Sign1 once the host has signed the `Sig_structure`.
@@ -42,16 +42,9 @@ impl DeviceSignatureBuild {
     /// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
     /// [`SignerError::Serialize`] on a (here impossible) COSE re-encode failure.
     pub fn assemble(&self, signature: &[u8]) -> Result<Vec<u8>, SignerError> {
-        match self.input.algorithm() {
-            SignatureAlgorithm::Es256 => {
-                if signature.len() != 64 {
-                    return Err(SignerError::BadSignatureLength(
-                        SignatureAlgorithm::Es256,
-                        signature.len(),
-                    ));
-                }
-            }
-        }
+        // The ES256 raw-`r‖s` length gate is the shared [`super::signer::check_sig_len`] the JOSE
+        // ceremonies use too (DRY — Principle III; no duplicated magic `64`).
+        super::signer::check_sig_len(self.input.algorithm(), signature)?;
         // Rebuild the protected header the Sig_structure was built over, attach the host signature,
         // and emit a DETACHED COSE_Sign1 (no payload) — exactly what the verifier reconstructs and
         // checks against the DeviceAuthentication payload.
@@ -93,18 +86,17 @@ pub fn build_device_signature(
     audience: &str,
     nonce: &str,
 ) -> Result<DeviceSignatureBuild, SignerError> {
-    // Carry the presented DeviceNameSpacesBytes verbatim: the verifier rebuilds DeviceAuthentication
-    // from the document's actual deviceSigned.nameSpaces, so the signed payload must match it exactly.
-    let device_ns_value = decode(device_name_spaces_bytes)?;
-
+    // Rebuild `DeviceAuthentication` via the ONE shared builder the verifier also calls (DRY —
+    // Principle III): the signer half and verifier half MUST produce byte-identical output. The
+    // verifier rebuilds it from the document's actual `deviceSigned.nameSpaces`, so
+    // `device_name_spaces_bytes` is carried verbatim.
     let transcript_value = decode(session_transcript)?;
-    let device_auth_inner = encode(&CborValue::Array(vec![
-        CborValue::Text("DeviceAuthentication".to_owned()),
-        transcript_value,
-        CborValue::Text(doc_type.to_owned()),
-        device_ns_value,
-    ]))?;
-    let device_auth_payload = crate::encode_tagged_cbor(&device_auth_inner);
+    let device_auth_payload = crate::mdoc::build_device_authentication(
+        &transcript_value,
+        doc_type,
+        device_name_spaces_bytes,
+    )
+    .ok_or_else(|| SignerError::Serialize("malformed DeviceNameSpacesBytes".to_owned()))?;
 
     // The ES256 protected header is what the verifier reads the alg from; build the Sig_structure
     // (Signature1 context) over the detached DeviceAuthentication payload with no external aad.
@@ -142,21 +134,11 @@ pub fn build_device_signature(
 }
 
 /// The `DeviceNameSpacesBytes` for an empty device-disclosed namespace map (`#6.24(bstr .cbor {})`)
-/// — the bytes to sign over when the device discloses no extra namespaces.
-///
-/// # Errors
-///
-/// [`SignerError::Serialize`] on a (here impossible) CBOR-encode failure of an in-memory value.
-pub fn empty_device_name_spaces_bytes() -> Result<Vec<u8>, SignerError> {
-    let device_ns_inner = encode(&CborValue::Map(vec![]))?;
-    Ok(crate::encode_tagged_cbor(&device_ns_inner))
-}
-
-/// Encode a `ciborium` value to CBOR bytes, surfacing the (impossible) failure as [`SignerError`].
-fn encode(value: &CborValue) -> Result<Vec<u8>, SignerError> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(value, &mut buf).map_err(|e| SignerError::Serialize(e.to_string()))?;
-    Ok(buf)
+/// — the bytes to sign over when the device discloses no extra namespaces. Infallible (the encode is
+/// the crate's infallible `cbor_to_vec`).
+#[must_use]
+pub fn empty_device_name_spaces_bytes() -> Vec<u8> {
+    crate::encode_tagged_cbor(&crate::cbor_to_vec(&CborValue::Map(vec![])))
 }
 
 /// Decode CBOR bytes to a `ciborium` value, surfacing a malformed input as [`SignerError`].

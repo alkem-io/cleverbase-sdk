@@ -538,6 +538,21 @@ struct WalkState<'a> {
     last_err: ChainError,
 }
 
+impl WalkState<'_> {
+    /// Charge one unit of the global issued-by-attempt budget. Returns `true` if a unit was available
+    /// (budget decremented), `false` when the budget is exhausted — the single source for the per-attempt
+    /// charge shared by both the anchor and intermediate loops in [`walk`].
+    fn charge(&mut self) -> bool {
+        match self.budget.checked_sub(1) {
+            Some(remaining) => {
+                self.budget = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// The outcome of one [`walk`] branch. On success it carries the **processed** certificates of the
 /// reaching path (leaf-first, i.e. `[leaf, intermediate₁, …]`, **excluding** the terminating anchor)
 /// plus the terminating `anchor`, so [`verify_chain`] can run the per-path extension / name-constraint
@@ -636,9 +651,8 @@ fn walk<'c>(
         // Global work budget: charge one unit per issued-by ATTEMPT (the signature verify is the
         // dominant cost). Exhausting it means the supplied chain × anchors forced more path-building
         // work than any conformant credential needs → a denial-of-service reject.
-        match state.budget.checked_sub(1) {
-            Some(remaining) => state.budget = remaining,
-            None => return WalkResult::TooLong,
+        if !state.charge() {
+            return WalkResult::TooLong;
         }
         match issued_by(current, &tbs_der, anchor, ctx.now_unix, pathlen_depth) {
             Ok(()) => {
@@ -687,9 +701,8 @@ fn walk<'c>(
         }
         // Charge the global work budget per issued-by ATTEMPT (the dominant signature-verify cost),
         // bounding the TOTAL work the backtracking search can do across all branches.
-        match state.budget.checked_sub(1) {
-            Some(remaining) => state.budget = remaining,
-            None => return WalkResult::TooLong,
+        if !state.charge() {
+            return WalkResult::TooLong;
         }
         if let Err(e) = issued_by(current, &tbs_der, candidate, ctx.now_unix, pathlen_depth) {
             record_more_specific(&mut state.last_err, e);
@@ -1222,11 +1235,32 @@ fn absorb_name_constraints(
 }
 
 /// Whether `name` (a `directoryName`) is **within** the subtree rooted at `base` (RFC 5280 §4.2.1.10):
-/// the subtree's RDN sequence is an initial prefix of `name`'s RDN sequence, each RDN compared for
-/// equality (§7.1 — the same binary DN comparison the path uses elsewhere). A subtree DN equal to or
-/// shorter-and-a-prefix-of the name is satisfied; a longer or diverging base is not.
+/// the subtree's RDN sequence is an initial prefix of `name`'s RDN sequence, each RDN compared per
+/// RFC 5280 §7.1. DirectoryString attribute values use **caseIgnoreMatch** and are **encoding-agnostic**
+/// (PrintableString vs UTF8String), so a byte-exact RDN compare fails **open in the EXCLUDED direction**:
+/// a subject spelled `O=example` (case variant) or re-encoded PrintableString↔UTF8String would evade an
+/// excluded `O=Example` subtree. Compare each RDN's RFC 4514 rendering, case-folded with collapsed
+/// whitespace — which normalizes both case and string encoding. The normalization is symmetric on both
+/// sides, so the PERMITTED direction stays correct (a genuine caseIgnore-equal name is still recognized
+/// as within a permitted subtree — never a new fail-open there).
 fn dn_within_subtree(base: &x509_cert::name::Name, name: &x509_cert::name::Name) -> bool {
-    base.0.len() <= name.0.len() && base.0.iter().zip(name.0.iter()).all(|(b, n)| b == n)
+    base.0.len() <= name.0.len()
+        && base
+            .0
+            .iter()
+            .zip(name.0.iter())
+            .all(|(b, n)| normalize_rdn(b) == normalize_rdn(n))
+}
+
+/// Normalize one RDN for RFC 5280 §7.1 name-constraint comparison: render it (RFC 4514), lowercase it
+/// (caseIgnoreMatch), and collapse insignificant whitespace (RFC 4518). The rendering is value-based, so
+/// two RDNs that differ only in string encoding (PrintableString vs UTF8String) normalize identically.
+fn normalize_rdn(rdn: &x509_cert::name::RelativeDistinguishedName) -> String {
+    rdn.to_string()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether `name` (a `dNSName`) is **within** the subtree rooted at `base` (RFC 5280 §4.2.1.10): equal
@@ -1236,8 +1270,15 @@ fn dn_within_subtree(base: &x509_cert::name::Name, name: &x509_cert::name::Name)
 fn dns_within_subtree(base: &str, name: &str) -> bool {
     // DNS labels are case-insensitive (RFC 5280 §7.2); compare lowercased copies (the constrained
     // dNSName path is rare, so the allocation is immaterial) and avoid any panicking byte/char indexing.
-    let base = base.trim_start_matches('.').to_ascii_lowercase();
-    let name = name.to_ascii_lowercase();
+    // Normalize a trailing absolute-FQDN root dot on BOTH sides — `evil.example.com.` must be treated as
+    // within `example.com`; an un-normalized trailing dot makes `strip_suffix` miss the match and lets a
+    // leaf evade an EXCLUDED dNSName subtree (a fail-open in the excluded direction). A leading `.` on
+    // `base` (the alternate subtree convention) is also tolerated.
+    let base = base
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
     // Within the subtree iff `name` equals `base`, or `name` is `base` with ≥1 label added on the left
     // (`host.example.com` within `example.com`) — i.e. it strips a trailing `.base` on a label boundary.
     name == base
@@ -2688,6 +2729,38 @@ mod tests {
         assert!(!dns_within_subtree("example.com", "example.org"));
         assert!(!dns_within_subtree("example.com", "notexample.com"));
         assert!(!dns_within_subtree("example.com", "com"));
+    }
+
+    #[test]
+    fn dns_within_subtree_normalizes_a_trailing_fqdn_dot() {
+        use super::dns_within_subtree;
+        // RFC 5280 §7.2: a trailing absolute-FQDN root dot must NOT let a leaf evade a subtree. An
+        // un-normalized `strip_suffix` misses these — a fail-open in the EXCLUDED direction.
+        assert!(dns_within_subtree("example.com", "evil.example.com.")); // trailing dot on the name
+        assert!(dns_within_subtree("example.com.", "evil.example.com")); // trailing dot on the base
+        assert!(dns_within_subtree("example.com", "example.com.")); // equal modulo the root dot
+        assert!(!dns_within_subtree("example.com", "example.org.")); // still a different domain
+    }
+
+    #[test]
+    fn dn_within_subtree_matches_case_and_encoding_variants() {
+        use super::dn_within_subtree;
+        use core::str::FromStr;
+        use x509_cert::name::Name;
+        // RFC 5280 §7.1 caseIgnoreMatch: `O=Example Org` and `O=example org` are the SAME DN, so a
+        // case-variant subject must be recognized as within an excluded/permitted subtree — a byte-exact
+        // compare fails open in the EXCLUDED direction. (Encoding-invariance — PrintableString vs
+        // UTF8String — follows from the same value-based rendering.)
+        let base = Name::from_str("O=Example Org").expect("parse base DN");
+        assert!(dn_within_subtree(
+            &base,
+            &Name::from_str("O=example org").expect("parse case variant")
+        ));
+        // A genuinely different organization is NOT within the subtree.
+        assert!(!dn_within_subtree(
+            &base,
+            &Name::from_str("O=Evil Org").expect("parse other")
+        ));
     }
 
     #[test]

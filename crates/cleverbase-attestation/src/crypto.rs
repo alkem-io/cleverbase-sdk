@@ -42,6 +42,19 @@ pub(crate) fn decode_base64_cert_lenient(body: &str) -> Result<Vec<u8>, base64ct
     Base64::decode_vec(&compact)
 }
 
+/// Decode a **standard** base64 body to bytes, trimming ONLY leading/trailing whitespace (no
+/// internal-whitespace tolerance). The **one** authoritative strict trim-only base64 decode (DRY —
+/// Principle III): the qualified-status national TL JSON SKI field ([`crate::qualified`]) and the JSON
+/// trust manifest anchor-cert body ([`crate::trust::manifest`]) both carried the identical
+/// `Base64::decode_vec(s.trim())` step. Returns the underlying [`base64ct::Error`] so each caller maps
+/// it into its own error variant (mirroring [`decode_base64_cert_lenient`]).
+///
+/// Deliberately distinct from [`decode_base64_cert_lenient`], which strips ALL internal whitespace for
+/// PEM-wrapped certificate bodies; this trims only the ends.
+pub(crate) fn decode_base64_strict(s: &str) -> Result<Vec<u8>, base64ct::Error> {
+    Base64::decode_vec(s.trim())
+}
+
 /// The byte length of a single P-256 affine coordinate (and of the raw `r`/`s` scalars).
 const P256_COORD_LEN: usize = 32;
 
@@ -129,4 +142,27 @@ pub(crate) fn p256_verifying_key_from_cert_der(
     let cert = x509_cert::Certificate::from_der(cert_der).ok()?;
     let spki_der = cert.tbs_certificate.subject_public_key_info.to_der().ok()?;
     p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der).ok()
+}
+
+/// Verify a P-256 **ES256** signature `raw_sig` over `msg` under `vk`, accepting ONLY the fixed-width
+/// raw `r‖s` COSE/JOSE form. Returns `Err(())` on a non-raw/malformed signature encoding or a failed
+/// verification. The **one** ES256 verify-out kernel for the crate (DRY — Principle III): the
+/// JOSE/SD-JWT VC compact-JWS verifier ([`crate::sdjwtvc`]) and both COSE_Sign1 mdoc verifiers
+/// ([`crate::mdoc`], the attached `IssuerAuth` and detached `DeviceSignature`) previously transcribed
+/// the identical `Signature::from_slice(raw) → vk.verify(msg, &sig)` body; they now share this.
+///
+/// RFC 9053 §2.1 (ECDSA, the COSE algorithm definition) and RFC 7515/7518 (JOSE) both mandate the
+/// signature be the concatenation of `R` and `S` as fixed-width octet strings —
+/// `Signature = I2OSP(R, n) | I2OSP(S, n)`, `n = ceil(key_length / 8)` — i.e. the raw 64-byte `r‖s`
+/// for P-256, NEVER an ASN.1/DER `SEQUENCE`. `p256::ecdsa::Signature::from_slice` is exactly that
+/// raw-only parse (a DER-encoded signature is rejected here, matching what a reference COSE/JOSE
+/// validator accepts). No hand-rolled crypto (Principle IV): the SDK's vetted `p256`/`ecdsa`.
+pub(crate) fn p256_verify_es256(
+    vk: &p256::ecdsa::VerifyingKey,
+    msg: &[u8],
+    raw_sig: &[u8],
+) -> Result<(), ()> {
+    use p256::ecdsa::signature::Verifier as _;
+    let signature = p256::ecdsa::Signature::from_slice(raw_sig).map_err(|_| ())?;
+    vk.verify(msg, &signature).map_err(|_| ())
 }

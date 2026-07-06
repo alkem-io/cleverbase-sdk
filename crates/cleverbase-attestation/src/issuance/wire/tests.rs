@@ -226,7 +226,7 @@ fn present_over_wire_and_verify(held: HeldAttestation) {
         &anchors,
         NOW,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,

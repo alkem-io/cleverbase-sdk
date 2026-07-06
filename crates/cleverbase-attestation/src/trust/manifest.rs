@@ -11,7 +11,6 @@
 
 use std::collections::BTreeMap;
 
-use base64ct::{Base64, Encoding as _};
 use serde::Deserialize;
 
 use crate::types::{Format, IssuerRole};
@@ -106,7 +105,8 @@ impl TrustListManifest {
         for entry in raw.anchors {
             let role = parse_role(&entry.role)?;
             let format = parse_format(&entry.format)?;
-            let der = Base64::decode_vec(entry.anchor_cert_der_b64.trim())
+            // The crate's single strict trim-only base64 decode (DRY — Principle III).
+            let der = crate::crypto::decode_base64_strict(&entry.anchor_cert_der_b64)
                 .map_err(|e| ManifestError::Base64(e.to_string()))?;
             anchors.entry((role, format)).or_default().push(der);
         }

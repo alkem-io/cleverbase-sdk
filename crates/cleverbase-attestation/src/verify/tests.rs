@@ -185,7 +185,7 @@ fn sd_jwt_vc_revoked_status_through_verify() {
     let anchors = sd_jwt_anchors();
     let ctx = VerifyContext {
         now_unix: NOW,
-        status: StatusOutcome::Revoked,
+        statuses: &[StatusOutcome::Revoked],
         ..VerifyContext::default()
     };
     let result = verify(
@@ -271,7 +271,7 @@ fn mdoc_unavailable_status_through_verify() {
     let anchors = mdoc_anchors();
     let ctx = VerifyContext {
         now_unix: MDOC_NOW,
-        status: StatusOutcome::Unavailable,
+        statuses: &[StatusOutcome::Unavailable],
         ..VerifyContext::default()
     };
     let result = verify(
@@ -609,11 +609,13 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
     let ctx = VerifyContext {
         now_unix: RELEVANT_AFTER_WITHDRAWN,
         role: IssuerRole::Pid,
+        // Two documents, neither declaring a status mechanism → one NoStatus per document (the single
+        // default would fail documents[1] closed to Unavailable before the qualified fold runs).
+        statuses: &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
         session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
-        ..VerifyContext::default()
     };
     let result = verify(
         &Presentation::Mdoc {
@@ -676,11 +678,13 @@ fn multi_document_mdoc_with_a_foreign_issuer_document_is_indeterminate_end_to_en
     let ctx = VerifyContext {
         now_unix: RELEVANT_GRANTED,
         role: IssuerRole::Pid,
+        // Two documents, neither declaring a status mechanism -- one NoStatus per document (the single
+        // default would fail documents[1] closed to Unavailable before the qualified fold runs).
+        statuses: &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
         session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
         qualified_scheme_anchors: &scheme,
-        ..VerifyContext::default()
     };
     let result = verify(
         &Presentation::Mdoc {

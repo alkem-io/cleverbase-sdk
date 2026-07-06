@@ -378,3 +378,43 @@ data yields `Indeterminate` (never a false "qualified"). Scenario 4's independen
 FR-013 signal but requires an external different-language reference verifier (Kotlin
 `eudi-lib-jvm-sdjwt-kt` / TS `mdoc-ts`), which is not packaged with the SDK; the harness self-skips
 when it is absent (the opt-in `attestation-crosscheck.yml` workflow wires it).
+
+## §2 — Full-PR unbiased-review remediation (RCA record)
+
+A final unsteered, max-effort code review of the entire feature branch (10 independent finder angles
+over the whole diff, adversarial per-finding verification, gap sweep) surfaced defects the earlier
+spec-anchored waves — framed around the single-credential path — had missed. Each verified finding was
+fixed at root cause, test-first. The always-on crypto/trust core (ES256/alg-confusion pinning,
+`valueDigests` bytes↔value tie, RFC 5280 §6.1 path build, fail-closed CBOR/time parsing, FFI boundary)
+was re-confirmed sound; no additional false-accept was found there.
+
+| # | Defect (RCA: why it was wrong / why missed) | Fix | Test |
+|---|---------------------------------------------|-----|------|
+| 1 | **Multi-document mdoc revocation false-accept** (HIGH). A `DeviceResponse` may carry several documents, each with its OWN status-list pointer, but the always-on bar applied ONE host-supplied `StatusOutcome` to every document (the per-MSO status was never read). Missed because every prior revocation test used a single-document response. A host with one status slot could only pass `Good`/`NoStatus` → a revoked second document rode inside a VALID verdict (SC-002). | Per-document positional status seam: `statuses: &[StatusOutcome]` (index `i` ↔ `documents[i]`); a document with no covering entry fails closed to `Unavailable` — one outcome is never reused across documents. Threaded through `VerifyContext`/`WireContext` (C-ABI) and the OpenID4VP request path. | `mdoc::tests::multi_document_second_document_revoked_is_rejected_not_false_accepted`, `…_short_status_slice_fails_the_uncovered_document_closed` |
+| 2 | **Primary-path DCQL claims-gate bypass** (`claim_sets: [[]]`). An empty claim-set combination made `claims_satisfied`'s `.any(|set| set.iter().all(…))` vacuously true, so a credential disclosing NONE of the requested claims satisfied the query — reachable on the single-presentation C-ABI path. | Guard: an empty claim-set option is never satisfiable (`!set.is_empty() && …`). | `dcql::tests::empty_claim_set_option_is_not_vacuously_satisfied` |
+| 3/4 | **Set-level DCQL vacuous-truth** — `credential_sets_satisfied` returned true for an empty `credentials` list (unparseable/all-dropped query → `unwrap_or_default`) and for an empty required option (`options: [[]]`). | Guards: empty `credentials` ⇒ not satisfied; empty option ⇒ not satisfiable (fail closed). | `dcql::tests::empty_credential_set_option_is_not_vacuously_satisfied`, `…empty_query_is_not_set_level_satisfied` |
+| 5 | **Set-level DCQL unreachable from the C-ABI** — the wire surface enforces only `evaluate_single` (per-presentation match of *some* query); `credential_sets`/`multiple` cardinality (in the native `verify_vp_token`) is not reachable, and the single-presentation scope was undocumented at the boundary. NOT a per-credential false-accept — a request-completeness under-enforcement. | Documented the boundary scope (C-ABI = one presentation, single-query match; set-level completeness is `verify_vp_token`/the integrator). See §2.1 below. | (doc) |
+| 6 | **Qualified-gate `matches_leaf` false-label** — the issuing-CA Sdi match fell back to bare issuer-DN equality when the AKI/SKI tie was absent (`_ => true`), so a DN collision could read a granted status off the wrong CA's service entry → false `Qualified` label (opt-in gate; never affects VALID). | Fail-closed: the issuing-CA path requires the leaf AKI == Sdi SKI (both present and equal); a bare DN collision does not match. | `qualified::tests::issuing_ca_sdi_match_is_fail_closed_without_the_aki_ski_tie` |
+| 7 | **`role_from_meta` PID over-derivation** — a heterogeneous `vct_values` list (a PID vct + a non-PID type) forced the PID anchoring role via `find_map`, so a presented non-PID credential could be trust-anchored under `IssuerRole::Pid`. | Derive a role only when EVERY `vct` maps to the SAME role; a heterogeneous/ambiguous list ⇒ the caller's default role. | `dcql::tests::role_from_meta_is_ambiguous_for_a_heterogeneous_vct_list` |
+| 8 | **KB-JWT `iat` false-reject** — the 300 s freshness window was enforced even on the request-less path, where RFC 9901 §7.3 (step 5.e, nested under "If Key Binding is required") imposes no freshness requirement → a legitimate stored/high-latency presentation was rejected. | Gate the `iat` window on the presence of a challenge (with `aud`/`nonce`); the signature + `sd_hash` still verify request-less. | `sdjwtvc::tests::request_less_kb_jwt_with_an_old_iat_is_accepted` |
+| 9 | **Holder-side `finish()` multi-doc gap** — `prepare_mdoc` rejects a multi-document held response, but `finish()`/`replace_device_signature` (reachable via a wire-deserialized `PreparedKind::Mdoc`) did not, so it would splice one holder signature into every document. Holder-side robustness (a conformant verifier rejects the token), not a verifier false-accept. | Mirror the single-document guard at the splice site (`MultiDocumentMdoc`). | `issuance::present::tests::finish_rejects_a_wire_injected_multi_document_prepared_mdoc` |
+| 10 | **RFC 5280 §7 name-constraint excluded-subtree evasion** (latent; excluded subtrees are not present in EUDI anchors, so not decision-reachable here). `dns_within_subtree` did not normalize a trailing FQDN dot; `dn_within_subtree` used binary RDN equality (not §7.1 caseIgnore / encoding-agnostic). Fail-open only in the EXCLUDED direction. | Normalize the trailing dot; compare RDNs by case-folded, whitespace-collapsed RFC 4514 rendering (case- and encoding-agnostic). | `trust::chain::tests::dns_within_subtree_normalizes_a_trailing_fqdn_dot`, `…dn_within_subtree_matches_case_and_encoding_variants` |
+
+Cleanup applied in the same pass (DRY / dead-code / efficiency, no behavior change): a single shared
+ES256 verify kernel + strict-base64 decode in `crypto`; the authoritative `cbor_to_vec` used in place
+of inline re-rolls; one shared mdoc `DeviceAuthentication` builder (signed↔verified byte-symmetry); a
+`WalkState::charge` helper for the duplicated path-budget block; removal of a write-only `proof_jwt`
+field, a no-op `kb_challenge_without_request` seam, and a redundant `CoseKey` re-parse; and the mdoc
+`SessionTranscript` decoded once per response rather than per document.
+
+### §2.1 — C-ABI DCQL scope (finding #5)
+
+The C-ABI / `verify()` surface verifies **one presentation per call** and enforces DCQL at the
+**single-Credential-Query** level (`dcql::evaluate_single`): `valid = true` means the presented
+credential is cryptographically sound, trust-anchored, request-bound, and matches **at least one**
+Credential Query of its format (including that query's `claims`/`claim_sets`/`values`). It does **not**
+assert the request's **set-level completeness** — `credential_sets` (required option-sets) and
+`multiple` cardinality — which is the job of the native multi-credential `openid4vp::verify_vp_token`
+(not exposed over the wire). An integrator combining several presentations against a `credential_sets`
+request MUST evaluate set-level completeness itself (or via `verify_vp_token`); a C-ABI `valid = true`
+per presentation does not imply "the whole DCQL request is satisfied".

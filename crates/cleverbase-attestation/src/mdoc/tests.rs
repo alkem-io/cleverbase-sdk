@@ -84,7 +84,17 @@ fn params() -> MdocVerifyParams<'static> {
         now_unix: NOW,
         session_transcript: Some(static_default_transcript()),
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
+    }
+}
+
+/// Like [`params`] but carries one `NoStatus` entry per document of a TWO-document response (neither
+/// document declares a status mechanism). The single-document [`params`] would leave the second
+/// document without a positional status ⇒ fail closed (`Unavailable`), so multi-document tests use this.
+fn params_two_docs() -> MdocVerifyParams<'static> {
+    MdocVerifyParams {
+        statuses: &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
+        ..params()
     }
 }
 
@@ -289,7 +299,7 @@ fn explicit_session_transcript_binds_the_device_signature() {
         now_unix: NOW,
         session_transcript: Some(&transcript),
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(result.valid, "matching session transcript must verify");
@@ -310,7 +320,7 @@ fn device_signature_without_a_session_transcript_is_missing_request_binding() {
         now_unix: NOW,
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(
@@ -344,7 +354,7 @@ fn session_transcript_mismatch_fails_holder_binding() {
         now_unix: NOW,
         session_transcript: Some(&transcript_b),
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -512,7 +522,7 @@ fn default_params_are_offline_pid_at_epoch() {
     assert_eq!(p.now_unix, 0);
     assert!(p.session_transcript.is_none());
     assert_eq!(p.role, IssuerRole::Pid);
-    assert_eq!(p.status, StatusOutcome::NoStatus);
+    assert_eq!(p.statuses, [StatusOutcome::NoStatus]);
 }
 
 #[test]
@@ -523,7 +533,7 @@ fn revoked_status_is_rejected_as_revoked() {
         now_unix: NOW,
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::Revoked,
+        statuses: &[StatusOutcome::Revoked],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -538,7 +548,7 @@ fn unavailable_status_is_rejected_as_status_unavailable() {
         now_unix: NOW,
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::Unavailable,
+        statuses: &[StatusOutcome::Unavailable],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -554,13 +564,54 @@ fn good_status_still_verifies() {
         now_unix: NOW,
         session_transcript: Some(&transcript),
         role: IssuerRole::Pid,
-        status: StatusOutcome::Good,
+        statuses: &[StatusOutcome::Good],
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(
         result.valid,
         "a Good status must not disturb a VALID verdict"
     );
+}
+
+#[test]
+fn multi_document_second_document_revoked_is_rejected_not_false_accepted() {
+    // FALSE-ACCEPT REGRESSION (conformance-audit, SC-002): a multi-document response where documents[0]
+    // is current but documents[1] is REVOKED MUST be rejected. Revocation is now checked PER DOCUMENT
+    // (statuses[i] is documents[i]'s outcome). The pre-fix bug applied a SINGLE outcome to every
+    // document, so a host with one status slot could only pass `Good`/`NoStatus` for the whole response
+    // → the revoked second document rode inside a VALID verdict. Here statuses = [NoStatus, Revoked].
+    let response = MdocBuilder::new()
+        .append_colliding_document("nationality", CborValue::Text("NL".to_owned()))
+        .build();
+    let p = MdocVerifyParams {
+        statuses: &[StatusOutcome::NoStatus, StatusOutcome::Revoked],
+        ..params()
+    };
+    let result = verify(&response, &trusted_anchors(), &p);
+    assert!(
+        !result.valid,
+        "a revoked second document must never be accepted inside a multi-document response"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::Revoked]);
+}
+
+#[test]
+fn multi_document_short_status_slice_fails_the_uncovered_document_closed() {
+    // A multi-document response with a SINGLE status entry must NOT reuse it for documents[1]: the
+    // uncovered document fails closed to StatusUnavailable (never a silent VALID via one-outcome-for-all).
+    let response = MdocBuilder::new()
+        .append_colliding_document("nationality", CborValue::Text("NL".to_owned()))
+        .build();
+    let p = MdocVerifyParams {
+        statuses: &[StatusOutcome::Good], // covers documents[0] only; documents[1] is uncovered
+        ..params()
+    };
+    let result = verify(&response, &trusted_anchors(), &p);
+    assert!(
+        !result.valid,
+        "the uncovered second document must fail closed, not reuse documents[0]'s status"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
 }
 
 #[test]
@@ -599,7 +650,8 @@ fn cose_der_encoded_issuer_auth_signature_is_rejected_raw_accepted() {
     // concatenation (`I2OSP(R, n) | I2OSP(S, n)`), NEVER an ASN.1/DER `SEQUENCE`. A DER-encoded
     // COSE_Sign1 signature is a valid ECDSA signature but a non-conformant ENCODING — a reference COSE
     // validator rejects what a DER-tolerant verifier would accept. The SDK's COSE path must therefore
-    // reject the DER form (`Tamper`): the `from_der` fallback was dropped from `verify_p256_es256_sig`.
+    // reject the DER form (`Tamper`): the shared `crate::crypto::p256_verify_es256` kernel accepts only
+    // the raw `r‖s` form (`Signature::from_slice`), never `from_der`.
     let der = MdocBuilder::new().issuer_auth_der_signature().build();
     let result = verify(&der, &trusted_anchors(), &params());
     assert!(
@@ -762,7 +814,7 @@ fn cross_document_attribute_collision_is_rejected_no_silent_shadow() {
     let response = MdocBuilder::new()
         .append_colliding_document("given_name", CborValue::Text("EVIL".to_owned()))
         .build();
-    let result = verify(&response, &trusted_anchors(), &params());
+    let result = verify(&response, &trusted_anchors(), &params_two_docs());
     assert!(
         !result.valid,
         "a cross-document claim collision must NOT be silently merged"
@@ -789,7 +841,7 @@ fn cross_document_distinct_identifiers_merge_cleanly() {
     let response = MdocBuilder::new()
         .append_colliding_document("nationality", CborValue::Text("NL".to_owned()))
         .build();
-    let result = verify(&response, &trusted_anchors(), &params());
+    let result = verify(&response, &trusted_anchors(), &params_two_docs());
     assert!(
         result.valid,
         "non-colliding documents must merge: {:?}",
@@ -814,7 +866,7 @@ fn cross_document_identical_redisclosure_is_accepted() {
     let response = MdocBuilder::new()
         .append_colliding_document("given_name", CborValue::Text("Ada".to_owned()))
         .build();
-    let result = verify(&response, &trusted_anchors(), &params());
+    let result = verify(&response, &trusted_anchors(), &params_two_docs());
     assert!(
         result.valid,
         "an identical re-disclosure must not be treated as a conflict: {:?}",
@@ -839,7 +891,7 @@ fn multi_namespace_same_id_different_values_is_valid_and_namespace_distinguished
     let response = MdocBuilder::new()
         .append_document_in_namespace(OTHER_NS, "given_name", CborValue::Text("Grace".to_owned()))
         .build();
-    let result = verify(&response, &trusted_anchors(), &params());
+    let result = verify(&response, &trusted_anchors(), &params_two_docs());
     assert!(
         result.valid,
         "the same id in two DIFFERENT namespaces is not a collision — must be VALID: {:?}",

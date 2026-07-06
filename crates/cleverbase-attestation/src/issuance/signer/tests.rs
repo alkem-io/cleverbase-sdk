@@ -296,8 +296,7 @@ fn device_signature_built_via_signer_hook_verifies_under_us1_openid4vp() {
     // The test issuer's DeviceResponse carries an empty DeviceNameSpaces, so sign over the matching
     // empty `DeviceNameSpacesBytes` (the verifier rebuilds DeviceAuthentication from the document's
     // actual deviceSigned.nameSpaces).
-    let device_name_spaces_bytes =
-        crate::issuance::device::empty_device_name_spaces_bytes().expect("empty device namespaces");
+    let device_name_spaces_bytes = crate::issuance::device::empty_device_name_spaces_bytes();
     let build = build_device_signature(
         doc_type,
         &transcript,
@@ -331,7 +330,7 @@ fn device_signature_built_via_signer_hook_verifies_under_us1_openid4vp() {
         &anchors,
         1_700_000_000,
         IssuerRole::Pid,
-        crate::status::StatusOutcome::NoStatus,
+        &[crate::status::StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,

@@ -29,6 +29,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::StatusReachability;
 
+/// The default per-document/per-credential status seam: a single [`StatusOutcome::NoStatus`] entry.
+///
+/// Used as the offline-suite / single-credential default for the positional `statuses` seam
+/// ([`crate::verify::VerifyContext::statuses`], [`crate::mdoc`]'s params). It covers exactly ONE
+/// document: an mdoc `DeviceResponse` carrying MORE than one document needs one [`StatusOutcome`] per
+/// document (the per-document revocation check is positional), so an under-supplied multi-document
+/// response fails closed to [`StatusOutcome::Unavailable`] rather than reusing one outcome for all.
+pub const DEFAULT_STATUSES: &[StatusOutcome] = &[StatusOutcome::NoStatus];
+
 /// The canonical outcome of the revocation/status check, consumed by both per-format verifiers'
 /// status seam (the single authoritative status type — DRY, Principle III).
 ///
@@ -86,6 +95,14 @@ pub enum StatusReference {
 /// fetches the referenced status document (network, transport caching) and returns its parsed form,
 /// or `None` when it is unreachable. A `None` under [`StatusReachability::FailClosed`] is the
 /// fail-closed reject; under [`StatusReachability::BestEffort`] it is tolerated.
+///
+/// **Host obligation — authenticate the status document.** A Token Status List (or CRL) is a *signed*
+/// artifact (draft-ietf-oauth-status-list: a JWT/CWT signed by the status provider). This seam receives
+/// the ALREADY-AUTHENTICATED, unpacked status array — the host MUST verify the status-list token's
+/// signature (and that its signer is the credential's authorized status provider) BEFORE unpacking and
+/// returning the bytes. The core does not receive the signed token and therefore cannot check it; a
+/// host that returns an unauthenticated (e.g. attacker-served) status document would defeat revocation.
+/// This mirrors the trust-list seam, where the host/engine authenticates each fetched list before use.
 pub trait StatusSource {
     /// Fetch the packed Token Status List bytes for `uri`, or `None` if unreachable.
     ///

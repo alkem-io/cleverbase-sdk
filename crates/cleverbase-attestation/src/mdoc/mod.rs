@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ciborium::value::Value;
 use ciborium::Value as CborValue;
-use coset::{AsCborValue, CborSerializable, CoseKey, CoseSign1, Label, RegisteredLabelWithPrivate};
+use coset::{AsCborValue, CoseSign1, Label, RegisteredLabelWithPrivate};
 use sha2::{Digest, Sha384, Sha512};
 
 use crate::status::StatusOutcome;
@@ -161,10 +161,14 @@ pub struct MdocVerifyParams<'a> {
     /// The issuer role under which DS trust is resolved against the anchors (mdoc anchors to an IACA
     /// root; the role selects the per-role/format anchor set).
     pub role: IssuerRole,
-    /// The revocation/status outcome (the T014 seam) — the canonical [`StatusOutcome`] the
-    /// [`verify()`](crate::verify()) entry point resolves through the host status source. Mirrors the SD-JWT VC
-    /// status seam so the always-on bar's revocation check covers both formats.
-    pub status: StatusOutcome,
+    /// The revocation/status outcomes (the T014 seam) — one canonical [`StatusOutcome`] **per document**,
+    /// positional (index `i` is `documents[i]`'s status), resolved by the host through the status source.
+    /// A `DeviceResponse` MAY carry MORE THAN ONE document, each with its OWN status-list pointer, so a
+    /// single outcome cannot cover them (applying one to all would let a revoked second document ride
+    /// inside a VALID verdict — SC-002). A document whose index is not covered by `statuses` fails closed
+    /// to [`StatusOutcome::Unavailable`] (never a silent VALID). Mirrors the SD-JWT VC status seam (which
+    /// carries a single credential's single outcome).
+    pub statuses: &'a [StatusOutcome],
 }
 
 impl Default for MdocVerifyParams<'_> {
@@ -178,7 +182,7 @@ impl Default for MdocVerifyParams<'_> {
             now_unix: 0,
             session_transcript: None,
             role: IssuerRole::Pid,
-            status: StatusOutcome::NoStatus,
+            statuses: crate::status::DEFAULT_STATUSES,
         }
     }
 }
@@ -334,9 +338,9 @@ fn classify_binding_machinery(documents: &[CborValue]) -> DeviceBindingMachinery
 /// fixed-width raw `r‖s` signature. No payload is checked (transcript-independent).
 ///
 /// The well-formed test matches the verifier's accepted-signature set exactly (raw `r‖s` only — RFC
-/// 9053 §2.1; see [`verify_p256_es256_sig`]): a DER-encoded COSE signature is NOT well-formed here, so
-/// it is classified `Faulty` — a genuine, transcript-INDEPENDENT binding fault that the verifier now
-/// rejects for any transcript, never a freshness/replay signal.
+/// 9053 §2.1; see [`crate::crypto::p256_verify_es256`]): a DER-encoded COSE signature is NOT well-formed
+/// here, so it is classified `Faulty` — a genuine, transcript-INDEPENDENT binding fault that the verifier
+/// now rejects for any transcript, never a freshness/replay signal.
 fn device_binding_machinery_sound(document: &CborValue) -> bool {
     let check = || -> Option<bool> {
         // The MSO DeviceKey must parse (a malformed key is a binding fault, not a freshness issue).
@@ -422,8 +426,21 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
         // Capture the first document's on-wire `IssuerSignedItemBytes` (ISO/IEC 18013-5 §9.2.2.5
         // hashes the received bytes); the issuer-side check below consults these exact spans.
         let raw_items = scan_raw_issuer_items(device_response);
-        let verified =
-            verify_issuer_signed(issuer_signed, raw_items.first(), anchors, &doc_type, params)?;
+        // The external-vector path verifies the FIRST document only; use its positional status (index 0),
+        // failing closed to `Unavailable` if the caller supplied none.
+        let status = params
+            .statuses
+            .first()
+            .copied()
+            .unwrap_or(StatusOutcome::Unavailable);
+        let verified = verify_issuer_signed(
+            issuer_signed,
+            raw_items.first(),
+            anchors,
+            &doc_type,
+            status,
+            params,
+        )?;
         // Project the internal nested disclosure to the public namespace-grouped wire shape
         // (`{ ns: AttributeValue::Map({ id: value }) }`) — the same shape `verify` returns.
         Ok(namespace_grouped_attributes(verified.disclosed))
@@ -540,12 +557,36 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let mut disclosed: DisclosedByNamespace = BTreeMap::new();
     let mut claimed_issuers: Vec<(Vec<u8>, i64)> = Vec::with_capacity(document_count);
     let mut doc_types: Vec<String> = Vec::with_capacity(document_count);
+    // The SessionTranscript is invariant across the whole response; decode it ONCE here rather than
+    // once per document (Ef2). `None` here covers BOTH "no transcript supplied" and "supplied but not
+    // decodable CBOR": the per-document binding check still distinguishes them (absent →
+    // `MissingRequestBinding` via `params.session_transcript`; present-but-`None` here → `malformed`)
+    // at the SAME point the former per-document decode raised each.
+    let session_transcript = params
+        .session_transcript
+        .and_then(|bytes| decode_session_transcript_value(bytes).ok());
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
         let doc_raw_items = raw_items.get(index);
-        let (doc_disclosed, claimed_issuer) =
-            verify_one_document(document, doc_raw_items, anchors, params).map_err(fail)?;
+        // Per-document revocation status (positional): `documents[i]` is checked against `statuses[i]`.
+        // An index the host supplied no status for fails closed to `Unavailable` — a multi-document
+        // response with a single/short `statuses` slice MUST NOT silently reuse one outcome for every
+        // document (that let a revoked document ride inside a VALID verdict — SC-002, conformance-audit).
+        let doc_status = params
+            .statuses
+            .get(index)
+            .copied()
+            .unwrap_or(StatusOutcome::Unavailable);
+        let (doc_disclosed, claimed_issuer) = verify_one_document(
+            document,
+            doc_raw_items,
+            anchors,
+            doc_status,
+            session_transcript.as_ref(),
+            params,
+        )
+        .map_err(fail)?;
         claimed_issuers.push(claimed_issuer);
         // The document's `docType` (verified == the signed MSO `docType` inside `verify_one_document`)
         // is the DCQL `doctype_value` match input the in-core OpenID4VP gate reads from the meta.
@@ -621,6 +662,8 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     document: &CborValue,
     raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
+    status: StatusOutcome,
+    session_transcript: Option<&CborValue>,
     params: &MdocVerifyParams<'_>,
 ) -> Result<(DisclosedByNamespace, (Vec<u8>, i64)), VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
@@ -629,10 +672,16 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
 
     // --- Issuer-side bar: IssuerAuth signature + DS trust + MSO validity + valueDigests integrity. --
     let issuer_verified =
-        verify_issuer_signed(issuer_signed, raw_items, anchors, &doc_type, params)?;
+        verify_issuer_signed(issuer_signed, raw_items, anchors, &doc_type, status, params)?;
 
     // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
-    verify_device_binding(document, &issuer_verified.device_key, &doc_type, params)?;
+    verify_device_binding(
+        document,
+        &issuer_verified.device_key,
+        &doc_type,
+        session_transcript,
+        params,
+    )?;
 
     let claimed_issuer = (issuer_verified.ds_cert_der, issuer_verified.issuance_time);
     Ok((issuer_verified.disclosed, claimed_issuer))
@@ -671,6 +720,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     raw_items: Option<&RawDocumentItems<'_>>,
     anchors: &A,
     doc_type: &str,
+    status: StatusOutcome,
     params: &MdocVerifyParams<'_>,
 ) -> Result<IssuerVerified, VerifyFailure> {
     // --- Parse the IssuerAuth COSE_Sign1 and the MSO it carries. -----------------------------------
@@ -757,8 +807,8 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         DigestAlgorithm::from_name(&digest_alg_name).ok_or_else(VerifyFailure::malformed)?;
     enforce_validity(&validity, params.now_unix)?;
 
-    // --- Revocation / status (the T014 seam): the canonical outcome maps onto the bar. -------------
-    match params.status {
+    // --- Revocation / status (the T014 seam): THIS document's own outcome maps onto the bar. --------
+    match status {
         StatusOutcome::NoStatus | StatusOutcome::Good => {}
         StatusOutcome::Revoked => return Err(VerifyFailure::reason(ReasonCode::Revoked)),
         StatusOutcome::Unavailable => {
@@ -1043,18 +1093,9 @@ impl<'a> CborCursor<'a> {
             // Peek whether the key is a text string; if not, skip key + value together.
             let key_start = self.pos;
             if let Some(key) = self.take_text() {
-                // `take_text` borrowed `self.input`; re-borrow the key for the callback by slicing the
-                // same range (avoids holding an immutable borrow across the &mut self call).
-                let key_range = key_start..self.pos;
-                let key_owned = self.input.get(key_range)?;
-                // Re-decode the (already-validated) key text from the captured bytes.
-                let mut key_cursor = Self {
-                    input: key_owned,
-                    pos: 0,
-                };
-                let key_text = key_cursor.take_text()?;
-                debug_assert_eq!(key_text, key);
-                on_entry(key_text, self)?;
+                // `take_text` returns `&'a str` (tied to the input lifetime, NOT to `*self`), so the
+                // key borrow does not conflict with the `&mut self` re-borrow for the callback.
+                on_entry(key, self)?;
             } else {
                 // Reset to the key start, skip the key item and its value.
                 self.pos = key_start;
@@ -1358,45 +1399,21 @@ fn verify_cose_sign1_es256(sign1: &CoseSign1, cert_der: &[u8]) -> Result<(), Ver
         .ok_or_else(|| VerifyFailure::reason(ReasonCode::Tamper))?;
 
     let outcome = sign1.verify_signature(&[], |sig, tbs| {
-        verify_p256_es256_sig(&verifying_key, sig, tbs)
+        crate::crypto::p256_verify_es256(&verifying_key, tbs, sig)
     });
     outcome.map_err(|()| VerifyFailure::reason(ReasonCode::Tamper))
 }
 
-/// Verify a P-256 ES256 signature `sig_bytes` over `tbs` under `vk`, accepting ONLY the COSE
-/// fixed-width raw `r‖s` form. The **one** ES256-signature-bytes check shared by both the attached
-/// (`IssuerAuth`) and detached (`DeviceSignature`) COSE_Sign1 verifiers (DRY — Principle III): both
-/// transcribe the identical `from_slice(sig)? → vk.verify(tbs, &sig)` body; the byte-level
-/// accepted-signature set is identical at both sites.
+/// Parse the bytes of a COSE ES256 signature into a [`p256::ecdsa::Signature`], accepting ONLY the
+/// fixed-width raw `r‖s` form (RFC 9053 §2.1 — NEVER an ASN.1/DER `SEQUENCE`), or `None` for any other
+/// encoding. Used by the structural binding-machinery probe ([`device_binding_machinery_sound`]) to
+/// classify a `DeviceSignature`'s well-formedness independently of any transcript.
 ///
-/// RFC 9053 §2.1 (ECDSA, the COSE algorithm definition) mandates the signature be the concatenation
-/// of `R` and `S` as fixed-width octet strings — `Signature = I2OSP(R, n) | I2OSP(S, n)`,
-/// `n = ceil(key_length / 8)` — i.e. the raw 64-byte `r‖s` for P-256, NEVER an ASN.1/DER `SEQUENCE`.
-/// A DER-encoded COSE_Sign1 signature is non-conformant (a reference COSE validator rejects what a
-/// DER-tolerant verifier would accept), so the DER fallback is dropped here: only `from_slice`
-/// (fixed-width raw) is accepted. (The JOSE/SD-JWT VC path `verify_compact_es256` is likewise
-/// raw-only, per RFC 7515/7518.) Returns `Err(())` on a non-raw/malformed signature encoding or a
-/// failed verification (no hand-rolled crypto — the SDK's `p256`/`ecdsa`).
-fn verify_p256_es256_sig(
-    vk: &p256::ecdsa::VerifyingKey,
-    sig_bytes: &[u8],
-    tbs: &[u8],
-) -> Result<(), ()> {
-    use p256::ecdsa::signature::Verifier as _;
-    let signature = parse_es256_sig(sig_bytes).ok_or(())?;
-    vk.verify(tbs, &signature).map_err(|_| ())
-}
-
-/// Parse the bytes of a COSE/JOSE ES256 signature into a [`p256::ecdsa::Signature`], accepting ONLY
-/// the fixed-width raw `r‖s` form (RFC 9053 §2.1 / RFC 7515 §3 — NEVER an ASN.1/DER `SEQUENCE`), or
-/// `None` for any other encoding.
-///
-/// This is the **single** definition of "what counts as a well-formed ES256 signature" the verifier
-/// honors (DRY — Principle III). Both the cryptographic check ([`verify_p256_es256_sig`]) and the
-/// structural binding-machinery probe ([`device_binding_machinery_sound`]) parse through this one
-/// helper, so the probe's notion of "well-formed" is the verifier's accepted set BY CONSTRUCTION: a
-/// DER-encoded signature the verifier rejects is likewise `None` here (classified a transcript-
-/// INDEPENDENT binding fault, never a freshness/replay signal), and the two can never drift apart.
+/// This uses the SAME `p256::ecdsa::Signature::from_slice` raw-only parse the crate's ES256 verify
+/// kernel ([`crate::crypto::p256_verify_es256`]) applies, so the probe's notion of "well-formed" is
+/// EXACTLY the verifier's accepted set BY CONSTRUCTION: a DER-encoded signature is `None` here
+/// (classified a transcript-INDEPENDENT binding fault, never a freshness/replay signal) and is
+/// likewise rejected by the verifier — the two can never drift apart.
 fn parse_es256_sig(sig_bytes: &[u8]) -> Option<p256::ecdsa::Signature> {
     p256::ecdsa::Signature::from_slice(sig_bytes).ok()
 }
@@ -1701,21 +1718,11 @@ fn mso_device_key(mso: &CborValue) -> Result<DeviceKey, VerifyFailure> {
     let key_info = get_map_entry(mso, "deviceKeyInfo").ok_or_else(VerifyFailure::malformed)?;
     let device_key_value =
         get_map_entry(key_info, "deviceKey").ok_or_else(VerifyFailure::malformed)?;
-    // Re-encode the COSE_Key value and parse it via `coset` for label handling.
-    let mut buf = Vec::new();
-    ciborium::into_writer(device_key_value, &mut buf).map_err(|_| VerifyFailure::malformed())?;
-    let cose_key = CoseKey::from_slice(&buf).map_err(|_| VerifyFailure::malformed())?;
-
-    // Require an EC2 (kty=2) P-256 (crv=1) key; read X (-2) and Y (-3) coordinates.
-    let kty_ok = matches!(
-        cose_key.kty,
-        coset::RegisteredLabel::Assigned(coset::iana::KeyType::EC2)
-    );
-    if !kty_ok {
-        // Defensive: also accept a raw kty=2 carried in `params` if `coset` did not assign it.
-        if find_key_label(device_key_value, COSE_KEY_KTY, integer_label) != Some(COSE_KTY_EC2) {
-            return Err(VerifyFailure::malformed());
-        }
+    // Require an EC2 (kty=2) P-256 (crv=1) key; read kty/crv and X (-2)/Y (-3) directly from the
+    // COSE_Key CBOR map via the shared `find_key_label` (the same integer-label reader used for the
+    // coordinates below — no separate `coset::CoseKey` re-encode/parse just to read `kty`).
+    if find_key_label(device_key_value, COSE_KEY_KTY, integer_label) != Some(COSE_KTY_EC2) {
+        return Err(VerifyFailure::malformed());
     }
     if find_key_label(device_key_value, COSE_KEY_CRV, integer_label) != Some(COSE_CRV_P256) {
         return Err(VerifyFailure::malformed());
@@ -1757,6 +1764,7 @@ fn verify_device_binding(
     document: &CborValue,
     device_key: &DeviceKey,
     doc_type: &str,
+    session_transcript: Option<&CborValue>,
     params: &MdocVerifyParams<'_>,
 ) -> Result<(), VerifyFailure> {
     let device_signed =
@@ -1777,9 +1785,9 @@ fn verify_device_binding(
     // mdoc-no-transcript case (see the `ReasonCode` rustdoc; one of three distinct "binding material
     // absent" conditions the code intentionally covers — distinct from a present-but-invalid binding,
     // which is `HolderBinding`).
-    let Some(session_transcript_bytes) = params.session_transcript else {
+    if params.session_transcript.is_none() {
         return Err(VerifyFailure::reason(ReasonCode::MissingRequestBinding));
-    };
+    }
     let device_signature = parse_cose_sign1(device_signature_value)?;
 
     // `deviceSigned.nameSpaces` is a `#6.24(bstr .cbor DeviceNameSpaces)`; carry its exact bytes.
@@ -1787,9 +1795,13 @@ fn verify_device_binding(
         get_map_entry(device_signed, "nameSpaces").ok_or_else(VerifyFailure::malformed)?;
     let device_name_spaces_bytes = reencode_tagged(device_name_spaces_value)?;
 
-    let session_transcript = decode_session_transcript_value(session_transcript_bytes)?;
+    // The `SessionTranscript` was decoded ONCE up front (Ef2, in `verify_inner`). It was confirmed
+    // present above, so a `None` here means the supplied bytes were malformed CBOR → `malformed` (the
+    // same reason the former per-document decode raised, at this same point).
+    let session_transcript = session_transcript.ok_or_else(VerifyFailure::malformed)?;
     let device_auth_payload =
-        build_device_authentication(&session_transcript, doc_type, &device_name_spaces_bytes)?;
+        build_device_authentication(session_transcript, doc_type, &device_name_spaces_bytes)
+            .ok_or_else(VerifyFailure::malformed)?;
 
     verify_cose_sign1_detached_es256(&device_signature, &device_auth_payload, &device_key.sec1)
         .map_err(|()| VerifyFailure::reason(ReasonCode::HolderBinding))
@@ -1802,32 +1814,38 @@ fn reencode_tagged(value: &CborValue) -> Result<Vec<u8>, VerifyFailure> {
 }
 
 /// Decode the supplied `SessionTranscript` bytes to a CBOR value. The transcript is REQUIRED to verify
-/// a `DeviceSignature` (ISO/IEC 18013-5 §9.1.5); [`verify_device_binding`] rejects an absent transcript
-/// up front ([`ReasonCode::MissingRequestBinding`]) before calling this, so this helper never has to
-/// fabricate one — it only re-hydrates the explicit, caller-supplied bytes.
+/// a `DeviceSignature` (ISO/IEC 18013-5 §9.1.5); [`verify_inner`] decodes it ONCE for the whole response
+/// (Ef2) and threads the value into each document's [`verify_device_binding`], which rejects an absent
+/// transcript ([`ReasonCode::MissingRequestBinding`]). This never fabricates one — it only re-hydrates
+/// the explicit, caller-supplied bytes.
 fn decode_session_transcript_value(session_transcript: &[u8]) -> Result<CborValue, VerifyFailure> {
     ciborium::from_reader(session_transcript).map_err(|_| VerifyFailure::malformed())
 }
 
 /// Build the `DeviceAuthentication` detached payload bytes: the `#6.24(bstr .cbor [...])` wrapping of
-/// `["DeviceAuthentication", SessionTranscript, docType, DeviceNameSpacesBytes]`.
-fn build_device_authentication(
+/// `["DeviceAuthentication", SessionTranscript, docType, DeviceNameSpacesBytes]` (ISO/IEC 18013-5
+/// §9.1.3). Returns `None` only when `device_name_spaces_bytes` is not decodable CBOR.
+///
+/// The **one** authoritative `DeviceAuthentication` builder (DRY — Principle III): the holder signer
+/// ([`crate::issuance::device::build_device_signature`]) signs over these bytes and this verifier
+/// rebuilds them to check the signature, so the two MUST produce byte-identical output — a
+/// signed↔verified symmetry that must never drift. Both call this one `pub(crate)` fn (mirroring the
+/// shared [`crate::openid4vp::oid4vp_handover_transcript`]). Each caller maps the `None` into its own
+/// error variant.
+pub(crate) fn build_device_authentication(
     session_transcript: &CborValue,
     doc_type: &str,
     device_name_spaces_bytes: &[u8],
-) -> Result<Vec<u8>, VerifyFailure> {
+) -> Option<Vec<u8>> {
     // DeviceNameSpacesBytes is itself a #6.24(bstr) item; embed it as the already-encoded CBOR value.
-    let device_ns_value: CborValue =
-        ciborium::from_reader(device_name_spaces_bytes).map_err(|_| VerifyFailure::malformed())?;
+    let device_ns_value: CborValue = ciborium::from_reader(device_name_spaces_bytes).ok()?;
     let device_auth = CborValue::Array(vec![
         CborValue::Text("DeviceAuthentication".to_owned()),
         session_transcript.clone(),
         CborValue::Text(doc_type.to_owned()),
         device_ns_value,
     ]);
-    let mut inner = Vec::new();
-    ciborium::into_writer(&device_auth, &mut inner).map_err(|_| VerifyFailure::malformed())?;
-    Ok(crate::encode_tagged_cbor(&inner))
+    Some(crate::encode_tagged_cbor(&crate::cbor_to_vec(&device_auth)))
 }
 
 /// Verify a COSE_Sign1 ES256 signature over a **detached** payload against a SEC1 P-256 public key.
@@ -1855,9 +1873,10 @@ fn verify_cose_sign1_detached_es256(
     let verifying_key =
         p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key_sec1).map_err(|_| ())?;
     // The detached coset call (`verify_detached_signature`) stays distinct from the attached path's
-    // `verify_signature`; only the inner raw-`r‖s` ES256 check is shared (DRY).
+    // `verify_signature`; only the inner raw-`r‖s` ES256 check is shared — the single
+    // [`crate::crypto::p256_verify_es256`] kernel (DRY).
     sign1.verify_detached_signature(payload, &[], |sig, tbs| {
-        verify_p256_es256_sig(&verifying_key, sig, tbs)
+        crate::crypto::p256_verify_es256(&verifying_key, tbs, sig)
     })
 }
 

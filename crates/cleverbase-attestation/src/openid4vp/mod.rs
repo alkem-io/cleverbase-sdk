@@ -199,16 +199,21 @@ impl VpToken<'_> {
 ///   subject claim would never resolve. The resolution set is the FULL presented claim set — the clear
 ///   issuer-signed claims MERGED with the disclosed claims ([`sdjwtvc::presented_claims`]).
 /// - **mdoc**: the namespace-grouped `disclosed_attributes` is already the full presented set (the
-///   `IssuerSignedItems` the holder released), so it is used as-is (cloned).
+///   `IssuerSignedItems` the holder released), so it is BORROWED as-is (no clone — the DCQL evaluator
+///   only reads it).
 ///
+/// Returned as a [`Cow`](std::borrow::Cow) so the mdoc path avoids deep-cloning the whole
+/// namespace-grouped map (the SD-JWT VC path owns the freshly-merged clear+disclosed set).
 /// Computed only when `result.valid` (the only branch where the DCQL gate runs).
-fn dcql_resolution_set(
+fn dcql_resolution_set<'a>(
     vp_token: &VpToken<'_>,
-    result: &VerificationResult,
-) -> BTreeMap<String, AttributeValue> {
+    result: &'a VerificationResult,
+) -> std::borrow::Cow<'a, BTreeMap<String, AttributeValue>> {
     match vp_token {
-        VpToken::SdJwtVc(presentation) => sdjwtvc::presented_claims(presentation),
-        VpToken::Mdoc(_) => result.disclosed_attributes.clone(),
+        VpToken::SdJwtVc(presentation) => {
+            std::borrow::Cow::Owned(sdjwtvc::presented_claims(presentation))
+        }
+        VpToken::Mdoc(_) => std::borrow::Cow::Borrowed(&result.disclosed_attributes),
     }
 }
 
@@ -225,8 +230,15 @@ fn dcql_resolution_set(
 /// `policy` carries the accepted-format restriction (`policy.formats`); a `vp_token` whose format the
 /// policy excludes is rejected with [`ReasonCode::UnsupportedFormat`] BEFORE any bar runs, so this
 /// public entry honors the gate even when a native caller invokes it directly (not only via the
-/// [`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`status` are the remaining per-format-bar
-/// inputs (the validity instant, the trust-anchor role, and the resolved status outcome).
+/// [`verify()`](crate::verify()) wrapper). `now_unix`/`role`/`statuses` are the remaining
+/// per-format-bar inputs (the validity instant, the trust-anchor role, and the per-document resolved
+/// status outcomes — SD-JWT VC reads index 0; an mdoc `DeviceResponse` checks `documents[i]` against
+/// `statuses[i]`).
+///
+/// **Qualified-status gate:** this entry NEVER populates `VerificationResult.qualified_status`,
+/// regardless of `policy.qualified_gate`. The opt-in eIDAS qualified gate (TS 119 615 cl. 4.12) runs
+/// ONLY via the [`crate::verify::verify()`] entry point, which carries the `qualified_trust_list` +
+/// `qualified_scheme_anchors` inputs this function does not receive; `None` here is the honest value.
 pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     vp_token: &VpToken<'_>,
     request: &PresentationRequest,
@@ -234,9 +246,9 @@ pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    status: StatusOutcome,
+    statuses: &[StatusOutcome],
 ) -> VerificationResult {
-    verify_response_with_meta(vp_token, request, policy, anchors, now_unix, role, status).0
+    verify_response_with_meta(vp_token, request, policy, anchors, now_unix, role, statuses).0
 }
 
 /// Verify an OpenID4VP `vp_token` exactly as [`verify_response`] AND surface the mdoc
@@ -252,7 +264,7 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    status: StatusOutcome,
+    statuses: &[StatusOutcome],
 ) -> (VerificationResult, Option<MdocVerifyMeta>) {
     // Format gate (identical to the `verify()` entry point's, so the public `verify_response` honors
     // the `policy` it takes): the policy may restrict accepted formats (an empty set = both). A
@@ -269,6 +281,12 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     // DCQL gate keys on (SD-JWT VC `vct`; mdoc `docType`s) from what the bar already produced.
     let (mut result, meta, credential_type) = match vp_token {
         VpToken::SdJwtVc(presentation) => {
+            // SD-JWT VC is a single credential — its one status is `statuses[0]` (fail closed on an
+            // empty slice).
+            let status = statuses
+                .first()
+                .copied()
+                .unwrap_or(StatusOutcome::Unavailable);
             let result =
                 verify_sd_jwt_vc_bound(presentation, request, anchors, now_unix, role, status);
             // Read the verified `vct` only on a VALID presentation (the bar has signature-verified +
@@ -280,7 +298,8 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
             (result, None, crate::dcql::CredentialType::Vct(vct))
         }
         VpToken::Mdoc(token) => {
-            let (result, meta) = verify_mdoc_bound(token, request, anchors, now_unix, role, status);
+            let (result, meta) =
+                verify_mdoc_bound(token, request, anchors, now_unix, role, statuses);
             let doc_types = meta.doc_types.clone();
             (
                 result,
@@ -368,7 +387,7 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    status: StatusOutcome,
+    statuses: &[StatusOutcome],
 ) -> (VerificationResult, MdocVerifyMeta) {
     if token.audience != request.audience {
         return (
@@ -386,7 +405,9 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
         now_unix,
         session_transcript: Some(&transcript),
         role,
-        status,
+        // Per-document positional statuses (documents[i] against statuses[i]); a document with no
+        // covering entry fails closed (`Unavailable`) — one outcome is never reused across documents.
+        statuses,
     };
     // Run the bar ONCE and read the byproducts it already computed (document count + binding-machinery
     // soundness) from the returned meta — no second `DeviceResponse` decode for the replay classifier.
@@ -544,7 +565,15 @@ pub struct VpTokenVerification {
 /// the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
 /// validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
 /// [`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
-/// for the response, mirroring the single-credential [`verify_response`]).
+/// per credential query — it covers each token's `documents[0]`; a multi-document `DeviceResponse`'s
+/// `documents[1..]` then fail closed, mirroring the single-credential [`verify_response`]).
+///
+/// This is the ONLY entry that enforces the **set-level** DCQL semantics (`credential_sets` required
+/// option-sets + `multiple` cardinality); the single-presentation [`verify_response`] / the C-ABI
+/// `verify()` surface enforce only the per-presentation single-query match. It is native-Rust-only (no
+/// C-ABI wire shape carries the multi-credential `{credential_id: [presentations]}` map). Like
+/// [`verify_response`], it NEVER populates `qualified_status` — the opt-in qualified gate runs only via
+/// [`crate::verify::verify()`].
 pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     request: &PresentationRequest,
     vp_token: &BTreeMap<String, Vec<VpToken<'_>>>,
@@ -588,7 +617,9 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
                 anchors,
                 now_unix,
                 credential_role,
-                status,
+                // The multi-credential fold carries ONE status per credential query; it covers each
+                // token's documents[0] (a multi-document DeviceResponse's documents[1..] fail closed).
+                std::slice::from_ref(&status),
             );
             // The Presentation counts toward THIS Credential Query only if it both verified AND matches
             // this specific query (by id) — format + `meta` + claims/`claim_sets`/`values`.

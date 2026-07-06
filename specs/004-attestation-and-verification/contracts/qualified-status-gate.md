@@ -51,8 +51,12 @@ The determination takes **two** instants, used for two different jobs (do not co
    v1.4.1's form; v1.3.1 used the shorter `urn:etsi:eaa:eu:qualified` (verified online).
 3. Match the issuer's signing cert against an `…/Svctype/EAA/Q` service's **service digital identity
    (Sdi, TS 119 612 §5.5.3)** by any of: exact **X509Certificate** DER, **X509SKI**
-   (`SubjectKeyIdentifier`), or the **issuing-CA** relationship (the Sdi lists the issuing CA → the leaf's
-   `issuer` DN == the Sdi cert's `subject` DN, tightened by AKI==SKI when both present). `X509SubjectName`
+   (`SubjectKeyIdentifier`), or the **issuing-CA** relationship. The issuing-CA match is **fail-closed**:
+   the leaf's `issuer` DN must equal the Sdi cert's `subject` DN **AND** the leaf's `AuthorityKeyIdentifier`
+   must equal the Sdi cert's `SubjectKeyIdentifier` (both present and equal). A **bare issuer-DN collision
+   is NOT sufficient** — two distinct CAs can share a subject DN, and chaining to *some* configured anchor
+   does not prove the leaf was issued by *this* Sdi's CA (a false `Qualified` otherwise — SC-007). When the
+   AKI/SKI key-identifier tie cannot be established, the issuing-CA path does not match. `X509SubjectName`
    is NOT machine-matched (§5.5.3: it *"should not be used by applications in machine processable way"*;
    EU DSS matches X509Certificate only).
 4. Read the current/historical `granted` / `withdrawn` status **at the relevant time** (the credential's
@@ -96,8 +100,12 @@ The determination takes **two** instants, used for two different jobs (do not co
   "qualified"); missing TL data → `Indeterminate`. With the gate disabled, the always-on verdict is unchanged.
 - **Type-indication precondition (PRO-4.12.4-03)**: a granted-`EAA/Q` issuer signing an attestation
   WITHOUT the URN `urn:etsi:esi:eaa:eu:qualified` → `Indeterminate`; WITH the URN → `Qualified`.
-- **Sdi matching (§5.5.3)**: a QEAA whose service entry lists the **issuing CA** (or a bare **X509SKI**),
-  not the byte-identical leaf, is still matched → `Qualified` (not false-rejected as `Indeterminate`).
+- **Sdi matching (§5.5.3)**: a QEAA whose service entry lists the **issuing CA** (with the leaf's
+  `AuthorityKeyIdentifier` matching the CA Sdi's `SubjectKeyIdentifier`) or a **X509SKI**, not the
+  byte-identical leaf, is still matched → `Qualified` (not false-rejected as `Indeterminate`). The
+  issuing-CA path is **fail-closed on the AKI==SKI tie**: a bare issuer-DN collision without that
+  key-identifier match does NOT confer `Qualified` (a different CA sharing a subject DN must never
+  mislabel a non-qualified issuer's credential — SC-007 "no false qualified").
 - **now-vs-relevant split**: a properly-signed TL that is STALE at `now` (`NextUpdate < now`) but whose
   `NextUpdate` is AFTER the credential's issuance time → `Indeterminate` (NOT `Qualified`) — even though the
   issuer is granted at the relevant time. A TL whose signer cert has EXPIRED by `now` but was valid at the

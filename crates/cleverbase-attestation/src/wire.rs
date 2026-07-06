@@ -102,8 +102,11 @@ pub struct WireContext {
     pub now_unix: i64,
     /// The issuer role under which trust is anchored.
     pub role: IssuerRole,
-    /// The host-resolved revocation/status outcome.
-    pub status: StatusOutcome,
+    /// The host-resolved revocation/status outcomes, one **per presented document**, positional (SD-JWT
+    /// VC uses index `0`; a multi-document mdoc `DeviceResponse` needs one per document). A document with
+    /// no covering entry fails closed to [`StatusOutcome::Unavailable`] — never a silent reuse of one
+    /// outcome across documents (SC-002).
+    pub statuses: Vec<StatusOutcome>,
     /// The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
     #[serde(default, with = "serde_bytes")]
     pub session_transcript: Option<Vec<u8>>,
@@ -256,7 +259,7 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,
-                status: req.context.status,
+                statuses: &req.context.statuses,
                 session_transcript: req.context.session_transcript.as_deref(),
                 qualified_gate: req.context.qualified_gate,
                 qualified_trust_list: qualified_trust_list.as_ref(),

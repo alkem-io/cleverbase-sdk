@@ -11,7 +11,7 @@ const RESPONSE_URI: &str = "https://verifier.example/cb/response";
 
 fn a_build() -> crate::issuance::device::DeviceSignatureBuild {
     let transcript = oid4vp_handover_transcript(AUDIENCE, b"nonce-bytes-here", RESPONSE_URI);
-    let device_ns = empty_device_name_spaces_bytes().expect("empty device namespaces");
+    let device_ns = empty_device_name_spaces_bytes();
     build_device_signature(
         "org.iso.18013.5.1.mDL",
         &transcript,
@@ -60,7 +60,7 @@ fn assemble_with_a_64_byte_signature_produces_decodable_cose_sign1() {
 fn malformed_session_transcript_is_a_serialize_error_not_a_panic() {
     // A truncated/invalid CBOR transcript (an indefinite-length map header with no break) surfaces as
     // a clean error (never a panic — the strict bar forbids them).
-    let device_ns = empty_device_name_spaces_bytes().expect("empty device namespaces");
+    let device_ns = empty_device_name_spaces_bytes();
     let err = build_device_signature("doc", &[0xbf, 0x00], &device_ns, AUDIENCE, "n").unwrap_err();
     assert!(matches!(err, SignerError::Serialize(_)));
 }

@@ -23,8 +23,9 @@
 //! it is absent — `qualified_trust_list_fixture()` returns `None` and each test returns early.
 
 use super::{
-    qualified_status, QualifiedTrustError, QualifiedTrustList, QualifiedTrustListError,
-    EAA_EU_QUALIFIED_TYPE, EAA_Q_SERVICE_TYPE, SERVICE_STATUS_GRANTED, TS_119_615_VERSION,
+    qualified_status, LeafIdentity, QualifiedTrustError, QualifiedTrustList,
+    QualifiedTrustListError, ServiceEntry, EAA_EU_QUALIFIED_TYPE, EAA_Q_SERVICE_TYPE,
+    SERVICE_STATUS_GRANTED, TS_119_615_VERSION,
 };
 use crate::sdjwtvc::test_issuer::{
     block_on, holder_cnf, mint_sd_jwt_with_validity, Es256Signer, Sha2Hasher, ISSUER_CERT_DER,
@@ -397,6 +398,51 @@ fn qeaa_matched_by_ski_sdi_is_qualified() {
         ),
         QualifiedStatus::Qualified,
         "a leaf matched by its X509SKI must be matched (not false-rejected)"
+    );
+}
+
+#[test]
+fn issuing_ca_sdi_match_is_fail_closed_without_the_aki_ski_tie() {
+    // FALSE-QUALIFIED PROBE (§5.5.3 Sdi-matching precision): the issuing-CA case (3) must NOT match on
+    // issuer-DN byte-equality ALONE. A leaf whose `issuer` DN merely COLLIDES with a granted EAA/Q Sdi
+    // cert's `subject` DN — with the AKI (leaf) or SKI (Sdi) absent so the key-identifier tie cannot be
+    // established — must NOT be bound to that service. Chaining to *some* trusted anchor does not prove
+    // the leaf was issued by *this* Sdi's CA, so a DN collision would otherwise mislabel a non-qualified
+    // issuer's credential `Qualified`. Fail closed: no AKI==SKI tie ⇒ no issuing-CA match.
+    let colliding_dn = vec![0x30, 0x0a, 0x31, 0x08, 0x06, 0x03, 0x55, 0x04, 0x0a];
+    let entry = ServiceEntry {
+        service_type: EAA_Q_SERVICE_TYPE.to_owned(),
+        status_history: Vec::new(),
+        sdi_cert_der: None, // no exact-DER Sdi
+        sdi_subject_der: Some(colliding_dn.clone()),
+        sdi_ski: None, // SKI absent on the Sdi side → tie unestablishable
+    };
+    let leaf = LeafIdentity {
+        issuer_der: colliding_dn.clone(), // collides with the Sdi subject DN
+        ski: Some(vec![0xAA, 0xBB]),      // present but irrelevant (Sdi carries no SKI)
+        aki: None,                        // AKI absent on the leaf side → tie unestablishable
+    };
+    assert!(
+        !entry.matches_leaf(b"an-unrelated-leaf-der", &leaf),
+        "a bare issuer-DN collision without the AKI==SKI tie must not match a qualified service"
+    );
+
+    // Control: with the AKI==SKI tie present and equal, the issuing-CA match still holds (no over-tighten).
+    let entry_tied = ServiceEntry {
+        service_type: EAA_Q_SERVICE_TYPE.to_owned(),
+        status_history: Vec::new(),
+        sdi_cert_der: None,
+        sdi_subject_der: Some(colliding_dn.clone()),
+        sdi_ski: Some(vec![0xCA, 0xFE]),
+    };
+    let leaf_tied = LeafIdentity {
+        issuer_der: colliding_dn,
+        ski: None,
+        aki: Some(vec![0xCA, 0xFE]),
+    };
+    assert!(
+        entry_tied.matches_leaf(b"an-unrelated-leaf-der", &leaf_tied),
+        "an issuing-CA match with a present, equal AKI==SKI tie must still match"
     );
 }
 

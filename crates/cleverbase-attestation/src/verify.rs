@@ -39,7 +39,7 @@
 
 use crate::mdoc::{self, MdocVerifyMeta, MdocVerifyParams};
 use crate::openid4vp::{self, MdocVpToken, PresentationRequest, VpToken};
-use crate::sdjwtvc::{self, KeyBindingChallenge, SdJwtVcInput};
+use crate::sdjwtvc::{self, SdJwtVcInput};
 use crate::status::StatusOutcome;
 use crate::trust::TrustAnchorSource;
 use crate::types::{Format, IssuerRole, ReasonCode, VerificationPolicy, VerificationResult};
@@ -91,8 +91,13 @@ pub struct VerifyContext<'a> {
     pub now_unix: i64,
     /// The issuer role under which trust is anchored.
     pub role: IssuerRole,
-    /// The revocation/status outcome resolved by the host (via [`crate::status::check_status`]).
-    pub status: StatusOutcome,
+    /// The revocation/status outcomes resolved by the host (via [`crate::status::check_status`]), one
+    /// **per presented document**, positional. SD-JWT VC carries a single credential (index `0`); an mdoc
+    /// `DeviceResponse` MAY carry more than one document, each with its own status pointer, so `statuses[i]`
+    /// is `documents[i]`'s outcome. A document with no covering entry fails closed to
+    /// [`StatusOutcome::Unavailable`] — one outcome is never silently reused across documents (SC-002). The
+    /// default [`crate::status::DEFAULT_STATUSES`] covers exactly one document.
+    pub statuses: &'a [StatusOutcome],
     /// The mdoc `SessionTranscript` the `DeviceAuth` is bound to, for a presentation **without** an
     /// OpenID4VP request (with a request, the handover is reconstructed from the request instead).
     pub session_transcript: Option<&'a [u8]>,
@@ -124,7 +129,7 @@ impl Default for VerifyContext<'_> {
         Self {
             now_unix: 0,
             role: IssuerRole::Pid,
-            status: StatusOutcome::NoStatus,
+            statuses: crate::status::DEFAULT_STATUSES,
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
@@ -178,6 +183,15 @@ fn looks_like_mdoc(bytes: &[u8]) -> bool {
 /// configured `anchors`, and — when `request` is supplied — the OpenID4VP binding (nonce + audience).
 /// Returns a [`VerificationResult`] that is `valid = true` only when every check passed, else
 /// `valid = false` with a specific [`ReasonCode`] (no false-accept — SC-002).
+///
+/// **DCQL scope (single presentation).** When `request` carries a DCQL query, this enforces it at the
+/// single-Credential-Query level: `valid = true` means the presentation matched **at least one**
+/// Credential Query of its format (format + `meta` + `claims`/`claim_sets`/`values`). It does NOT
+/// assert the request's **set-level completeness** — `credential_sets` (required option-sets) and
+/// `multiple` cardinality — which is the job of the native [`crate::openid4vp::verify_vp_token`] over a
+/// multi-presentation `vp_token`. An integrator answering a `credential_sets` request across several
+/// presentations MUST fold set-level completeness itself; a per-presentation `valid = true` does not
+/// mean "the whole DCQL request is satisfied".
 #[must_use]
 pub fn verify<A: TrustAnchorSource + ?Sized>(
     presentation: &Presentation<'_>,
@@ -196,6 +210,17 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
     // per-document claimed `(cert, issuance_time)` the qualified gate folds) the SAME decode already
     // computed — so the gate reads those cached values rather than re-decoding the `DeviceResponse`.
     // SD-JWT VC has no mdoc meta (`None`).
+    //
+    // The request-less SD-JWT VC bar takes a SINGLE status outcome (one credential): `status_head` is
+    // `statuses[0]`, failing closed to `Unavailable` on an empty slice. Every OTHER arm threads the FULL
+    // positional slice `ctx.statuses` (SD-JWT VC reads index 0 inside the binding path; mdoc checks
+    // `documents[i]` against `statuses[i]`), so a multi-document response is verified per document —
+    // one outcome is never silently reused across documents (SC-002).
+    let status_head = ctx
+        .statuses
+        .first()
+        .copied()
+        .unwrap_or(StatusOutcome::Unavailable);
     let (mut result, mdoc_meta): (VerificationResult, Option<MdocVerifyMeta>) =
         match (presentation, request) {
             // --- With an OpenID4VP request: run the binding verifier (bar + nonce/audience). ------
@@ -207,7 +232,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     anchors,
                     ctx.now_unix,
                     ctx.role,
-                    ctx.status,
+                    ctx.statuses,
                 ),
                 None,
             ),
@@ -236,7 +261,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     anchors,
                     ctx.now_unix,
                     ctx.role,
-                    ctx.status,
+                    ctx.statuses,
                 )
             }
 
@@ -246,12 +271,13 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     presentation: p,
                     anchors,
                     role: ctx.role,
-                    // No request ⇒ no `aud`/`nonce` challenge (so no replay/audience protection). A
-                    // present KB-JWT is STILL signature- and `sd_hash`-verified by the bar; only the
-                    // request-binding (`aud`/`nonce`) checks are skipped. See `kb_challenge_without_request`.
-                    key_binding: kb_challenge_without_request(p),
+                    // No request ⇒ no `aud`/`nonce` challenge, so no replay/audience protection (and the
+                    // KB-JWT `iat` freshness window is not enforced). A present KB-JWT is STILL signature-
+                    // and `sd_hash`-verified by the bar (see `sdjwtvc::check_holder_binding`); only the
+                    // request-binding checks are skipped.
+                    key_binding: None,
                     now_unix: ctx.now_unix,
-                    status: ctx.status,
+                    status: status_head,
                 };
                 (sdjwtvc::verify_sd_jwt_vc(&input), None)
             }
@@ -265,7 +291,9 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     now_unix: ctx.now_unix,
                     session_transcript: ctx.session_transcript,
                     role: ctx.role,
-                    status: ctx.status,
+                    // The request-less mdoc path carries the FULL positional slice, so a multi-document
+                    // response is checked per document (documents[i] against statuses[i]).
+                    statuses: ctx.statuses,
                 };
                 let (result, meta) = mdoc::verify_with_meta(device_response, anchors, &params);
                 (result, Some(meta))
@@ -429,19 +457,6 @@ where
         .into_iter()
         .max_by_key(|status| severity(status))
         .unwrap_or(QualifiedStatus::Indeterminate)
-}
-
-/// For a request-less SD-JWT VC, supply **no** holder-binding challenge (always `None`). This gates
-/// **only** the `aud`/`nonce` request-binding checks — there is no request to bind to, so a request-less
-/// verify provides **no replay/audience protection**. It does NOT relax the cryptographic holder check:
-/// when the presentation carries a KB-JWT, the always-on bar
-/// ([`sdjwtvc::check_holder_binding`](crate::sdjwtvc)) STILL verifies its ES256 signature (under the
-/// issuer-bound `cnf` key) AND its `sd_hash` binding to the presented issuer-JWS-plus-disclosures — so a
-/// present-but-forged/tampered KB-JWT is rejected ([`ReasonCode::HolderBinding`]) even with no request.
-/// A presentation that simply omits the KB-JWT is an issuer-only credential and is accepted. Kept as a
-/// named seam so the request-less intent is explicit at the call site.
-const fn kb_challenge_without_request(_presentation: &str) -> Option<KeyBindingChallenge<'static>> {
-    None
 }
 
 #[cfg(test)]

@@ -59,7 +59,7 @@ fn valid_sd_jwt_request() -> VerifyRequest {
         context: WireContext {
             now_unix: IN_WINDOW_NOW,
             role: IssuerRole::Pid,
-            status: StatusOutcome::NoStatus,
+            statuses: vec![StatusOutcome::NoStatus],
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
@@ -176,7 +176,7 @@ fn well_formed_mdoc_request_verifies_valid() {
         context: WireContext {
             now_unix: IN_WINDOW_NOW,
             role: IssuerRole::Pid,
-            status: StatusOutcome::NoStatus,
+            statuses: vec![StatusOutcome::NoStatus],
             // The mdoc `DeviceSignature` is signed over the builder's default transcript; a request-less
             // verify must be handed that same transcript (§9.1.5 — the verifier no longer fabricates
             // one) for the holder binding to verify.

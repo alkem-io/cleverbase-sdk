@@ -119,7 +119,7 @@ fn sd_jwt_bound_to_the_issued_request_is_valid() {
         &anchors,
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -143,7 +143,7 @@ fn sd_jwt_replayed_with_a_stale_nonce_is_replay() {
         &anchors,
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::Replay]);
@@ -162,7 +162,7 @@ fn sd_jwt_built_for_a_different_audience_is_wrong_audience() {
         &anchors,
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::WrongAudience]);
@@ -182,7 +182,7 @@ fn sd_jwt_without_a_kb_jwt_is_missing_request_binding() {
         &anchors,
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::MissingRequestBinding]);
@@ -215,7 +215,7 @@ fn mdoc_bound_to_the_issued_request_is_valid() {
         &anchors,
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -246,7 +246,7 @@ fn mdoc_replayed_with_a_stale_nonce_is_replay() {
         &anchors,
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::Replay]);
@@ -265,7 +265,7 @@ fn mdoc_built_for_a_different_audience_is_wrong_audience() {
         &anchors,
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::WrongAudience]);
@@ -293,7 +293,7 @@ fn mdoc_binding_failure_other_than_holder_binding_passes_through() {
         &anchors,
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::UntrustedIssuer]);
@@ -319,7 +319,7 @@ fn verify_response_rejects_a_format_the_policy_excludes() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::UnsupportedFormat]);
@@ -338,7 +338,7 @@ fn verify_response_rejects_a_format_the_policy_excludes() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::UnsupportedFormat]);
@@ -357,7 +357,7 @@ fn verify_response_rejects_a_format_the_policy_excludes() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         ok.valid,
@@ -392,7 +392,7 @@ fn mdoc_bound_presentation_with_a_corrupt_device_signature_is_holder_binding_not
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(
@@ -435,7 +435,9 @@ fn multi_document_wrong_key_device_signature_is_holder_binding_not_replay() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        // Two documents, neither declaring a status → the wrong-key binding fault on documents[1] is the
+        // failing check (a single-element slice would fail documents[1] closed on status first).
+        &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(
@@ -606,7 +608,7 @@ fn sd_jwt_satisfying_the_dcql_query_is_valid() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -629,7 +631,7 @@ fn sd_jwt_of_the_wrong_vct_is_query_not_satisfied() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         !result.valid,
@@ -657,7 +659,7 @@ fn sd_jwt_missing_a_requested_claim_is_query_not_satisfied() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
@@ -678,7 +680,7 @@ fn sd_jwt_claim_value_match_and_mismatch() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -699,7 +701,7 @@ fn sd_jwt_claim_value_match_and_mismatch() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
@@ -718,7 +720,7 @@ fn verify_clear_claim_with_dcql(dcql_json: &str) -> crate::types::VerificationRe
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     )
 }
 
@@ -809,7 +811,7 @@ fn mdoc_matching_doctype_is_valid_and_wrong_doctype_is_query_not_satisfied() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -828,7 +830,7 @@ fn mdoc_matching_doctype_is_valid_and_wrong_doctype_is_query_not_satisfied() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::QueryNotSatisfied]);
@@ -851,7 +853,7 @@ fn pid_typed_sd_jwt_under_the_pid_role_is_valid() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         result.valid,
@@ -876,7 +878,7 @@ fn pid_typed_sd_jwt_under_a_non_pid_role_is_role_mismatch() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Qeaa,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(
         !result.valid,
@@ -904,7 +906,7 @@ fn pid_typed_mdoc_under_a_non_pid_role_is_role_mismatch() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Qeaa,
-        StatusOutcome::NoStatus,
+        &[StatusOutcome::NoStatus],
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::RoleMismatch]);

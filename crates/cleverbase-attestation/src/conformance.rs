@@ -95,7 +95,7 @@ fn iso_18013_5_annex_d_issuer_auth_verifies_under_the_sdk_verifier() {
         now_unix: ANNEX_D_NOW,
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
 
     let disclosed = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params)
@@ -151,7 +151,7 @@ fn iso_18013_5_annex_d_after_validity_window_is_expired() {
         now_unix: 1_672_531_200, // 2023-01-01T00:00:00Z — after validUntil (2021-10-01).
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
     let result = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params);
     assert_eq!(
@@ -171,7 +171,7 @@ fn iso_18013_5_annex_d_untrusted_ds_is_untrusted_issuer() {
         now_unix: ANNEX_D_NOW,
         session_transcript: None,
         role: IssuerRole::Pid,
-        status: StatusOutcome::NoStatus,
+        statuses: &[StatusOutcome::NoStatus],
     };
     let result = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params);
     assert_eq!(

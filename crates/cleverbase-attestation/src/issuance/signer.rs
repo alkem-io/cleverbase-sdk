@@ -236,8 +236,13 @@ pub enum SignerError {
 /// The raw `r‖s` length of an ES256 (P-256) signature.
 const ES256_SIG_LEN: usize = 64;
 
-/// Validate that a host-returned signature is the expected length for `algorithm`.
-fn check_sig_len(algorithm: SignatureAlgorithm, signature: &[u8]) -> Result<(), SignerError> {
+/// Validate that a host-returned signature is the expected length for `algorithm`. The **one**
+/// signature-length gate the JOSE (`PopJwtBuild`/`KbJwtBuild`) and mdoc
+/// ([`super::device::DeviceSignatureBuild`]) assemble paths share (DRY — Principle III).
+pub(crate) fn check_sig_len(
+    algorithm: SignatureAlgorithm,
+    signature: &[u8],
+) -> Result<(), SignerError> {
     match algorithm {
         SignatureAlgorithm::Es256 => {
             if signature.len() == ES256_SIG_LEN {

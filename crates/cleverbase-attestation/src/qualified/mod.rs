@@ -102,7 +102,6 @@
 #[cfg(test)]
 mod tests;
 
-use base64ct::{Base64, Encoding as _};
 use der::{Decode as _, Encode as _};
 use serde::Deserialize;
 use x509_cert::ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier};
@@ -229,19 +228,20 @@ impl ServiceEntry {
                 return true;
             }
         }
-        // (3) Issuing-CA: the Sdi lists the CA that issued the leaf. Match the leaf's `issuer` DN to
-        // the Sdi cert's `subject` DN; when both AKI (leaf) and SKI (Sdi) are present, also require
-        // they match (so a mere DN collision is insufficient).
+        // (3) Issuing-CA: the Sdi lists the CA that issued the leaf. Match the leaf's `issuer` DN to the
+        // Sdi cert's `subject` DN AND require the leaf's AKI (its authority key id, pointing at the
+        // issuing CA's key) to equal the Sdi cert's SKI. Both key-ids MUST be present and equal —
+        // fail-closed when either is absent. A bare issuer-DN collision is NOT sufficient: the gate runs
+        // only on a VALID, chain-verified credential, but chaining to *some* configured anchor does not
+        // prove the leaf was issued by *this* Sdi's CA (two distinct CAs can share a subject DN — a
+        // re-issued/cross-scheme national CA). Without the AKI==SKI tie a DN collision would mislabel a
+        // non-qualified issuer's credential `Qualified` (SC-007 "no false qualified"; conformance-audit).
         if let Some(sdi_subject) = &self.sdi_subject_der {
             if &leaf.issuer_der == sdi_subject {
-                let aki_ski_consistent = match (&leaf.aki, &self.sdi_ski) {
-                    (Some(aki), Some(ski)) => aki == ski,
-                    // One side absent → fall back to the issuer/subject DN match (the gate runs only
-                    // on a VALID, chain-verified credential, so the leaf genuinely chains to a CA).
-                    _ => true,
-                };
-                if aki_ski_consistent {
-                    return true;
+                if let (Some(aki), Some(ski)) = (&leaf.aki, &self.sdi_ski) {
+                    if aki == ski {
+                        return true;
+                    }
                 }
             }
         }
@@ -315,9 +315,11 @@ fn decode_b64_cert(body: &str) -> Result<Vec<u8>, QualifiedTrustListError> {
         .map_err(|e| QualifiedTrustListError::Base64(e.to_string()))
 }
 
-/// Decode a base64 X509SKI (SubjectKeyIdentifier octets) body to bytes.
+/// Decode a base64 X509SKI (SubjectKeyIdentifier octets) body to bytes, via the crate's single strict
+/// trim-only base64 decode (DRY — Principle III).
 fn decode_b64_ski(body: &str) -> Result<Vec<u8>, QualifiedTrustListError> {
-    Base64::decode_vec(body.trim()).map_err(|e| QualifiedTrustListError::Base64(e.to_string()))
+    crate::crypto::decode_base64_strict(body)
+        .map_err(|e| QualifiedTrustListError::Base64(e.to_string()))
 }
 
 /// Extract the `subject` DN (DER) + `SubjectKeyIdentifier` octets from a DER certificate, or
