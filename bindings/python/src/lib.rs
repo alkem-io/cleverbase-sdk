@@ -82,6 +82,37 @@ fn resume_http(handle: Vec<u8>, status: u16, body: Vec<u8>, now_unix: i64, entro
     Ok(encode_handle_step(&handle, &step))
 }
 
+/// Run the EUDI attestation verifier over a CBOR `VerifyRequest` envelope (attestation schema
+/// version 5) and return the CBOR `VerifyResponse`.
+///
+/// Unlike the signing surface, the attestation surface is CBOR-in / CBOR-out: the caller builds the
+/// `VerifyRequest` and decodes the `VerifyResponse` (see the wire schema). The VALID/INVALID verdict
+/// (and any decode/usage error) rides *inside* the response envelope — a malformed request yields a
+/// well-formed response carrying an `err` outcome rather than raising. The holder key never crosses
+/// this boundary.
+#[pyfunction]
+// CBOR-through: every outcome (verdict or decode/usage error) rides inside the response envelope, so
+// this never raises — but the fallible `PyResult` signature is kept uniform with the rest of the
+// module (and reserves the Python error channel) rather than diverging to a bare return.
+#[allow(clippy::unnecessary_wraps)]
+fn attestation_verify(request: Vec<u8>) -> PyResult<Vec<u8>> {
+    Ok(cleverbase_attestation::wire::process_verify_bytes(&request))
+}
+
+/// Drive the EUDI attestation issuance / presentation sans-IO state machine over a CBOR
+/// `IssuanceRequest` envelope (issuance schema version 1) and return the CBOR `IssuanceResponse`.
+///
+/// Like [`attestation_verify`] it is CBOR-in / CBOR-out (see the wire schema): the next step / outcome
+/// (and any decode/usage error) rides *inside* the response envelope. The holder's private key never
+/// crosses this boundary.
+#[pyfunction]
+// CBOR-through: see [`attestation_verify`] — the outcome rides inside the response envelope, so this
+// never raises; the `PyResult` signature is kept uniform with the rest of the module.
+#[allow(clippy::unnecessary_wraps)]
+fn attestation_issuance(request: Vec<u8>) -> PyResult<Vec<u8>> {
+    Ok(cleverbase_attestation::issuance::wire::process_issuance_bytes(&request))
+}
+
 #[pymodule]
 fn cleverbase(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SCHEMA_VERSION", cleverbase_core::SCHEMA_VERSION)?;
@@ -89,5 +120,7 @@ fn cleverbase(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resume_redirect, m)?)?;
     m.add_function(wrap_pyfunction!(resume_redirect_error, m)?)?;
     m.add_function(wrap_pyfunction!(resume_http, m)?)?;
+    m.add_function(wrap_pyfunction!(attestation_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(attestation_issuance, m)?)?;
     Ok(())
 }

@@ -11,3 +11,30 @@ export declare function resumeRedirect(handle: Buffer, code: string, state: stri
 export declare function resumeRedirectError(handle: Buffer, error: string, state: string, nowUnix: number, entropy: Buffer): Buffer
 /** Resume after performing an HTTP effect (status + body). Returns a CBOR `{handle, step}` Buffer. */
 export declare function resumeHttp(handle: Buffer, status: number, body: Buffer, nowUnix: number, entropy: Buffer): Buffer
+/**
+ * Verify an EUDI attestation presentation.
+ *
+ * CBOR-through: takes a CBOR-encoded `VerifyRequest` (attestation wire schema v5 — the presented
+ * SD-JWT VC / mdoc, verifier policy, host-resolved trust anchors, and verification context) and
+ * returns a CBOR-encoded `VerifyResponse` (schema v5) carrying the `outcome`. The always-on verdict
+ * (`VerificationResult` — `valid` plus machine-readable reason codes) and any decode/usage error
+ * ride *inside* the response body, not through this call's error channel; a malformed request
+ * fails closed to an `err` outcome rather than throwing. The holder's private key never crosses
+ * this boundary — the verifier only inspects the presentation the holder already produced. All
+ * protocol/crypto logic lives in `cleverbase-attestation` (Constitution Principle III/VIII); this
+ * wrapper is bytes-in / bytes-out only.
+ */
+export declare function attestationVerify(request: Buffer): Buffer
+/**
+ * Drive an EUDI attestation issuance / holder-presentation step.
+ *
+ * CBOR-through: takes a CBOR-encoded `IssuanceRequest` (issuance wire schema v1 — one `obtain` /
+ * `prepare-present` / `finish-present` operation plus its opaque carried session/prepared handle)
+ * and returns a CBOR-encoded `IssuanceResponse` (schema v1) carrying the `outcome` (the next step,
+ * the produced `vp_token`, or an `err`). As with `attestation_verify`, errors ride inside the
+ * response — a malformed request fails closed to an `err` outcome — and the holder key never
+ * crosses this boundary (the host signs the returned `SigningInput` out-of-band and hands the
+ * signature back on the next step). All protocol/crypto logic lives in `cleverbase-attestation`
+ * (Constitution Principle III/VIII); this wrapper is bytes-in / bytes-out only.
+ */
+export declare function attestationIssuance(request: Buffer): Buffer

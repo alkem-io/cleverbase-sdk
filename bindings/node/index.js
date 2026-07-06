@@ -310,9 +310,11 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { beginSigning, resumeRedirect, resumeRedirectError, resumeHttp } = nativeBinding
+const { beginSigning, resumeRedirect, resumeRedirectError, resumeHttp, attestationVerify, attestationIssuance } = nativeBinding
 
 module.exports.beginSigning = beginSigning
 module.exports.resumeRedirect = resumeRedirect
 module.exports.resumeRedirectError = resumeRedirectError
 module.exports.resumeHttp = resumeHttp
+module.exports.attestationVerify = attestationVerify
+module.exports.attestationIssuance = attestationIssuance

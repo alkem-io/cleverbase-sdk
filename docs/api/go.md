@@ -12,6 +12,8 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 
 ## Index
 
+- [func AttestationIssuance\(request \[\]byte\) \(\[\]byte, error\)](<#AttestationIssuance>)
+- [func AttestationVerify\(request \[\]byte\) \(\[\]byte, error\)](<#AttestationVerify>)
 - [type Appearance](<#Appearance>)
 - [type AppearanceShow](<#AppearanceShow>)
 - [type Config](<#Config>)
@@ -26,6 +28,24 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 - [type SignatureMeta](<#SignatureMeta>)
 - [type Step](<#Step>)
 
+
+<a name="AttestationIssuance"></a>
+## func AttestationIssuance
+
+```go
+func AttestationIssuance(request []byte) ([]byte, error)
+```
+
+AttestationIssuance drives the EUDI attestation issuance / presentation sans\-IO state machine over a CBOR IssuanceRequest envelope \(issuance schema version 1\) and returns the CBOR IssuanceResponse. Like AttestationVerify it is CBOR\-in / CBOR\-out \(see the wire schema\). The holder's private key never crosses this boundary: a \`sign\` step surfaces a signing input the host signs out\-of\-process and feeds back via a follow\-up op \(finish\_present / resume\_obtain\).
+
+<a name="AttestationVerify"></a>
+## func AttestationVerify
+
+```go
+func AttestationVerify(request []byte) ([]byte, error)
+```
+
+AttestationVerify runs the EUDI attestation verifier over a CBOR VerifyRequest envelope \(attestation schema version 5\) and returns the CBOR VerifyResponse. Unlike the signing surface, the attestation surface is CBOR\-in / CBOR\-out: the caller builds the VerifyRequest and decodes the VerifyResponse per the documented wire schema \(see specs/004\-attestation\-and\-verification/standards\-conformance.md\). The VALID/INVALID verdict \(and any decode error\) rides inside the VerifyResponse \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere INVALID verdict.
 
 <a name="Appearance"></a>
 ## type Appearance

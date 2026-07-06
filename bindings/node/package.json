@@ -13,7 +13,7 @@
   },
   "scripts": {
     "build": "napi build --platform",
-    "test": "node --test test/signing.test.cjs",
+    "test": "node --test test/*.test.cjs",
     "docs": "typedoc"
   },
   "devDependencies": {
