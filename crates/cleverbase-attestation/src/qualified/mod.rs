@@ -28,18 +28,22 @@
 //! of EAA and if this URN is not present"* → set the result to `Indeterminate`
 //! (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) and **stop**. So an attestation whose declared type
 //! does not carry [`EAA_EU_QUALIFIED_TYPE`] is `Indeterminate`, **never** `Qualified`, even if its
-//! issuer is a granted `EAA/Q` QTSP. The type indication is threaded from
-//! [`verify`](crate::verify()) as `type_indication`:
+//! issuer is a granted `EAA/Q` QTSP. Per **ETSI TS 119 472-1** (the format profile, v1.2.1 — verified
+//! online) the URN is carried in the issuer-signed **`category`** element, distinct from the
+//! credential-TYPE identifier (`vct`/`docType`); the type indication is threaded from
+//! [`verify`](crate::verify()) as `type_indication`, read from `category` for **both** formats:
 //!
-//! - **SD-JWT VC** — the issuer-signed `vct` (the credential's type claim). When it is not
-//!   [`EAA_EU_QUALIFIED_TYPE`] the determination is `Indeterminate`.
-//! - **ISO mdoc** — `None`: cl. 4.12's URN is an EAA-content (SD-JWT VC / JWT-VC `vct`/`type`)
-//!   construct, and TS 119 615 cl. 4.12 defines **no** mapping of this URN into ISO 18013-5 mdoc
-//!   content (an mdoc declares its type via `docType`, a reverse-domain ISO identifier). The mdoc
-//!   path therefore passes `None` and the precondition is **not enforced** for it; its qualified
-//!   determination uses the cert→granted-`EAA/Q`-service status (TS 119 612 §5.5.4). A non-`None`
-//!   indication that is not the URN always fails closed to `Indeterminate` (conservative — never a
-//!   false "qualified").
+//! - **SD-JWT VC** — the issuer-signed `category` claim (`crate::sdjwtvc::issuer_category`), NOT the
+//!   `vct` (which is the credential type, e.g. `urn:eudi:pid:1`, and never the qualified URN).
+//! - **ISO mdoc** — the `category` data element in namespace `org.etsi.01947201.010101` (TS 119 472-1
+//!   cl. 6.2.2), surfaced per document by the always-on bar in `MdocVerifyMeta.categories`.
+//!
+//! The precondition is **enforced for both formats**: an ABSENT `category` (an ordinary EAA, which TS
+//! 119 472-1 EAA-5.2.2.1-01 says MUST NOT carry `category`; or an mdoc document that did not disclose
+//! the element → `None`) OR a present-but-non-URN value fails closed to `Indeterminate` (never a false
+//! "qualified"). (This corrects an earlier model that read the SD-JWT `vct` and exempted mdoc entirely
+//! — reading `vct` made the SD-JWT gate mechanically dead, since a real QEAA's `vct` is its credential
+//! type, not the qualified URN.)
 //!
 //! **Version note (the doc-nit reconciliation):** cl. 4.12 was introduced in TS 119 615 **v1.3.1**
 //! (2026-01) and is retained in the pinned **v1.4.1** (2026-05). The QEAA self-declaration URN was
@@ -589,14 +593,38 @@ pub fn qualified_status(
     if trust_list.authenticate(scheme_anchors, now_unix).is_err() {
         return QualifiedStatus::Indeterminate;
     }
+    // The list authenticated; read this issuer's status against it.
+    read_status_authenticated(
+        issuer_cert_der,
+        relevant_time_unix,
+        trust_list,
+        type_indication,
+    )
+}
 
-    // PRO-4.12.4-03: the EAA must self-declare the qualified-EAA type via the URN. A present type
-    // indication that is not EAA_EU_QUALIFIED_TYPE stops the process → Indeterminate (never Qualified).
-    // `None` (ISO mdoc — no cl. 4.12 URN construct) does not enforce the precondition (see module docs).
-    if let Some(declared) = type_indication {
-        if declared != EAA_EU_QUALIFIED_TYPE {
-            return QualifiedStatus::Indeterminate;
-        }
+/// Read one issuer's qualified status against an **already-authenticated** national TL — the type-
+/// indication precondition + §5.5.3 Sdi match + effective-status read, WITHOUT re-authenticating the
+/// list. Split out of [`qualified_status`] so a multi-document mdoc fold authenticates the (invariant)
+/// TL **once** at `now_unix` and then reads each document's issuer status here, rather than re-running
+/// the full signer chain-validation + freshness check per document (an attacker-multipliable soft-DoS
+/// on the `documents[]` count when the gate is enabled). The caller MUST have authenticated
+/// `trust_list` at the verification instant before calling this.
+#[must_use]
+pub(crate) fn read_status_authenticated(
+    issuer_cert_der: &[u8],
+    relevant_time_unix: i64,
+    trust_list: &QualifiedTrustList,
+    type_indication: Option<&str>,
+) -> QualifiedStatus {
+    // PRO-4.12.4-03: the EAA MUST self-declare the qualified-EAA type via the URN
+    // `urn:etsi:esi:eaa:eu:qualified`. Per ETSI TS 119 472-1 this is carried in the issuer-signed
+    // `category` claim (SD-JWT VC) / `category` data element (mdoc, namespace org.etsi.01947201.010101)
+    // — for BOTH formats. A type indication that is absent (`None` — no `category`, i.e. an ordinary
+    // EAA that per TS 119 472-1 EAA-5.2.2.1-01 MUST NOT carry `category`) OR present-but-not-the-URN
+    // stops the process → Indeterminate (never a false "qualified" — SC-007). Requiring `Some(URN)`
+    // fails closed on a missing/undisclosed category.
+    if type_indication != Some(EAA_EU_QUALIFIED_TYPE) {
+        return QualifiedStatus::Indeterminate;
     }
 
     let services = trust_list.services_for(issuer_cert_der);

@@ -174,6 +174,14 @@ pub enum ClaimValue {
     Integer(i64),
     /// A boolean value.
     Boolean(bool),
+    /// A numeric `values` entry that is NOT representable as the comparison type (`i64`) — a JSON
+    /// float, or an integer outside `i64` range. Such a value can never equal a disclosed
+    /// string/integer/boolean, so it is retained as an explicit NEVER-matching sentinel rather than
+    /// dropped: dropping it would collapse the whole Credential Query (via the lenient parse), leaving
+    /// `evaluate_single` `Inactive` and the "did I get what I requested" gate silently disabled — a
+    /// fail-OPEN. Keeping it as unmatchable keeps the query enforced (the claim simply never resolves →
+    /// `NotSatisfied`, fail-closed). Never produced from a spec-valid, representable value.
+    Unrepresentable,
 }
 
 /// One OpenID4VP 1.0 Credential Set Query (§6.2).
@@ -196,6 +204,11 @@ pub enum DcqlError {
     /// The query is valid JSON but not a JSON object (§6: a DCQL query is a JSON object).
     #[error("DCQL query is not a JSON object")]
     NotAnObject,
+    /// Two Credential Queries share the same `id` (§6.1: credential `id`s MUST be unique). A duplicate
+    /// is rejected rather than silently last-wins — otherwise the set-level `by_id` lookup
+    /// ([`crate::openid4vp::verify_vp_token`]) would evaluate a presentation against the WRONG query.
+    #[error("DCQL query has duplicate credential ids")]
+    DuplicateCredentialId,
 }
 
 impl DcqlQuery {
@@ -212,11 +225,17 @@ impl DcqlQuery {
     pub fn parse(json: &str) -> Result<Self, DcqlError> {
         let value: Value = serde_json::from_str(json).map_err(|_| DcqlError::Json)?;
         let object = value.as_object().ok_or(DcqlError::NotAnObject)?;
-        let credentials = object
+        let credentials: Vec<CredentialQuery> = object
             .get("credentials")
             .and_then(Value::as_array)
             .map(|entries| entries.iter().filter_map(CredentialQuery::parse).collect())
             .unwrap_or_default();
+        // §6.1: credential `id`s MUST be unique. Reject a duplicate rather than silently last-wins in
+        // the set-level `by_id` map (which would apply one query's constraints to another credential).
+        let mut seen_ids = BTreeSet::new();
+        if credentials.iter().any(|c| !seen_ids.insert(c.id.as_str())) {
+            return Err(DcqlError::DuplicateCredentialId);
+        }
         let credential_sets = object
             .get("credential_sets")
             .and_then(Value::as_array)
@@ -387,12 +406,19 @@ fn parse_values(value: &Value) -> Option<Vec<ClaimValue>> {
     array.iter().map(parse_claim_value).collect()
 }
 
-/// Parse one expected value (§6.3): a string, integer, or boolean. `None` for anything else.
+/// Parse one expected value (§6.3): a string, integer, or boolean. `None` for a non-scalar (array/
+/// object/null). A numeric value that is not representable as `i64` (a float, or an out-of-`i64`-range
+/// integer) is retained as [`ClaimValue::Unrepresentable`] — NOT `None` — so it cannot collapse the
+/// whole Credential Query and silently disable the claims gate (it just never matches; see the variant).
 fn parse_claim_value(value: &Value) -> Option<ClaimValue> {
     match value {
         Value::String(text) => Some(ClaimValue::Text(text.clone())),
         Value::Bool(boolean) => Some(ClaimValue::Boolean(*boolean)),
-        Value::Number(number) => number.as_i64().map(ClaimValue::Integer),
+        Value::Number(number) => Some(
+            number
+                .as_i64()
+                .map_or(ClaimValue::Unrepresentable, ClaimValue::Integer),
+        ),
         _ => None,
     }
 }
@@ -499,8 +525,19 @@ pub(crate) fn evaluate_single(
     credential_type: &CredentialType,
     presented: &BTreeMap<String, AttributeValue>,
 ) -> DcqlGate {
-    let Ok(query) = DcqlQuery::parse(query_json) else {
+    // Empty/absent DCQL: the verifier imposed no query → Inactive (the always-on bar's verdict stands).
+    if query_json.trim().is_empty() {
         return DcqlGate::Inactive;
+    }
+    // A NON-EMPTY query that fails to parse (malformed JSON/object, or a duplicate credential id) is a
+    // verifier-authored constraint we cannot understand. It MUST NOT silently drop to Inactive
+    // (fail-OPEN — the "did I get what I requested" gate would be disabled); fail closed to
+    // NotSatisfied. (Contrast: a well-formed query with only unsupported-FORMAT entries parses OK to
+    // empty `credentials` → Inactive below — the documented lenient case, which imposes no enforceable
+    // constraint on THIS format's presentation; a supported-format entry with a bad value is kept
+    // enforceable by the parsers, e.g. `ClaimValue::Unrepresentable`, so it fails closed here.)
+    let Ok(query) = DcqlQuery::parse(query_json) else {
+        return DcqlGate::NotSatisfied;
     };
     if query.credentials.is_empty() {
         return DcqlGate::Inactive;

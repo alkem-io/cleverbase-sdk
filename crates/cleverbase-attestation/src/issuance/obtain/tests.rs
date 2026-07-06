@@ -247,9 +247,12 @@ fn tx_code_never_leaks_via_debug_on_the_offer() {
 // --- Secret handling: the bearer token never leaks via Debug (FR-010 / Constitution IV) ----------
 
 #[test]
-fn obtain_session_debug_does_not_leak_the_access_token_or_c_nonce() {
-    // Drive begin → token → nonce, so the session holds the OAuth access token + the Nonce-Endpoint
-    // c_nonce (both redacting `Secret`s).
+fn obtain_session_debug_does_not_leak_the_access_token() {
+    // Drive begin → token → nonce, so the session holds the OAuth access token (a redacting `Secret`).
+    // The Nonce-Endpoint `c_nonce` is now carried inside the built `PopJwtBuild` — the exact public
+    // `SigningInput` the SDK also hands the host via the `Sign` effect (which by design exposes
+    // `aud`/`nonce` for policy inspection) — so it is deliberately NOT a session secret; only the
+    // bearer access token (and the pre-authorized code) are redacted.
     let access_token = "super-secret-bearer-token-xyz";
     let c_nonce = "issuer-one-time-c-nonce-abc";
     let (session, _step) = begin_obtain(an_offer(), reference_backend(), holder_ctx(), NOW);
@@ -258,16 +261,12 @@ fn obtain_session_debug_does_not_leak_the_access_token_or_c_nonce() {
         resume_obtain(session, http_ok(serde_json::to_vec(&token).unwrap())).unwrap();
     let (session, _step) = resume_obtain(session, http_ok(nonce_response(c_nonce))).unwrap();
 
-    // Formatting the session (a log line / panic message) must NOT print the bearer token or the
-    // one-time nonce — they are held as redacting `Secret`s.
+    // Formatting the session (a log line / panic message) must NOT print the bearer token — it is held
+    // as a redacting `Secret`.
     let dbg = format!("{session:?}");
     assert!(
         !dbg.contains(access_token),
         "the access token must never appear in Debug output: {dbg}"
-    );
-    assert!(
-        !dbg.contains(c_nonce),
-        "the one-time c_nonce must never appear in Debug output: {dbg}"
     );
     assert!(
         dbg.contains("Secret(***)"),

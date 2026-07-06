@@ -26,8 +26,9 @@ fn a_build() -> crate::issuance::device::DeviceSignatureBuild {
 fn build_is_deterministic_and_exposes_aud_nonce() {
     let b1 = a_build();
     let b2 = a_build();
+    // The signing input is deterministic — and since the Sig_structure `to_be_signed` covers the
+    // `DeviceAuthentication` payload, equal `to_be_signed` bytes imply an equal signed payload.
     assert_eq!(b1.input.to_be_signed(), b2.input.to_be_signed());
-    assert_eq!(b1.device_auth_payload, b2.device_auth_payload);
     assert_eq!(b1.input.ceremony(), Ceremony::DeviceSignature);
     assert_eq!(b1.input.algorithm(), SignatureAlgorithm::Es256);
     assert_eq!(b1.input.audience(), AUDIENCE);

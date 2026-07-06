@@ -330,6 +330,11 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
             result = VerificationResult::invalid(ReasonCode::QueryNotSatisfied);
         }
     }
+    // This path ran the OpenID4VP request binding (nonce/audience + KB-JWT freshness for SD-JWT VC, the
+    // handover transcript for mdoc), so the result IS request-bound — the observable signal that lets a
+    // caller confirm a request was actually applied (vs the request-less bare path, which leaves it
+    // `false`). Stamped on any outcome of this fn (VALID or a binding/query INVALID).
+    result.request_bound = true;
     (result, meta)
 }
 
@@ -564,9 +569,11 @@ pub struct VpTokenVerification {
 /// type (`meta`) when it names a EUDI PID type (conformance-audit T4.3 — the verifier's own query states
 /// the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
 /// validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
-/// [`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
-/// per credential query — it covers each token's `documents[0]`; a multi-document `DeviceResponse`'s
-/// `documents[1..]` then fail closed, mirroring the single-credential [`verify_response`]).
+/// [`ReasonCode::RoleMismatch`]). `now_unix` is the shared per-bar instant. `statuses` carries the
+/// host-resolved revocation outcomes keyed by credential id → per **token** (presentation) → per
+/// **document** (positional), so EACH credential and EACH document is checked against its OWN outcome —
+/// one outcome is never silently reused across credentials or documents (SC-002). A credential id /
+/// token / document with no supplied outcome fails closed to [`StatusOutcome::Unavailable`].
 ///
 /// This is the ONLY entry that enforces the **set-level** DCQL semantics (`credential_sets` required
 /// option-sets + `multiple` cardinality); the single-presentation [`verify_response`] / the C-ABI
@@ -581,7 +588,7 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    status: StatusOutcome,
+    statuses: &BTreeMap<String, Vec<Vec<StatusOutcome>>>,
 ) -> VpTokenVerification {
     // Parse the DCQL once. An unparseable query has no enforceable structure → nothing is satisfied
     // (the explicit multi-credential entry needs a real query; the single-presentation gate is the
@@ -607,9 +614,17 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
         let multiple_allowed = credential_query.is_some_and(|candidate| candidate.multiple);
         let cardinality_ok = multiple_allowed || tokens.len() <= 1;
 
+        // This credential's per-token status outcomes (each token is one Presentation, itself possibly a
+        // multi-document mdoc `DeviceResponse` ⇒ a positional per-document slice). A credential_id / token
+        // the host supplied no statuses for yields an empty slice ⇒ each document fails closed to
+        // `Unavailable` (never a single outcome silently reused across credentials/documents — SC-002).
+        let credential_statuses = statuses.get(credential_id);
         let mut presentations = Vec::with_capacity(tokens.len());
         let mut matched = 0usize;
-        for token in tokens {
+        for (token_index, token) in tokens.iter().enumerate() {
+            let token_statuses: &[StatusOutcome] = credential_statuses
+                .and_then(|per_token| per_token.get(token_index))
+                .map_or(&[], Vec::as_slice);
             let (result, meta) = verify_response_with_meta(
                 token,
                 request,
@@ -617,9 +632,7 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
                 anchors,
                 now_unix,
                 credential_role,
-                // The multi-credential fold carries ONE status per credential query; it covers each
-                // token's documents[0] (a multi-document DeviceResponse's documents[1..] fail closed).
-                std::slice::from_ref(&status),
+                token_statuses,
             );
             // The Presentation counts toward THIS Credential Query only if it both verified AND matches
             // this specific query (by id) — format + `meta` + claims/`claim_sets`/`values`.

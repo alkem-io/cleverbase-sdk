@@ -399,14 +399,20 @@ fn a_presentation_of_a_format_with_no_matching_query_is_not_satisfied() {
 }
 
 #[test]
-fn empty_or_unparseable_query_is_inactive() {
+fn a_query_with_no_enforceable_constraint_is_inactive() {
     let disclosed = sd_jwt_disclosed();
     let credential_type = CredentialType::Vct(Some("x".to_owned()));
+    // These impose NO enforceable in-core constraint on an SD-JWT VC presentation, so the always-on
+    // bar's verdict stands (Inactive, not a reject): empty/absent DCQL, an empty `credentials` array,
+    // and a query whose only entry is an UNSUPPORTED format / missing a required field (dropped by the
+    // lenient parse). None of these is a verifier constraint we failed to understand.
     for json in [
+        "",
+        "   ",
         "{}",
         r#"{"credentials":[]}"#,
-        "not json",
-        r#"{"credentials":[{"id":"x"}]}"#,
+        r#"{"credentials":[{"id":"x"}]}"#, // no `format` → dropped
+        r#"{"credentials":[{"id":"x","format":"jwt_vc_json","meta":{}}]}"#, // unsupported format → dropped
     ] {
         assert_eq!(
             evaluate_single(json, Format::SdJwtVc, &credential_type, &disclosed),
@@ -414,6 +420,50 @@ fn empty_or_unparseable_query_is_inactive() {
             "{json} imposes no enforceable constraint"
         );
     }
+}
+
+#[test]
+fn a_malformed_nonempty_query_fails_closed_not_inactive() {
+    // A NON-EMPTY query the verifier authored but that we cannot parse is a constraint we don't
+    // understand — it MUST fail closed (NotSatisfied → reject), NEVER silently drop to Inactive (which
+    // would disable the "did I get what I requested" gate — a fail-open). Covers malformed JSON, a
+    // non-object query, and a duplicate credential id (§6.1 ids MUST be unique).
+    let disclosed = sd_jwt_disclosed();
+    let credential_type = CredentialType::Vct(Some("x".to_owned()));
+    for json in [
+        "not json",
+        "[]", // valid JSON, not an object
+        r#"{"credentials":[{"id":"a","format":"dc+sd-jwt","meta":{}},{"id":"a","format":"mso_mdoc","meta":{}}]}"#,
+    ] {
+        assert_eq!(
+            evaluate_single(json, Format::SdJwtVc, &credential_type, &disclosed),
+            DcqlGate::NotSatisfied,
+            "{json} is a malformed constraint and must fail closed"
+        );
+    }
+    // The duplicate id is a hard parse error (not a lenient drop).
+    assert!(matches!(
+        DcqlQuery::parse(
+            r#"{"credentials":[{"id":"a","format":"dc+sd-jwt","meta":{}},{"id":"a","format":"mso_mdoc","meta":{}}]}"#
+        ),
+        Err(DcqlError::DuplicateCredentialId)
+    ));
+}
+
+#[test]
+fn credential_sets_all_optional_is_satisfied_with_nothing_matched() {
+    // INTENDED DCQL semantics (not a vacuous-truth bug): `required` DEFAULTS to true, so a set marked
+    // `required:false` is a DELIBERATE "optional". If a verifier marks EVERY set optional, nothing is
+    // mandatory → the request is satisfied even with no matching credential. This is distinct from the
+    // malformed empty-option / empty-credentials cases (which DO fail closed). Pinned so it is not
+    // re-flagged as a false-accept.
+    let json = r#"{"credentials":[{"id":"a","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}],
+        "credential_sets":[{"options":[["a"]],"required":false}]}"#;
+    let query = DcqlQuery::parse(json).expect("parses");
+    assert!(
+        credential_sets_satisfied(&query, &BTreeSet::new()),
+        "all-optional credential_sets ⇒ satisfied (nothing is required)"
+    );
 }
 
 #[test]
@@ -448,6 +498,39 @@ fn claim_sets_satisfied_when_one_option_fully_resolves() {
     assert_eq!(
         evaluate_single(json_none, Format::SdJwtVc, &credential_type, &disclosed),
         DcqlGate::NotSatisfied
+    );
+}
+
+#[test]
+fn an_unrepresentable_values_entry_keeps_the_query_enforceable_and_not_satisfied() {
+    // A DCQL `values` entry that is a JSON float or an integer outside i64 range must NOT drop the whole
+    // Credential Query (which would leave `evaluate_single` Inactive → the claims gate silently disabled
+    // → the wrong credential accepted). It is retained as a NEVER-matching value, so the claim does not
+    // resolve → NotSatisfied (fail closed). `sd_jwt_disclosed()` carries `age = 42`.
+    let disclosed = sd_jwt_disclosed();
+    let credential_type = CredentialType::Vct(Some("urn:eudi:pid:1".to_owned()));
+    // A >i64 expected value can never equal the disclosed i64 age → the age claim is not satisfied.
+    let json_big = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},
+        "claims":[{"id":"age","path":["age"],"values":[18446744073709551615]}]}]}"#;
+    assert_eq!(
+        evaluate_single(json_big, Format::SdJwtVc, &credential_type, &disclosed),
+        DcqlGate::NotSatisfied,
+        "an out-of-i64-range values entry must keep the gate enforcing (reject), not disable it"
+    );
+    // A spec-invalid float value likewise keeps the query enforceable and never matches.
+    let json_float = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},
+        "claims":[{"id":"age","path":["age"],"values":[3.5]}]}]}"#;
+    assert_eq!(
+        evaluate_single(json_float, Format::SdJwtVc, &credential_type, &disclosed),
+        DcqlGate::NotSatisfied
+    );
+    // Control: a mixed values array where a representable entry DOES match still satisfies (the
+    // unrepresentable sibling doesn't poison the OR).
+    let json_mixed = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},
+        "claims":[{"id":"age","path":["age"],"values":[18446744073709551615,42]}]}]}"#;
+    assert_eq!(
+        evaluate_single(json_mixed, Format::SdJwtVc, &credential_type, &disclosed),
+        DcqlGate::Satisfied
     );
 }
 

@@ -262,6 +262,14 @@ An expected claim value (§6.3 `values`: *"an array of strings, integers or bool
   - An integer value.
 - `Boolean(bool)`
   - A boolean value.
+- `Unrepresentable`
+  - A numeric `values` entry that is NOT representable as the comparison type (`i64`) — a JSON
+float, or an integer outside `i64` range. Such a value can never equal a disclosed
+string/integer/boolean, so it is retained as an explicit NEVER-matching sentinel rather than
+dropped: dropping it would collapse the whole Credential Query (via the lenient parse), leaving
+`evaluate_single` `Inactive` and the "did I get what I requested" gate silently disabled — a
+fail-OPEN. Keeping it as unmatchable keeps the query enforced (the claim simply never resolves →
+`NotSatisfied`, fail-closed). Never produced from a spec-valid, representable value.
 
 #### enum `CredentialMeta`
 
@@ -297,6 +305,10 @@ JSON value that is not an object) errors; malformed/unsupported sub-entries are 
   - The query text is not valid JSON.
 - `NotAnObject`
   - The query is valid JSON but not a JSON object (§6: a DCQL query is a JSON object).
+- `DuplicateCredentialId`
+  - Two Credential Queries share the same `id` (§6.1: credential `id`s MUST be unique). A duplicate
+is rejected rather than silently last-wins — otherwise the set-level `by_id` lookup
+([`crate::openid4vp::verify_vp_token`]) would evaluate a presentation against the WRONG query.
 
 #### enum `PathComponent`
 
@@ -374,9 +386,6 @@ reconstruct the detached COSE_Sign1 once the host has signed the `Sig_structure`
 
 - `input: SigningInput`
   - The signing input the host must sign (exposes the verifier `aud`/`nonce`).
-- `device_auth_payload: Vec<u8>`
-  - The `#6.24(bstr .cbor DeviceAuthentication)` detached payload (kept so the verifier-side and a
-caller assembling the `DeviceResponse` use the identical bytes).
 
 ###### Methods
 
@@ -993,7 +1002,9 @@ Splice the host-returned `r‖s` ES256 signature into the compact KB-JWT.
 
 # Errors
 
-[`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length.
+[`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
+[`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
+SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
 
 ##### struct `PopJwtBuild`
 
@@ -1019,7 +1030,9 @@ Splice the host-returned `r‖s` ES256 signature into the compact PoP-JWT.
 
 # Errors
 
-[`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length.
+[`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
+[`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
+SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
 
 ##### struct `SigningInput`
 
@@ -1467,6 +1480,13 @@ VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL ga
 `doctype_value`), reading the bar's already-decoded `docType` rather than re-decoding the
 response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
 it), so this is the authoritative type view for the "did I get what I requested" check.
+- `categories: Vec<Option<String>>`
+  - Per-document ETSI TS 119 472-1 **`category`** data element (the qualified-EAA type indication in
+`org.etsi.01947201.010101`), aligned 1:1 with [`Self::claimed_issuers`] — `Some(urn)` when
+the document disclosed the `category` element, else `None`. The opt-in [`crate::qualified`] gate
+reads this as the PRO-4.12.4-03 type indication for each mdoc document (`None` ⇒ the precondition
+is undecidable for that document ⇒ fail closed, never a false "qualified"). Collected during the
+VALID bar pass (EMPTY on any INVALID verdict).
 - `binding_machinery: Option<DeviceBindingMachinery>`
   - The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
 when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
@@ -1908,7 +1928,7 @@ ONLY via the [`crate::verify::verify()`] entry point, which carries the `qualifi
 #### fn `verify_vp_token`
 
 ```rust
-fn verify_vp_token<A: TrustAnchorSource + ?Sized>(request: &PresentationRequest, vp_token: &BTreeMap<String, Vec<VpToken<'_>>>, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, status: StatusOutcome) -> VpTokenVerification
+fn verify_vp_token<A: TrustAnchorSource + ?Sized>(request: &PresentationRequest, vp_token: &BTreeMap<String, Vec<VpToken<'_>>>, policy: &VerificationPolicy, anchors: &A, now_unix: i64, role: IssuerRole, statuses: &BTreeMap<String, Vec<Vec<StatusOutcome>>>) -> VpTokenVerification
 ```
 
 Evaluate a full OpenID4VP `vp_token` (the `{ credential_id: [presentations] }` shape — OpenID4VP 1.0
@@ -1926,9 +1946,11 @@ The per-credential trust-anchoring **role** is derived from the matching Credent
 type (`meta`) when it names a EUDI PID type (conformance-audit T4.3 — the verifier's own query states
 the type it expects), falling back to the supplied `role` otherwise; the per-format bar then
 validates the credential's ACTUAL claimed type against that role (rejecting a contradiction as
-[`ReasonCode::RoleMismatch`]). `now_unix`/`status` are the shared per-bar inputs (one resolved status
-per credential query — it covers each token's `documents[0]`; a multi-document `DeviceResponse`'s
-`documents[1..]` then fail closed, mirroring the single-credential [`verify_response`]).
+[`ReasonCode::RoleMismatch`]). `now_unix` is the shared per-bar instant. `statuses` carries the
+host-resolved revocation outcomes keyed by credential id → per **token** (presentation) → per
+**document** (positional), so EACH credential and EACH document is checked against its OWN outcome —
+one outcome is never silently reused across credentials or documents (SC-002). A credential id /
+token / document with no supplied outcome fails closed to [`StatusOutcome::Unavailable`].
 
 This is the ONLY entry that enforces the **set-level** DCQL semantics (`credential_sets` required
 option-sets + `multiple` cardinality); the single-presentation [`verify_response`] / the C-ABI
@@ -1969,18 +1991,22 @@ mandates: *"check whether the URN `'urn:etsi:esi:eaa:eu:qualified'` is present w
 of EAA and if this URN is not present"* → set the result to `Indeterminate`
 (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) and **stop**. So an attestation whose declared type
 does not carry [`EAA_EU_QUALIFIED_TYPE`] is `Indeterminate`, **never** `Qualified`, even if its
-issuer is a granted `EAA/Q` QTSP. The type indication is threaded from
-[`verify`](crate::verify()) as `type_indication`:
+issuer is a granted `EAA/Q` QTSP. Per **ETSI TS 119 472-1** (the format profile, v1.2.1 — verified
+online) the URN is carried in the issuer-signed **`category`** element, distinct from the
+credential-TYPE identifier (`vct`/`docType`); the type indication is threaded from
+[`verify`](crate::verify()) as `type_indication`, read from `category` for **both** formats:
 
-- **SD-JWT VC** — the issuer-signed `vct` (the credential's type claim). When it is not
-  [`EAA_EU_QUALIFIED_TYPE`] the determination is `Indeterminate`.
-- **ISO mdoc** — `None`: cl. 4.12's URN is an EAA-content (SD-JWT VC / JWT-VC `vct`/`type`)
-  construct, and TS 119 615 cl. 4.12 defines **no** mapping of this URN into ISO 18013-5 mdoc
-  content (an mdoc declares its type via `docType`, a reverse-domain ISO identifier). The mdoc
-  path therefore passes `None` and the precondition is **not enforced** for it; its qualified
-  determination uses the cert→granted-`EAA/Q`-service status (TS 119 612 §5.5.4). A non-`None`
-  indication that is not the URN always fails closed to `Indeterminate` (conservative — never a
-  false "qualified").
+- **SD-JWT VC** — the issuer-signed `category` claim (`crate::sdjwtvc::issuer_category`), NOT the
+  `vct` (which is the credential type, e.g. `urn:eudi:pid:1`, and never the qualified URN).
+- **ISO mdoc** — the `category` data element in namespace `org.etsi.01947201.010101` (TS 119 472-1
+  cl. 6.2.2), surfaced per document by the always-on bar in `MdocVerifyMeta.categories`.
+
+The precondition is **enforced for both formats**: an ABSENT `category` (an ordinary EAA, which TS
+119 472-1 EAA-5.2.2.1-01 says MUST NOT carry `category`; or an mdoc document that did not disclose
+the element → `None`) OR a present-but-non-URN value fails closed to `Indeterminate` (never a false
+"qualified"). (This corrects an earlier model that read the SD-JWT `vct` and exempted mdoc entirely
+— reading `vct` made the SD-JWT gate mechanically dead, since a real QEAA's `vct` is its credential
+type, not the qualified URN.)
 
 **Version note (the doc-nit reconciliation):** cl. 4.12 was introduced in TS 119 615 **v1.3.1**
 (2026-01) and is retained in the pinned **v1.4.1** (2026-05). The QEAA self-declaration URN was
@@ -3716,6 +3742,14 @@ required.
   - The issuer trust status.
 - `qualified_status: Option<QualifiedStatus>`
   - The eIDAS qualified status, present only when the opt-in gate ran.
+- `request_bound: bool`
+  - Whether **request binding** (the OpenID4VP nonce/audience/replay + KB-JWT freshness checks) was
+evaluated — `true` iff a `request` was supplied to [`crate::verify::verify`]. A request-less
+verification (offline / batch / stored re-verification) is a legitimate mode but provides NO
+replay/audience protection, so a `valid = true` with `request_bound = false` means "the credential
+is cryptographically sound + trusted + in-window, but NOT bound to any request". An integrator that
+intended bound verification MUST assert this is `true` — it is the observable signal that a
+silently-omitted `request` (an envelope-construction slip) did not downgrade the check.
 - `reasons: Vec<ReasonCode>`
   - The machine-readable reasons for the verdict (especially for INVALID — FR-005); empty for a
 clean VALID.
@@ -4161,6 +4195,12 @@ struct VerifyRequest
 A `verify` request: the presented credential, the policy, the configured anchors, the
 verification context, and (optionally) the OpenID4VP request the presentation must be bound to.
 
+`deny_unknown_fields`: an unrecognized key is a hard decode error, NOT silently ignored. This closes
+the request-binding footgun — a **misspelled** `request` key (e.g. `"reqeust"`) would otherwise be
+dropped to the `#[serde(default)] None` and silently downgrade to the request-LESS path (no
+replay/audience protection) while still reporting `valid = true`. Within a schema version the field
+set is fixed; forward compatibility is the `schema_version` bump, not unknown-field tolerance.
+
 ##### Fields
 
 - `schema_version: u32`
@@ -4198,6 +4238,11 @@ struct WireContext
 ```
 
 The verification context carried on the wire (the CBOR mirror of [`VerifyContext`]).
+
+`deny_unknown_fields`: a typo'd optional key (`statuses`, `session_transcript`, `qualified_gate`,
+`qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
+default — a misspelled `qualified_gate` must not silently leave the gate off, nor a misspelled
+`session_transcript` silently skip the mdoc binding. Same rationale as [`VerifyRequest`].
 
 ##### Fields
 

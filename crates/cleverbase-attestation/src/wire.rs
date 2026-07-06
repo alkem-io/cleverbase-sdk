@@ -96,7 +96,13 @@ pub enum WirePresentation {
 }
 
 /// The verification context carried on the wire (the CBOR mirror of [`VerifyContext`]).
+///
+/// `deny_unknown_fields`: a typo'd optional key (`statuses`, `session_transcript`, `qualified_gate`,
+/// `qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
+/// default — a misspelled `qualified_gate` must not silently leave the gate off, nor a misspelled
+/// `session_transcript` silently skip the mdoc binding. Same rationale as [`VerifyRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireContext {
     /// The verification instant (Unix seconds).
     pub now_unix: i64,
@@ -143,7 +149,14 @@ pub struct WireSchemeAnchor {
 
 /// A `verify` request: the presented credential, the policy, the configured anchors, the
 /// verification context, and (optionally) the OpenID4VP request the presentation must be bound to.
+///
+/// `deny_unknown_fields`: an unrecognized key is a hard decode error, NOT silently ignored. This closes
+/// the request-binding footgun — a **misspelled** `request` key (e.g. `"reqeust"`) would otherwise be
+/// dropped to the `#[serde(default)] None` and silently downgrade to the request-LESS path (no
+/// replay/audience protection) while still reporting `valid = true`. Within a schema version the field
+/// set is fixed; forward compatibility is the `schema_version` bump, not unknown-field tolerance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyRequest {
     /// Wire schema version of this envelope.
     pub schema_version: u32,

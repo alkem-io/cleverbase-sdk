@@ -37,7 +37,10 @@ use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
 use pkcs8::DecodePrivateKey as _;
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
-use super::{COSE_HEADER_X5CHAIN, TAG_ENCODED_CBOR};
+use super::{
+    COSE_HEADER_X5CHAIN, MDOC_QEAA_CATEGORY_ELEMENT, MDOC_QEAA_CATEGORY_NAMESPACE, TAG_ENCODED_CBOR,
+};
+use crate::qualified::EAA_EU_QUALIFIED_TYPE;
 
 /// A single attribute to embed as an `IssuerSignedItem`.
 pub(super) struct Element {
@@ -183,6 +186,16 @@ pub(crate) struct MdocBuilder {
     /// item's bytes win the slot); `false` places it after. Either ordering MUST be rejected
     /// (`DisclosureIntegrity`) and the forged claim never disclosed.
     append_forged_item: Option<ForgedItem>,
+    /// When set, inject an ADDITIONAL namespace group carrying the ETSI TS 119 472-1 cl. 6.2.2
+    /// **`category`** data element (value = the QEAA type-indication URN [`EAA_EU_QUALIFIED_TYPE`]) into
+    /// the SAME (primary) document — so one document carries TWO namespaces: the primary ISO namespace
+    /// PLUS the ETSI `org.etsi.01947201.010101` category namespace, exactly as a conformant QEAA mdoc
+    /// does. Both the `issuerSigned.nameSpaces` group AND a matching MSO `valueDigests` entry are added
+    /// (each disclosed item MUST have a matching MSO digest — that is how the bar verifies it), mirroring
+    /// how the primary namespace's elements are minted. The opt-in qualified gate reads this per-document
+    /// `category` as the PRO-4.12.4-03 type indication. Distinct from [`Self::append_document_in_namespace`],
+    /// which appends a SECOND document; the `category` MUST live in the SAME document as the ISO elements.
+    qeaa_category: bool,
 }
 
 /// A forged `IssuerSignedItem` to splice into the on-wire `nameSpaces` array (the false-accept probe):
@@ -336,6 +349,7 @@ impl MdocBuilder {
             omit_mso_version: false,
             omit_mso_signed: false,
             append_forged_item: None,
+            qeaa_category: false,
         }
     }
 
@@ -356,6 +370,16 @@ impl MdocBuilder {
             value,
             forged_first,
         });
+        self
+    }
+
+    /// Make this a conformant QEAA mdoc: inject the ETSI TS 119 472-1 cl. 6.2.2 **`category`** data
+    /// element (value = [`EAA_EU_QUALIFIED_TYPE`]) into a SECOND namespace (`org.etsi.01947201.010101`)
+    /// of the SAME (primary) document — alongside the ISO namespace's elements — so the opt-in qualified
+    /// gate reads the PRO-4.12.4-03 type indication for this document (`MdocVerifyMeta.categories`). Both
+    /// the `issuerSigned.nameSpaces` group and a matching MSO `valueDigests` entry are minted.
+    pub(crate) fn qeaa_category(mut self) -> Self {
+        self.qeaa_category = true;
         self
     }
 
@@ -791,6 +815,38 @@ impl MdocBuilder {
             }
         }
 
+        // --- optional ETSI TS 119 472-1 cl. 6.2.2 `category` element (QEAA type indication) in a SECOND
+        //     namespace of the SAME document. A conformant QEAA mdoc carries the qualified-EAA type URN in
+        //     the `category` data element under `org.etsi.01947201.010101`, ALONGSIDE the ISO namespace.
+        //     The disclosed item AND its MSO `valueDigests` entry are both minted (each disclosed item MUST
+        //     have a matching MSO digest — that is how the bar verifies it), mirroring the primary loop. ---
+        let (category_item, category_digest) = if self.qeaa_category {
+            let item = CborValue::Map(vec![
+                (
+                    CborValue::Text("digestID".to_owned()),
+                    CborValue::Integer(0.into()),
+                ),
+                (
+                    CborValue::Text("random".to_owned()),
+                    CborValue::Bytes(vec![0xC0; 16]),
+                ),
+                (
+                    CborValue::Text("elementIdentifier".to_owned()),
+                    CborValue::Text(MDOC_QEAA_CATEGORY_ELEMENT.to_owned()),
+                ),
+                (
+                    CborValue::Text("elementValue".to_owned()),
+                    CborValue::Text(EAA_EU_QUALIFIED_TYPE.to_owned()),
+                ),
+            ]);
+            let tagged =
+                CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(encode(&item))));
+            let digest = self.digest_algorithm.digest(&encode(&tagged));
+            (Some(tagged), Some(digest))
+        } else {
+            (None, None)
+        };
+
         // --- holder DeviceKey (COSE_Key) from the holder private key's public point. ----------------
         let holder_key = SigningKey::from_pkcs8_der(HOLDER_KEY).expect("holder key");
         let holder_pub = holder_key.verifying_key().to_encoded_point(false);
@@ -828,10 +884,24 @@ impl MdocBuilder {
             ),
             (
                 CborValue::Text("valueDigests".to_owned()),
-                CborValue::Map(vec![(
-                    CborValue::Text(self.namespace.clone()),
-                    CborValue::Map(value_digests),
-                )]),
+                CborValue::Map({
+                    let mut namespaces = vec![(
+                        CborValue::Text(self.namespace.clone()),
+                        CborValue::Map(value_digests),
+                    )];
+                    // The category element lives in its OWN namespace's `valueDigests` sub-map (a single
+                    // digestID → digest), mirroring the primary namespace's entry.
+                    if let Some(digest) = &category_digest {
+                        namespaces.push((
+                            CborValue::Text(MDOC_QEAA_CATEGORY_NAMESPACE.to_owned()),
+                            CborValue::Map(vec![(
+                                CborValue::Integer(0.into()),
+                                CborValue::Bytes(digest.clone()),
+                            )]),
+                        ));
+                    }
+                    namespaces
+                }),
             ),
             (
                 CborValue::Text("deviceKeyInfo".to_owned()),
@@ -1010,10 +1080,22 @@ impl MdocBuilder {
         let issuer_signed = CborValue::Map(vec![
             (
                 CborValue::Text("nameSpaces".to_owned()),
-                CborValue::Map(vec![(
-                    CborValue::Text(self.namespace.clone()),
-                    CborValue::Array(issuer_items),
-                )]),
+                CborValue::Map({
+                    let mut namespaces = vec![(
+                        CborValue::Text(self.namespace.clone()),
+                        CborValue::Array(issuer_items),
+                    )];
+                    // The category element is disclosed under its OWN namespace's `IssuerSignedItems`
+                    // array (matching the MSO `valueDigests` entry added above), so the SAME document
+                    // carries both the ISO namespace and the ETSI category namespace.
+                    if let Some(item) = category_item {
+                        namespaces.push((
+                            CborValue::Text(MDOC_QEAA_CATEGORY_NAMESPACE.to_owned()),
+                            CborValue::Array(vec![item]),
+                        ));
+                    }
+                    namespaces
+                }),
             ),
             (CborValue::Text("issuerAuth".to_owned()), issuer_auth_value),
         ]);
@@ -1172,6 +1254,10 @@ fn build_single_valid_document_issued_at(signed_at: &str, valid_until: &str) -> 
             identifier: "document_number",
             value: CborValue::Text("D-2027".to_owned()),
         }])
+        // A conformant QEAA document: carry the ETSI `category` type indication so the qualified gate
+        // reads THIS document's PRO-4.12.4-03 precondition (else it would fail closed to Indeterminate
+        // and the fold could not narrow to NotQualified at the post-withdrawal relevant time).
+        .qeaa_category()
         .signed(signed_at)
         .validity(signed_at, valid_until)
         .build();

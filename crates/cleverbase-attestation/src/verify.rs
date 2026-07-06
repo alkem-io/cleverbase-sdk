@@ -350,15 +350,18 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
 /// `documents[1]`'s attributes (SC-007). The fold is fail-closed: `Qualified` only if all qualify;
 /// else `Indeterminate` if any document is undecidable; else `NotQualified`.
 ///
-/// Each per-document/credential delegate authenticates the TL (signer chains to a scheme anchor + not
-/// stale) **at `ctx.now_unix`** (the verification instant) BEFORE reading status, then reads the
-/// issuer's granted/withdrawn status **at that credential's/document's own relevant time**. The two
-/// times are deliberately distinct: TL freshness and the TL-signer's chain validity are "now"
-/// properties — a stale or expired-signer trust snapshot must never be trusted just because the
-/// credential being checked is old — whereas the status read is "status at the relevant time". When a
-/// signing cert OR the issuance time cannot be read, no trust list was supplied, or the list fails to
-/// authenticate, it yields [`QualifiedStatus::Indeterminate`] — the data needed to decide is absent or
-/// untrustworthy (never a false "qualified", SC-007).
+/// The TL is authenticated (signer chains to a scheme anchor + not stale) **once at `ctx.now_unix`**
+/// (the verification instant) BEFORE any status read — it is invariant across the response's documents,
+/// so authenticating per document would be wasted work (finding #8). Each document's issuer status is
+/// then read **at that document's own relevant time**. The two times are deliberately distinct: TL
+/// freshness and the TL-signer's chain validity are "now" properties — a stale or expired-signer trust
+/// snapshot must never be trusted just because the credential being checked is old — whereas the status
+/// read is "status at the relevant time". The PRO-4.12.4-03 type indication is the credential's
+/// issuer-signed **`category`** (SD-JWT VC claim / mdoc `category` data element per ETSI TS 119 472-1),
+/// enforced for BOTH formats. When a signing cert OR the issuance time OR the qualifying `category`
+/// cannot be read, no trust list was supplied, or the list fails to authenticate, it yields
+/// [`QualifiedStatus::Indeterminate`] — the data needed to decide is absent or untrustworthy (never a
+/// false "qualified", SC-007).
 ///
 /// [`QualifiedStatus::Indeterminate`]: crate::types::QualifiedStatus::Indeterminate
 fn qualified_status_for(
@@ -371,63 +374,74 @@ fn qualified_status_for(
         // The gate is enabled but the host supplied no national TL → the data is unreachable.
         return QualifiedStatus::Indeterminate;
     };
-    // Resolve the status of one claimed signing cert. TWO distinct times are threaded (the load-
-    // bearing split): the TL is AUTHENTICATED at `ctx.now_unix` (the verification instant — TL
-    // freshness `now >= NextUpdate` and the TL-signer's chain validity are "now" properties), while the
-    // issuer's granted/withdrawn status is READ at the credential's OWN relevant time. A missing cert OR
-    // a missing issuance time fails closed (Indeterminate) — the status is never read at "now".
+    // AUTHENTICATE the national TL ONCE, at `ctx.now_unix` (the verification instant — TL freshness
+    // `now >= NextUpdate` and the TL-signer's chain validity are "now" properties, invariant across the
+    // documents of a response). A forged / unsigned / unchained / stale-at-now list cannot be
+    // authoritative → Indeterminate. Doing this once (rather than inside the per-document fold) avoids
+    // re-running the full signer chain-validation + freshness check per document — an
+    // attacker-multipliable soft-DoS on the `documents[]` count when the gate is enabled (finding #8).
+    if trust_list
+        .authenticate(ctx.qualified_scheme_anchors, ctx.now_unix)
+        .is_err()
+    {
+        return QualifiedStatus::Indeterminate;
+    }
+    // Resolve one claimed signing cert against the ALREADY-AUTHENTICATED list: the issuer's
+    // granted/withdrawn status is READ at the credential's OWN relevant time (NOT "now"). A missing cert
+    // OR a missing issuance time fails closed (Indeterminate).
     //
-    // `type_indication` is the credential's self-declared type — the TS 119 615 v1.4.1 PRO-4.12.4-03
-    // QEAA self-declaration precondition (the URN `urn:etsi:esi:eaa:eu:qualified` must be present in the
-    // EAA content before a `Qualified` verdict, else `Indeterminate`). For SD-JWT VC it is the
-    // issuer-signed `vct`; for ISO mdoc it is `None` (cl. 4.12's URN is an SD-JWT-VC/JWT EAA-content
-    // construct with no defined mapping into mdoc content — the gate does not enforce it for mdoc; see
-    // `crate::qualified`).
+    // `type_indication` is the credential's self-declared **`category`** — the TS 119 615 PRO-4.12.4-03
+    // QEAA self-declaration precondition (the URN `urn:etsi:esi:eaa:eu:qualified` must be present before
+    // a `Qualified` verdict, else `Indeterminate`). Per ETSI TS 119 472-1 it is the issuer-signed
+    // `category` claim (SD-JWT VC) / the `category` data element in namespace `org.etsi.01947201.010101`
+    // (mdoc) — NOT the `vct`/`docType`, which is the credential-TYPE identifier and never the qualified
+    // URN. `None` (absent/undisclosed category) fails the precondition closed.
     let status_of = |cert: Option<Vec<u8>>,
                      relevant_time: Option<i64>,
                      type_indication: Option<&str>|
      -> QualifiedStatus {
         match (cert, relevant_time) {
-            (Some(cert_der), Some(relevant_time_unix)) => crate::qualified::qualified_status(
-                &cert_der,
-                ctx.now_unix,
-                relevant_time_unix,
-                trust_list,
-                ctx.qualified_scheme_anchors,
-                type_indication,
-            ),
+            (Some(cert_der), Some(relevant_time_unix)) => {
+                crate::qualified::read_status_authenticated(
+                    &cert_der,
+                    relevant_time_unix,
+                    trust_list,
+                    type_indication,
+                )
+            }
             // No signing cert, or no issuance time to read the status at → undecidable, fail closed.
             _ => QualifiedStatus::Indeterminate,
         }
     };
     match presentation {
         Presentation::SdJwtVc(p) => {
-            // The SD-JWT VC `vct` is the credential's self-declared type-indication (PRO-4.12.4-03).
-            let vct = sdjwtvc::verified_vct(p);
+            // The SD-JWT VC issuer-signed `category` claim is the type indication (PRO-4.12.4-03) — NOT
+            // the `vct` (the credential-type id). `None` (no category) fails the precondition closed.
+            let category = sdjwtvc::issuer_category(p);
             status_of(
                 sdjwtvc::issuer_signing_cert_der(p),
                 sdjwtvc::issuance_time_unix(p),
-                vct.as_deref(),
+                category.as_deref(),
             )
         }
         Presentation::Mdoc { .. } => {
             // Decide over EVERY document's issuer at that document's OWN issuance time; fold so
             // `Qualified` requires all to qualify. The gate runs only on a VALID credential, where the
-            // always-on bar already extracted EACH document's `(ds_cert_der, signed)` and surfaced them
-            // in `mdoc_meta.claimed_issuers` — fold those CACHED pairs (the bar's single decode; no
-            // second `DeviceResponse` decode + per-document COSE/MSO re-parse). On a VALID mdoc `signed`
-            // is mandatory, so the cached `(cert, signed)` pairs are the single authoritative issuer
-            // view. A `None` meta (no claimed issuers to fold) fails closed — empty fold →
-            // `Indeterminate` — never a false "qualified".
-            let claimed = mdoc_meta.map(|meta| meta.claimed_issuers.as_slice());
-            // ISO mdoc carries no cl. 4.12 URN type-indication construct → `None` (the precondition is
-            // not enforced for mdoc; its qualified determination uses the cert→granted-status path).
-            fold_qualified(
-                claimed
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|(cert, issued)| status_of(Some(cert.clone()), Some(*issued), None)),
-            )
+            // always-on bar already extracted EACH document's `(ds_cert_der, signed)` + its `category`
+            // and surfaced them in `mdoc_meta` — fold those CACHED values (the bar's single decode; no
+            // second `DeviceResponse` decode). On a VALID mdoc `signed` is mandatory. A `None` meta (no
+            // claimed issuers) fails closed — empty fold → `Indeterminate` — never a false "qualified".
+            let Some(meta) = mdoc_meta else {
+                return QualifiedStatus::Indeterminate;
+            };
+            fold_qualified(meta.claimed_issuers.iter().enumerate().map(
+                |(index, (cert, issued))| {
+                    // The mdoc `category` data element (TS 119 472-1 cl. 6.2.2), per document, is the
+                    // PRO-4.12.4-03 type indication for mdoc — enforced now (was skipped as `None`).
+                    let category = meta.categories.get(index).and_then(Option::as_deref);
+                    status_of(Some(cert.clone()), Some(*issued), category)
+                },
+            ))
         }
     }
 }

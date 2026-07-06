@@ -211,6 +211,57 @@ fn wrong_schema_version_is_rejected() {
 }
 
 #[test]
+fn a_misspelled_request_key_fails_closed_not_silently_bare() {
+    // FOOTGUN GUARD (#5): a typo'd top-level key must be a hard decode error (`deny_unknown_fields`),
+    // NOT silently ignored. Otherwise a misspelled `request` key would drop to `None` and downgrade to
+    // the request-LESS path (no replay/audience protection) while still reporting valid — with no
+    // signal. Build a valid request map, then rename `request` → `reqeust` and confirm the decode fails.
+    let req = valid_sd_jwt_request();
+    // Round-trip through a generic CBOR value so we can rename a key (the struct can't express a typo).
+    let mut value: ciborium::value::Value = ciborium::de::from_reader(&encode(&req)[..]).unwrap();
+    // Add an unknown top-level key to the request map.
+    if let ciborium::value::Value::Map(entries) = &mut value {
+        entries.push((
+            ciborium::value::Value::Text("reqeust".to_owned()), // deliberate typo of `request`
+            ciborium::value::Value::Null,
+        ));
+    } else {
+        panic!("VerifyRequest must encode as a CBOR map");
+    }
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&value, &mut bytes).unwrap();
+    assert!(
+        decode_verify_request(&bytes).is_err(),
+        "an unknown/misspelled top-level key must fail the decode (deny_unknown_fields), never be ignored"
+    );
+}
+
+#[test]
+fn request_bound_signal_reflects_whether_a_request_was_supplied() {
+    // OBSERVABILITY (#5): `VerificationResult.request_bound` lets a caller confirm request binding
+    // actually ran. A request-less verify (no `request`) is VALID but NOT request-bound; supplying the
+    // matching OpenID4VP request flips it true.
+    let bare = valid_sd_jwt_request(); // valid_sd_jwt_request supplies no `request`
+    assert!(
+        bare.request.is_none(),
+        "the baseline request is request-less"
+    );
+    let out = process_verify_bytes(&encode(&bare));
+    let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        VerifyOutcome::Ok { result } => {
+            assert!(result.valid, "reasons {:?}", result.reasons);
+            assert!(
+                !result.request_bound,
+                "a request-less verification must report request_bound = false (no replay/audience \
+                 protection was applied)"
+            );
+        }
+        VerifyOutcome::Err { message } => panic!("unexpected error: {message}"),
+    }
+}
+
+#[test]
 fn response_round_trips_through_cbor() {
     let bytes = encode_verify_response(VerifyOutcome::Err {
         message: "x".to_owned(),
@@ -232,18 +283,20 @@ const WRONG_ISSUER: &[u8] =
 /// against the signer cert's window), so the gate test mints an in-window credential and runs here.
 const QUALIFIED_RELEVANT_GRANTED: i64 = IN_WINDOW_NOW; // 2026-09-01.
 
-/// Mint an SD-JWT VC whose `vct` IS the TS 119 615 v1.4.1 QEAA self-declaration URN
-/// ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03), with caller-chosen `nbf`/`exp`. The canonical
-/// `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both), so the
-/// qualified-gate wire test — which needs BOTH a self-declared QEAA type AND an in-window credential —
-/// builds it here from the shared test-issuer primitives.
+/// Mint an SD-JWT VC that self-declares the TS 119 615 v1.4.1 QEAA type indication via the
+/// issuer-signed **`category`** claim ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03, per ETSI TS 119 472-1 —
+/// NOT the `vct`, which is the credential-TYPE identifier), with caller-chosen `nbf`/`exp`. The
+/// canonical `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both), so
+/// the qualified-gate wire test — which needs BOTH a self-declared QEAA type AND an in-window
+/// credential — builds it here from the shared test-issuer primitives.
 fn mint_qeaa_sd_jwt(nbf: i64, exp: i64) -> sd_jwt_payload::SdJwt {
     use base64ct::{Base64, Encoding as _};
     use sd_jwt_payload::SdJwtBuilder;
     let cert_b64 = Base64::encode_string(ISSUER_CERT_DER);
     let claims = serde_json::json!({
         "iss": "https://issuer.example/cb",
-        "vct": EAA_EU_QUALIFIED_TYPE,
+        "vct": "urn:eudi:pid:1",
+        "category": EAA_EU_QUALIFIED_TYPE,
         "nbf": nbf,
         "exp": exp,
         "given_name": "Ada",

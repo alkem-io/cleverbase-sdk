@@ -345,7 +345,154 @@ fn disclosed_array_values(_issued: &str, token: &str) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn sd_jwt_vc_present_nested_pid_discloses_one_branch_without_leaking_its_sibling_leaf() {
+    // FLAGSHIP PID SHAPE (EUDI ARF): nested SD claims sharing a leaf name under different parents —
+    // `address.locality` = "London" and `place_of_birth.locality` = "Paris". Before the present.rs fix
+    // the concealer used the disclosure's ROOT leaf pointer (`/locality`), which (a) does NOT resolve
+    // for a nested claim (`sd_jwt_payload` → InvalidPath → the whole PID was unpresentable) and (b)
+    // collapsed both `locality` leaves into ONE selector (disclosing one leaked its sibling). The fix
+    // conceals by the FULL path (`/address/locality`, `/place_of_birth/locality`), so a nested PID is
+    // presentable AND the two same-leaf siblings are independently selectable.
+    use crate::sdjwtvc::test_issuer::{mint_nested_shared_leaf, ISSUER_CERT_DER, ISSUER_KEY_PK8};
+
+    let held = HeldAttestation::SdJwtVc {
+        issued: mint_nested_shared_leaf(ISSUER_KEY_PK8, ISSUER_CERT_DER).presentation(),
+    };
+    let request = request(b"nested-pid-nonce");
+
+    // Disclose ONLY `address.locality` (its full-path selector), leaving `place_of_birth.locality`
+    // concealed. This must SUCCEED (no InvalidPath) — the nested PID is presentable.
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["address/locality"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("a nested PID must be presentable (no root-pointer InvalidPath)");
+
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::SdJwtVc, ISSUER_CERT_DER);
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        crate::sdjwtvc::test_issuer::NOW,
+        IssuerRole::Pid,
+        &[crate::status::StatusOutcome::NoStatus],
+    );
+    assert!(
+        result.valid,
+        "the nested PID presentation must verify under US1; reasons {:?}",
+        result.reasons
+    );
+
+    // `address` is disclosed with its `locality` = "London".
+    let mut london = std::collections::BTreeMap::new();
+    london.insert(
+        "locality".to_owned(),
+        crate::types::AttributeValue::Text("London".to_owned()),
+    );
+    assert_eq!(
+        result.disclosed_attributes.get("address"),
+        Some(&crate::types::AttributeValue::Map(london)),
+        "the disclosed branch must carry address.locality"
+    );
+    // The same-leaf-name sibling must NOT leak: `place_of_birth` stays concealed entirely.
+    assert!(
+        !result.disclosed_attributes.contains_key("place_of_birth"),
+        "disclosing address.locality must not leak the same-leaf-name place_of_birth.locality"
+    );
+}
+
 // --- mdoc: present bound to the request, verify under US1 ----------------------------------------
+
+#[test]
+fn mdoc_present_discloses_only_the_requested_element_and_prunes_the_rest() {
+    // OVER-DISCLOSURE FIX (privacy, FR-007): the held mdoc carries three issued elements (family_name,
+    // given_name, age_over_18). Presenting with `disclose = {family_name}` MUST prune given_name +
+    // age_over_18 off the wire (ISO/IEC 18013-5 selective disclosure). Before the fix `prepare_mdoc`
+    // ignored `disclose` and copied the FULL issuerSigned.nameSpaces verbatim, so every issued element
+    // rode on the wire regardless of the requested subset. The pruned presentation must still verify
+    // VALID — the MSO/IssuerAuth are untouched and valueDigests pass for the kept item.
+    use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
+
+    let held = HeldAttestation::Mdoc {
+        device_response: MdocBuilder::new().build(),
+    };
+    let request = request(b"mdoc-prune-nonce");
+
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["family_name"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present mdoc");
+
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        1_700_000_000,
+        IssuerRole::Pid,
+        &[crate::status::StatusOutcome::NoStatus],
+    );
+    assert!(
+        result.valid,
+        "the pruned presentation must still verify VALID (valueDigests pass for the kept item); \
+         reasons {:?}",
+        result.reasons
+    );
+    let Some(crate::types::AttributeValue::Map(ns)) =
+        result.disclosed_attributes.get("org.iso.18013.5.1")
+    else {
+        panic!("expected the org.iso.18013.5.1 namespace map");
+    };
+    assert!(
+        ns.contains_key("family_name"),
+        "the requested element must be disclosed"
+    );
+    assert!(
+        !ns.contains_key("given_name"),
+        "an unrequested element must be pruned off the wire (no over-disclosure)"
+    );
+    assert!(
+        !ns.contains_key("age_over_18"),
+        "an unrequested element must be pruned off the wire (no over-disclosure)"
+    );
+    assert_eq!(ns.len(), 1, "exactly the requested element is disclosed");
+}
+
+#[test]
+fn mdoc_present_rejects_a_non_disclosable_element() {
+    // A `disclose` name that matches no issued `elementIdentifier` MUST be rejected (mirroring the
+    // SD-JWT arm), never silently accepted. Before the fix `prepare_mdoc` ignored `disclose` entirely,
+    // so a garbage element name was accepted and the full credential presented.
+    use crate::mdoc::test_issuer::MdocBuilder;
+    let held = HeldAttestation::Mdoc {
+        device_response: MdocBuilder::new().build(),
+    };
+    let err = present(
+        &held,
+        &request(b"n"),
+        &holder_ctx(),
+        &subset(&["not_an_element"]),
+        &hsm(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, PresentError::UndisclosableClaim(c) if c == "not_an_element"),
+        "an unknown element must be UndisclosableClaim, got {err:?}"
+    );
+}
 
 #[test]
 fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
@@ -358,8 +505,17 @@ fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
     };
     let request = request(b"mdoc-vp-nonce");
 
-    let vp =
-        present(&held, &request, &holder_ctx(), &subset(&[]), &hsm(), NOW).expect("present mdoc");
+    // Disclose all three issued elements (the mdoc `present` seam now honors `disclose`; an empty set
+    // would disclose nothing).
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["family_name", "given_name", "age_over_18"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present mdoc");
 
     let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
     let result = verify_response(
@@ -407,8 +563,15 @@ fn mdoc_present_with_non_empty_device_namespaces_verifies_under_us1() {
     };
     let request = request(b"mdoc-dev-ns-nonce");
 
-    let vp =
-        present(&held, &request, &holder_ctx(), &subset(&[]), &hsm(), NOW).expect("present mdoc");
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["family_name", "given_name", "age_over_18"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present mdoc");
 
     let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
     let result = verify_response(
@@ -495,7 +658,15 @@ fn mdoc_present_wrong_audience_is_rejected_by_the_verifier() {
         device_response: MdocBuilder::new().build(),
     };
     let built_for = request(b"mdoc-vp-nonce");
-    let vp = present(&held, &built_for, &holder_ctx(), &subset(&[]), &hsm(), NOW).expect("present");
+    let vp = present(
+        &held,
+        &built_for,
+        &holder_ctx(),
+        &subset(&["family_name", "given_name", "age_over_18"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present");
     let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
     // A request for a different audience must reject (the addressed audience won't match).
     let other = PresentationRequest {

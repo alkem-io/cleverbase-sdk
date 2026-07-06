@@ -239,6 +239,14 @@ pub struct VerificationResult {
     pub trust_status: TrustStatus,
     /// The eIDAS qualified status, present only when the opt-in gate ran.
     pub qualified_status: Option<QualifiedStatus>,
+    /// Whether **request binding** (the OpenID4VP nonce/audience/replay + KB-JWT freshness checks) was
+    /// evaluated — `true` iff a `request` was supplied to [`crate::verify::verify`]. A request-less
+    /// verification (offline / batch / stored re-verification) is a legitimate mode but provides NO
+    /// replay/audience protection, so a `valid = true` with `request_bound = false` means "the credential
+    /// is cryptographically sound + trusted + in-window, but NOT bound to any request". An integrator that
+    /// intended bound verification MUST assert this is `true` — it is the observable signal that a
+    /// silently-omitted `request` (an envelope-construction slip) did not downgrade the check.
+    pub request_bound: bool,
     /// The machine-readable reasons for the verdict (especially for INVALID — FR-005); empty for a
     /// clean VALID.
     pub reasons: Vec<ReasonCode>,
@@ -255,6 +263,9 @@ impl VerificationResult {
             disclosed_attributes: BTreeMap::new(),
             trust_status: TrustStatus::Untrusted,
             qualified_status: None,
+            // Request binding is stamped by the OpenID4VP layer when a request runs; an early/bare
+            // INVALID never bound to a request.
+            request_bound: false,
             reasons: vec![reason],
         }
     }
@@ -295,6 +306,7 @@ mod tests {
             disclosed_attributes: disclosed,
             trust_status: TrustStatus::Trusted,
             qualified_status: None,
+            request_bound: true,
             reasons: Vec::new(),
         };
         assert_eq!(cbor_roundtrip(&result), result);

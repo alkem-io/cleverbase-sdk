@@ -260,15 +260,13 @@ fn to_json_bytes(value: &Value) -> Result<Vec<u8>, SignerError> {
 }
 
 /// Build the compact-JWS `header.payload` signing input (base64url of each), returning the
-/// to-be-signed ASCII bytes plus the prefix string the signature is appended to on splice.
-fn jws_signing_input(header: &Value, payload: &Value) -> Result<(Vec<u8>, String), SignerError> {
+/// to-be-signed ASCII bytes. The splice prefix (`header.payload`) is these same bytes as UTF-8, so
+/// each builder's `assemble` derives it from [`SigningInput::to_be_signed`] rather than storing a
+/// byte-identical copy (DRY — one authoritative signing-input buffer).
+fn jws_signing_input(header: &Value, payload: &Value) -> Result<Vec<u8>, SignerError> {
     let header_b64 = Base64UrlUnpadded::encode_string(&to_json_bytes(header)?);
     let payload_b64 = Base64UrlUnpadded::encode_string(&to_json_bytes(payload)?);
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    // Copy the to-be-signed bytes from the borrow, then move the String out (no `.clone()` of the
-    // whole String just to `into_bytes()` it).
-    let to_be_signed = signing_input.as_bytes().to_vec();
-    Ok((to_be_signed, signing_input))
+    Ok(format!("{header_b64}.{payload_b64}").into_bytes())
 }
 
 /// Splice a raw `r‖s` ES256 signature onto a compact-JWS `header.payload` prefix, yielding the full
@@ -284,7 +282,6 @@ fn splice_compact_jws(prefix: &str, signature: &[u8]) -> String {
 pub struct PopJwtBuild {
     /// The signing input the host must sign (exposes `aud`/`nonce`).
     pub input: SigningInput,
-    prefix: String,
 }
 
 impl PopJwtBuild {
@@ -292,10 +289,16 @@ impl PopJwtBuild {
     ///
     /// # Errors
     ///
-    /// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length.
+    /// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
+    /// [`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
+    /// SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
     pub fn assemble(&self, signature: &[u8]) -> Result<String, SignerError> {
         check_sig_len(self.input.algorithm, signature)?;
-        Ok(splice_compact_jws(&self.prefix, signature))
+        // The splice prefix is the signing input verbatim (`header.payload`), so derive it from the
+        // one authoritative buffer instead of storing a byte-identical copy.
+        let prefix = std::str::from_utf8(&self.input.to_be_signed)
+            .map_err(|e| SignerError::Serialize(e.to_string()))?;
+        Ok(splice_compact_jws(prefix, signature))
     }
 }
 
@@ -331,7 +334,7 @@ pub fn build_pop_jwt(
         "nonce": c_nonce,
         "iat": iat,
     });
-    let (to_be_signed, prefix) = jws_signing_input(&header, &payload)?;
+    let to_be_signed = jws_signing_input(&header, &payload)?;
     Ok(PopJwtBuild {
         input: SigningInput {
             ceremony: Ceremony::Oid4vciProof,
@@ -340,7 +343,6 @@ pub fn build_pop_jwt(
             audience: audience.to_owned(),
             nonce: c_nonce.to_owned(),
         },
-        prefix,
     })
 }
 
@@ -350,7 +352,6 @@ pub fn build_pop_jwt(
 pub struct KbJwtBuild {
     /// The signing input the host must sign (exposes the verifier `aud`/`nonce`).
     pub input: SigningInput,
-    prefix: String,
 }
 
 impl KbJwtBuild {
@@ -358,10 +359,16 @@ impl KbJwtBuild {
     ///
     /// # Errors
     ///
-    /// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length.
+    /// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
+    /// [`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
+    /// SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
     pub fn assemble(&self, signature: &[u8]) -> Result<String, SignerError> {
         check_sig_len(self.input.algorithm, signature)?;
-        Ok(splice_compact_jws(&self.prefix, signature))
+        // The splice prefix is the signing input verbatim (`header.payload`), so derive it from the
+        // one authoritative buffer instead of storing a byte-identical copy.
+        let prefix = std::str::from_utf8(&self.input.to_be_signed)
+            .map_err(|e| SignerError::Serialize(e.to_string()))?;
+        Ok(splice_compact_jws(prefix, signature))
     }
 }
 
@@ -395,7 +402,7 @@ pub fn build_kb_jwt(
         "nonce": nonce,
         "sd_hash": sd_hash,
     });
-    let (to_be_signed, prefix) = jws_signing_input(&header, &payload)?;
+    let to_be_signed = jws_signing_input(&header, &payload)?;
     Ok(KbJwtBuild {
         input: SigningInput {
             ceremony: Ceremony::KeyBinding,
@@ -404,7 +411,6 @@ pub fn build_kb_jwt(
             audience: audience.to_owned(),
             nonce: nonce.to_owned(),
         },
-        prefix,
     })
 }
 

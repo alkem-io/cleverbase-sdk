@@ -227,7 +227,9 @@ pub fn prepare_present(
 ) -> Result<PreparedPresentation, PresentError> {
     match held {
         HeldAttestation::SdJwtVc { issued } => prepare_sd_jwt_vc(issued, request, disclose, iat),
-        HeldAttestation::Mdoc { device_response } => prepare_mdoc(device_response, request),
+        HeldAttestation::Mdoc { device_response } => {
+            prepare_mdoc(device_response, request, disclose)
+        }
     }
 }
 
@@ -278,12 +280,15 @@ fn prepare_sd_jwt_vc(
     let sd_jwt =
         sd_jwt_payload::SdJwt::parse(issued).map_err(|e| PresentError::Malformed(e.to_string()))?;
 
-    // The named (object-property) disclosable claims — those that carry a `claim_name` (RFC 9901).
-    let named_disclosable: BTreeSet<String> = sd_jwt
-        .disclosures()
-        .iter()
-        .filter_map(|d| d.claim_name.clone())
-        .collect();
+    // Named (object-property) disclosures resolved to their FULL JSON-pointer path — the level-scoped
+    // identity RFC 9901 §7.1 assigns them. A NESTED SD claim (`address.locality`) MUST be concealed by
+    // its full path (`/address/locality`): the disclosure's `claim_name` is only the LEAF (`locality`),
+    // and `/locality` does not resolve at the root → `sd_jwt_payload` `InvalidPath` (the flagship EUDI
+    // PID — `address`/`place_of_birth`/`age_equal_or_over` — is entirely nested). Full paths also give
+    // two siblings that share a leaf name under different parents (`address.locality` /
+    // `place_of_birth.locality`) DISTINCT selectors, so each is independently selectable — no collision
+    // over-disclosure (a leaf-keyed set would collapse them and leak both when one is disclosed).
+    let object_property_paths = object_property_disclosure_paths(&sd_jwt)?;
 
     // Array-element disclosures carry NO `claim_name` (RFC 9901), so the named set never covers them —
     // left untouched they would ALWAYS ride on the wire regardless of `disclose`, an over-disclosure
@@ -291,11 +296,12 @@ fn prepare_sd_jwt_vc(
     // contains it, so it can be concealed/disclosed in step with that claim.
     let array_element_paths = array_element_disclosure_paths(&sd_jwt)?;
 
-    // A claim is selectable if it is a named disclosure OR a (possibly always-visible) claim that
-    // holds array-element disclosures — so `disclose` can reference the parent of an array.
-    let disclosable: BTreeSet<&str> = named_disclosable
+    // A claim is selectable by its full-path `selector` (an object property — top-level claims stay
+    // their bare name, nested claims are `parent/leaf`) OR by the top-level claim that holds an array
+    // of disclosable elements (so `disclose` can reference the parent of an array).
+    let disclosable: BTreeSet<&str> = object_property_paths
         .iter()
-        .map(String::as_str)
+        .map(|p| p.selector.as_str())
         .chain(
             array_element_paths
                 .iter()
@@ -312,13 +318,13 @@ fn prepare_sd_jwt_vc(
         .into_presentation(&Sha2Hasher)
         .map_err(|e| PresentError::Build(e.to_string()))?;
 
-    // Conceal every named claim NOT in the requested subset (selective disclosure). Concealing a
-    // claim also drops its concealable sub-values, so an explicitly-concealed parent takes its
-    // array-element disclosures with it.
-    for name in &named_disclosable {
-        if !disclose.contains(name) {
+    // Conceal every object-property disclosure NOT in the requested subset, BY ITS FULL PATH (selective
+    // disclosure). Concealing a claim also drops its concealable sub-values, so an explicitly-concealed
+    // parent takes its array-element disclosures with it.
+    for path in &object_property_paths {
+        if !disclose.contains(&path.selector) {
             builder = builder
-                .conceal(&format!("/{name}"))
+                .conceal(&path.pointer)
                 .map_err(|e| PresentError::Build(e.to_string()))?;
         }
     }
@@ -348,6 +354,95 @@ fn prepare_sd_jwt_vc(
             kb,
         },
     })
+}
+
+/// A named (object-property) disclosure located in the issued credential: the JSON-pointer `pointer`
+/// the presentation builder conceals it at (its full, level-scoped path — RFC 9901 §7.1), and the
+/// `selector` a caller names it by in `disclose` (that pointer without the leading `/`, so a top-level
+/// claim is its bare name — `given_name` — and a nested claim is `parent/leaf` — `address/locality` —
+/// distinguishing siblings that share a leaf name).
+struct ObjectPropertyPath {
+    pointer: String,
+    selector: String,
+}
+
+/// Resolve every object-property (named) disclosure of the issued SD-JWT to its FULL JSON-pointer path.
+///
+/// `sd_jwt_payload::Disclosure` carries only the LEAF `claim_name`, not its parent path, so a nested SD
+/// claim cannot be concealed by the leaf alone. We walk the issuer-signed claims, and for each `_sd`
+/// digest that matches a named disclosure we record its full pointer (`/<parent>/…/<leaf>`) — mirroring
+/// the array-element path walk ([`array_element_disclosure_paths`]).
+fn object_property_disclosure_paths(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<Vec<ObjectPropertyPath>, PresentError> {
+    use sd_jwt_payload::Hasher as _;
+
+    // Map each named disclosure's base64url digest → its leaf `claim_name` (array-element disclosures,
+    // which carry no `claim_name`, are excluded — they are handled by `array_element_disclosure_paths`).
+    let hasher = Sha2Hasher;
+    let claim_name_by_digest: std::collections::BTreeMap<String, String> = sd_jwt
+        .disclosures()
+        .iter()
+        .filter_map(|d| {
+            d.claim_name
+                .clone()
+                .map(|name| (hasher.encoded_digest(d.as_str()), name))
+        })
+        .collect();
+    if claim_name_by_digest.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let claims =
+        serde_json::to_value(sd_jwt.claims()).map_err(|e| PresentError::Build(e.to_string()))?;
+    let mut paths = Vec::new();
+    collect_object_property_paths(&claims, "", &claim_name_by_digest, &mut paths);
+    Ok(paths)
+}
+
+/// Recursively walk `value`, recording the full conceal path of every `_sd` digest whose named
+/// disclosure is in `claim_names`. `pointer` is the JSON pointer to `value` — the object whose `_sd`
+/// array holds the digest — so the concealed property's full path is `pointer/<leaf>`.
+fn collect_object_property_paths(
+    value: &serde_json::Value,
+    pointer: &str,
+    claim_names: &std::collections::BTreeMap<String, String>,
+    out: &mut Vec<ObjectPropertyPath>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if key == "_sd" {
+                    // Each `_sd` entry is a digest of a named disclosure whose leaf is a property of the
+                    // object AT `pointer`; its full path is `pointer/<leaf>`.
+                    if let serde_json::Value::Array(digests) = child {
+                        for digest in digests {
+                            let Some(digest) = digest.as_str() else {
+                                continue;
+                            };
+                            if let Some(claim_name) = claim_names.get(digest) {
+                                let full = format!("{pointer}/{}", escape_json_pointer(claim_name));
+                                out.push(ObjectPropertyPath {
+                                    selector: full.trim_start_matches('/').to_owned(),
+                                    pointer: full,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let child_pointer = format!("{pointer}/{}", escape_json_pointer(key));
+                collect_object_property_paths(child, &child_pointer, claim_names, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let item_pointer = format!("{pointer}/{idx}");
+                collect_object_property_paths(item, &item_pointer, claim_names, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An array-element disclosure located in the issued credential: the JSON-pointer `pointer` the
@@ -439,18 +534,25 @@ fn escape_json_pointer(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
-/// Prepare the mdoc presentation: reconstruct the `DeviceAuthentication` over the request's OID4VP
-/// handover and build the `DeviceSignature` input (the holder signs it next; the held `DeviceResponse`
-/// is carried so [`PreparedPresentation::finish`] can splice the fresh signature in).
+/// Prepare the mdoc presentation: PRUNE the issuer-signed items to the disclosed subset, reconstruct
+/// the `DeviceAuthentication` over the request's OID4VP handover, and build the `DeviceSignature` input
+/// (the holder signs it next; the pruned `DeviceResponse` is carried so [`PreparedPresentation::finish`]
+/// can splice the fresh signature in).
 ///
-/// mdoc selective disclosure is enforced at the namespace/element level inside the held
-/// `DeviceResponse` (the issuer-signed `IssuerSignedItem`s the holder chooses to include); this
-/// presents the issued document's disclosed items as-is and binds them to the request with a fresh
-/// device signature. (Per-element pruning is a follow-on; the issued document already carries exactly
-/// the items the holder presents.)
+/// mdoc selective disclosure (ISO/IEC 18013-5 §9.2.2.5) is enforced at the element level: each
+/// `issuerSigned.nameSpaces[ns]` array is pruned to keep ONLY the `IssuerSignedItem`s whose
+/// `elementIdentifier` is in `disclose` (dropping the rest so they never ride on the wire — FR-007), and
+/// a `disclose` name matching no issued element is rejected as [`PresentError::UndisclosableClaim`]
+/// (mirroring the SD-JWT arm). This is safe without re-signing: the MSO + `IssuerAuth` are UNTOUCHED (a
+/// recorded `valueDigests` entry with no disclosed item is simply unused — the verifier's
+/// [`crate::mdoc`] `verify_value_digests` only recomputes digests for the DISCLOSED items), and the
+/// `DeviceSignature` covers `deviceSigned`/docType/transcript, never `issuerSigned`. Kept items retain
+/// their EXACT on-wire tagged bytes (the item node is carried verbatim, its inner `IssuerSignedItem`
+/// never re-encoded), so the verifier's verbatim-bytes digest still matches.
 fn prepare_mdoc(
     device_response: &[u8],
     request: &PresentationRequest,
+    disclose: &BTreeSet<String>,
 ) -> Result<PreparedPresentation, PresentError> {
     let response: CborValue = ciborium::from_reader(device_response)
         .map_err(|e| PresentError::Malformed(e.to_string()))?;
@@ -472,8 +574,20 @@ fn prepare_mdoc(
     // so the DeviceSignature must be computed over the SAME bytes (`finish` keeps these namespaces
     // unchanged and only replaces deviceAuth.deviceSignature). Carry the first document's exact
     // `DeviceNameSpacesBytes` (`#6.24(bstr .cbor DeviceNameSpaces)`), defaulting to the empty map when
-    // the document discloses no device namespaces.
+    // the document discloses no device namespaces. Pruning below touches `issuerSigned` only, so these
+    // device-signed bytes are unaffected.
     let device_name_spaces_bytes = first_device_name_spaces_bytes(&response)?;
+
+    // Validate every requested name against the ISSUED `elementIdentifier`s (a garbage `disclose` name
+    // is rejected, never silently accepted), then prune `issuerSigned.nameSpaces` to the disclosed
+    // subset so only the requested items ride on the wire.
+    let issued_identifiers = issued_element_identifiers(&response);
+    for name in disclose {
+        if !issued_identifiers.contains(name.as_str()) {
+            return Err(PresentError::UndisclosableClaim(name.clone()));
+        }
+    }
+    let pruned = prune_issuer_signed(&response, disclose)?;
 
     let transcript =
         oid4vp_handover_transcript(&request.audience, &request.nonce, &request.response_uri);
@@ -487,10 +601,103 @@ fn prepare_mdoc(
     .map_err(|e| PresentError::Build(e.to_string()))?;
     Ok(PreparedPresentation {
         kind: PreparedKind::Mdoc {
-            device_response: device_response.to_vec(),
+            // Carry the PRUNED response — `finish` re-encodes it (splicing the holder DeviceSignature)
+            // so only the disclosed issuer-signed items reach the verifier.
+            device_response: crate::cbor_to_vec(&pruned),
             build,
         },
     })
+}
+
+/// Collect the `elementIdentifier` of every issued `IssuerSignedItem` across the response's documents'
+/// `issuerSigned.nameSpaces` — the set a requested `disclose` name must match (ISO/IEC 18013-5).
+fn issued_element_identifiers(response: &CborValue) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let documents = get_map_entry(response, "documents").and_then(CborValue::as_array);
+    for doc in documents.into_iter().flatten() {
+        let name_spaces = get_map_entry(doc, "issuerSigned")
+            .and_then(|issuer_signed| get_map_entry(issuer_signed, "nameSpaces"))
+            .and_then(CborValue::as_map);
+        for (_ns, items) in name_spaces.into_iter().flatten() {
+            for item in items.as_array().into_iter().flatten() {
+                if let Some(id) = issuer_signed_item_identifier(item) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// The `elementIdentifier` of an on-wire `IssuerSignedItem` (`#6.24(bstr .cbor IssuerSignedItem)`):
+/// unwrap the tagged byte string (via the crate's single `#6.24(bstr)` unwrap — DRY) and read
+/// `elementIdentifier` from the inner map. `None` for any value that is not a well-formed tagged item
+/// carrying a text `elementIdentifier`.
+fn issuer_signed_item_identifier(item: &CborValue) -> Option<String> {
+    let inner = crate::unwrap_tagged_cbor_payload(item)?;
+    let inner_map: CborValue = ciborium::from_reader(inner.as_slice()).ok()?;
+    get_map_entry(&inner_map, "elementIdentifier")
+        .and_then(CborValue::as_text)
+        .map(str::to_owned)
+}
+
+/// Rebuild `response`, pruning each document's `issuerSigned.nameSpaces` to keep ONLY the
+/// `IssuerSignedItem`s whose `elementIdentifier` is in `disclose` (ISO/IEC 18013-5 selective
+/// disclosure). Walks `DeviceResponse → documents[] → issuerSigned → nameSpaces` via the single
+/// map-key-replace primitive [`replace_map_entry`] (DRY — Principle III). Pure re-serialization of the
+/// issuer-signed half: no re-signing (see [`prepare_mdoc`] for why this is sound).
+fn prune_issuer_signed(
+    response: &CborValue,
+    disclose: &BTreeSet<String>,
+) -> Result<CborValue, PresentError> {
+    replace_map_entry(response, "DeviceResponse", "documents", |documents| {
+        let documents = documents
+            .as_array()
+            .ok_or_else(|| PresentError::Malformed("documents is not an array".to_owned()))?;
+        let rebuilt = documents
+            .iter()
+            .map(|doc| {
+                replace_map_entry(doc, "Document", "issuerSigned", |issuer_signed| {
+                    replace_map_entry(issuer_signed, "IssuerSigned", "nameSpaces", |name_spaces| {
+                        prune_name_spaces(name_spaces, disclose)
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CborValue::Array(rebuilt))
+    })
+}
+
+/// Prune one `issuerSigned.nameSpaces` map (`{ namespace: [IssuerSignedItemBytes, …] }`) to the
+/// disclosed subset: within each namespace keep only the items whose `elementIdentifier` is in
+/// `disclose`, retaining each kept item's EXACT tagged bytes (the node is cloned verbatim — the inner
+/// `IssuerSignedItem` is never re-encoded, so the verifier's verbatim-bytes digest still matches). A
+/// namespace left with no disclosed items is dropped (its unused MSO `valueDigests` entries are simply
+/// never checked).
+fn prune_name_spaces(
+    name_spaces: &CborValue,
+    disclose: &BTreeSet<String>,
+) -> Result<CborValue, PresentError> {
+    let map = name_spaces.as_map().ok_or_else(|| {
+        PresentError::Malformed("issuerSigned.nameSpaces is not a map".to_owned())
+    })?;
+    let mut out = Vec::with_capacity(map.len());
+    for (ns_key, items) in map {
+        let items = items.as_array().ok_or_else(|| {
+            PresentError::Malformed("an issuerSigned.nameSpaces entry is not an array".to_owned())
+        })?;
+        let kept: Vec<CborValue> = items
+            .iter()
+            .filter(|item| {
+                issuer_signed_item_identifier(item).is_some_and(|id| disclose.contains(&id))
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out.push((ns_key.clone(), CborValue::Array(kept)));
+        }
+    }
+    Ok(CborValue::Map(out))
 }
 
 /// The `docType` of the first document in a `DeviceResponse`.

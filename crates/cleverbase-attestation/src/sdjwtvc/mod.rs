@@ -165,6 +165,23 @@ pub(crate) fn verified_vct(presentation: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The issuer-signed **`category`** claim — the ETSI TS 119 472-1 QEAA type-indication carrying the
+/// PRO-4.12.4-03 URN `urn:etsi:esi:eaa:eu:qualified` for a qualified EAA (`None` for an ordinary EAA,
+/// which per TS 119 472-1 EAA-5.2.2.1-01 MUST NOT include `category`). This is the type indication the
+/// opt-in qualified gate ([`crate::qualified`]) checks — NOT `vct` (which is the credential-TYPE
+/// identifier, e.g. `urn:eudi:pid:1`, and never the qualified URN). Read from the issuer-signed clear
+/// payload (a QEAA declares its category in the clear), only after the always-on bar accepted the
+/// presentation. Returns `None` when absent / not a string / unparseable.
+#[must_use]
+pub(crate) fn issuer_category(presentation: &str) -> Option<String> {
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(presentation).ok()?;
+    sd_jwt
+        .claims()
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// The FULL set of claims a presented SD-JWT VC actually carries — the issuer-signed **clear** payload
 /// claims MERGED with the selectively-**disclosed** claims ([`collect_presented_claims`]) — for the
 /// in-core OpenID4VP DCQL Claims Query resolution ([`crate::dcql`]).
@@ -225,6 +242,8 @@ fn accept(disclosed: BTreeMap<String, AttributeValue>) -> VerificationResult {
         disclosed_attributes: disclosed,
         trust_status: TrustStatus::Trusted,
         qualified_status: None,
+        // Request-agnostic bar result; the OpenID4VP layer stamps `request_bound` when a request runs.
+        request_bound: false,
         reasons: Vec::new(),
     }
 }

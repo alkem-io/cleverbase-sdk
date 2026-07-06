@@ -44,7 +44,7 @@ use serde_json::Value;
 use crate::secret::Secret;
 
 use super::present::HeldAttestation;
-use super::signer::{HolderContext, SigningInput};
+use super::signer::{HolderContext, PopJwtBuild, SigningInput};
 use crate::types::Format;
 
 /// HTTP method for an [`HttpEffect`] (the issuance flow uses POST for both endpoints).
@@ -254,10 +254,14 @@ pub struct ObtainSession {
     /// the host still receives it on the wire when the session is CBOR-serialized (by design in the
     /// sans-IO model — only the `Debug` exposure was the leak).
     access_token: Option<Secret>,
-    /// The issuer `c_nonce` the PoP-JWT must echo (carried from the **Nonce Endpoint** response to the
-    /// `Sign` resume, where the deterministic PoP-JWT is rebuilt and the host signature spliced in).
-    /// Held as a redacting [`Secret`] so the one-time nonce never appears in `Debug`/log output.
-    pending_c_nonce: Option<Secret>,
+    /// The PoP-JWT built in the **Nonce Endpoint** leg (bound to the credential-issuer `aud` + the
+    /// fresh `c_nonce`), carried across the `Sign` effect so the `ProofPending` leg splices the host
+    /// signature into the SAME build rather than re-deriving it. It holds only public material (the
+    /// bytes to sign + the bound `aud`/`nonce` — the exact [`SigningInput`] also handed to the host via
+    /// the `Sign` effect), never a private key. Boxed so this transient, only-briefly-populated build
+    /// does not bloat every `ObtainSession` (and the wire enum that carries it) — `Box` is
+    /// serde-transparent, so the CBOR session shape is unchanged.
+    pending_pop: Option<Box<PopJwtBuild>>,
 }
 
 /// Begin an OpenID4VCI `obtain` flow.
@@ -279,7 +283,7 @@ pub fn begin_obtain(
         offer: offer.clone(),
         now_unix,
         access_token: None,
-        pending_c_nonce: None,
+        pending_pop: None,
     };
     if backend.kind == IssuerBackendKind::None {
         // Gated: no issuer API configured → skip cleanly (the verification suite is unaffected).
@@ -336,9 +340,9 @@ pub fn resume_obtain(
                 Err(e) => return Ok(fail(session, ObtainError::NonceRequest(e))),
             };
             // Build the PoP-JWT signing input bound to the credential-issuer `aud` + the fresh
-            // `c_nonce`; the host signs it next (the signer-hook effect). The build is deterministic,
-            // so the `ProofPending` arm re-derives the identical PoP-JWT and splices the returned
-            // signature — we carry only the `c_nonce` (no private material) across the effect.
+            // `c_nonce`; the host signs it next (the signer-hook effect). Carry the built `PopJwtBuild`
+            // across the effect so the `ProofPending` arm splices the returned signature into the SAME
+            // build (no redundant re-derivation) — it holds only public material, never a private key.
             let pop = match super::signer::build_pop_jwt(
                 &session.holder,
                 &session.backend.credential_issuer,
@@ -349,25 +353,18 @@ pub fn resume_obtain(
                 Err(e) => return Ok(fail(session, ObtainError::Proof(e.to_string()))),
             };
             session.phase = ObtainPhase::ProofPending;
-            session.pending_c_nonce = Some(Secret::new(c_nonce));
-            Ok((session, ObtainStep::Sign(pop.input)))
+            let sign_input = pop.input.clone();
+            session.pending_pop = Some(Box::new(pop));
+            Ok((session, ObtainStep::Sign(sign_input)))
         }
         ObtainPhase::ProofPending => {
             let signature = require_signature(input)?;
-            let c_nonce = session
-                .pending_c_nonce
+            // Splice the host signature into the PoP-JWT built (and carried) in the `NoncePending`
+            // leg — no second, redundant build of the byte-identical JWT.
+            let proof_jwt = session
+                .pending_pop
                 .as_ref()
                 .ok_or(ObtainError::UnexpectedInput)?
-                .expose()
-                .to_owned();
-            let pop = super::signer::build_pop_jwt(
-                &session.holder,
-                &session.backend.credential_issuer,
-                &c_nonce,
-                session.now_unix,
-            )
-            .map_err(|e| ObtainError::Proof(e.to_string()))?;
-            let proof_jwt = pop
                 .assemble(&signature)
                 .map_err(|e| ObtainError::Proof(e.to_string()))?;
             session.phase = ObtainPhase::CredentialPending;
@@ -502,11 +499,19 @@ fn credential_request(
 /// `token_type` (always `Bearer` on this path) and DPoP are documented scope cuts — see
 /// `standards-conformance.md`.
 fn parse_token_response(body: &[u8]) -> Result<String, String> {
+    required_top_level_string(body, "access_token")
+}
+
+/// Parse a JSON object `body` and return the REQUIRED top-level string member `field`, mapping a
+/// non-JSON body or a missing/non-string member to a caller-classified error string. The one routine
+/// the Token Response (`access_token`) and Nonce Response (`c_nonce`) parsers share (DRY — Principle
+/// III; they differ only in the field name).
+fn required_top_level_string(body: &[u8], field: &str) -> Result<String, String> {
     let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    json.get("access_token")
+    json.get(field)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "missing access_token".to_owned())
+        .ok_or_else(|| format!("missing {field}"))
 }
 
 /// Build the OpenID4VCI Nonce-Endpoint request (OpenID4VCI 1.0 §7.1 `#nonce-request`): an HTTP POST
@@ -524,11 +529,7 @@ fn nonce_request(backend: &IssuerBackend) -> HttpEffect {
 /// Parse the OpenID4VCI Nonce Response (OpenID4VCI 1.0 §7.2 `#nonce-response`): a JSON object carrying
 /// the REQUIRED top-level `c_nonce` string.
 fn parse_nonce_response(body: &[u8]) -> Result<String, String> {
-    let json: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    json.get("c_nonce")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "missing c_nonce".to_owned())
+    required_top_level_string(body, "c_nonce")
 }
 
 /// The parsed outcome of an OpenID4VCI Credential Response: an immediately-issued credential, or a

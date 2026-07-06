@@ -330,10 +330,13 @@ fn granted_issuer_with_the_qualified_type_indication_is_qualified() {
 }
 
 #[test]
-fn an_absent_type_indication_does_not_enforce_the_precondition() {
-    // The mdoc seam: `None` means the format carries no cl. 4.12 URN construct (ISO mdoc), so the
-    // precondition is NOT enforced and the cert→granted-status determination governs → Qualified for a
-    // granted EAA/Q issuer. (The verify() mdoc path passes `None`.)
+fn an_absent_type_indication_is_indeterminate() {
+    // PRO-4.12.4-03 (per ETSI TS 119 472-1): a QEAA MUST self-declare the qualified-EAA type via the
+    // `category` URN in BOTH formats (SD-JWT VC claim / mdoc data element). An ABSENT type indication
+    // (`None` — no `category`, i.e. an ordinary EAA, OR an mdoc document that did not disclose the
+    // element) is NOT a self-declared QEAA → the precondition fails closed → `Indeterminate`, even for a
+    // granted EAA/Q issuer. (Previously `None` was an mdoc-only "precondition N/A" skip; now that mdoc
+    // also carries `category`, absence fails closed for both formats — never a false "qualified".)
     let Some(tl) = qualified_trust_list_fixture() else {
         return;
     };
@@ -346,7 +349,7 @@ fn an_absent_type_indication_does_not_enforce_the_precondition() {
             &scheme_anchors(),
             None,
         ),
-        QualifiedStatus::Qualified
+        QualifiedStatus::Indeterminate
     );
 }
 
@@ -604,17 +607,19 @@ fn mint_in_window_sd_jwt() -> sd_jwt_payload::SdJwt {
     )
 }
 
-/// Mint an in-window SD-JWT VC whose `vct` IS the QEAA self-declaration URN
-/// ([`EAA_EU_QUALIFIED_TYPE`]) — a credential that self-declares the qualified-EAA type
-/// (PRO-4.12.4-03), so a granted EAA/Q issuer resolves to `Qualified` through `verify()`. Built from
-/// the shared test-issuer primitives (the canonical minters fix either the `vct` or the validity
-/// window, never both — and `crate::sdjwtvc` test helpers must not be modified for this task).
+/// Mint an in-window SD-JWT VC that self-declares the qualified-EAA type via the issuer-signed
+/// **`category`** claim ([`EAA_EU_QUALIFIED_TYPE`], per ETSI TS 119 472-1 — NOT the `vct`, which is the
+/// credential-type identifier), so a granted EAA/Q issuer resolves to `Qualified` through `verify()`
+/// (PRO-4.12.4-03 satisfied). Built from the shared test-issuer primitives (the canonical minters fix
+/// either the `vct` or the validity window, never both — and `crate::sdjwtvc` test helpers must not be
+/// modified for this task).
 fn mint_in_window_qeaa_sd_jwt() -> sd_jwt_payload::SdJwt {
     use sd_jwt_payload::SdJwtBuilder;
     let cert_b64 = Base64::encode_string(ISSUER_CERT_DER);
     let claims = serde_json::json!({
         "iss": "https://issuer.example/cb",
-        "vct": EAA_EU_QUALIFIED_TYPE,
+        "vct": "urn:eudi:pid:1",
+        "category": EAA_EU_QUALIFIED_TYPE,
         "nbf": RELEVANT_GRANTED - 1_000,
         "exp": RELEVANT_GRANTED + 1_000_000,
         "given_name": "Ada",

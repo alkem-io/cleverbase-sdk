@@ -939,6 +939,82 @@ fn two_credential_dcql(credential_sets: &str) -> String {
     )
 }
 
+/// Build a `NoStatus`-per-document statuses map matching a `vp_token` (each token treated as one
+/// document — the single-credential/single-document shape these tests use), so a valid presentation is
+/// not fail-closed on a missing status. See [`super::verify_vp_token`]'s `statuses` parameter.
+fn all_no_status(
+    vp_token: &BTreeMap<String, Vec<VpToken<'_>>>,
+) -> BTreeMap<String, Vec<Vec<StatusOutcome>>> {
+    vp_token
+        .iter()
+        .map(|(id, tokens)| {
+            (
+                id.clone(),
+                tokens
+                    .iter()
+                    .map(|_| vec![StatusOutcome::NoStatus])
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn verify_vp_token_revoked_credential_does_not_satisfy_a_required_set() {
+    // SC-002 (per-credential status): a vp_token with TWO credentials where the REQUIRED one ("a") is
+    // marked Revoked must NOT satisfy the request. Before per-credential statuses, a single shared
+    // outcome was reused for every credential — passing Good (to clear "b") also cleared the revoked
+    // "a", a false-accept. Now each credential is checked against its OWN outcome.
+    let dcql = two_credential_dcql(r#","credential_sets":[{"options":[["a"]],"required":true}]"#);
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let pres_a = sd_jwt_of_vct(VCT_A, &request);
+    let pres_b = sd_jwt_of_vct(VCT_B, &request);
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("a".to_owned(), vec![VpToken::SdJwtVc(&pres_a)]);
+    vp_token.insert("b".to_owned(), vec![VpToken::SdJwtVc(&pres_b)]);
+
+    // "a" (the required credential) is REVOKED; "b" is current.
+    let mut statuses = BTreeMap::new();
+    statuses.insert("a".to_owned(), vec![vec![StatusOutcome::Revoked]]);
+    statuses.insert("b".to_owned(), vec![vec![StatusOutcome::NoStatus]]);
+    let outcome = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &statuses,
+    );
+    assert!(
+        !outcome.satisfied,
+        "a required-but-revoked credential must not satisfy the request"
+    );
+    let a = &outcome.credentials["a"];
+    assert!(
+        !a.satisfied,
+        "the revoked credential must not satisfy its query"
+    );
+    assert_eq!(a.presentations[0].reasons, vec![ReasonCode::Revoked]);
+
+    // Control: with "a" current, the SAME required set IS satisfied — proving the per-credential status
+    // is what gates it (a single shared status could not express "a revoked, b current").
+    statuses.insert("a".to_owned(), vec![vec![StatusOutcome::NoStatus]]);
+    let ok = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &statuses,
+    );
+    assert!(
+        ok.satisfied,
+        "with the required credential current, the request is satisfied"
+    );
+}
+
 #[test]
 fn verify_vp_token_required_set_satisfied_by_one_option() {
     let dcql =
@@ -954,7 +1030,7 @@ fn verify_vp_token_required_set_satisfied_by_one_option() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(
         outcome.satisfied,
@@ -980,7 +1056,7 @@ fn verify_vp_token_wrong_vct_under_an_id_is_unsatisfied() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(!outcome.satisfied);
     let credential = outcome.credentials.get("a").expect("entry for id a");
@@ -1008,7 +1084,7 @@ fn verify_vp_token_optional_set_absent_does_not_block() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(
         outcome.satisfied,
@@ -1033,7 +1109,7 @@ fn verify_vp_token_required_optional_set_unsatisfied_when_required_missing() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(
         !outcome.satisfied,
@@ -1063,7 +1139,7 @@ fn verify_vp_token_multiple_false_rejects_two_presentations() {
         &anchors_sd_jwt(),
         NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(
         !outcome.satisfied,
@@ -1086,7 +1162,7 @@ fn verify_vp_token_mdoc_credential_is_satisfied() {
         &anchors_mdoc(),
         MDOC_NOW,
         IssuerRole::Pid,
-        StatusOutcome::NoStatus,
+        &all_no_status(&vp_token),
     );
     assert!(outcome.satisfied, "the mdoc matches its DCQL query");
     assert!(outcome.credentials.get("mdl").is_some_and(|c| c.satisfied));

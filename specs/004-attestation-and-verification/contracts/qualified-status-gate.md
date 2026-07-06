@@ -12,8 +12,14 @@ qualifiedStatus(issuer, now, relevantTime, trustList, schemeAnchors, typeIndicat
     -> Qualified | NotQualified | Indeterminate
 ```
 
-`typeIndication` is the credential's self-declared type (SD-JWT VC `vct`; `None` for ISO mdoc) — the
-PRO-4.12.4-03 QEAA self-declaration input (step 2 below).
+`typeIndication` is the credential's self-declared qualified-EAA type — the PRO-4.12.4-03 input (step 2
+below). Per **ETSI TS 119 472-1** it is the issuer-signed **`category`** claim (SD-JWT VC) / **`category`
+data element** in namespace `org.etsi.01947201.010101` (ISO mdoc), carrying the URN
+`urn:etsi:esi:eaa:eu:qualified` for a qualified EAA. It is **NOT** the `vct`/`docType` (the
+credential-TYPE identifier, e.g. `urn:eudi:pid:1`, which is never the qualified URN). The precondition is
+enforced for **both** formats: an absent `category` (an ordinary EAA, which TS 119 472-1 EAA-5.2.2.1-01
+says MUST NOT carry `category`; or an mdoc document that did not disclose the element) ⇒ **Indeterminate**
+(fail closed — never a false "qualified").
 
 Enabled via `VerificationPolicy.qualifiedGate = true`; the result populates `VerificationResult.qualifiedStatus`.
 
@@ -43,12 +49,18 @@ The determination takes **two** instants, used for two different jobs (do not co
    TL-signer's chain validity). A stale-at-`now` / unsigned / forged / unchained list — or no scheme anchor
    — fails closed → **Indeterminate** before any status is read. Then select the relevant national TL.
 2. **QEAA type-indication precondition (PRO-4.12.4-03).** Check that the attestation self-declares the
-   qualified-EAA type via the URN **`urn:etsi:esi:eaa:eu:qualified`** present in the EAA content. If it is
-   **not** present, set the result to **Indeterminate** (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) and
-   STOP — never `Qualified`. The type indication is threaded from `verify()`: SD-JWT VC `vct`; ISO mdoc
-   passes `None` (cl. 4.12 defines no mapping of this URN into mdoc content, so the precondition is not
-   enforced for mdoc — the cert→service-status determination governs). **Version note:** the URN is
-   v1.4.1's form; v1.3.1 used the shorter `urn:etsi:eaa:eu:qualified` (verified online).
+   qualified-EAA type via the URN **`urn:etsi:esi:eaa:eu:qualified`**. Per **ETSI TS 119 472-1** this URN
+   is carried in the issuer-signed **`category`** claim (SD-JWT VC) / the **`category` data element** in
+   namespace `org.etsi.01947201.010101` (ISO mdoc) — **NOT** the `vct`/`docType`. If it is **not** present
+   (or not that exact URN), set the result to **Indeterminate**
+   (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) and STOP — never `Qualified`. The type indication is
+   threaded from `verify()` for **both** formats: SD-JWT VC `issuer_category` (the `category` claim); ISO
+   mdoc the per-document `category` data element surfaced by the always-on bar
+   (`MdocVerifyMeta.categories`). An ordinary EAA (which TS 119 472-1 EAA-5.2.2.1-01 says MUST NOT carry
+   `category`), or an mdoc document that did not disclose the element, has an absent indication ⇒
+   Indeterminate (fail closed — the precondition is enforced for mdoc too, no longer skipped). **Version
+   notes:** the URN is TS 119 615 v1.4.1's form (`…:esi:eaa:…`); v1.3.1 used the shorter
+   `urn:etsi:eaa:eu:qualified`. The `category`-claim carrier is ETSI TS 119 472-1 v1.2.1 (verified online).
 3. Match the issuer's signing cert against an `…/Svctype/EAA/Q` service's **service digital identity
    (Sdi, TS 119 612 §5.5.3)** by any of: exact **X509Certificate** DER, **X509SKI**
    (`SubjectKeyIdentifier`), or the **issuing-CA** relationship. The issuing-CA match is **fail-closed**:
@@ -71,9 +83,11 @@ The determination takes **two** instants, used for two different jobs (do not co
 - **No false "qualified"** (SC-007): `Qualified` is returned only on a positive determination; absent/
   ambiguous trust-list data ⇒ honest **`Indeterminate`** (never assume qualified).
 - **QEAA type-indication precondition** (PRO-4.12.4-03): the attestation MUST self-declare the
-  qualified-EAA type (URN `urn:etsi:esi:eaa:eu:qualified` in the EAA content) before a `Qualified`
-  verdict; an attestation that does not (SD-JWT VC `vct` ≠ the URN) ⇒ **`Indeterminate`**, even when the
-  issuer is a granted `EAA/Q` QTSP. ISO mdoc passes no indication (`None`) and is not gated by it.
+  qualified-EAA type via the URN `urn:etsi:esi:eaa:eu:qualified` in its issuer-signed **`category`**
+  (SD-JWT VC claim / mdoc `category` data element in namespace `org.etsi.01947201.010101`, per ETSI TS
+  119 472-1) before a `Qualified` verdict; an attestation whose `category` is absent or ≠ the URN ⇒
+  **`Indeterminate`**, even when the issuer is a granted `EAA/Q` QTSP. Enforced for **both** formats
+  (mdoc is no longer exempt): a QEAA that does not carry the `category` URN is never `Qualified`.
 - **Only meaningful for a VALID credential** (SC-002/SC-007): the determination matches the credential's
   *claimed* signing cert against the TL **without** re-verifying its signature (X.509 certs are public, so
   an attacker could embed a real qualified issuer's cert). The gate is therefore computed only when the

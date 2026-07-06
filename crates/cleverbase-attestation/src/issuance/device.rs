@@ -25,10 +25,6 @@ use super::signer::{SignerError, SigningInput};
 pub struct DeviceSignatureBuild {
     /// The signing input the host must sign (exposes the verifier `aud`/`nonce`).
     pub input: SigningInput,
-    /// The `#6.24(bstr .cbor DeviceAuthentication)` detached payload (kept so the verifier-side and a
-    /// caller assembling the `DeviceResponse` use the identical bytes).
-    #[serde(with = "serde_bytes")]
-    pub device_auth_payload: Vec<u8>,
     #[serde(with = "serde_bytes")]
     protected_header_value: Vec<u8>,
 }
@@ -128,7 +124,6 @@ pub fn build_device_signature(
             audience.to_owned(),
             nonce.to_owned(),
         ),
-        device_auth_payload,
         protected_header_value,
     })
 }

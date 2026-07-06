@@ -77,6 +77,16 @@ const COSE_KTY_EC2: i64 = 2;
 /// the ISO CDDL (e.g. the auth0-lab/mdl reference parser likewise enforces the MSO version is `"1.0"`).
 const MDOC_SCHEMA_VERSION: &str = "1.0";
 
+/// The ETSI TS 119 472-1 clause 6.2.2 mdoc namespace carrying the QEAA/PuB-EAA **`category`** data
+/// element — the TS 119 615 PRO-4.12.4-03 qualified-EAA type indication for ISO mdoc (value
+/// `urn:etsi:esi:eaa:eu:qualified` for a qualified EAA). Surfaced per document so the opt-in qualified
+/// gate ([`crate::qualified`]) can enforce the precondition for mdoc (previously it passed `None`,
+/// skipping the precondition entirely). Absent element / undisclosed → the gate fails closed
+/// (`Indeterminate`), never a false "qualified".
+const MDOC_QEAA_CATEGORY_NAMESPACE: &str = "org.etsi.01947201.010101";
+/// The `category` element identifier within [`MDOC_QEAA_CATEGORY_NAMESPACE`] (TS 119 472-1 cl. 6.2.2).
+const MDOC_QEAA_CATEGORY_ELEMENT: &str = "category";
+
 /// The hash algorithm named by the MSO `digestAlgorithm` field (ISO/IEC 18013-5 §9.1.2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DigestAlgorithm {
@@ -237,6 +247,13 @@ pub struct MdocVerifyMeta {
     /// response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
     /// it), so this is the authoritative type view for the "did I get what I requested" check.
     pub doc_types: Vec<String>,
+    /// Per-document ETSI TS 119 472-1 **`category`** data element (the qualified-EAA type indication in
+    /// `org.etsi.01947201.010101`), aligned 1:1 with [`Self::claimed_issuers`] — `Some(urn)` when
+    /// the document disclosed the `category` element, else `None`. The opt-in [`crate::qualified`] gate
+    /// reads this as the PRO-4.12.4-03 type indication for each mdoc document (`None` ⇒ the precondition
+    /// is undecidable for that document ⇒ fail closed, never a false "qualified"). Collected during the
+    /// VALID bar pass (EMPTY on any INVALID verdict).
+    pub categories: Vec<Option<String>>,
     /// The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
     /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
     /// classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
@@ -534,6 +551,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
                 document_count,
                 claimed_issuers: Vec::new(),
                 doc_types: Vec::new(),
+                categories: Vec::new(),
                 binding_machinery,
             },
         )
@@ -557,6 +575,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let mut disclosed: DisclosedByNamespace = BTreeMap::new();
     let mut claimed_issuers: Vec<(Vec<u8>, i64)> = Vec::with_capacity(document_count);
     let mut doc_types: Vec<String> = Vec::with_capacity(document_count);
+    let mut categories: Vec<Option<String>> = Vec::with_capacity(document_count);
     // The SessionTranscript is invariant across the whole response; decode it ONCE here rather than
     // once per document (Ef2). `None` here covers BOTH "no transcript supplied" and "supplied but not
     // decodable CBOR": the per-document binding check still distinguishes them (absent →
@@ -593,6 +612,18 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         if let Some(doc_type) = get_text(document, "docType") {
             doc_types.push(doc_type);
         }
+        // Surface THIS document's ETSI TS 119 472-1 `category` (the QEAA type indication the opt-in
+        // qualified gate reads), aligned 1:1 with `claimed_issuers`, BEFORE the merge consumes
+        // `doc_disclosed`. `None` when the document did not disclose the element (⇒ gate fails closed).
+        categories.push(
+            doc_disclosed
+                .get(MDOC_QEAA_CATEGORY_NAMESPACE)
+                .and_then(|ns| ns.get(MDOC_QEAA_CATEGORY_ELEMENT))
+                .and_then(|value| match value {
+                    AttributeValue::Text(text) => Some(text.clone()),
+                    _ => None,
+                }),
+        );
         // `doc_disclosed` is namespace-grouped (`{ ns: { id: value } }`); merge each `(namespace, id,
         // value)` triple so the cross-document no-shadow rule is keyed per `(namespace, id)`.
         for (namespace, ns_map) in doc_disclosed {
@@ -609,6 +640,9 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
         disclosed_attributes: namespace_grouped_attributes(disclosed),
         trust_status: TrustStatus::Trusted,
         qualified_status: None,
+        // The bar itself is request-agnostic; the OpenID4VP layer stamps `request_bound` when it runs
+        // the binding against a request (a bare bar pass is not request-bound).
+        request_bound: false,
         reasons: Vec::new(),
     };
     Ok((
@@ -617,6 +651,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             document_count,
             claimed_issuers,
             doc_types,
+            categories,
             binding_machinery: None,
         },
     ))

@@ -499,19 +499,21 @@ fn qualified_trust_list_fixture() -> Option<QualifiedTrustList> {
     Some(QualifiedTrustList::parse(QUALIFIED_TRUST_LIST_JSON).expect("qualified TL fixture parses"))
 }
 
-/// Mint an SD-JWT VC whose `vct` IS the TS 119 615 v1.4.1 QEAA self-declaration URN
-/// ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03), with caller-chosen `nbf`/`exp`. The canonical
-/// `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both, and the
-/// `crate::sdjwtvc` test helpers must not be modified for this task), so the qualified-gate tests that
-/// need BOTH a self-declared QEAA type AND a specific issuance window build the credential here from the
-/// shared test-issuer primitives.
+/// Mint an SD-JWT VC that self-declares the TS 119 615 v1.4.1 QEAA type indication via the
+/// issuer-signed **`category`** claim ([`EAA_EU_QUALIFIED_TYPE`], PRO-4.12.4-03, per ETSI TS 119 472-1 —
+/// NOT the `vct`, which is the credential-TYPE identifier), with caller-chosen `nbf`/`exp`. The
+/// canonical `mint_sd_jwt_with_*` helpers fix either the `vct` or the validity window (never both, and
+/// the `crate::sdjwtvc` test helpers must not be modified for this task), so the qualified-gate tests
+/// that need BOTH a self-declared QEAA type AND a specific issuance window build the credential here
+/// from the shared test-issuer primitives.
 fn mint_qeaa_sd_jwt(nbf: i64, exp: i64) -> sd_jwt_payload::SdJwt {
     use base64ct::Encoding as _;
     use sd_jwt_payload::SdJwtBuilder;
     let cert_b64 = base64ct::Base64::encode_string(ISSUER_CERT_DER);
     let claims = serde_json::json!({
         "iss": "https://issuer.example/cb",
-        "vct": EAA_EU_QUALIFIED_TYPE,
+        "vct": "urn:eudi:pid:1",
+        "category": EAA_EU_QUALIFIED_TYPE,
         "nbf": nbf,
         "exp": exp,
         "given_name": "Ada",
@@ -538,8 +540,10 @@ fn single_document_mdoc_qualified_issuer_reports_qualified() {
         return; // self-skip: fixture absent
     };
     // Mint the credential ISSUED in the grant window: the gate reads `mdoc-ds`'s status at the MSO
-    // `signed` (the credential's relevant time), not at `RELEVANT_GRANTED`.
+    // `signed` (the credential's relevant time), not at `RELEVANT_GRANTED`. The document self-declares
+    // the ETSI TS 119 472-1 `category` type indication (the QEAA URN) so PRO-4.12.4-03 is satisfied.
     let response = MdocBuilder::new()
+        .qeaa_category()
         .signed(MDOC_ISSUED_IN_GRANT)
         .validity(MDOC_ISSUED_IN_GRANT, MDOC_VALID_UNTIL)
         .build();
@@ -579,6 +583,60 @@ fn single_document_mdoc_qualified_issuer_reports_qualified() {
 }
 
 #[test]
+fn single_document_mdoc_without_the_category_element_is_indeterminate() {
+    // PRO-4.12.4-03 precondition ENFORCED for mdoc (the mdoc analogue of the SD-JWT
+    // `an_absent_type_indication_is_indeterminate`): the SAME granted EAA/Q `mdoc-ds` issuer, issued
+    // in-window (so `read_status` would otherwise resolve Qualified), but the document does NOT disclose
+    // the ETSI TS 119 472-1 `category` data element. Absent type indication → the gate fails closed to
+    // `Indeterminate`, NEVER a false `Qualified` — even for a genuinely granted-at-issuance EAA/Q issuer.
+    let Some(tl) = qualified_trust_list_fixture() else {
+        return; // self-skip: fixture absent
+    };
+    // Identical to `single_document_mdoc_qualified_issuer_reports_qualified` MINUS `.qeaa_category()`.
+    let response = MdocBuilder::new()
+        .signed(MDOC_ISSUED_IN_GRANT)
+        .validity(MDOC_ISSUED_IN_GRANT, MDOC_VALID_UNTIL)
+        .build();
+    let anchors = mdoc_anchors();
+    let scheme = [CA_IACA.to_vec()];
+    let transcript = default_session_transcript();
+    let ctx = VerifyContext {
+        now_unix: RELEVANT_GRANTED,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        qualified_gate: true,
+        qualified_trust_list: Some(&tl),
+        qualified_scheme_anchors: &scheme,
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "the always-on bar still passes (the missing category is not a bar failure): {:?}",
+        result.reasons
+    );
+    assert_ne!(
+        result.qualified_status,
+        Some(QualifiedStatus::Qualified),
+        "an mdoc that does not disclose the ETSI `category` element must NOT be a false Qualified"
+    );
+    assert_eq!(
+        result.qualified_status,
+        Some(QualifiedStatus::Indeterminate),
+        "an absent `category` type indication fails the PRO-4.12.4-03 precondition closed → Indeterminate"
+    );
+}
+
+#[test]
 fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
     // PROVENANCE + PER-DOCUMENT-RELEVANT-TIME PROBE: a VALID two-document response, BOTH signed by the
     // trusted `mdoc-ds` DS (so the always-on bar accepts it and the qualified gate runs). documents[0]
@@ -592,7 +650,11 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
         return; // self-skip: fixture absent
     };
     let response = MdocBuilder::new()
-        // documents[0]: issued in-grant, valid window covers `now` (RELEVANT_AFTER_WITHDRAWN).
+        // documents[0]: issued in-grant, valid window covers `now` (RELEVANT_AFTER_WITHDRAWN). Carries
+        // the ETSI `category` type indication so its PRO-4.12.4-03 precondition is satisfied → Qualified
+        // on its own (the appended documents[1] also carries `category`, so the fold narrows on the
+        // relevant-time STATUS, not on a missing precondition).
+        .qeaa_category()
         .signed(MDOC_ISSUED_IN_GRANT)
         .validity(MDOC_ISSUED_IN_GRANT, MDOC_AFTER_WITHDRAWN_VALID_UNTIL)
         // documents[1]: same trusted DS, issued AFTER the withdrawal, valid window covers `now`.

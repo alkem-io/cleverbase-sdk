@@ -35,7 +35,16 @@ verify(presentation: bytes, policy: VerificationPolicy, anchors: TrustAnchors, r
    `untrusted_issuer`. Absent/expired/revoked anchor → INVALID `untrusted_issuer`.
 4. **Validity period** in range at the relevant time (SD-JWT VC `nbf`/`exp`; mdoc MSO `validityInfo`).
 5. **Revocation/status** — checked per the credential's status mechanism; **unreachable → fail-closed by
-   default** (policy-configurable) → INVALID `status_unavailable` (never silent VALID).
+   default** (policy-configurable) → INVALID `status_unavailable` (never silent VALID). The host supplies
+   the resolved outcome(s) through the sans-IO status seam and **MUST authenticate** the signed status
+   document (verify the status-list JWT/CWT signature + the provider's authorization) before returning
+   it — the core consumes an already-authenticated outcome. **Per-document positional obligation:** an
+   mdoc `DeviceResponse` MAY carry several documents, so the outcomes are a **positional slice**
+   (`statuses[i]` is `documents[i]`'s outcome, in the wire order of the CBOR `documents` array). The host
+   MUST build the slice by iterating `documents[]` in that same order (or use the
+   `status_reference_of(presentation)` helper, which returns each document's own status pointer in wire
+   order) — a misaligned slice would apply one document's outcome to another. A document with no covering
+   entry fails closed to `status_unavailable`; one outcome is **never** silently reused across documents.
 6. **Holder binding** verifies (SD-JWT VC KB-JWT over `aud`/`nonce`/`sd_hash`; mdoc DeviceAuth).
 7. **Selective-disclosure integrity** — each disclosed attribute matches an issuer-signed digest
    (SD-JWT disclosure digest; mdoc `valueDigests`); undisclosed attributes neither revealed nor required.
