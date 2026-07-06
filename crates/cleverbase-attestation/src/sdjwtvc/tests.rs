@@ -48,6 +48,7 @@ fn input<'a>(
         }),
         now_unix: NOW,
         status: StatusInput::NoStatus,
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     }
 }
 

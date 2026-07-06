@@ -187,6 +187,7 @@ fn reference_backend_obtains_a_credential_that_verifies_under_us1() {
         key_binding: None,
         now_unix: NOW,
         status: StatusInput::NoStatus,
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     });
     assert!(
         result.valid,

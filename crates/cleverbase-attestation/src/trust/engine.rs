@@ -458,7 +458,37 @@ impl TrustAnchorSource for NativeTrustEngine {
             issuer_cert_der,
             supplied_intermediates,
             self.now_unix,
-            leaf_validity_time,
+            super::LeafCheck {
+                validity_time: leaf_validity_time,
+                purpose: super::credential_leaf_purpose(role, format),
+            },
+        )
+    }
+
+    fn resolve_status_signer(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        signer_leaf_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
+        // Fail-closed at resolve time (as `resolve`): a stale/never-refreshed cache anchors nothing.
+        if !self.cache_is_fresh() {
+            return TrustDecision::untrusted();
+        }
+        // Chain-validate a DISTINCT status-list signer to the SAME cached anchors, with NO
+        // credential-leaf purpose (`TrustListSigner`); the status-signing EKU is the caller's gate.
+        super::resolve_chain(
+            self.cache.anchors.get(&(role, format)),
+            role,
+            format,
+            signer_leaf_der,
+            supplied_intermediates,
+            self.now_unix,
+            super::LeafCheck {
+                validity_time: None,
+                purpose: crate::trust::chain::LeafPurpose::TrustListSigner,
+            },
         )
     }
 

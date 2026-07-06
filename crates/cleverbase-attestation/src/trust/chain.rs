@@ -962,6 +962,43 @@ fn leaf_has_required_qc_statements(leaf: &Certificate, role: IssuerRole) -> Resu
     }
 }
 
+/// Whether the certificate `leaf_der` carries the Token Status List **status-signing** Extended Key
+/// Usage (draft-ietf-oauth-status-list-21 §13, `id-kp-oauthStatusSigning`) — the leaf-purpose floor a
+/// DISTINCT status-list signer (one that is NOT the credential's own issuer) must clear before the
+/// in-core status verifier ([`crate::status::verify_status_list_token`]) trusts its signature.
+///
+/// **PROVISIONAL — pending IANA (this is the single update point).** The draft defines the purpose as
+/// `{ id-kp TBD }`: the PKIX `id-kp` arc ([`crate::status::STATUS_SIGNING_EKU_ID_KP_ARC`] =
+/// `1.3.6.1.5.5.7.3`) with a terminal sub-arc IANA has **not yet assigned**. Enforcing the (unknown)
+/// terminal OID would reject every real certificate, so — fail-closed but not vacuous — this requires
+/// the leaf to carry an `extendedKeyUsage` extension listing at least one key purpose UNDER the id-kp
+/// arc (`1.3.6.1.5.5.7.3.*`), NOT merely equal to the arc. When IANA assigns the terminal arc, tighten
+/// this to the exact OID (change ONLY [`crate::status::STATUS_SIGNING_EKU_ID_KP_ARC`] to the full dotted
+/// value and drop the trailing-dot prefix trick below). A leaf with NO `extendedKeyUsage`, an
+/// unparsable/duplicate one, or only foreign (non-id-kp) purposes is rejected (`false`). The EKU is NOT
+/// silently skipped — the provisional nature is explicit and localized.
+///
+/// `pub(crate)` — consumed by the status-signer authorization glue in [`crate::verify`], which pairs it
+/// with a chain-to-anchor check (the structural §6.1 path, via
+/// [`crate::trust::TrustAnchorSource::resolve_status_signer`]); neither alone authorizes the signer.
+pub(crate) fn leaf_has_status_signing_eku(leaf_der: &[u8]) -> bool {
+    use x509_cert::ext::pkix::ExtendedKeyUsage;
+    let Ok(leaf) = Certificate::from_der(leaf_der) else {
+        return false; // a status signer whose cert cannot be parsed is not trusted (fail-closed)
+    };
+    // The id-kp arc, with a trailing dot so `starts_with` matches only OIDs strictly UNDER the arc
+    // (`1.3.6.1.5.5.7.3.<n>`), never the bare arc itself nor a sibling arc like `1.3.6.1.5.5.7.30`.
+    let arc_prefix = format!("{}.", crate::status::STATUS_SIGNING_EKU_ID_KP_ARC);
+    match leaf.tbs_certificate.get::<ExtendedKeyUsage>() {
+        Ok(Some((_critical, eku))) => eku
+            .0
+            .iter()
+            .any(|oid| oid.to_string().starts_with(&arc_prefix)),
+        // Absent / unparsable (duplicate) EKU ⇒ not a conformant status signer (fail-closed).
+        _ => false,
+    }
+}
+
 /// One decoded entry of the `qcStatements` extension: `QCStatement ::= SEQUENCE { statementId OBJECT
 /// IDENTIFIER, statementInfo ANY DEFINED BY statementId OPTIONAL }` (RFC 3739 §3.2.6). Decoded with the
 /// `der` `Sequence` derive (typed, no hand-rolled ASN.1).

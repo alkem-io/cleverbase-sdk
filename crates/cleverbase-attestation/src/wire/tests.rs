@@ -60,6 +60,7 @@ fn valid_sd_jwt_request() -> VerifyRequest {
             now_unix: IN_WINDOW_NOW,
             role: IssuerRole::Pid,
             statuses: vec![StatusOutcome::NoStatus],
+            status_tokens: std::collections::BTreeMap::new(),
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
@@ -177,6 +178,7 @@ fn well_formed_mdoc_request_verifies_valid() {
             now_unix: IN_WINDOW_NOW,
             role: IssuerRole::Pid,
             statuses: vec![StatusOutcome::NoStatus],
+            status_tokens: std::collections::BTreeMap::new(),
             // The mdoc `DeviceSignature` is signed over the builder's default transcript; a request-less
             // verify must be handed that same transcript (§9.1.5 — the verifier no longer fabricates
             // one) for the holder binding to verify.

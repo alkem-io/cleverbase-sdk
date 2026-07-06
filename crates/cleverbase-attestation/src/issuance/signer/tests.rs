@@ -259,6 +259,7 @@ fn kb_jwt_built_via_signer_hook_verifies_under_us1() {
         }),
         now_unix: NOW,
         status: StatusInput::NoStatus,
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     });
     assert!(
         result.valid,

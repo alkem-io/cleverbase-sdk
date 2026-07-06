@@ -256,7 +256,37 @@ pub fn verify_response<A: TrustAnchorSource + ?Sized>(
     role: IssuerRole,
     statuses: &[StatusOutcome],
 ) -> VerificationResult {
-    verify_response_with_meta(vp_token, request, policy, anchors, now_unix, role, statuses).0
+    // This public entry carries no signed Token Status List tokens (its many native/test callers pass
+    // only the host-pre-resolved positional `statuses`), so the in-core token seam is empty here — the
+    // positional outcome is authoritative, exactly as before. The C-ABI `verify()` request-bound path
+    // reaches [`verify_response_with_meta`] directly with `ctx.status_tokens` for the in-core path.
+    verify_response_with_meta(
+        vp_token,
+        request,
+        policy,
+        anchors,
+        now_unix,
+        role,
+        StatusInputs {
+            positional: statuses,
+            tokens: &crate::status::DEFAULT_STATUS_TOKENS,
+        },
+    )
+    .0
+}
+
+/// The per-bar revocation/status inputs threaded through the OpenID4VP bound bar as one unit (keeping
+/// the bound-bar functions under the argument-count bar): the host-pre-resolved **positional** outcomes
+/// (one per presented document — [`crate::status::check_status`]) AND the host-fetched signed Token
+/// Status List **tokens** (uri → raw token bytes) that drive the in-core authenticated path. `pub(crate)`
+/// so the [`crate::verify`] entry point can build it from its `VerifyContext`.
+#[derive(Clone, Copy)]
+pub(crate) struct StatusInputs<'a> {
+    /// The host-pre-resolved per-document positional outcomes (the fallback when no signed token covers
+    /// a credential's list URI, or for a CRL / no reference).
+    pub positional: &'a [StatusOutcome],
+    /// The host-fetched signed Token Status List tokens, keyed by list URI → raw token bytes.
+    pub tokens: &'a BTreeMap<String, Vec<u8>>,
 }
 
 /// Verify an OpenID4VP `vp_token` exactly as [`verify_response`] AND surface the mdoc
@@ -272,7 +302,7 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    statuses: &[StatusOutcome],
+    status: StatusInputs<'_>,
 ) -> (VerificationResult, Option<MdocVerifyMeta>) {
     // Format gate (identical to the `verify()` entry point's, so the public `verify_response` honors
     // the `policy` it takes): the policy may restrict accepted formats (an empty set = both). A
@@ -299,12 +329,6 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
     // Run the per-format always-on bar + request binding.
     let (mut result, meta) = match vp_token {
         VpToken::SdJwtVc(presentation) => {
-            // SD-JWT VC is a single credential — its one status is `statuses[0]` (fail closed on an
-            // empty slice).
-            let status = statuses
-                .first()
-                .copied()
-                .unwrap_or(StatusOutcome::Unavailable);
             let result = verify_sd_jwt_vc_bound(
                 presentation,
                 sd_jwt.as_ref(),
@@ -317,8 +341,7 @@ pub(crate) fn verify_response_with_meta<A: TrustAnchorSource + ?Sized>(
             (result, None)
         }
         VpToken::Mdoc(token) => {
-            let (result, meta) =
-                verify_mdoc_bound(token, request, anchors, now_unix, role, statuses);
+            let (result, meta) = verify_mdoc_bound(token, request, anchors, now_unix, role, status);
             (result, Some(meta))
         }
     };
@@ -371,7 +394,7 @@ fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    status: StatusOutcome,
+    status: StatusInputs<'_>,
 ) -> VerificationResult {
     let expected_nonce = request.nonce_b64();
 
@@ -403,7 +426,14 @@ fn verify_sd_jwt_vc_bound<A: TrustAnchorSource + ?Sized>(
             nonce: &expected_nonce,
         }),
         now_unix,
-        status,
+        // SD-JWT VC is a single credential — its one positional outcome is `positional[0]` (fail closed
+        // on an empty slice); the signed-token map drives the in-core path when it covers the list URI.
+        status: status
+            .positional
+            .first()
+            .copied()
+            .unwrap_or(StatusOutcome::Unavailable),
+        status_tokens: status.tokens,
     };
     sdjwtvc::verify_sd_jwt_vc(&input)
 }
@@ -418,7 +448,7 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
     anchors: &A,
     now_unix: i64,
     role: IssuerRole,
-    statuses: &[StatusOutcome],
+    status: StatusInputs<'_>,
 ) -> (VerificationResult, MdocVerifyMeta) {
     if token.audience != request.audience.as_str() {
         return (
@@ -438,7 +468,8 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
         role,
         // Per-document positional statuses (documents[i] against statuses[i]); a document with no
         // covering entry fails closed (`Unavailable`) — one outcome is never reused across documents.
-        statuses,
+        statuses: status.positional,
+        status_tokens: status.tokens,
     };
     // Run the bar ONCE and read the byproducts it already computed (document count + binding-machinery
     // soundness) from the returned meta — no second `DeviceResponse` decode for the replay classifier.
@@ -658,7 +689,13 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
                 anchors,
                 now_unix,
                 credential_role,
-                token_statuses,
+                // The native multi-credential entry carries only host-pre-resolved positional statuses
+                // (no per-credential signed-token map on this surface); the in-core token seam is empty
+                // here, so the positional outcome stays authoritative — unchanged behavior.
+                StatusInputs {
+                    positional: token_statuses,
+                    tokens: &crate::status::DEFAULT_STATUS_TOKENS,
+                },
             );
             // The Presentation counts toward THIS Credential Query only if it both verified AND matches
             // this specific query (by id) — format + `meta` + claims/`claim_sets`/`values`.

@@ -63,6 +63,7 @@ pub fn valid_sd_jwt_verify_request_cbor() -> Vec<u8> {
             now_unix: SMOKE_NOW,
             role: IssuerRole::Pid,
             statuses: vec![crate::status::StatusOutcome::NoStatus],
+            status_tokens: std::collections::BTreeMap::new(),
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,

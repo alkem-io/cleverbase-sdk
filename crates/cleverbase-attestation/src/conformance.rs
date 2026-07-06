@@ -96,6 +96,7 @@ fn iso_18013_5_annex_d_issuer_auth_verifies_under_the_sdk_verifier() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
 
     let disclosed = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params)
@@ -152,6 +153,7 @@ fn iso_18013_5_annex_d_after_validity_window_is_expired() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params);
     assert_eq!(
@@ -172,6 +174,7 @@ fn iso_18013_5_annex_d_untrusted_ds_is_untrusted_issuer() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = mdoc::verify_issuer_auth_against_vector(&device_response, &anchors, &params);
     assert_eq!(

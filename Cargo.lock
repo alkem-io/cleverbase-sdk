@@ -204,6 +204,7 @@ dependencies = [
  "const-oid",
  "coset",
  "der",
+ "miniz_oxide",
  "p256",
  "pkcs8",
  "quick-xml",

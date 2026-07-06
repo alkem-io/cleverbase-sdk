@@ -674,6 +674,7 @@ fn multi_document_mdoc_does_not_report_a_single_qualified_that_under_covers() {
         // Two documents, neither declaring a status mechanism → one NoStatus per document (the single
         // default would fail documents[1] closed to Unavailable before the qualified fold runs).
         statuses: &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
         session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
@@ -743,6 +744,7 @@ fn multi_document_mdoc_with_a_foreign_issuer_document_is_indeterminate_end_to_en
         // Two documents, neither declaring a status mechanism -- one NoStatus per document (the single
         // default would fail documents[1] closed to Unavailable before the qualified fold runs).
         statuses: &[StatusOutcome::NoStatus, StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
         session_transcript: Some(&transcript),
         qualified_gate: true,
         qualified_trust_list: Some(&tl),
@@ -946,4 +948,405 @@ fn credential_without_any_issuance_time_fails_closed_to_indeterminate() {
         Some(QualifiedStatus::Indeterminate),
         "no issuance time → fail closed to Indeterminate, never read status at now"
     );
+}
+
+// =================================================================================================
+// In-core Token Status List authentication through `verify()` (layer 2, draft-ietf-oauth-status-list).
+//
+// A presented credential DECLARES a Token Status List reference (SD-JWT VC `status.status_list` /
+// mdoc MSO `status`); the host supplies the fetched SIGNED status-list token in `ctx.status_tokens`,
+// keyed by list URI; the core AUTHENTICATES it in-core (signature under a key authorized by the
+// credential's OWN issuer/anchor, `sub` binding, freshness, bit read) and the outcome OVERRIDES the
+// positional `statuses` seam. These mint the credential + a REAL signed token with the issuer's own
+// key (the same-issuer path) and assert `verify()` returns valid / `Revoked` per the bit. The
+// negatives assert fail-closed: a token for the WRONG uri is not matched (falls back to positional),
+// and a token signed by an UNTRUSTED key is REJECTED (`StatusUnavailable`), never accepted.
+// =================================================================================================
+
+use std::collections::BTreeMap;
+
+use crate::sdjwtvc::test_issuer::{mint_sd_jwt_with_status, WRONG_ISSUER_CERT_DER};
+
+/// The credential's Token Status List URI (its `status.status_list.uri` / MSO `status` uri).
+const STATUS_LIST_URI: &str = "https://issuer.example/statuslists/verify-1";
+/// The mdoc Document Signer private key (PKCS#8) — signs the same-issuer mdoc status-list CWT so the
+/// token's `x5chain` leaf (`mdoc-ds` cert) equals the credential's verified DS leaf (same-issuer path).
+const MDOC_DS_KEY_PK8: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/mdoc-ds.key.pk8");
+
+/// A single-entry `uri → signed-token` map for `ctx.status_tokens`.
+fn tokens(uri: &str, token: Vec<u8>) -> BTreeMap<String, Vec<u8>> {
+    let mut map = BTreeMap::new();
+    map.insert(uri.to_owned(), token);
+    map
+}
+
+/// zlib-compress (RFC 1950) a status bitstring, mirroring a status provider's `lst`.
+fn zlib(bytes: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec_zlib(bytes, 6)
+}
+
+/// The single-byte `bits=1` bitstring whose entry 0 is 0 (VALID) or 1 (INVALID/revoked) — the tests
+/// reference `idx = 0`, so entry 0 is the LSB of byte 0.
+fn one_bit_lst(revoked: bool) -> Vec<u8> {
+    vec![u8::from(revoked)]
+}
+
+/// Mint a `statuslist+jwt` compact-JWS Status List Token signed by `signer_pk8`, carrying `leaf_der`
+/// as its `x5c` leaf (base64 standard), `sub` bound to the credential's list URI, fresh `iat`/`exp`
+/// around `now`, and entry 0 = 0/1 per `revoked`.
+fn mint_status_jwt(
+    signer_pk8: &[u8],
+    leaf_der: &[u8],
+    sub: &str,
+    now: i64,
+    revoked: bool,
+) -> Vec<u8> {
+    use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
+    use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+    use pkcs8::DecodePrivateKey as _;
+
+    let sk = SigningKey::from_pkcs8_der(signer_pk8).expect("valid PKCS#8 P-256 key");
+    let header = serde_json::json!({
+        "alg": "ES256",
+        "typ": "statuslist+jwt",
+        "x5c": [Base64::encode_string(leaf_der)],
+    });
+    let payload = serde_json::json!({
+        "sub": sub,
+        "iat": now - 100,
+        "exp": now + 1_000,
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&one_bit_lst(revoked))),
+        },
+    });
+    let h = Base64UrlUnpadded::encode_string(&serde_json::to_vec(&header).unwrap());
+    let p = Base64UrlUnpadded::encode_string(&serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{h}.{p}");
+    let sig: Signature = sk.sign(signing_input.as_bytes());
+    let s = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    format!("{signing_input}.{s}").into_bytes()
+}
+
+/// Mint a tagged `COSE_Sign1` `application/statuslist+cwt` Status List Token signed by `signer_pk8`,
+/// carrying `leaf_der` as its `x5chain` leaf (label 33), `sub` (key 2) bound to the list URI, fresh
+/// `iat`/`exp`, and entry 0 = 0/1 per `revoked` (the mdoc baseline wire form).
+fn mint_status_cwt(
+    signer_pk8: &[u8],
+    leaf_der: &[u8],
+    sub: &str,
+    now: i64,
+    revoked: bool,
+) -> Vec<u8> {
+    use ciborium::value::Value as Cbor;
+    use coset::{iana, CoseSign1Builder, HeaderBuilder, TaggedCborSerializable as _};
+    use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+    use pkcs8::DecodePrivateKey as _;
+
+    let sk = SigningKey::from_pkcs8_der(signer_pk8).expect("valid PKCS#8 P-256 key");
+    let status_list = Cbor::Map(vec![
+        (Cbor::Text("bits".to_owned()), Cbor::Integer(1.into())),
+        (
+            Cbor::Text("lst".to_owned()),
+            Cbor::Bytes(zlib(&one_bit_lst(revoked))),
+        ),
+    ]);
+    let claims = Cbor::Map(vec![
+        (Cbor::Integer(2.into()), Cbor::Text(sub.to_owned())), // sub
+        (Cbor::Integer(6.into()), Cbor::Integer((now - 100).into())), // iat
+        (Cbor::Integer(4.into()), Cbor::Integer((now + 1_000).into())), // exp
+        (Cbor::Integer(65_533.into()), status_list),           // status_list (provisional key)
+    ]);
+    let mut payload = Vec::new();
+    ciborium::into_writer(&claims, &mut payload).unwrap();
+    let protected = HeaderBuilder::new()
+        .algorithm(iana::Algorithm::ES256)
+        .value(16, Cbor::Text("application/statuslist+cwt".to_owned()))
+        .build();
+    let unprotected = HeaderBuilder::new()
+        .value(33, Cbor::Bytes(leaf_der.to_vec()))
+        .build();
+    CoseSign1Builder::new()
+        .protected(protected)
+        .unprotected(unprotected)
+        .payload(payload)
+        .create_signature(&[], |tbs| {
+            let sig: Signature = sk.sign(tbs);
+            sig.to_bytes().as_slice().to_vec()
+        })
+        .build()
+        .to_tagged_vec()
+        .unwrap()
+}
+
+// --- SD-JWT VC -----------------------------------------------------------------------------------
+
+#[test]
+fn sd_jwt_status_list_valid_bit_verifies_in_core() {
+    // The issuer signs its OWN status list (same-issuer path): the token's `x5c` leaf equals the
+    // credential's `x5c` issuer leaf, so the key is resolved from that already-verified leaf. Entry 0
+    // is VALID (bit 0) → the in-core outcome is `Good` → the credential is VALID.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER, STATUS_LIST_URI, NOW, false);
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        // The positional seam says Unavailable — the in-core authenticated token MUST override it.
+        statuses: &[StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a VALID (bit 0) in-core status list token must verify, overriding the positional Unavailable: {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn sd_jwt_status_list_revoked_bit_is_rejected_in_core() {
+    // Entry 0 is INVALID (bit 1) in the signed token → the in-core outcome is `Revoked` → REJECTED,
+    // even though the positional seam says the credential is current (Good). The authenticated token
+    // is authoritative.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER, STATUS_LIST_URI, NOW, true);
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::Revoked]);
+}
+
+#[test]
+fn sd_jwt_status_token_for_wrong_uri_is_unresolved_and_fails_closed() {
+    // A signed token is supplied, but under a DIFFERENT map key than the credential's declared list
+    // URI, so the lookup by the credential's URI misses. The credential DECLARES a Token Status List
+    // and the positional outcome is the default NoStatus (no host pre-resolution) — so the declared
+    // list is UNRESOLVED → fail closed to StatusUnavailable (a declared-but-unresolved status must NOT
+    // read as VALID). Contrast the pre-resolved-positional test below, where the host resolved it.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(ISSUER_KEY_PK8, ISSUER_CERT_DER, STATUS_LIST_URI, NOW, true);
+    let status_tokens = tokens("https://issuer.example/statuslists/OTHER", token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        // Default NoStatus positional outcome — the credential has no host-pre-resolved revocation.
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "an unresolved declared status list must fail closed"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+}
+
+#[test]
+fn sd_jwt_declared_status_with_a_host_pre_resolved_positional_outcome_is_honored() {
+    // The credential declares a Token Status List but NO signed token is supplied for its URI; the host
+    // instead PRE-RESOLVED the outcome positionally to Good (e.g. its own out-of-band check). A resolved
+    // positional outcome (anything but the NoStatus default) is honored, so this verifies VALID — only
+    // the NoStatus default means "declared but unresolved" and fails closed.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let empty = BTreeMap::new();
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &empty,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a host-pre-resolved Good positional outcome is honored for a declared list with no token"
+    );
+}
+
+#[test]
+fn sd_jwt_status_token_signed_by_untrusted_key_is_rejected() {
+    // The token is signed by an UNTRUSTED key (wrong-issuer), carrying the wrong-issuer cert as its
+    // `x5c` leaf. Same-issuer key reuse fails (leaf ≠ the credential's issuer leaf); the distinct
+    // status-signer path fails too (the exact-pin test anchors authorize no distinct signer). So the
+    // signer is NOT authorized → the token is Unavailable → the credential is REJECTED with
+    // `StatusUnavailable`, NEVER accepted off an unauthenticated token.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(
+        WRONG_ISSUER_KEY_PK8,
+        WRONG_ISSUER_CERT_DER,
+        STATUS_LIST_URI,
+        NOW,
+        false, // even a "valid" bit must NOT rescue an unauthenticated token
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+}
+
+// --- mdoc ----------------------------------------------------------------------------------------
+
+#[test]
+fn mdoc_status_list_valid_bit_verifies_in_core() {
+    // The mdoc DS signs its own status list (same-issuer path): the CWT's `x5chain` leaf equals the
+    // verified DS leaf. Entry 0 is VALID (bit 0) → `Good` → VALID, overriding the positional Unavailable.
+    let response = MdocBuilder::new()
+        .status_reference(0, STATUS_LIST_URI)
+        .build();
+    let transcript = default_session_transcript();
+    let token = mint_status_cwt(
+        MDOC_DS_KEY_PK8,
+        mdoc_ds_cert_der(),
+        STATUS_LIST_URI,
+        MDOC_NOW,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &mdoc_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a VALID (bit 0) in-core mdoc status list token must verify: {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn mdoc_status_list_revoked_bit_is_rejected_in_core() {
+    // Entry 0 is INVALID (bit 1) in the signed CWT → `Revoked` → REJECTED, overriding a positional Good.
+    let response = MdocBuilder::new()
+        .status_reference(0, STATUS_LIST_URI)
+        .build();
+    let transcript = default_session_transcript();
+    let token = mint_status_cwt(
+        MDOC_DS_KEY_PK8,
+        mdoc_ds_cert_der(),
+        STATUS_LIST_URI,
+        MDOC_NOW,
+        true,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &mdoc_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::Revoked]);
+}
+
+#[test]
+fn mdoc_status_token_signed_by_untrusted_key_is_rejected() {
+    // The CWT is signed by the untrusted wrong-issuer key (its own cert as `x5chain` leaf), distinct
+    // from the credential's DS leaf. Neither authorization path clears (same-issuer mismatch; the
+    // exact-pin anchors authorize no distinct signer) → Unavailable → `StatusUnavailable`, never
+    // accepted — even with a "valid" bit.
+    let response = MdocBuilder::new()
+        .status_reference(0, STATUS_LIST_URI)
+        .build();
+    let transcript = default_session_transcript();
+    let token = mint_status_cwt(
+        WRONG_ISSUER_KEY_PK8,
+        wrong_issuer_cert_der(),
+        STATUS_LIST_URI,
+        MDOC_NOW,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &mdoc_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
 }

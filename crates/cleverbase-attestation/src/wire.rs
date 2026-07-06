@@ -42,6 +42,18 @@
 //! `PresentationRequest` carried in [`VerifyRequest::request`] now requires this field, so the CBOR
 //! shape changed and the schema version was bumped (Principle VII); a binding speaking an older
 //! version is refused with a clear message rather than mis-parsed.
+//!
+//! Version 5 ALSO carries (additively, no further bump) the host-fetched **signed** Token Status List
+//! tokens ([`WireContext::status_tokens`], uri → raw token bytes) that drive the in-core Token Status
+//! List authentication: when a presented credential declares a Token Status List reference and a
+//! matching token is supplied, the core verifies the token's signature (against a key authorized by the
+//! credential's own trust anchor) and reads the revocation bit itself, rather than trusting a
+//! host-supplied outcome. The field is `#[serde(default)]` (empty), so an older v5 payload without it
+//! decodes to "no signed tokens ⇒ the positional `statuses` seam alone" — a decode-compatible addition.
+//! Because this crate is pre-release (0.1.0, unmerged), the addition consolidates into v5 rather than
+//! minting a v6 for an unreleased shape.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +109,8 @@ pub enum WirePresentation {
 
 /// The verification context carried on the wire (the CBOR mirror of [`VerifyContext`]).
 ///
-/// `deny_unknown_fields`: a typo'd optional key (`statuses`, `session_transcript`, `qualified_gate`,
-/// `qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
+/// `deny_unknown_fields`: a typo'd optional key (`statuses`, `status_tokens`, `session_transcript`,
+/// `qualified_gate`, `qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
 /// default — a misspelled `qualified_gate` must not silently leave the gate off, nor a misspelled
 /// `session_transcript` silently skip the mdoc binding. Same rationale as [`VerifyRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +125,19 @@ pub struct WireContext {
     /// no covering entry fails closed to [`StatusOutcome::Unavailable`] — never a silent reuse of one
     /// outcome across documents (SC-002).
     pub statuses: Vec<StatusOutcome>,
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes (a
+    /// `statuslist+jwt` compact JWS, or an `application/statuslist+cwt` tagged `COSE_Sign1`). When a
+    /// presented credential declares a Token Status List reference AND a token is supplied here for its
+    /// URI, the core AUTHENTICATES that token in-core (signature against a key authorized by the
+    /// credential's own trust anchor + `sub` binding + freshness + bit read) and that outcome OVERRIDES
+    /// the positional [`Self::statuses`] entry. Absent (the default `#[serde(default)]` empty map) ⇒ the
+    /// positional `statuses` seam alone (host pre-resolved), preserving the pre-existing behavior. The
+    /// values are CBOR byte strings ([`serde_bytes::ByteBuf`]) so the raw token round-trips through
+    /// ciborium without a lossy text re-encode. Carried additively within schema version 5 (this crate
+    /// is pre-release / unmerged, so the field consolidates into v5 rather than forcing a bump; an older
+    /// v5 payload lacking it decodes to the empty default — a decode-compatible addition).
+    #[serde(default)]
+    pub status_tokens: BTreeMap<String, serde_bytes::ByteBuf>,
     /// The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
     #[serde(default, with = "serde_bytes")]
     pub session_transcript: Option<Vec<u8>>,
@@ -302,10 +327,20 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
                 .iter()
                 .map(|a| a.cert_der.clone())
                 .collect();
+            // Convert the wire `BTreeMap<String, ByteBuf>` to the typed `BTreeMap<String, Vec<u8>>` the
+            // sans-IO `VerifyContext` borrows (the raw signed Token Status List token bytes, keyed by
+            // list URI). Empty (the `#[serde(default)]`) ⇒ the positional `statuses` seam alone.
+            let status_tokens: BTreeMap<String, Vec<u8>> = req
+                .context
+                .status_tokens
+                .iter()
+                .map(|(uri, token)| (uri.clone(), token.clone().into_vec()))
+                .collect();
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,
                 statuses: &req.context.statuses,
+                status_tokens: &status_tokens,
                 session_transcript: req.context.session_transcript.as_deref(),
                 qualified_gate: req.context.qualified_gate,
                 qualified_trust_list: qualified_trust_list.as_ref(),

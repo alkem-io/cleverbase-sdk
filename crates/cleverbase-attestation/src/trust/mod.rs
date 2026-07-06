@@ -202,6 +202,31 @@ impl TrustDecision {
 /// a cert outside its validity window on the path → [`TrustFailure::Expired`] (so the verifier reports
 /// `Expired`, not a misleading `UntrustedIssuer`); every other reason the path reaches no anchor →
 /// [`TrustFailure::NotTrusted`].
+/// The leaf key purpose the chain validator enforces on a CREDENTIAL signing leaf, from its format +
+/// role (mdoc → the ISO 18013-5 Annex B Table B.3 DS profile; SD-JWT VC → the EN 319 412-2/-3 base
+/// floor + the per-role eIDAS QcStatement keyed by `role`) — the single mapping shared by both
+/// chain-validating sources' `resolve` (DRY — Principle III). Distinct from a status-list *signer*
+/// leaf, which chains with [`LeafPurpose::TrustListSigner`] (no credential-leaf purpose) and is instead
+/// gated by the status-signing EKU (see [`TrustAnchorSource::resolve_status_signer`]).
+pub(super) const fn credential_leaf_purpose(role: IssuerRole, format: Format) -> LeafPurpose {
+    match format {
+        Format::Mdoc => LeafPurpose::MdocDocumentSigner,
+        Format::SdJwtVc => LeafPurpose::SdJwtVcIssuer(role),
+    }
+}
+
+/// How [`resolve_chain`] checks the signing **leaf** during path validation: the instant its OWN
+/// validity window is enforced at, and the role/format key purpose it must carry. Bundled so the
+/// resolve body stays under the argument-count bar and the "leaf policy" travels as one unit.
+pub(super) struct LeafCheck {
+    /// The instant the leaf's own validity window is checked at: `None` = the source clock (`now_unix`),
+    /// `Some(t)` = the mdoc DS `validityInfo.signed` seam (ISO/IEC 18013-5 §9.3.1).
+    pub validity_time: Option<i64>,
+    /// The key purpose the leaf must carry ([`credential_leaf_purpose`] for a credential signing leaf;
+    /// [`LeafPurpose::TrustListSigner`] for a distinct status-list signer — no credential-leaf profile).
+    pub purpose: LeafPurpose,
+}
+
 fn resolve_chain(
     anchors_for_key: Option<&Vec<Vec<u8>>>,
     role: IssuerRole,
@@ -209,7 +234,7 @@ fn resolve_chain(
     issuer_cert_der: &[u8],
     supplied_intermediates: &[Vec<u8>],
     now_unix: i64,
-    leaf_validity_time: Option<i64>,
+    leaf: LeafCheck,
 ) -> TrustDecision {
     let Some(anchors) = anchors_for_key else {
         return TrustDecision::untrusted();
@@ -220,16 +245,13 @@ fn resolve_chain(
     let mut chain: Vec<&[u8]> = Vec::with_capacity(1 + supplied_intermediates.len());
     chain.push(issuer_cert_der);
     chain.extend(supplied_intermediates.iter().map(Vec::as_slice));
-    // The credential's format + role fix the leaf key purpose the chain validator enforces on the
-    // signing leaf (mdoc → the ISO 18013-5 Annex B Table B.3 DS profile; SD-JWT VC → the EN 319 412-2/-3
-    // base floor + the per-role eIDAS QcStatement keyed by `role`) — a genuinely-chained-but-WRONG-
-    // PURPOSE leaf is rejected (no "right chain, wrong purpose" false-accept). `leaf_validity_time`
-    // (Some for the mdoc DS leaf at the MSO `signed` time, None elsewhere) is the seam for ISO §9.3.1.
-    let leaf_purpose = match format {
-        Format::Mdoc => LeafPurpose::MdocDocumentSigner,
-        Format::SdJwtVc => LeafPurpose::SdJwtVcIssuer(role),
-    };
-    match verify_chain(&chain, anchors, now_unix, leaf_validity_time, leaf_purpose) {
+    // `leaf.purpose` fixes the key purpose the chain validator enforces on the signing leaf — a
+    // genuinely-chained-but-WRONG-PURPOSE leaf is rejected (no "right chain, wrong purpose"
+    // false-accept). For a credential leaf it is [`credential_leaf_purpose`]; for a distinct status-list
+    // signer it is [`LeafPurpose::TrustListSigner`] (no credential-leaf profile — the status-signing EKU
+    // is the caller's separate gate). `leaf.validity_time` (Some for the mdoc DS leaf at the MSO `signed`
+    // time, None elsewhere) is the seam for ISO §9.3.1.
+    match verify_chain(&chain, anchors, now_unix, leaf.validity_time, leaf.purpose) {
         Ok(()) => TrustDecision::trusted(TrustListEntry {
             role,
             format,
@@ -327,7 +349,34 @@ impl TrustAnchorSource for ChainValidatingAnchors {
             issuer_cert_der,
             supplied_intermediates,
             self.now_unix,
-            leaf_validity_time,
+            LeafCheck {
+                validity_time: leaf_validity_time,
+                purpose: credential_leaf_purpose(role, format),
+            },
+        )
+    }
+
+    fn resolve_status_signer(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        signer_leaf_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
+        // Chain-validate a DISTINCT status-list signer to the SAME anchors as the credential's issuer,
+        // with NO credential-leaf purpose (`TrustListSigner`) — the status-signing EKU is the caller's
+        // separate gate. The signer leaf's window is checked at `now_unix` (no distinct signing instant).
+        resolve_chain(
+            self.anchors.get(&(role, format)),
+            role,
+            format,
+            signer_leaf_der,
+            supplied_intermediates,
+            self.now_unix,
+            LeafCheck {
+                validity_time: None,
+                purpose: LeafPurpose::TrustListSigner,
+            },
         )
     }
 
@@ -386,6 +435,34 @@ pub trait TrustAnchorSource {
         supplied_intermediates: &[Vec<u8>],
         leaf_validity_time: Option<i64>,
     ) -> TrustDecision;
+
+    /// Authorize a Token Status List **signer** leaf that is DISTINCT from the credential's own issuer:
+    /// chain-validate the signer leaf (+ its supplied intermediates) to the SAME configured anchor set
+    /// the credential's issuer chains to for `(role, format)`, WITHOUT imposing the credential-leaf key
+    /// purpose. A status-list signer follows its own profile (draft-ietf-oauth-status-list §13), so the
+    /// credential-leaf QcStatement / mdlDS-EKU floor MUST NOT be applied here; the status-signing EKU is
+    /// enforced separately by the caller (the [`mod@crate::verify`] status-signer glue). **Pure / sans-IO.**
+    ///
+    /// Used ONLY on the distinct-signer branch of the in-core Token Status List check: the primary path
+    /// (the issuer signs its own status list) resolves the key from the credential's already-verified
+    /// issuer leaf by byte-equality and never calls this. Returns a [`TrustDecision`]; `trusted` iff the
+    /// signer leaf chains to a configured anchor.
+    ///
+    /// **Default: fail-closed** (`untrusted`). An exact-DER-pin source ([`StaticTestAnchors`]) cannot
+    /// chain-validate a signer that is not itself pinned, so it authorizes NO distinct status signer —
+    /// only the same-issuer key-reuse path applies there. The chain-validating production sources
+    /// ([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) override this.
+    fn resolve_status_signer(
+        &self,
+        role: IssuerRole,
+        format: Format,
+        signer_leaf_der: &[u8],
+        supplied_intermediates: &[Vec<u8>],
+    ) -> TrustDecision {
+        // Fail-closed: a source that does not chain-validate authorizes no distinct status signer.
+        let _ = (role, format, signer_leaf_der, supplied_intermediates);
+        TrustDecision::untrusted()
+    }
 
     /// Fetch and cache the signed trust lists (host-driven, **not** per-verification). The native
     /// engine applies the [`Reachability`] policy here; the offline anchors are infallible.

@@ -40,6 +40,8 @@ base64ct.workspace = true
 coset.workspace = true
 sd-jwt-payload.workspace = true
 quick-xml.workspace = true
+# Pure-Rust zlib inflate for the in-core Token Status List `lst` bitstring (no C/zlib-sys — WASM-able).
+miniz_oxide.workspace = true
 # Optional, enabled only by the `test-vectors` feature (the shared test-issuer minters): a downstream
 # crate (e.g. `cleverbase-ffi`) enables them as a dev-dependency to drive a VALID end-to-end smoke
 # test through the C-ABI without re-implementing the issuer side (DRY). Otherwise dev-only.

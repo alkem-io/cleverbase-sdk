@@ -87,8 +87,18 @@ pub struct SdJwtVcInput<'a, A: TrustAnchorSource + ?Sized> {
     pub key_binding: Option<KeyBindingChallenge<'a>>,
     /// The current time (Unix seconds) the `nbf`/`exp` window is checked against.
     pub now_unix: i64,
-    /// The revocation/status outcome (the T014 seam).
+    /// The revocation/status outcome (the T014 seam) — the host-pre-resolved positional outcome used as
+    /// the fallback when the credential declares no Token Status List reference, or declares one for
+    /// which no signed token is supplied in [`Self::status_tokens`].
     pub status: StatusInput,
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes. When
+    /// this credential's issuer-signed `status` claim declares a `status_list` reference AND a token is
+    /// supplied here for its `uri`, the bar AUTHENTICATES that token in-core (verifying its signature
+    /// against a key authorized by this credential's own trust anchor) and reads the revocation bit
+    /// itself — overriding [`Self::status`] for this credential. Empty
+    /// ([`crate::status::DEFAULT_STATUS_TOKENS`]) ⇒ the positional [`Self::status`] seam alone
+    /// (pre-existing behavior).
+    pub status_tokens: &'a BTreeMap<String, Vec<u8>>,
 }
 
 /// The holder-binding challenge a presented KB-JWT must satisfy (RFC 9901 §4.3).
@@ -309,8 +319,37 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     // 4. Validity window (`nbf`/`exp`).
     check_validity(sd_jwt.claims(), input.now_unix)?;
 
-    // 5. Revocation / status (the T014 seam).
-    match input.status {
+    // 5. Revocation / status (the T014 seam) — in-core Token Status List authentication (layer 2). The
+    //    credential's OWN issuer-signed `status` claim decides the reference; when it names a Token
+    //    Status List AND a signed token is supplied for that URI, the token is authenticated in-core
+    //    (signature under a key authorized by THIS credential's trust anchor + `sub` binding + freshness
+    //    + bit read) and that outcome OVERRIDES the positional `input.status`. Otherwise (no reference,
+    //    no supplied token, or a CRL) the positional `input.status` is used exactly as before. The
+    //    signer authorization uses the issuer leaf verified in step 2 + the anchors/role/format the bar
+    //    anchored against (step 3), so a status signer is authorized against the credential's own trust.
+    let status_reference = sd_jwt.claims().get("status").map_or(
+        crate::status::StatusReference::None,
+        crate::status::status_reference_from_sd_jwt_claim,
+    );
+    let status_outcome = crate::verify::resolve_status_outcome(
+        &status_reference,
+        input.status,
+        input.status_tokens,
+        input.now_unix,
+        &crate::verify::StatusTrust {
+            issuer_leaf_der: issuer_cert_der,
+            // The SPECIFIC anchor the issuer chained to (the matched entry, present because
+            // `decision.trusted` was checked above) — a distinct status signer must chain to THIS anchor.
+            issuer_anchor_der: decision
+                .entry
+                .as_ref()
+                .map_or(&[][..], |entry| entry.anchor_cert_der.as_slice()),
+            anchors: input.anchors,
+            role: effective_role,
+            format: crate::types::Format::SdJwtVc,
+        },
+    );
+    match status_outcome {
         StatusInput::NoStatus | StatusInput::Good => {}
         StatusInput::Revoked => return Err(ReasonCode::Revoked),
         StatusInput::Unavailable => return Err(ReasonCode::StatusUnavailable),

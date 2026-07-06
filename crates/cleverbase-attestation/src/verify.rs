@@ -98,6 +98,18 @@ pub struct VerifyContext<'a> {
     /// [`StatusOutcome::Unavailable`] — one outcome is never silently reused across documents (SC-002). The
     /// default [`crate::status::DEFAULT_STATUSES`] covers exactly one document.
     pub statuses: &'a [StatusOutcome],
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI (the credential's
+    /// `status.status_list.uri`) → the raw token bytes (a `statuslist+jwt` compact JWS or an
+    /// `application/statuslist+cwt` tagged `COSE_Sign1`). When a presented credential declares a Token
+    /// Status List reference AND a token is supplied here for its URI, the core AUTHENTICATES that token
+    /// in-core ([`crate::status::verify_status_list_token`]) — verifying its signature against a key
+    /// authorized by the credential's own trust anchor, binding `sub` to the URI, checking freshness,
+    /// and reading the revocation bit itself — and that outcome OVERRIDES the positional
+    /// [`Self::statuses`] entry for that credential/document. With no token supplied for a URI (or for a
+    /// CRL / no reference), the positional `statuses` outcome is used exactly as before. Host-supplied
+    /// (the core stays sans-IO: the host does the fetch; the core does the authentication). The default
+    /// [`crate::status::DEFAULT_STATUS_TOKENS`] is empty (⇒ the positional seam alone, unchanged).
+    pub status_tokens: &'a std::collections::BTreeMap<String, Vec<u8>>,
     /// The mdoc `SessionTranscript` the `DeviceAuth` is bound to, for a presentation **without** an
     /// OpenID4VP request (with a request, the handover is reconstructed from the request instead).
     pub session_transcript: Option<&'a [u8]>,
@@ -123,13 +135,14 @@ pub struct VerifyContext<'a> {
 }
 
 impl Default for VerifyContext<'_> {
-    /// The offline-suite default: epoch instant, PID role, no status, no transcript, gate off, no
-    /// qualified trust list.
+    /// The offline-suite default: epoch instant, PID role, no status (positional + no signed tokens),
+    /// no transcript, gate off, no qualified trust list.
     fn default() -> Self {
         Self {
             now_unix: 0,
             role: IssuerRole::Pid,
             statuses: crate::status::DEFAULT_STATUSES,
+            status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
             session_transcript: None,
             qualified_gate: false,
             qualified_trust_list: None,
@@ -226,15 +239,22 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
         match (presentation, request) {
             // --- With an OpenID4VP request: run the binding verifier (bar + nonce/audience). ------
             (Presentation::SdJwtVc(p), Some(req)) => (
-                openid4vp::verify_response(
+                // Delegate to the meta-returning entry (dropping the always-`None` SD-JWT meta) so the
+                // in-core `status_tokens` reach the bound bar — the public `verify_response` keeps its
+                // status-token-less signature for its many native callers (DRY: one bound bar body).
+                openid4vp::verify_response_with_meta(
                     &VpToken::SdJwtVc(p),
                     req,
                     policy,
                     anchors,
                     ctx.now_unix,
                     ctx.role,
-                    ctx.statuses,
-                ),
+                    openid4vp::StatusInputs {
+                        positional: ctx.statuses,
+                        tokens: ctx.status_tokens,
+                    },
+                )
+                .0,
                 None,
             ),
             (
@@ -264,7 +284,10 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     anchors,
                     ctx.now_unix,
                     ctx.role,
-                    ctx.statuses,
+                    openid4vp::StatusInputs {
+                        positional: ctx.statuses,
+                        tokens: ctx.status_tokens,
+                    },
                 )
             }
 
@@ -281,6 +304,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     key_binding: None,
                     now_unix: ctx.now_unix,
                     status: status_head,
+                    status_tokens: ctx.status_tokens,
                 };
                 (sdjwtvc::verify_sd_jwt_vc(&input), None)
             }
@@ -297,6 +321,7 @@ pub fn verify<A: TrustAnchorSource + ?Sized>(
                     // The request-less mdoc path carries the FULL positional slice, so a multi-document
                     // response is checked per document (documents[i] against statuses[i]).
                     statuses: ctx.statuses,
+                    status_tokens: ctx.status_tokens,
                 };
                 let (result, meta) = mdoc::verify_with_meta(device_response, anchors, &params);
                 (result, Some(meta))
@@ -481,6 +506,135 @@ where
         .into_iter()
         .max_by_key(|status| severity(status))
         .unwrap_or(QualifiedStatus::Indeterminate)
+}
+
+/// Resolve a credential's revocation/status outcome, preferring the IN-CORE authenticated Token Status
+/// List path over the host-supplied positional outcome (the shared status step for BOTH per-format bars
+/// — DRY, Principle III).
+///
+/// The credential's own [`crate::status::StatusReference`] (parsed in-core from its issuer-signed status
+/// claim / MSO element) decides the source:
+/// - **`StatusList { index, uri }` with a supplied signed token** — the token is AUTHENTICATED in-core
+///   ([`crate::status::verify_status_list_token`]): its signature is verified under a key
+///   [`authorize_status_signer`] authorizes against the credential's OWN trust context, `sub` is bound
+///   to `uri`, freshness is enforced, and the bit at `index` is read. This outcome OVERRIDES the
+///   positional one (the core no longer trusts a host-supplied *outcome* for a token it can check).
+/// - **`StatusList` with NO supplied token, or `Crl`, or `None`** — the positional `positional` outcome
+///   (host pre-resolved via [`crate::status::check_status`]) is used, exactly as before.
+///
+/// Fail-closed: a supplied-but-unverifiable token yields [`StatusOutcome::Unavailable`]
+/// ([`crate::status::verify_status_list_token`] never returns `Good` on any doubt), which the bars map to
+/// [`ReasonCode::StatusUnavailable`] — NEVER a silent fall-back to the positional outcome for a token
+/// that was supplied but failed authentication.
+pub(crate) fn resolve_status_outcome<A: TrustAnchorSource + ?Sized>(
+    reference: &crate::status::StatusReference,
+    positional: StatusOutcome,
+    status_tokens: &std::collections::BTreeMap<String, Vec<u8>>,
+    now_unix: i64,
+    trust: &StatusTrust<'_, A>,
+) -> StatusOutcome {
+    use crate::status::StatusReference;
+    match reference {
+        StatusReference::StatusList { index, uri } => status_tokens.get(uri).map_or_else(
+            // No signed token supplied for THIS declared list. Fall back to the host-pre-resolved
+            // positional outcome — EXCEPT `NoStatus`: a credential that declares a status list is never
+            // legitimately "no status mechanism", so a positional `NoStatus` here means the declared
+            // list was left UNRESOLVED (host fetch failed / not wired). Fail closed to `Unavailable`
+            // rather than continue the bar with no revocation check (the core parsed the reference and
+            // knows a list is declared — a declared-but-unresolved contradiction must not read as VALID).
+            || match positional {
+                StatusOutcome::NoStatus => StatusOutcome::Unavailable,
+                resolved => resolved,
+            },
+            // A signed token supplied for THIS list is authenticated in-core (authoritative).
+            |token| {
+                crate::status::verify_status_list_token(token, uri, *index, now_unix, |material| {
+                    authorize_status_signer(material, trust)
+                })
+            },
+        ),
+        // CRL is host-resolved; `None` → the host's NoStatus. Positional either way (unchanged).
+        StatusReference::Crl { .. } | StatusReference::None => positional,
+    }
+}
+
+/// The credential's OWN trust context, bundled so it travels to the status-signer authorization as one
+/// unit (keeping [`resolve_status_outcome`] under the argument-count bar). It carries exactly what
+/// [`authorize_status_signer`] needs to decide whether a Token Status List signer is authorized to sign
+/// THIS credential's list: the already-verified issuer leaf (for the same-issuer key-reuse check) and
+/// the anchors/role/format the bar anchored the credential against (for the distinct-signer chain check).
+pub(crate) struct StatusTrust<'a, A: TrustAnchorSource + ?Sized> {
+    /// The credential's already signature- and trust-verified issuer leaf (SD-JWT VC `x5c` leaf / mdoc
+    /// DS cert). The same-issuer path resolves the key from this leaf on a byte-equal match.
+    pub issuer_leaf_der: &'a [u8],
+    /// The SPECIFIC trust anchor (DER) the credential's issuer chained to (the matched
+    /// [`crate::trust::TrustListEntry::anchor_cert_der`]). A distinct status signer must chain to THIS
+    /// SAME anchor — not merely any anchor in the `(role, format)` set: in a federated set holding
+    /// several issuers' roots, binding only to the set would let a status signer trusted under issuer
+    /// A's root sign a list for issuer B's credential (cross-issuer un-revocation). Empty when the
+    /// issuer's matched entry carried no anchor (then the distinct-signer path cannot match → fail-closed).
+    pub issuer_anchor_der: &'a [u8],
+    /// The trust anchors the credential's issuer chained to — a distinct status signer must chain to the
+    /// SAME set for `(role, format)`, AND (see [`Self::issuer_anchor_der`]) to the same specific anchor.
+    pub anchors: &'a A,
+    /// The (reconciled) issuer role the credential anchored under.
+    pub role: IssuerRole,
+    /// The credential's format.
+    pub format: Format,
+}
+
+/// The trust-authorization closure for the in-core Token Status List verifier (security-critical): given
+/// the token's embedded [`crate::status::SignerKeyMaterial`], decide whether its signer is authorized to
+/// sign THIS credential's status list, and if so return the [`VerifyingKey`] to verify the token under.
+/// Fail-closed — any doubt is `Err(())`, which folds to [`StatusOutcome::Unavailable`].
+///
+/// Two authorization paths (a key is NEVER authorized merely because it is embedded in the token —
+/// self-authorization would defeat the check):
+/// 1. **Same-issuer key reuse (primary path).** If the token's `x5chain` leaf DER byte-equals the
+///    credential's already-verified issuer leaf (`issuer_leaf_der` — the SD-JWT VC `x5c` leaf / the mdoc
+///    DS cert), the issuer signs its own status list: resolve the key straight from that leaf. No EKU /
+///    chain check — it IS the credential's issuer, already signature- and trust-verified by the bar.
+/// 2. **Distinct status-signer.** Otherwise the token's leaf must BOTH (a) chain to the SAME anchor the
+///    credential's issuer chained to — [`TrustAnchorSource::resolve_status_signer`] for the same
+///    `(role, format)`, WITHOUT the credential-leaf purpose — AND (b) bear the status-signing EKU
+///    ([`crate::trust::chain::leaf_has_status_signing_eku`], provisional id-kp arc). Only then is the key
+///    resolved from the (authorized) leaf.
+fn authorize_status_signer<A: TrustAnchorSource + ?Sized>(
+    material: &crate::status::SignerKeyMaterial,
+    trust: &StatusTrust<'_, A>,
+) -> Result<p256::ecdsa::VerifyingKey, ()> {
+    // A status list token carries its signer chain leaf-first; with no chain there is nothing to
+    // authorize (a bare `kid` is not, by itself, an authorization) → fail-closed.
+    let (leaf, intermediates) = material.x5chain.split_first().ok_or(())?;
+
+    // (1) Same-issuer key reuse: the issuer signs its own status list. Byte-equal leaf ⇒ resolve the
+    // key from the credential's already-verified issuer leaf (no EKU / chain — it IS that issuer).
+    if leaf.as_slice() == trust.issuer_leaf_der {
+        return crate::crypto::p256_verifying_key_from_cert_der(leaf).ok_or(());
+    }
+
+    // (2) Distinct status-signer: (a) chain to the credential's issuer's SAME SPECIFIC anchor (not just
+    // any anchor in the (role, format) set — see `issuer_anchor_der`), structural (no credential-leaf
+    // purpose), AND (b) bear the status-signing EKU. Either check failing is fail-closed (`Err`), NEVER a
+    // fall-through that would authorize an embedded-but-untrusted key.
+    let decision =
+        trust
+            .anchors
+            .resolve_status_signer(trust.role, trust.format, leaf, intermediates);
+    // Bind to the issuer's OWN anchor: the signer must chain to the exact anchor the credential chained
+    // to. A signer chaining to a DIFFERENT root in the same set (a federated cross-issuer signer) is
+    // rejected. An empty `issuer_anchor_der` (issuer entry carried no anchor) matches nothing → Err.
+    let same_anchor = decision
+        .entry
+        .as_ref()
+        .is_some_and(|entry| entry.anchor_cert_der == trust.issuer_anchor_der);
+    if !(decision.trusted && same_anchor) {
+        return Err(());
+    }
+    if !crate::trust::chain::leaf_has_status_signing_eku(leaf) {
+        return Err(());
+    }
+    crate::crypto::p256_verifying_key_from_cert_der(leaf).ok_or(())
 }
 
 #[cfg(test)]

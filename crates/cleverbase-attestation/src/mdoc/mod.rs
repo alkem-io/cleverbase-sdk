@@ -179,6 +179,13 @@ pub struct MdocVerifyParams<'a> {
     /// to [`StatusOutcome::Unavailable`] (never a silent VALID). Mirrors the SD-JWT VC status seam (which
     /// carries a single credential's single outcome).
     pub statuses: &'a [StatusOutcome],
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes. When a
+    /// document's MSO `status` element declares a `status_list` reference AND a token is supplied here
+    /// for its `uri`, the bar AUTHENTICATES that token in-core (verifying its signature against a key
+    /// authorized by that document's DS trust anchor) and reads the revocation bit itself — overriding
+    /// that document's positional [`Self::statuses`] entry. Empty
+    /// ([`crate::status::DEFAULT_STATUS_TOKENS`]) ⇒ the positional seam alone (pre-existing behavior).
+    pub status_tokens: &'a BTreeMap<String, Vec<u8>>,
 }
 
 impl Default for MdocVerifyParams<'_> {
@@ -193,6 +200,7 @@ impl Default for MdocVerifyParams<'_> {
             session_transcript: None,
             role: IssuerRole::Pid,
             statuses: crate::status::DEFAULT_STATUSES,
+            status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
         }
     }
 }
@@ -843,7 +851,35 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     enforce_validity(&validity, params.now_unix)?;
 
     // --- Revocation / status (the T014 seam): THIS document's own outcome maps onto the bar. --------
-    match status {
+    // In-core Token Status List authentication (layer 2): the MSO's OWN `status` element decides the
+    // reference; when it names a Token Status List AND a signed token is supplied for that URI, the token
+    // is authenticated in-core (signature under a key authorized by THIS document's DS trust anchor +
+    // `sub` binding + freshness + bit read) and OVERRIDES the positional `status`. Otherwise (no
+    // reference, no supplied token, or a CRL) the positional `status` is used exactly as before. The
+    // signer authorization uses the DS leaf + the anchors/role/format this document anchored against.
+    let status_reference = get_map_entry(&mso, "status").map_or(
+        crate::status::StatusReference::None,
+        crate::status::status_reference_from_mdoc_status,
+    );
+    let status_outcome = crate::verify::resolve_status_outcome(
+        &status_reference,
+        status,
+        params.status_tokens,
+        params.now_unix,
+        &crate::verify::StatusTrust {
+            issuer_leaf_der: ds_cert_der,
+            // The SPECIFIC anchor the DS cert chained to (the matched entry, present because
+            // `decision.trusted` was checked above) — a distinct status signer must chain to THIS anchor.
+            issuer_anchor_der: decision
+                .entry
+                .as_ref()
+                .map_or(&[][..], |entry| entry.anchor_cert_der.as_slice()),
+            anchors,
+            role: effective_role,
+            format: crate::types::Format::Mdoc,
+        },
+    );
+    match status_outcome {
         StatusOutcome::NoStatus | StatusOutcome::Good => {}
         StatusOutcome::Revoked => return Err(VerifyFailure::reason(ReasonCode::Revoked)),
         StatusOutcome::Unavailable => {

@@ -1551,6 +1551,13 @@ single outcome cannot cover them (applying one to all would let a revoked second
 inside a VALID verdict — SC-002). A document whose index is not covered by `statuses` fails closed
 to [`StatusOutcome::Unavailable`] (never a silent VALID). Mirrors the SD-JWT VC status seam (which
 carries a single credential's single outcome).
+- `status_tokens: &'a BTreeMap<String, Vec<u8>>`
+  - The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes. When a
+document's MSO `status` element declares a `status_list` reference AND a token is supplied here
+for its `uri`, the bar AUTHENTICATES that token in-core (verifying its signature against a key
+authorized by that document's DS trust anchor) and reads the revocation bit itself — overriding
+that document's positional [`Self::statuses`] entry. Empty
+([`crate::status::DEFAULT_STATUS_TOKENS`]) ⇒ the positional seam alone (pre-existing behavior).
 
 ### Enums
 
@@ -2360,7 +2367,17 @@ or `None` to accept a presentation without holder binding (e.g. an issuer-only c
 - `now_unix: i64`
   - The current time (Unix seconds) the `nbf`/`exp` window is checked against.
 - `status: StatusInput`
-  - The revocation/status outcome (the T014 seam).
+  - The revocation/status outcome (the T014 seam) — the host-pre-resolved positional outcome used as
+the fallback when the credential declares no Token Status List reference, or declares one for
+which no signed token is supplied in [`Self::status_tokens`].
+- `status_tokens: &'a BTreeMap<String, Vec<u8>>`
+  - The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes. When
+this credential's issuer-signed `status` claim declares a `status_list` reference AND a token is
+supplied here for its `uri`, the bar AUTHENTICATES that token in-core (verifying its signature
+against a key authorized by this credential's own trust anchor) and reads the revocation bit
+itself — overriding [`Self::status`] for this credential. Empty
+([`crate::status::DEFAULT_STATUS_TOKENS`]) ⇒ the positional [`Self::status`] seam alone
+(pre-existing behavior).
 
 ### Functions
 
@@ -2431,10 +2448,24 @@ INVALID `status_unavailable` (never a silent VALID). This module evaluates that 
 
 The core performs no network I/O. A credential references its status mechanism (a Token Status
 List pointer `uri`+`idx`, or a CRL the integrator names); the **host** fetches the referenced
-status document and supplies its bytes through the [`StatusSource`] seam, exactly as the trust
-engine takes fetched trust-list bytes through `TrustListFetcher`. The fetch (network, caching,
-freshness of the *transport*) is the host's; the *evaluation* and the **fail-closed policy** are
-the core's.
+status document and supplies its bytes, exactly as the trust engine takes fetched trust-list
+bytes through `TrustListFetcher`. The fetch (network, caching, freshness of the *transport*) is
+the host's; the *evaluation* and the **fail-closed policy** are the core's.
+
+Two host seams exist, at different trust levels:
+
+- **Authenticated in-core (the authoritative path, [`verify_status_list_token`]).** The host
+  fetches the *signed* Token Status List Token by URI and hands the RAW token bytes to the core,
+  which then AUTHENTICATES it end-to-end — verifies the JWS/`COSE_Sign1` signature under a key the
+  caller's trust closure authorizes, binds `sub` to the credential's list URI, checks `exp`/`ttl`,
+  zlib-inflates the bitstring, and reads the status bit itself. The core no longer trusts a
+  host-supplied *outcome*; it re-derives it from the signed artifact (fail-closed on any doubt).
+  The always-on [`verify()`](crate::verify()) entry point uses this whenever a credential declares a
+  Token Status List reference and the host supplied the matching token.
+- **Host-pre-resolved ([`StatusSource`] / [`check_status`]).** The legacy seam where the host has
+  already authenticated + unpacked the status document and supplies the byte-per-entry array; the
+  core only reads the bit under the fail-closed policy. Retained for CRL (host-resolved) and as the
+  positional fallback when no signed token is supplied for a given list URI.
 
 ## Status mechanisms
 
@@ -2447,6 +2478,31 @@ the core's.
 
 The decision maps to a single canonical [`StatusOutcome`] that the per-format verifiers consume
 through their status seam (one authoritative status type — DRY).
+
+### Structs
+
+#### struct `SignerKeyMaterial`
+
+```rust
+struct SignerKeyMaterial
+```
+
+The signer-identifying material a Status List Token embeds, handed to the caller's key-resolution
+closure ([`verify_status_list_token`]'s `resolve_key`) so that `crate::trust` (layer 2) can
+AUTHORIZE the signer WITHOUT this sans-IO module holding any trust anchors. The module extracts
+this from the token header and performs the signature verification with whatever [`VerifyingKey`]
+the closure returns; the trust/EKU policy is entirely the closure's.
+
+##### Fields
+
+- `x5chain: Vec<Vec<u8>>`
+  - The signer's X.509 certificate chain (DER, **leaf-first**), from the token's `x5c` (JOSE, RFC
+7515 §4.1.6 — base64 *standard*) or `x5chain` (COSE label 33, RFC 9360 — `bstr`/array of
+`bstr`) header. Empty when the token carries no chain (the closure may then resolve by
+[`Self::kid`], or reject).
+- `kid: Option<Vec<u8>>`
+  - The token's key identifier from the `kid` header — the UTF-8 bytes of the JOSE string value, or
+the raw COSE label-4 `bstr`. `None` when absent.
 
 ### Enums
 
@@ -2517,13 +2573,18 @@ fetches the referenced status document (network, transport caching) and returns 
 or `None` when it is unreachable. A `None` under [`StatusReachability::FailClosed`] is the
 fail-closed reject; under [`StatusReachability::BestEffort`] it is tolerated.
 
-**Host obligation — authenticate the status document.** A Token Status List (or CRL) is a *signed*
-artifact (draft-ietf-oauth-status-list: a JWT/CWT signed by the status provider). This seam receives
-the ALREADY-AUTHENTICATED, unpacked status array — the host MUST verify the status-list token's
-signature (and that its signer is the credential's authorized status provider) BEFORE unpacking and
-returning the bytes. The core does not receive the signed token and therefore cannot check it; a
-host that returns an unauthenticated (e.g. attacker-served) status document would defeat revocation.
-This mirrors the trust-list seam, where the host/engine authenticates each fetched list before use.
+**Host obligation on THIS seam — authenticate the status document.** A Token Status List (or CRL)
+is a *signed* artifact (draft-ietf-oauth-status-list: a JWT/CWT signed by the status provider). This
+seam receives the ALREADY-AUTHENTICATED, unpacked status array — a host using it MUST verify the
+status-list token's signature (and that its signer is the credential's authorized status provider)
+BEFORE unpacking and returning the bytes, because [`check_status`] does not see the signed token.
+
+**Prefer the in-core authenticated path.** For a Token Status List the authoritative surface is
+[`verify_status_list_token`], which takes the RAW signed token and authenticates it end-to-end
+inside the core (signature + `sub` binding + freshness + bit read) — so a host that returned an
+unauthenticated (e.g. attacker-served) array here would NOT defeat revocation, because the
+always-on verifier reads the bit from the signed token itself when one is supplied. This seam
+remains for CRL (host-resolved) and as the positional fallback when no signed token is available.
 
 ```rust
 fn fetch_status_list(&self, uri: &str) -> Option<Vec<u8>>
@@ -2534,8 +2595,8 @@ Fetch the packed Token Status List bytes for `uri`, or `None` if unreachable.
 The bytes are the **unpacked** status array: one byte per entry holding that entry's status
 value (`0` = valid; non-zero = revoked/suspended). The host is responsible for decompressing /
 bit-unpacking the wire form (the CBOR/JWT-wrapped, optionally DEFLATE-compressed bitstring)
-into this byte-per-entry view; the core does not pull a compression dependency into its
-sans-IO surface.
+into this byte-per-entry view. (The in-core [`verify_status_list_token`] path instead
+zlib-inflates the bitstring itself — this pre-unpacked seam is the host-pre-resolved fallback.)
 
 ```rust
 fn fetch_crl_revoked_serials(&self, uri: &str) -> Option<Vec<Vec<u8>>>
@@ -2566,6 +2627,61 @@ fail-closed reachability policy.
 
 Sans-IO: the status documents are supplied through `source`; this performs no network I/O.
 
+#### fn `status_reference_from_mdoc_status`
+
+```rust
+fn status_reference_from_mdoc_status(status_cbor: &Value) -> StatusReference
+```
+
+Parse the Token Status List reference an **mdoc** declares, from the already-parsed MSO `status`
+element (draft-ietf-oauth-status-list-21 §8): a CBOR map `status_list → { idx (uint), uri (tstr) }`
+with TEXT keys. As with the SD-JWT VC form the wire key is **`idx`**; it maps onto
+[`StatusReference::StatusList`]'s `index`. Returns [`StatusReference::None`] when no usable
+`status_list` reference is present. Pure parser — reaches into no other module (layer 2 threads the
+element in).
+
+#### fn `status_reference_from_sd_jwt_claim`
+
+```rust
+fn status_reference_from_sd_jwt_claim(status_claim: &Value) -> StatusReference
+```
+
+Parse the Token Status List reference an **SD-JWT VC** declares, from its already-parsed `status`
+claim value (draft-ietf-oauth-status-list-21 §8): `status → status_list → { idx, uri }`. Note the
+wire key is **`idx`** (not `index`); it maps onto [`StatusReference::StatusList`]'s `index` field.
+Returns [`StatusReference::None`] when no usable `status_list` reference is present (absent, or a
+missing/ill-typed `idx`/`uri`); the caller applies its own (fail-closed) policy to an absent
+reference. This is a pure parser — it reaches into no other module (layer 2 threads the claim in).
+
+#### fn `verify_status_list_token`
+
+```rust
+fn verify_status_list_token<F>(token: &[u8], expected_uri: &str, idx: u64, now_unix: i64, resolve_key: F) -> StatusOutcome where F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>
+```
+
+Authenticate a *signed* Token Status List Token and read this credential's status bit from it,
+returning the canonical [`StatusOutcome`] (draft-ietf-oauth-status-list-21). Both wire forms are
+accepted and auto-detected: a compact JWS (`statuslist+jwt`, SD-JWT VC baseline — pure ASCII) or a
+tagged `COSE_Sign1` CWT (`application/statuslist+cwt`, mdoc baseline — binary CBOR beginning with
+the tag-18 byte `0xD2`). The host fetched `token` by URI (sans-IO — the network is the host's); this
+verifies it in-core.
+
+Fail-closed contract: EVERY check must hold, else the result is [`StatusOutcome::Unavailable`],
+NEVER [`StatusOutcome::Good`]. In order:
+1. **Signature** — JWS ES256 / `COSE_Sign1` ES256 under the key `resolve_key` authorizes; a bad
+   signature, non-ES256 `alg`, wrong `typ`, present `crit`, or `COSE_Mac0` (tag 17) → `Unavailable`.
+2. **Subject binding** — the token's `sub` MUST byte-exactly equal `expected_uri` (the credential's
+   `status_list.uri`); a validly-signed list for a *different* URI is rejected.
+3. **Freshness** — a present `exp` MUST be `> now_unix`; a present `ttl` requires `iat + ttl >=
+   now_unix` (else the cached token is stale). `iat` is REQUIRED.
+4. **Bit** — the `lst` bitstring is zlib-inflated and the `bits`-wide, LSB-first entry at `idx` is
+   read (an out-of-range `idx` → `Unavailable`, never `Good`) and mapped through the status
+   registry (0=VALID→`Good`, 1=INVALID→`Revoked`, 2=SUSPENDED→`Revoked`, else→`Unavailable`).
+
+`resolve_key` receives the token's parsed [`SignerKeyMaterial`] and returns the [`VerifyingKey`] to
+verify under (or `Err(())` to reject). The signing-key TRUST/EKU decision is the closure's — layer 2
+implements it against `crate::trust`; this module only parses the hint and does the crypto.
+
 ### Constants
 
 #### const `DEFAULT_STATUSES`
@@ -2581,6 +2697,25 @@ Used as the offline-suite / single-credential default for the positional `status
 document: an mdoc `DeviceResponse` carrying MORE than one document needs one [`StatusOutcome`] per
 document (the per-document revocation check is positional), so an under-supplied multi-document
 response fails closed to [`StatusOutcome::Unavailable`] rather than reusing one outcome for all.
+
+#### const `STATUS_SIGNING_EKU_ID_KP_ARC`
+
+```rust
+const STATUS_SIGNING_EKU_ID_KP_ARC: &str = "1.3.6.1.5.5.7.3"
+```
+
+The X.509 Extended Key Usage `KeyPurposeId` that authorizes a certificate to sign a Token Status
+List — `id-kp-oauthStatusSigning` (draft-ietf-oauth-status-list-21 §13).
+
+**PROVISIONAL — pending IANA.** The draft defines this as `{ id-kp TBD }`: the PKIX `id-kp` arc
+(OID `1.3.6.1.5.5.7.3` = `iso(1) identified-organization(3) dod(6) internet(1) security(5)
+mechanisms(5) pkix(7) kp(3)`) with a FINAL sub-arc that IANA has **not yet assigned**. The full
+dotted OID is therefore `1.3.6.1.5.5.7.3.<TBD>`; this constant records the known arc prefix so the
+eventual assignment is a one-line update in a single place (DRY).
+
+The EKU authorization DECISION is **not** made in this sans-IO module — it lives in `crate::trust`
+(layer 2), which consumes this constant to check whether a status-list signer's leaf certificate
+bears the status-signing purpose. It is exposed here only so the value has one authoritative home.
 
 ## Module `trust`
 
@@ -3632,6 +3767,27 @@ rotate while mDLs live for years — a conformant mDL must not be false-rejected
 expires). An exact-match source ignores it.
 
 ```rust
+fn resolve_status_signer(&self, role: IssuerRole, format: Format, signer_leaf_der: &[u8], supplied_intermediates: &[Vec<u8>]) -> TrustDecision
+```
+
+Authorize a Token Status List **signer** leaf that is DISTINCT from the credential's own issuer:
+chain-validate the signer leaf (+ its supplied intermediates) to the SAME configured anchor set
+the credential's issuer chains to for `(role, format)`, WITHOUT imposing the credential-leaf key
+purpose. A status-list signer follows its own profile (draft-ietf-oauth-status-list §13), so the
+credential-leaf QcStatement / mdlDS-EKU floor MUST NOT be applied here; the status-signing EKU is
+enforced separately by the caller (the [`mod@crate::verify`] status-signer glue). **Pure / sans-IO.**
+
+Used ONLY on the distinct-signer branch of the in-core Token Status List check: the primary path
+(the issuer signs its own status list) resolves the key from the credential's already-verified
+issuer leaf by byte-equality and never calls this. Returns a [`TrustDecision`]; `trusted` iff the
+signer leaf chains to a configured anchor.
+
+**Default: fail-closed** (`untrusted`). An exact-DER-pin source ([`StaticTestAnchors`]) cannot
+chain-validate a signer that is not itself pinned, so it authorizes NO distinct status signer —
+only the same-issuer key-reuse path applies there. The chain-validating production sources
+([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) override this.
+
+```rust
 fn refresh(&mut self) -> Result<(), TrustError>
 ```
 
@@ -4019,6 +4175,18 @@ presentation (an OpenID4VP `request` overrides it with the reconstructed handove
 is `documents[i]`'s outcome. A document with no covering entry fails closed to
 [`StatusOutcome::Unavailable`] — one outcome is never silently reused across documents (SC-002). The
 default [`crate::status::DEFAULT_STATUSES`] covers exactly one document.
+- `status_tokens: &'a BTreeMap<String, Vec<u8>>`
+  - The host-fetched **signed** Token Status List tokens, keyed by list URI (the credential's
+`status.status_list.uri`) → the raw token bytes (a `statuslist+jwt` compact JWS or an
+`application/statuslist+cwt` tagged `COSE_Sign1`). When a presented credential declares a Token
+Status List reference AND a token is supplied here for its URI, the core AUTHENTICATES that token
+in-core ([`crate::status::verify_status_list_token`]) — verifying its signature against a key
+authorized by the credential's own trust anchor, binding `sub` to the URI, checking freshness,
+and reading the revocation bit itself — and that outcome OVERRIDES the positional
+[`Self::statuses`] entry for that credential/document. With no token supplied for a URI (or for a
+CRL / no reference), the positional `statuses` outcome is used exactly as before. Host-supplied
+(the core stays sans-IO: the host does the fetch; the core does the authentication). The default
+[`crate::status::DEFAULT_STATUS_TOKENS`] is empty (⇒ the positional seam alone, unchanged).
 - `session_transcript: Option<&'a [u8]>`
   - The mdoc `SessionTranscript` the `DeviceAuth` is bound to, for a presentation **without** an
 OpenID4VP request (with a request, the handover is reconstructed from the request instead).
@@ -4159,6 +4327,16 @@ adds the OpenID4VP request's first-class **`response_uri`**
 shape changed and the schema version was bumped (Principle VII); a binding speaking an older
 version is refused with a clear message rather than mis-parsed.
 
+Version 5 ALSO carries (additively, no further bump) the host-fetched **signed** Token Status List
+tokens ([`WireContext::status_tokens`], uri → raw token bytes) that drive the in-core Token Status
+List authentication: when a presented credential declares a Token Status List reference and a
+matching token is supplied, the core verifies the token's signature (against a key authorized by the
+credential's own trust anchor) and reads the revocation bit itself, rather than trusting a
+host-supplied outcome. The field is `#[serde(default)]` (empty), so an older v5 payload without it
+decodes to "no signed tokens ⇒ the positional `statuses` seam alone" — a decode-compatible addition.
+Because this crate is pre-release (0.1.0, unmerged), the addition consolidates into v5 rather than
+minting a v6 for an unreleased shape.
+
 ### Structs
 
 #### struct `VerifyRequest`
@@ -4214,8 +4392,8 @@ struct WireContext
 
 The verification context carried on the wire (the CBOR mirror of [`VerifyContext`]).
 
-`deny_unknown_fields`: a typo'd optional key (`statuses`, `session_transcript`, `qualified_gate`,
-`qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
+`deny_unknown_fields`: a typo'd optional key (`statuses`, `status_tokens`, `session_transcript`,
+`qualified_gate`, `qualified_trust_list`, `qualified_scheme_anchors`) is a hard decode error rather than a silent
 default — a misspelled `qualified_gate` must not silently leave the gate off, nor a misspelled
 `session_transcript` silently skip the mdoc binding. Same rationale as [`VerifyRequest`].
 
@@ -4230,6 +4408,18 @@ default — a misspelled `qualified_gate` must not silently leave the gate off, 
 VC uses index `0`; a multi-document mdoc `DeviceResponse` needs one per document). A document with
 no covering entry fails closed to [`StatusOutcome::Unavailable`] — never a silent reuse of one
 outcome across documents (SC-002).
+- `status_tokens: BTreeMap<String, ByteBuf>`
+  - The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes (a
+`statuslist+jwt` compact JWS, or an `application/statuslist+cwt` tagged `COSE_Sign1`). When a
+presented credential declares a Token Status List reference AND a token is supplied here for its
+URI, the core AUTHENTICATES that token in-core (signature against a key authorized by the
+credential's own trust anchor + `sub` binding + freshness + bit read) and that outcome OVERRIDES
+the positional [`Self::statuses`] entry. Absent (the default `#[serde(default)]` empty map) ⇒ the
+positional `statuses` seam alone (host pre-resolved), preserving the pre-existing behavior. The
+values are CBOR byte strings ([`serde_bytes::ByteBuf`]) so the raw token round-trips through
+ciborium without a lossy text re-encode. Carried additively within schema version 5 (this crate
+is pre-release / unmerged, so the field consolidates into v5 rather than forcing a bump; an older
+v5 payload lacking it decodes to the empty default — a decode-compatible addition).
 - `session_transcript: Option<Vec<u8>>`
   - The mdoc `SessionTranscript` for a non-OpenID4VP presentation (else `None`).
 - `qualified_gate: bool`

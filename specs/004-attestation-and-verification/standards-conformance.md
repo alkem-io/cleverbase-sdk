@@ -455,3 +455,68 @@ unified; tautological `!jws.contains('~')`; the SD-JWT presentation parsed once 
 **Determined NOT a defect (with reason):** `credential_sets` with EVERY set `required:false` ⇒ satisfied
 with nothing matched — this is intended DCQL semantics (`required` defaults to `true`, so all-optional is
 a deliberate "nothing required"), pinned by a test, not a vacuous-truth bug.
+
+## §4 — Third-review remediation + in-core Token Status List authentication (RCA record)
+
+A third unsteered, max-effort review (10 finder angles over the whole PR incl. both prior remediation
+waves + the bindings, adversarial per-finding verification, gap sweep) found the always-on verifier bar
+clean across the correctness angles (A/D returned `[]`; B only pre-existing documented spec-cuts; C only
+a stale doc; E no false-accept). The confirmed correctness findings were completions of the holder-`present`
+seam + the DCQL fail-open class, all fixed at root cause, test-first (committed with the §3 fixes):
+
+- **mdoc `present` cross-namespace over-disclosure** (FR-007): the `disclose` selector keyed on the bare
+  `elementIdentifier` across ALL namespaces (the SD-JWT arm was path-qualified in §2 but mdoc wasn't) →
+  a shared id in two namespaces leaked both. Now namespace-qualified (`namespace/elementIdentifier`).
+- **DCQL malformed claim `path`/`values`/`claims` fail-open**: a bad path component (float/neg-index/
+  nested) dropped the whole query → `evaluate_single` Inactive → claims gate silently off. Extended the
+  `ClaimValue::Unrepresentable` sentinel to paths + the whole claim; a supported-format query with a
+  malformed claim stays enforceable-but-unsatisfiable → `NotSatisfied` (only unsupported FORMAT drops).
+- **Duplicate DCQL claim `id`** silently last-wins (dropped an earlier claim's value restriction) → now
+  fail-closed (`NotSatisfied`), the analog of the credential-id dedup.
+- **Holder `finish()` unsigned-token no-op**: `replace_map_entry` no-ops on an absent key, so a
+  single-document mdoc missing `deviceSigned`/`deviceAuth` emitted an unsigned token → new
+  `replace_required_map_entry` + an exactly-one-document guard.
+
+### In-core Token Status List authentication (the largest addition — IETF draft-ietf-oauth-status-list-21)
+
+The review's altitude/status finding was that the revocation seam DELEGATED status-token authentication
+to the host (unauthenticated outcome), asymmetric with the trust-list/qualified-TL seams that authenticate
+in-core, and that the `verifier.md` contract referenced a `status_reference_of` helper that did not exist.
+By explicit product decision this was closed by authenticating the signed status-list token **in-core**:
+
+- **Verifier core** (`status/mod.rs`): `verify_status_list_token` authenticates a `statuslist+jwt` JWS or an
+  `application/statuslist+cwt` tagged `COSE_Sign1` (ES256 via the shared crypto kernel / `coset`), binds
+  `sub` byte-exactly to the credential's `status_list.uri`, enforces `exp`/`ttl`, zlib-inflates `lst`
+  (`miniz_oxide`, pure-Rust/WASM — the one new dep; the earlier "host decompresses" design is reversed) with
+  a 64 MiB anti-bomb cap, reads the LSB-first `bits`-wide bit at `idx`, and maps 0→Good / 1,2→Revoked /
+  else→Unavailable. Every check fails closed to `Unavailable` (never `Good`); the signature is verified
+  BEFORE the payload/decompression is trusted. `status_reference_from_sd_jwt_claim` /
+  `status_reference_from_mdoc_status` extract the `status.status_list.{idx,uri}` reference in-core.
+- **Signer authorization** (`verify.rs` + `trust`): a status-list signer is authorized against the
+  credential's OWN trust — same-issuer key reuse (byte-equal issuer leaf), else the signer cert MUST chain
+  to the **same specific anchor** the credential's issuer chained to (`TrustAnchorSource::resolve_status_signer`
+  + the matched `anchor_cert_der` equality — NOT merely any anchor in the (role,format) set, closing a
+  federated cross-issuer gap) AND bear the status-signing EKU. A key is never authorized merely because it
+  is embedded in the token. Fail-closed on every branch.
+- **Wire**: `VerifyContext`/`WireContext` gained `status_tokens` (uri → signed token bytes, `#[serde(default)]`,
+  additive within schema v5 — pre-release, no bump). When a credential declares a Token Status List and a
+  token is supplied for its URI, the in-core outcome is authoritative; otherwise the positional
+  host-pre-resolved outcome stands (CRL / no reference). A **declared** list left unresolved (no token AND a
+  default `NoStatus` positional) fails closed to `Unavailable` — a declared-but-unresolved status never
+  reads as VALID.
+- The adversarial security pass (signature-before-trust, key-auth bypass, `sub`/`uri` binding, fallback
+  fail-open, bit extraction, CWT strictness, exp/ttl) found NO path to a false-accept, auth-bypass, panic,
+  or unbounded DoS reachable by attacker-controlled input.
+
+**Provisional / documented residuals:** the CWT claim labels (`status_list`=65533, `ttl`=65534) and the
+`id-kp-oauthStatusSigning` EKU OID are IANA-TBD in draft-21 — single-sourced behind clearly-marked
+`const`s (the one update point when IANA assigns them); the mdoc status-list binding is normatively in the
+paywalled ISO/IEC 18013-5 2nd-edition draft. A Status List Token that omits BOTH `exp` and `ttl` has
+unbounded validity (spec-permitted — both are RECOMMENDED not REQUIRED); enforcing "exp-or-ttl required"
+would false-reject conformant tokens, so it is a documented issuer-config / transport-freshness residual,
+not a verifier defect.
+
+**Efficiency/cleanup residue** flagged by this round (efficiency angle) — SD-JWT disclosure reconstructed
+twice on a valid DCQL verify, `verify_vp_token` re-parse/re-derive, gate-off `claimed_issuers`/`categories`
+clones, `detect_format` double-decode, dead ungated `device_binding_machinery`, the `categories` parallel
+array, and minor reuse dups — is tracked for a cleanup pass; none is a correctness or security defect.

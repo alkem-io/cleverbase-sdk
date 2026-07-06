@@ -196,6 +196,11 @@ pub(crate) struct MdocBuilder {
     /// `category` as the PRO-4.12.4-03 type indication. Distinct from [`Self::append_document_in_namespace`],
     /// which appends a SECOND document; the `category` MUST live in the SAME document as the ISO elements.
     qeaa_category: bool,
+    /// When `Some((idx, uri))`, add an MSO `status` element carrying a Token Status List reference
+    /// (`status.status_list.{idx,uri}`, draft-ietf-oauth-status-list §8) — the in-core mdoc status probe.
+    /// The reference is inside the issuer-signed MSO, so the bar reads it authentically; the verifier
+    /// then authenticates the host-supplied signed token for `uri` in-core and reads the bit at `idx`.
+    status_reference: Option<(u64, String)>,
 }
 
 /// A forged `IssuerSignedItem` to splice into the on-wire `nameSpaces` array (the false-accept probe):
@@ -350,7 +355,16 @@ impl MdocBuilder {
             omit_mso_signed: false,
             append_forged_item: None,
             qeaa_category: false,
+            status_reference: None,
         }
+    }
+
+    /// Add an MSO `status` element carrying a Token Status List reference (`status.status_list.{idx,
+    /// uri}`) — the in-core mdoc status probe. The reference is issuer-signed (inside the MSO), so the
+    /// verifier reads it authentically and then authenticates the host-supplied signed token for `uri`.
+    pub(crate) fn status_reference(mut self, idx: u64, uri: &str) -> Self {
+        self.status_reference = Some((idx, uri.to_owned()));
+        self
     }
 
     /// Append a forged `IssuerSignedItem` reusing `digest_id` (a genuine element's id) but disclosing
@@ -933,6 +947,26 @@ impl MdocBuilder {
         } else {
             mso
         };
+        // Add the MSO `status` element (Token Status List reference) when requested — the in-core status
+        // probe. Appended to the (issuer-signed) MSO map so the bar reads `status.status_list.{idx,uri}`.
+        let mso = if let Some((idx, uri)) = &self.status_reference {
+            let status = CborValue::Map(vec![(
+                CborValue::Text("status_list".to_owned()),
+                CborValue::Map(vec![
+                    (
+                        CborValue::Text("idx".to_owned()),
+                        CborValue::Integer((*idx).into()),
+                    ),
+                    (
+                        CborValue::Text("uri".to_owned()),
+                        CborValue::Text(uri.clone()),
+                    ),
+                ]),
+            )]);
+            append_map_entry(mso, "status", status)
+        } else {
+            mso
+        };
         let mso_inner = encode(&mso);
         let mso_payload = encode(&CborValue::Tag(
             TAG_ENCODED_CBOR,
@@ -1344,6 +1378,18 @@ fn corrupt_issuer_auth_in_issuer_signed(issuer_signed: &CborValue) -> CborValue 
         })
         .collect();
     CborValue::Map(forged)
+}
+
+/// Append a text-keyed entry to a CBOR map value — used to add the optional MSO `status` element after
+/// the well-formed MSO is built (mirroring [`strip_map_key`], the other post-build MSO map editor).
+fn append_map_entry(value: CborValue, key: &str, entry: CborValue) -> CborValue {
+    match value {
+        CborValue::Map(mut entries) => {
+            entries.push((CborValue::Text(key.to_owned()), entry));
+            CborValue::Map(entries)
+        }
+        other => other,
+    }
 }
 
 /// Remove a text-keyed entry from a CBOR map value — the omit-field negative cases (absent MSO

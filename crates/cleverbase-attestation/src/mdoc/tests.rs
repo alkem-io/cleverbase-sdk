@@ -85,6 +85,7 @@ fn params() -> MdocVerifyParams<'static> {
         session_transcript: Some(static_default_transcript()),
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     }
 }
 
@@ -300,6 +301,7 @@ fn explicit_session_transcript_binds_the_device_signature() {
         session_transcript: Some(&transcript),
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(result.valid, "matching session transcript must verify");
@@ -321,6 +323,7 @@ fn device_signature_without_a_session_transcript_is_missing_request_binding() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(
@@ -355,6 +358,7 @@ fn session_transcript_mismatch_fails_holder_binding() {
         session_transcript: Some(&transcript_b),
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::NoStatus],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -534,6 +538,7 @@ fn revoked_status_is_rejected_as_revoked() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::Revoked],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -549,6 +554,7 @@ fn unavailable_status_is_rejected_as_status_unavailable() {
         session_transcript: None,
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::Unavailable],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(!result.valid);
@@ -565,6 +571,7 @@ fn good_status_still_verifies() {
         session_transcript: Some(&transcript),
         role: IssuerRole::Pid,
         statuses: &[StatusOutcome::Good],
+        status_tokens: &crate::status::DEFAULT_STATUS_TOKENS,
     };
     let result = verify(&response, &trusted_anchors(), &p);
     assert!(

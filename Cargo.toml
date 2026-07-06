@@ -125,6 +125,12 @@ coset = "=0.4.2"
 sd-jwt-payload = { version = "=0.5.1", default-features = false }
 # Trust-list XML (TS 119 612) reader/writer; pure-Rust, no_std-capable.
 quick-xml = "=0.40.1"
+# zlib/DEFLATE (RFC 1950/1951) inflate for the Token Status List `lst` bitstring
+# (draft-ietf-oauth-status-list). PURE-RUST backend REQUIRED (WASM-able, no C/zlib-sys): `miniz_oxide`
+# is exactly the pure-Rust inflate `flate2`'s default `rust_backend` wraps, used here directly to avoid
+# the wrapper. The default `with-alloc` feature (needed for the to-`Vec` decode) is kept. Already in the
+# lock at 0.8.9 (transitively via `flate2`→`lopdf`), so this introduces NO new crate version.
+miniz_oxide = "0.8"
 # `JwsSigner` is an `async_trait` (sd-jwt-payload); the test-only issuer helper that mints SD-JWT VCs
 # implements it. Already in-tree via `sd-jwt-payload`; declared here for the dev-dependency only.
 async-trait = "0.1"

@@ -225,6 +225,43 @@ pub(crate) fn mint_sd_jwt_with_clear_subject_claim(
     .expect("issuer signing succeeds")
 }
 
+/// Mint an SD-JWT VC carrying an issuer-signed Token Status List reference in the CLEAR `status` claim
+/// (`status.status_list.{idx,uri}`, draft-ietf-oauth-status-list §8) — the in-core status-authentication
+/// probe. The reference lives in the ISSUER-SIGNED clear payload (never selectively disclosable), so the
+/// always-on bar reads it authentically; everything else (trusted issuer signature + validity window +
+/// `cnf` holder binding, with `family_name` concealable) is sound, so it clears the bar and reaches the
+/// status step, where the supplied signed token (if any) is authenticated in-core.
+pub(crate) fn mint_sd_jwt_with_status(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    idx: u64,
+    uri: &str,
+) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": DEFAULT_VCT,
+        "given_name": "Ada",
+        "family_name": "Lovelace",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        // The Token Status List pointer — issuer-signed, in the clear (§8: `status.status_list`).
+        "status": { "status_list": { "idx": idx, "uri": uri } },
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
+            .make_concealable("/family_name")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
 /// Mint an SD-JWT VC OMITTING the REQUIRED `vct` type claim — the missing-`vct` probe for the always-on
 /// bar's [`super::check_vct`] (everything else, incl. the trusted issuer signature + window, is sound).
 pub(crate) fn mint_sd_jwt_without_vct(issuer_pk8: &[u8], issuer_cert_der: &[u8]) -> SdJwt {
