@@ -92,11 +92,18 @@ const FORMAT_MSO_MDOC: &str = "mso_mdoc";
 /// evaluates; unknown top-level and per-object properties are ignored (§6 *"Implementations MUST ignore
 /// any unknown properties"*).
 ///
-/// [`parse`](Self::parse) is **lenient**: a Credential Query whose `format` this SDK does not support,
-/// or that is structurally malformed, is dropped from [`Self::credentials`] (it cannot be satisfied by
-/// either supported format, so it imposes no enforceable in-core constraint) rather than failing the
-/// whole parse — a single bad entry never disables the gate for the rest. `parse` errors only on a
-/// non-JSON or non-object input.
+/// [`parse`](Self::parse) is **lenient** about entries it cannot enforce, but only up to the point that
+/// leniency stays fail-closed. A Credential Query whose `format` this SDK does not support (or that
+/// lacks an `id`/`format`) is dropped from [`Self::credentials`] — it cannot be satisfied by either
+/// supported format, so it imposes no enforceable in-core constraint on a presentation of a supported
+/// format. But once the `format` IS supported, a structurally-malformed `claims`/`path`/`values`/
+/// `claim_sets` does NOT drop the query: dropping it would collapse `credentials` toward empty and
+/// silently disable the "did I get what I requested" gate (`evaluate_single` → `Inactive`) — a
+/// fail-OPEN. Such a query is kept ALIVE but UNSATISFIABLE (via the never-resolving
+/// [`PathComponent::Unrepresentable`] / [`ClaimValue::Unrepresentable`] sentinels and never-matching
+/// `claim_sets` options), so the gate runs and returns `NotSatisfied` (fail closed). A single bad entry
+/// thus never disables the gate for the rest. `parse` errors only on a non-JSON / non-object input or a
+/// duplicate credential `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DcqlQuery {
     /// The Credential Queries this SDK can evaluate (supported format + well-formed), in request order.
@@ -163,6 +170,15 @@ pub enum PathComponent {
     Index(u64),
     /// A `null` component: select all elements of the currently selected array(s).
     AllElements,
+    /// A path component that is NOT a valid Claims Path Pointer element (§"Claims Path Pointer"
+    /// admits only strings, non-negative integers, and `null`) — a JSON float, a negative index, or a
+    /// nested object/array. Mirrors [`ClaimValue::Unrepresentable`]: it is retained as an explicit
+    /// NEVER-resolving sentinel rather than dropped, because dropping it would collapse the whole
+    /// Credential Query (via the lenient parse), leaving `evaluate_single` `Inactive` and the "did I
+    /// get what I requested" gate silently disabled — a fail-OPEN. Keeping it unresolvable keeps the
+    /// query enforced (the claim simply never resolves → `NotSatisfied`, fail closed). Never produced
+    /// from a spec-valid path component.
+    Unrepresentable,
 }
 
 /// An expected claim value (§6.3 `values`: *"an array of strings, integers or boolean values"*).
@@ -254,8 +270,15 @@ impl DcqlQuery {
 }
 
 impl CredentialQuery {
-    /// Parse one Credential Query (§6.1), returning `None` to drop an entry this SDK cannot evaluate (a
-    /// non-object, a missing/empty `id`, an unsupported/absent `format`, or a malformed `claims` entry).
+    /// Parse one Credential Query (§6.1), returning `None` to drop an entry this SDK cannot evaluate:
+    /// a non-object, a missing/empty `id` (unreferenceable), or an unsupported/absent `format` (no
+    /// supported presentation could satisfy it, so it imposes no enforceable in-core constraint).
+    ///
+    /// Once the `format` IS supported, a structurally-malformed `claims`/`path`/`values`/`claim_sets`
+    /// must NOT drop the query — that would collapse [`DcqlQuery::credentials`] toward empty and leave
+    /// `evaluate_single` `Inactive` (fail-OPEN). Such a query is kept ALIVE but UNSATISFIABLE (via the
+    /// never-resolving [`PathComponent::Unrepresentable`] / [`ClaimValue::Unrepresentable`] sentinels)
+    /// so the gate runs and returns `NotSatisfied` (fail closed).
     fn parse(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         let id = object
@@ -269,21 +292,26 @@ impl CredentialQuery {
             .get("multiple")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // `claims` (§6.3): a present `claims` MUST be a non-empty array; a malformed claim drops the
-        // whole query (we never half-enforce a partially-parsed claim set — that could under-reject).
+        // `claims` (§6.3): absent ⇒ no claim constraint (KEEP, no constraint). A present non-empty
+        // array ⇒ one claim per entry (parse is infallible — a malformed entry becomes an unsatisfiable
+        // claim, never dropped). A present EMPTY array or NON-array is itself malformed (§6.3 requires a
+        // non-empty array) ⇒ keep the query with a single unsatisfiable claim so it fails CLOSED, rather
+        // than dropping it to a fail-open `Inactive`.
         let claims = match object.get("claims") {
             None => Vec::new(),
-            Some(Value::Array(entries)) if !entries.is_empty() => entries
-                .iter()
-                .map(ClaimsQuery::parse)
-                .collect::<Option<Vec<_>>>()?,
-            Some(_) => return None,
+            Some(Value::Array(entries)) if !entries.is_empty() => {
+                entries.iter().map(ClaimsQuery::parse).collect()
+            }
+            Some(_) => vec![ClaimsQuery::unsatisfiable()],
         };
-        let claim_sets = match object.get("claim_sets") {
-            None => Vec::new(),
-            Some(value) => parse_claim_sets(value)?,
-        };
-        // §"Selecting Claims": `claim_sets` MUST NOT be present if `claims` is absent.
+        // `claim_sets` (§6.1): a malformed value must NOT drop the query (fail-open) — `parse_claim_sets`
+        // is infallible and yields never-matching options for malformed input, so the query stays
+        // enforceable and fails closed.
+        let claim_sets = object
+            .get("claim_sets")
+            .map_or_else(Vec::new, parse_claim_sets);
+        // §"Selecting Claims": `claim_sets` MUST NOT be present if `claims` is absent (it would
+        // reference nothing). A present `claim_sets` with no `claims` legitimately drops.
         if !claim_sets.is_empty() && claims.is_empty() {
             return None;
         }
@@ -330,21 +358,43 @@ impl CredentialMeta {
 }
 
 impl ClaimsQuery {
-    /// Parse one Claims Query (§6.3), returning `None` for a malformed entry (a non-object, a missing /
-    /// empty / non-array `path`, an invalid path component, or a present-but-malformed `values`).
-    fn parse(value: &Value) -> Option<Self> {
-        let object = value.as_object()?;
+    /// Parse one Claims Query (§6.3). Infallible by contract: a structurally-malformed entry (a
+    /// non-object, a missing / non-array / empty `path`, an invalid path component, or a
+    /// present-but-malformed `values`) is kept as an UNSATISFIABLE claim — via the never-resolving
+    /// [`PathComponent::Unrepresentable`] / [`ClaimValue::Unrepresentable`] sentinels — rather than
+    /// dropped, so it cannot collapse the owning Credential Query into a fail-open `Inactive` (see the
+    /// sentinel docs). A missing `id` stays `None` (only `claim_sets` references need one).
+    fn parse(value: &Value) -> Self {
+        let Some(object) = value.as_object() else {
+            // A non-object claim entry is malformed → unsatisfiable, never dropped.
+            return Self::unsatisfiable();
+        };
         let id = object
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .map(str::to_owned);
-        let path = parse_path(object.get("path")?)?;
-        let values = match object.get("values") {
-            None => None,
-            Some(value) => Some(parse_values(value)?),
-        };
-        Some(Self { id, path, values })
+        // A present `path` is parsed (a malformed one becomes `[Unrepresentable]`); an ABSENT `path`
+        // (REQUIRED §6.3) is likewise malformed → the same never-resolving sentinel, not a drop.
+        let path = object
+            .get("path")
+            .map_or_else(|| vec![PathComponent::Unrepresentable], parse_path);
+        // An absent `values` ⇒ no value restriction (`None`); a present `values` is parsed (a malformed
+        // one becomes `[Unrepresentable]`, never dropped — see `parse_values`).
+        let values = object.get("values").map(parse_values);
+        Self { id, path, values }
+    }
+
+    /// An UNSATISFIABLE claim: a never-resolving path ([`PathComponent::Unrepresentable`]), no `id`, no
+    /// `values`. Used where a present but structurally-malformed `claims` (a non-array or empty array —
+    /// §6.3 requires a non-empty array of Claims Queries) must keep the Credential Query ALIVE but
+    /// unsatisfiable rather than dropping it into a fail-open `Inactive`.
+    fn unsatisfiable() -> Self {
+        Self {
+            id: None,
+            path: vec![PathComponent::Unrepresentable],
+            values: None,
+        }
     }
 }
 
@@ -382,50 +432,74 @@ fn format_from_identifier(identifier: &str) -> Option<Format> {
 }
 
 /// Parse a Claims Path Pointer array (§"Claims Path Pointer"): a non-empty array of strings, `null`s,
-/// and non-negative integers. `None` for a non-array, an empty array, or any other element type.
-fn parse_path(value: &Value) -> Option<Vec<PathComponent>> {
-    let array = value.as_array().filter(|array| !array.is_empty())?;
-    array.iter().map(parse_path_component).collect()
+/// and non-negative integers. Infallible: a non-array OR an empty array is a present-but-malformed
+/// `path` (§6.3 `path` is REQUIRED and non-empty) and yields a single never-resolving
+/// [`PathComponent::Unrepresentable`] — never dropped, so a bad path cannot collapse the owning
+/// Credential Query into a fail-open `Inactive`. A non-empty array maps each component.
+fn parse_path(value: &Value) -> Vec<PathComponent> {
+    match value.as_array() {
+        Some(array) if !array.is_empty() => array.iter().map(parse_path_component).collect(),
+        _ => vec![PathComponent::Unrepresentable],
+    }
 }
 
 /// Parse one Claims Path Pointer component (§"Claims Path Pointer"): a string ⇒ object key, a `null` ⇒
-/// all array elements, a non-negative integer ⇒ array index. `None` for anything else.
-fn parse_path_component(value: &Value) -> Option<PathComponent> {
+/// all array elements, a non-negative integer ⇒ array index. Anything else (a float, a negative index,
+/// a nested object/array) ⇒ [`PathComponent::Unrepresentable`] — retained (not dropped) so it cannot
+/// collapse the whole Credential Query and silently disable the claims gate (it just never resolves).
+fn parse_path_component(value: &Value) -> PathComponent {
     match value {
-        Value::String(key) => Some(PathComponent::Key(key.clone())),
-        Value::Null => Some(PathComponent::AllElements),
-        Value::Number(number) => number.as_u64().map(PathComponent::Index),
-        _ => None,
+        Value::String(key) => PathComponent::Key(key.clone()),
+        Value::Null => PathComponent::AllElements,
+        Value::Number(number) => number
+            .as_u64()
+            .map_or(PathComponent::Unrepresentable, PathComponent::Index),
+        _ => PathComponent::Unrepresentable,
     }
 }
 
-/// Parse a `values` array (§6.3): a non-empty array of strings/integers/booleans. `None` for a
-/// non-array, an empty array, or any other element type.
-fn parse_values(value: &Value) -> Option<Vec<ClaimValue>> {
-    let array = value.as_array().filter(|array| !array.is_empty())?;
-    array.iter().map(parse_claim_value).collect()
-}
-
-/// Parse one expected value (§6.3): a string, integer, or boolean. `None` for a non-scalar (array/
-/// object/null). A numeric value that is not representable as `i64` (a float, or an out-of-`i64`-range
-/// integer) is retained as [`ClaimValue::Unrepresentable`] — NOT `None` — so it cannot collapse the
-/// whole Credential Query and silently disable the claims gate (it just never matches; see the variant).
-fn parse_claim_value(value: &Value) -> Option<ClaimValue> {
-    match value {
-        Value::String(text) => Some(ClaimValue::Text(text.clone())),
-        Value::Bool(boolean) => Some(ClaimValue::Boolean(*boolean)),
-        Value::Number(number) => Some(
-            number
-                .as_i64()
-                .map_or(ClaimValue::Unrepresentable, ClaimValue::Integer),
-        ),
-        _ => None,
+/// Parse a `values` array (§6.3): a non-empty array of strings/integers/booleans. Infallible: a
+/// non-array OR an empty array is a present-but-malformed `values` and yields a single never-matching
+/// [`ClaimValue::Unrepresentable`] — never dropped, so it cannot collapse the owning Credential Query
+/// into a fail-open `Inactive`. A non-empty array maps each element.
+fn parse_values(value: &Value) -> Vec<ClaimValue> {
+    match value.as_array() {
+        Some(array) if !array.is_empty() => array.iter().map(parse_claim_value).collect(),
+        _ => vec![ClaimValue::Unrepresentable],
     }
 }
 
-/// Parse `claim_sets` (§6.1): an array of arrays of claim-`id` strings.
-fn parse_claim_sets(value: &Value) -> Option<Vec<Vec<String>>> {
-    value.as_array()?.iter().map(parse_id_list).collect()
+/// Parse one expected value (§6.3): a string, integer, or boolean. A non-scalar (array/object/null), or
+/// a numeric value not representable as `i64` (a float, or an out-of-`i64`-range integer), is retained
+/// as [`ClaimValue::Unrepresentable`] — NOT dropped — so it cannot collapse the whole Credential Query
+/// and silently disable the claims gate (it just never matches; see the variant).
+fn parse_claim_value(value: &Value) -> ClaimValue {
+    match value {
+        Value::String(text) => ClaimValue::Text(text.clone()),
+        Value::Bool(boolean) => ClaimValue::Boolean(*boolean),
+        Value::Number(number) => number
+            .as_i64()
+            .map_or(ClaimValue::Unrepresentable, ClaimValue::Integer),
+        _ => ClaimValue::Unrepresentable,
+    }
+}
+
+/// Parse `claim_sets` (§6.1): an array of arrays of claim-`id` strings. Infallible: a non-array value,
+/// or a malformed element (a non-array, or a list containing a non-string id — where `parse_id_list`
+/// returns `None`), yields an option referencing the impossible empty id (real claim ids are
+/// parser-guaranteed non-empty in `claims_satisfied`'s `by_id`, so `""` can never match) instead of
+/// dropping the whole Credential Query to a fail-open `Inactive`. Such an option is non-empty (so it is
+/// not silently satisfied by the empty-option guard) yet unsatisfiable → the query fails CLOSED.
+fn parse_claim_sets(value: &Value) -> Vec<Vec<String>> {
+    value.as_array().map_or_else(
+        || vec![vec![String::new()]],
+        |entries| {
+            entries
+                .iter()
+                .map(|entry| parse_id_list(entry).unwrap_or_else(|| vec![String::new()]))
+                .collect()
+        },
+    )
 }
 
 /// Parse one array of identifier strings (a `claim_sets` element or a `credential_sets` option).
@@ -641,11 +715,20 @@ fn claims_satisfied(query: &CredentialQuery, presented: &BTreeMap<String, Attrib
             .iter()
             .all(|claim| claim_resolves(claim, presented));
     }
-    let by_id: BTreeMap<&str, &ClaimsQuery> = query
-        .claims
-        .iter()
-        .filter_map(|claim| claim.id.as_deref().map(|id| (id, claim)))
-        .collect();
+    // §6.3: a claim `id` referenced by `claim_sets` MUST be unique. Building `by_id` with a
+    // `collect()` would silently LAST-WINS a duplicate — dropping the earlier claim's constraint (e.g.
+    // its `values` restriction), a fail-OPEN. Detect the duplicate and fail CLOSED: a query whose
+    // `claim_sets`-referenced claims have a duplicate id is not satisfiable (we will not honor only one
+    // of two conflicting constraints).
+    let mut by_id: BTreeMap<&str, &ClaimsQuery> = BTreeMap::new();
+    for claim in &query.claims {
+        let Some(id) = claim.id.as_deref() else {
+            continue;
+        };
+        if by_id.insert(id, claim).is_some() {
+            return false;
+        }
+    }
     query.claim_sets.iter().any(|set| {
         // An EMPTY claim-set option requests zero claims — `[].all()` is vacuously true, which would
         // satisfy the claims requirement with NONE of the requested claims disclosed. Fail closed.
@@ -685,8 +768,10 @@ fn resolve_path<'a>(
     path: &[PathComponent],
 ) -> Vec<&'a AttributeValue> {
     let Some((PathComponent::Key(first), rest)) = path.split_first() else {
-        // An empty path, or a path whose first component is an index/`null`, cannot apply to the
-        // object root (§"Claims Path Pointer": the root is the top-level object).
+        // An empty path, or a path whose first component is an index/`null`/`Unrepresentable`, cannot
+        // apply to the object root (§"Claims Path Pointer": the root is the top-level object) — so a
+        // malformed path (first component `Unrepresentable`) selects nothing → the claim never
+        // resolves (fail closed).
         return Vec::new();
     };
     let mut selected: Vec<&AttributeValue> = root.get(first).into_iter().collect();
@@ -730,6 +815,10 @@ fn select<'a>(
                 _ => Vec::new(),
             })
             .collect(),
+        // A never-resolving sentinel (an unsupported/malformed path component) selects nothing, so a
+        // claim whose path contains it never resolves → `NotSatisfied` (fail closed). See
+        // [`PathComponent::Unrepresentable`].
+        PathComponent::Unrepresentable => Vec::new(),
     }
 }
 

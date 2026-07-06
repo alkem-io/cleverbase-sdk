@@ -428,7 +428,7 @@ fn mdoc_present_discloses_only_the_requested_element_and_prunes_the_rest() {
         &held,
         &request,
         &holder_ctx(),
-        &subset(&["family_name"]),
+        &subset(&["org.iso.18013.5.1/family_name"]),
         &hsm(),
         NOW,
     )
@@ -511,7 +511,11 @@ fn mdoc_present_binds_to_the_request_and_verifies_under_us1() {
         &held,
         &request,
         &holder_ctx(),
-        &subset(&["family_name", "given_name", "age_over_18"]),
+        &subset(&[
+            "org.iso.18013.5.1/family_name",
+            "org.iso.18013.5.1/given_name",
+            "org.iso.18013.5.1/age_over_18",
+        ]),
         &hsm(),
         NOW,
     )
@@ -567,7 +571,11 @@ fn mdoc_present_with_non_empty_device_namespaces_verifies_under_us1() {
         &held,
         &request,
         &holder_ctx(),
-        &subset(&["family_name", "given_name", "age_over_18"]),
+        &subset(&[
+            "org.iso.18013.5.1/family_name",
+            "org.iso.18013.5.1/given_name",
+            "org.iso.18013.5.1/age_over_18",
+        ]),
         &hsm(),
         NOW,
     )
@@ -662,7 +670,11 @@ fn mdoc_present_wrong_audience_is_rejected_by_the_verifier() {
         &held,
         &built_for,
         &holder_ctx(),
-        &subset(&["family_name", "given_name", "age_over_18"]),
+        &subset(&[
+            "org.iso.18013.5.1/family_name",
+            "org.iso.18013.5.1/given_name",
+            "org.iso.18013.5.1/age_over_18",
+        ]),
         &hsm(),
         NOW,
     )
@@ -1085,5 +1097,386 @@ fn finish_rejects_a_wire_injected_multi_document_prepared_mdoc() {
     assert!(
         matches!(err, PresentError::MultiDocumentMdoc(2)),
         "expected MultiDocumentMdoc(2), got {err:?}"
+    );
+}
+
+// --- FIX 1: mdoc `disclose` is NAMESPACE-QUALIFIED (no cross-namespace over-disclosure) -----------
+
+/// Read a text-keyed CBOR map entry (a self-contained navigator for the wire-inspection helpers).
+fn cbor_get<'a>(
+    value: &'a ciborium::value::Value,
+    key: &str,
+) -> Option<&'a ciborium::value::Value> {
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_text() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// Decode an mdoc presentation's on-wire `issuerSigned.nameSpaces` into
+/// `{ namespace: {elementIdentifier, …} }` — what actually rode to the verifier after pruning.
+fn wire_namespaces(
+    vp: &HolderPresentation,
+) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    use ciborium::value::Value as CborValue;
+    let HolderPresentation::Mdoc {
+        device_response, ..
+    } = vp
+    else {
+        panic!("expected an mdoc presentation");
+    };
+    let response: CborValue =
+        ciborium::from_reader(device_response.as_slice()).expect("decode DeviceResponse");
+    let mut out = std::collections::BTreeMap::<String, BTreeSet<String>>::new();
+    let documents = cbor_get(&response, "documents").and_then(CborValue::as_array);
+    for doc in documents.into_iter().flatten() {
+        let name_spaces = cbor_get(doc, "issuerSigned")
+            .and_then(|issuer_signed| cbor_get(issuer_signed, "nameSpaces"))
+            .and_then(CborValue::as_map);
+        for (ns, items) in name_spaces.into_iter().flatten() {
+            let ns = ns.as_text().expect("namespace is text").to_owned();
+            let entry = out.entry(ns).or_default();
+            for item in items.as_array().into_iter().flatten() {
+                if let Some(id) = super::issuer_signed_item_identifier(item) {
+                    entry.insert(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inject a SECOND `issuerSigned` namespace into the first document, carrying one `IssuerSignedItem`
+/// (`#6.24(bstr .cbor {digestID,random,elementIdentifier,elementValue})`) with `element_id` — so ONE
+/// mdoc document holds the SAME `elementIdentifier` under two namespaces (the cross-namespace probe).
+/// Built by hand via `ciborium` (no `test_issuer.rs` change): one document, two namespaces.
+fn with_second_issuer_namespace(
+    device_response: &[u8],
+    namespace: &str,
+    element_id: &str,
+    value: ciborium::value::Value,
+) -> Vec<u8> {
+    use ciborium::value::Value as CborValue;
+    const TAG_ENCODED_CBOR: u64 = 24;
+
+    let item = CborValue::Map(vec![
+        (
+            CborValue::Text("digestID".to_owned()),
+            CborValue::Integer(0.into()),
+        ),
+        (
+            CborValue::Text("random".to_owned()),
+            CborValue::Bytes(vec![0x11; 16]),
+        ),
+        (
+            CborValue::Text("elementIdentifier".to_owned()),
+            CborValue::Text(element_id.to_owned()),
+        ),
+        (CborValue::Text("elementValue".to_owned()), value),
+    ]);
+    let mut inner = Vec::new();
+    ciborium::into_writer(&item, &mut inner).expect("encode IssuerSignedItem");
+    let tagged = CborValue::Tag(TAG_ENCODED_CBOR, Box::new(CborValue::Bytes(inner)));
+
+    let response: CborValue =
+        ciborium::from_reader(device_response).expect("decode DeviceResponse");
+    let rebuilt = map_replace(&response, "documents", |documents| {
+        let docs = documents.as_array().expect("documents array");
+        let rebuilt_docs = docs
+            .iter()
+            .map(|doc| {
+                map_replace(doc, "issuerSigned", |issuer_signed| {
+                    map_replace(issuer_signed, "nameSpaces", |name_spaces| {
+                        let mut entries = name_spaces.as_map().expect("nameSpaces map").clone();
+                        entries.push((
+                            CborValue::Text(namespace.to_owned()),
+                            CborValue::Array(vec![tagged.clone()]),
+                        ));
+                        CborValue::Map(entries)
+                    })
+                })
+            })
+            .collect();
+        CborValue::Array(rebuilt_docs)
+    });
+    let mut out = Vec::new();
+    ciborium::into_writer(&rebuilt, &mut out).expect("encode DeviceResponse");
+    out
+}
+
+#[test]
+fn mdoc_present_qualified_selector_prunes_the_same_id_in_a_sibling_namespace() {
+    // FR-007 cross-namespace over-disclosure: ONE mdoc document carries the SAME `elementIdentifier`
+    // (`family_name`) in TWO namespaces (`org.iso.18013.5.1` + a sibling). ISO/IEC 18013-5 element ids
+    // are unique only WITHIN a namespace, so a bare-id `disclose` selector leaks BOTH. The fix makes
+    // the mdoc `disclose` entry NAMESPACE-QUALIFIED (`namespace/elementIdentifier`): disclosing only the
+    // ISO namespace's family_name keeps it on the wire and PRUNES the sibling namespace's same-id entry.
+    use crate::mdoc::test_issuer::{mdoc_ds_cert_der, MdocBuilder};
+    use ciborium::value::Value as CborValue;
+
+    const SIBLING_NS: &str = "org.eu.test.shared";
+    let held = HeldAttestation::Mdoc {
+        device_response: with_second_issuer_namespace(
+            &MdocBuilder::new().build(),
+            SIBLING_NS,
+            "family_name",
+            CborValue::Text("Sibling".to_owned()),
+        ),
+    };
+    let request = request(b"mdoc-xns-nonce");
+
+    // Disclose ONLY the ISO namespace's family_name (namespace-qualified).
+    let vp = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&["org.iso.18013.5.1/family_name"]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present mdoc");
+
+    let disclosed = wire_namespaces(&vp);
+    assert!(
+        disclosed
+            .get("org.iso.18013.5.1")
+            .is_some_and(|ids| ids.contains("family_name")),
+        "the disclosed ISO-namespace family_name must be on the wire; got {disclosed:?}"
+    );
+    assert!(
+        !disclosed.contains_key(SIBLING_NS),
+        "the SAME id in a sibling namespace must be pruned (no cross-namespace over-disclosure); \
+         got {disclosed:?}"
+    );
+    assert_eq!(
+        disclosed.get("org.iso.18013.5.1").map(BTreeSet::len),
+        Some(1),
+        "exactly the one disclosed element rides on the wire (given_name/age_over_18 pruned); \
+         got {disclosed:?}"
+    );
+
+    // Only the ISO family_name (which has a matching MSO digest) remains → the pruned presentation
+    // still verifies VALID under US1.
+    let anchors = StaticTestAnchors::new().trust(IssuerRole::Pid, Format::Mdoc, mdoc_ds_cert_der());
+    let result = verify_response(
+        &vp.as_vp_token(),
+        &request,
+        &VerificationPolicy::default(),
+        &anchors,
+        1_700_000_000,
+        IssuerRole::Pid,
+        &[crate::status::StatusOutcome::NoStatus],
+    );
+    assert!(result.valid, "reasons {:?}", result.reasons);
+
+    // Directional: disclosing the SIBLING namespace's family_name keeps ITS entry and prunes the ISO
+    // namespace's same-id entry — the selector targets the exact namespace, never the bare id.
+    let sibling_selector = format!("{SIBLING_NS}/family_name");
+    let vp_sibling = present(
+        &held,
+        &request,
+        &holder_ctx(),
+        &subset(&[sibling_selector.as_str()]),
+        &hsm(),
+        NOW,
+    )
+    .expect("present mdoc (sibling namespace)");
+    let disclosed_sibling = wire_namespaces(&vp_sibling);
+    assert!(
+        disclosed_sibling
+            .get(SIBLING_NS)
+            .is_some_and(|ids| ids.contains("family_name")),
+        "the sibling-namespace family_name must be disclosed; got {disclosed_sibling:?}"
+    );
+    assert!(
+        !disclosed_sibling.contains_key("org.iso.18013.5.1"),
+        "the ISO-namespace same-id entry must be pruned when only the sibling is disclosed; \
+         got {disclosed_sibling:?}"
+    );
+}
+
+#[test]
+fn mdoc_present_rejects_an_unqualified_or_wrong_namespace_disclose_entry() {
+    // A mdoc `disclose` entry MUST be namespace-qualified (`namespace/elementIdentifier`). A BARE
+    // (unqualified) id, or a qualified id naming the WRONG namespace, matches no issued
+    // `namespace/elementIdentifier` and is rejected as UndisclosableClaim — never silently matched
+    // across namespaces (the pre-fix bare-id behavior that leaked siblings).
+    use crate::mdoc::test_issuer::MdocBuilder;
+    let held = HeldAttestation::Mdoc {
+        device_response: MdocBuilder::new().build(),
+    };
+
+    // Bare id (no namespace) — the pre-fix selector; now rejected.
+    let bare = present(
+        &held,
+        &request(b"n"),
+        &holder_ctx(),
+        &subset(&["family_name"]),
+        &hsm(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&bare, PresentError::UndisclosableClaim(c) if c == "family_name"),
+        "a bare (unqualified) id must be UndisclosableClaim, got {bare:?}"
+    );
+
+    // Right id, wrong namespace — rejected (not matched against the id's real namespace).
+    let wrong_ns = present(
+        &held,
+        &request(b"n"),
+        &holder_ctx(),
+        &subset(&["org.wrong.ns/family_name"]),
+        &hsm(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&wrong_ns, PresentError::UndisclosableClaim(c) if c == "org.wrong.ns/family_name"),
+        "a wrong-namespace qualified id must be UndisclosableClaim, got {wrong_ns:?}"
+    );
+}
+
+// --- FIX 2: finish() MUST splice into an EXISTING deviceAuth (never emit an UNSIGNED token) --------
+
+/// Remove the `deviceAuth` entry from the first document's `deviceSigned` (the splice target `finish`
+/// requires) and re-encode the `DeviceResponse` — the pure-Rust path that `prepare_mdoc` accepts (it
+/// does not require `deviceAuth`) but `finish` must reject.
+fn strip_device_auth(device_response: &[u8]) -> Vec<u8> {
+    use ciborium::value::Value as CborValue;
+    let response: CborValue =
+        ciborium::from_reader(device_response).expect("decode DeviceResponse");
+    let rebuilt = map_replace(&response, "documents", |documents| {
+        let docs = documents.as_array().expect("documents array");
+        let rebuilt_docs = docs
+            .iter()
+            .map(|doc| {
+                map_replace(doc, "deviceSigned", |device_signed| {
+                    let kept = device_signed
+                        .as_map()
+                        .expect("deviceSigned map")
+                        .iter()
+                        .filter(|(k, _)| k.as_text() != Some("deviceAuth"))
+                        .cloned()
+                        .collect();
+                    CborValue::Map(kept)
+                })
+            })
+            .collect();
+        CborValue::Array(rebuilt_docs)
+    });
+    let mut out = Vec::new();
+    ciborium::into_writer(&rebuilt, &mut out).expect("encode DeviceResponse");
+    out
+}
+
+#[test]
+fn replace_device_signature_requires_the_splice_targets_to_exist() {
+    // FIX 2: the holder signature MUST be spliced into an EXISTING deviceAuth; replace_device_signature
+    // must NEVER no-op-copy an UNSIGNED DeviceResponse through when a splice target is absent. A
+    // single-document response lacking deviceAuth (or deviceSigned, or documents, or with an empty
+    // documents array) must ERROR, not return Ok with no holder signature spliced.
+    use ciborium::value::Value as CborValue;
+
+    let mut sig_cbor = Vec::new();
+    ciborium::into_writer(&CborValue::Null, &mut sig_cbor).expect("encode signature");
+
+    // A well-formed #6.24 empty DeviceNameSpaces (so `deviceSigned` is otherwise plausible).
+    let device_ns = {
+        let mut inner = Vec::new();
+        ciborium::into_writer(&CborValue::Map(vec![]), &mut inner).expect("encode");
+        CborValue::Tag(24, Box::new(CborValue::Bytes(inner)))
+    };
+    let one_document = |device_signed: CborValue| {
+        CborValue::Map(vec![(
+            CborValue::Text("documents".to_owned()),
+            CborValue::Array(vec![CborValue::Map(vec![
+                (
+                    CborValue::Text("docType".to_owned()),
+                    CborValue::Text("x".to_owned()),
+                ),
+                (CborValue::Text("deviceSigned".to_owned()), device_signed),
+            ])]),
+        )])
+    };
+
+    // (1) deviceSigned present but deviceAuth ABSENT → the exact splice-target-absent bug.
+    let no_device_auth = one_document(CborValue::Map(vec![(
+        CborValue::Text("nameSpaces".to_owned()),
+        device_ns,
+    )]));
+    assert!(
+        matches!(
+            super::replace_device_signature(&no_device_auth, &sig_cbor).unwrap_err(),
+            PresentError::Malformed(_)
+        ),
+        "a document lacking deviceAuth must be rejected, not copied through unsigned"
+    );
+
+    // (2) deviceSigned ABSENT → Err.
+    let no_device_signed = CborValue::Map(vec![(
+        CborValue::Text("documents".to_owned()),
+        CborValue::Array(vec![CborValue::Map(vec![(
+            CborValue::Text("docType".to_owned()),
+            CborValue::Text("x".to_owned()),
+        )])]),
+    )]);
+    assert!(
+        matches!(
+            super::replace_device_signature(&no_device_signed, &sig_cbor).unwrap_err(),
+            PresentError::Malformed(_)
+        ),
+        "a document lacking deviceSigned must be rejected"
+    );
+
+    // (3) EMPTY documents array → Err (require exactly one document to bind).
+    let empty_documents = CborValue::Map(vec![(
+        CborValue::Text("documents".to_owned()),
+        CborValue::Array(vec![]),
+    )]);
+    assert!(
+        matches!(
+            super::replace_device_signature(&empty_documents, &sig_cbor).unwrap_err(),
+            PresentError::Malformed(_)
+        ),
+        "an empty documents array must be rejected"
+    );
+
+    // (4) documents key ABSENT → Err (the top-level splice target is missing).
+    let no_documents = CborValue::Map(vec![(
+        CborValue::Text("version".to_owned()),
+        CborValue::Text("1.0".to_owned()),
+    )]);
+    assert!(
+        matches!(
+            super::replace_device_signature(&no_documents, &sig_cbor).unwrap_err(),
+            PresentError::Malformed(_)
+        ),
+        "an absent documents key must be rejected"
+    );
+}
+
+#[test]
+fn present_mdoc_lacking_device_auth_finishes_with_an_error_not_an_unsigned_token() {
+    // The pure-Rust path: prepare_mdoc does NOT require deviceAuth, so a held mdoc whose document lacks
+    // deviceSigned.deviceAuth prepares fine and reaches finish(). finish() MUST error (the holder
+    // signature has no deviceAuth to splice into) rather than return Ok with an UNSIGNED DeviceResponse.
+    use crate::mdoc::test_issuer::MdocBuilder;
+    let held = HeldAttestation::Mdoc {
+        device_response: strip_device_auth(&MdocBuilder::new().build()),
+    };
+    let err = present(
+        &held,
+        &request(b"no-device-auth-nonce"),
+        &holder_ctx(),
+        &subset(&["org.iso.18013.5.1/family_name"]),
+        &hsm(),
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PresentError::Malformed(_)),
+        "a held mdoc lacking deviceAuth must fail finish (no unsigned token emitted), got {err:?}"
     );
 }

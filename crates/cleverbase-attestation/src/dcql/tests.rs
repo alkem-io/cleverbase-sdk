@@ -165,19 +165,33 @@ fn unsupported_format_entries_are_dropped() {
 }
 
 #[test]
-fn malformed_sub_entries_are_dropped_leniently() {
-    // A non-array / empty `claims` drops the whole query (we never half-enforce a partial claim set).
+fn malformed_sub_entries_on_a_supported_format_fail_closed_not_dropped() {
+    // A present but structurally-malformed `claims`/`path`/`values` on a SUPPORTED-format query must
+    // NOT drop the whole Credential Query — that would collapse `credentials` to empty and leave
+    // `evaluate_single` `Inactive`, silently disabling the "did I get what I requested" gate (a
+    // fail-OPEN). It is kept ALIVE but UNSATISFIABLE: parse keeps a NON-empty `credentials`, and the
+    // gate (against a presentation of the matching type) rejects with `NotSatisfied`. Mirrors the
+    // `ClaimValue::Unrepresentable` sentinel behavior, now extended to paths and the whole claim.
+    let disclosed = sd_jwt_disclosed();
+    let credential_type = CredentialType::Vct(Some("x".to_owned()));
+    // A non-array / empty `claims` (§6.3 requires a non-empty array) — kept as one unsatisfiable claim.
     for bad_claims in [r#""claims":{}"#, r#""claims":[]"#] {
         let json = format!(
             r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{}},{bad_claims}}}]}}"#
         );
-        assert!(DcqlQuery::parse(&json)
-            .expect("parses")
-            .credentials
-            .is_empty());
+        assert_eq!(
+            DcqlQuery::parse(&json).expect("parses").credentials.len(),
+            1,
+            "{bad_claims} keeps the query alive (not dropped)"
+        );
+        assert_eq!(
+            evaluate_single(&json, Format::SdJwtVc, &credential_type, &disclosed),
+            DcqlGate::NotSatisfied,
+            "{bad_claims} must fail closed, not go Inactive"
+        );
     }
     // A claim with a non-array `path`, an invalid path component (a boolean), or a non-scalar `values`
-    // element drops the query.
+    // element — each kept as an unsatisfiable claim.
     for bad_claim in [
         r#"{"path":"family_name"}"#,
         r#"{"path":["a",true]}"#,
@@ -187,20 +201,70 @@ fn malformed_sub_entries_are_dropped_leniently() {
         let json = format!(
             r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{}},"claims":[{bad_claim}]}}]}}"#
         );
-        assert!(
-            DcqlQuery::parse(&json)
-                .expect("parses")
-                .credentials
-                .is_empty(),
-            "malformed claim {bad_claim} drops the query"
+        assert_eq!(
+            DcqlQuery::parse(&json).expect("parses").credentials.len(),
+            1,
+            "malformed claim {bad_claim} keeps the query alive"
+        );
+        assert_eq!(
+            evaluate_single(&json, Format::SdJwtVc, &credential_type, &disclosed),
+            DcqlGate::NotSatisfied,
+            "malformed claim {bad_claim} must fail closed, not go Inactive"
         );
     }
-    // A Credential Set Query with empty `options` is dropped.
+    // A malformed `claim_sets` (a non-array value, and an array with a non-array element) on a
+    // present-`claims` query is likewise kept and fails closed — the never-matching option can never
+    // resolve.
+    for bad_claim_sets in [r#""garbage""#, r"[42]"] {
+        let json = format!(
+            r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{}},"claims":[{{"id":"fn","path":["family_name"]}}],"claim_sets":{bad_claim_sets}}}]}}"#
+        );
+        assert_eq!(
+            DcqlQuery::parse(&json).expect("parses").credentials.len(),
+            1,
+            "malformed claim_sets {bad_claim_sets} keeps the query alive"
+        );
+        assert_eq!(
+            evaluate_single(&json, Format::SdJwtVc, &credential_type, &disclosed),
+            DcqlGate::NotSatisfied,
+            "malformed claim_sets {bad_claim_sets} must fail closed, not go Inactive"
+        );
+    }
+    // A Credential Set Query with empty `options` is still dropped (a `credential_sets` entry that
+    // constrains COMBINATIONS of credentials, not a per-credential claims constraint) — the lenient
+    // drop of a malformed set query is unchanged.
     let json = r#"{"credentials":[{"id":"a","format":"dc+sd-jwt","meta":{}}],"credential_sets":[{"options":[]}]}"#;
     assert!(DcqlQuery::parse(json)
         .expect("parses")
         .credential_sets
         .is_empty());
+}
+
+#[test]
+fn a_malformed_path_component_rejects_and_is_not_inactive() {
+    // A path with a NEGATIVE index, a FLOAT, or a NESTED object/array component is a malformed Claims
+    // Path Pointer (§"Claims Path Pointer" admits only strings, non-negative integers, and `null`). On
+    // a supported format it keeps the Credential Query alive-but-unsatisfiable, so `evaluate_single`
+    // REJECTS (`NotSatisfied`) and never silently drops to `Inactive` (fail-open). The presentation
+    // discloses `a`, so it is ONLY the malformed path component that blocks satisfaction.
+    let mut disclosed = BTreeMap::new();
+    disclosed.insert("a".to_owned(), text("value"));
+    let credential_type = CredentialType::Vct(Some("urn:eudi:pid:1".to_owned()));
+    for bad_path in [r#"["a",-1]"#, r#"["a",1.5]"#, r#"["a",{}]"#, r#"["a",[]]"#] {
+        let json = format!(
+            r#"{{"credentials":[{{"id":"c","format":"dc+sd-jwt","meta":{{"vct_values":["urn:eudi:pid:1"]}},"claims":[{{"path":{bad_path}}}]}}]}}"#
+        );
+        assert_eq!(
+            DcqlQuery::parse(&json).expect("parses").credentials.len(),
+            1,
+            "{bad_path} keeps the query alive (not dropped)"
+        );
+        assert_eq!(
+            evaluate_single(&json, Format::SdJwtVc, &credential_type, &disclosed),
+            DcqlGate::NotSatisfied,
+            "{bad_path} must reject (NotSatisfied), not go Inactive"
+        );
+    }
 }
 
 #[test]
@@ -497,6 +561,31 @@ fn claim_sets_satisfied_when_one_option_fully_resolves() {
         "claims":[{"id":"missing","path":["never"]}],"claim_sets":[["missing"]]}]}"#;
     assert_eq!(
         evaluate_single(json_none, Format::SdJwtVc, &credential_type, &disclosed),
+        DcqlGate::NotSatisfied
+    );
+}
+
+#[test]
+fn duplicate_claim_id_referenced_by_claim_sets_fails_closed() {
+    // Two claims share id "a": one `values`-restricted, one presence-only, under `claim_sets:[["a"]]`.
+    // Building `by_id` with a `collect()` LAST-WINS the presence-only claim — silently dropping the
+    // earlier `values` restriction (a fail-OPEN): a presentation disclosing "a" with a NON-matching
+    // value would be accepted. Fail closed: a duplicate claim id makes the query unsatisfiable, so a
+    // presentation disclosing "a" as "actual" (≠ the required "expected") does NOT satisfy — the value
+    // restriction is enforced, not bypassed. (Credential ids are already `DuplicateCredentialId`; this
+    // pins the analogous fail-closed for claim ids.)
+    let mut disclosed = BTreeMap::new();
+    disclosed.insert("a".to_owned(), text("actual"));
+    let json = r#"{"credentials":[{"id":"c","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]},
+        "claims":[{"id":"a","path":["a"],"values":["expected"]},{"id":"a","path":["a"]}],
+        "claim_sets":[["a"]]}]}"#;
+    assert_eq!(
+        evaluate_single(
+            json,
+            Format::SdJwtVc,
+            &CredentialType::Vct(Some("urn:eudi:pid:1".to_owned())),
+            &disclosed
+        ),
         DcqlGate::NotSatisfied
     );
 }

@@ -242,6 +242,11 @@ pub fn prepare_present(
 /// holder's signing instant (the KB-JWT `iat`). A thin wrapper over [`prepare_present`] +
 /// [`PreparedPresentation::finish`] with an in-process [`Signer`].
 ///
+/// A `disclose` entry is a `/`-delimited qualified string in BOTH formats: for an SD-JWT VC it is the
+/// claim's JSON-pointer path (a top-level claim is its bare name, a nested claim is `parent/leaf`); for
+/// an mdoc it is the namespace-qualified `"{namespace}/{elementIdentifier}"` (see `qualified_element_id`).
+/// An entry matching no disclosable claim is rejected as [`PresentError::UndisclosableClaim`].
+///
 /// # Errors
 ///
 /// [`PresentError`] when the held credential is malformed, a requested claim is not disclosable, or
@@ -542,9 +547,14 @@ fn escape_json_pointer(key: &str) -> String {
 ///
 /// mdoc selective disclosure (ISO/IEC 18013-5 §9.2.2.5) is enforced at the element level: each
 /// `issuerSigned.nameSpaces[ns]` array is pruned to keep ONLY the `IssuerSignedItem`s whose
-/// `elementIdentifier` is in `disclose` (dropping the rest so they never ride on the wire — FR-007), and
-/// a `disclose` name matching no issued element is rejected as [`PresentError::UndisclosableClaim`]
-/// (mirroring the SD-JWT arm). This is safe without re-signing: the MSO + `IssuerAuth` are UNTOUCHED (a
+/// NAMESPACE-QUALIFIED selector `"{namespace}/{elementIdentifier}"` is in `disclose` (dropping the rest
+/// so they never ride on the wire — FR-007), and a `disclose` entry matching no issued qualified id is
+/// rejected as [`PresentError::UndisclosableClaim`] (mirroring the SD-JWT arm's `/`-delimited path
+/// selector — see `qualified_element_id`). Qualifying by namespace is load-bearing for privacy: ISO/IEC
+/// 18013-5 element ids are unique only WITHIN a namespace and one document can carry multiple namespaces,
+/// so a bare id shared by two namespaces would leak BOTH; the qualified selector discloses exactly the
+/// requested `(namespace, id)` and prunes the same id in a sibling namespace. This is safe without
+/// re-signing: the MSO + `IssuerAuth` are UNTOUCHED (a
 /// recorded `valueDigests` entry with no disclosed item is simply unused — the verifier's
 /// [`crate::mdoc`] `verify_value_digests` only recomputes digests for the DISCLOSED items), and the
 /// `DeviceSignature` covers `deviceSigned`/docType/transcript, never `issuerSigned`. Kept items retain
@@ -610,8 +620,23 @@ fn prepare_mdoc(
     })
 }
 
-/// Collect the `elementIdentifier` of every issued `IssuerSignedItem` across the response's documents'
-/// `issuerSigned.nameSpaces` — the set a requested `disclose` name must match (ISO/IEC 18013-5).
+/// The namespace-qualified selector for an mdoc element — `"{namespace}/{elementIdentifier}"` — the
+/// single form both the disclosability check ([`issued_element_identifiers`]) and the pruner
+/// ([`prune_name_spaces`]) key on (DRY — Principle III). ISO/IEC 18013-5 element identifiers are unique
+/// only WITHIN a namespace and one document can carry multiple namespaces, so a bare id is ambiguous;
+/// qualifying it with its namespace mirrors the SD-JWT arm's `/`-delimited JSON-pointer path selector,
+/// giving both formats a consistent qualified-string `disclose` API. mdoc namespaces are reverse-DNS
+/// (`org.iso.18013.5.1`) and element identifiers carry no `/`, so a caller forms the entry by joining,
+/// and recovers `(namespace, elementIdentifier)` by splitting on the FIRST `/`.
+fn qualified_element_id(namespace: &str, element_identifier: &str) -> String {
+    format!("{namespace}/{element_identifier}")
+}
+
+/// Collect the NAMESPACE-QUALIFIED `"{namespace}/{elementIdentifier}"` of every issued
+/// `IssuerSignedItem` across the response's documents' `issuerSigned.nameSpaces` — the set a requested
+/// `disclose` entry must match (ISO/IEC 18013-5). The namespace is kept (not dropped) so an id present
+/// in two namespaces yields two DISTINCT selectors: disclosing one never leaks the other, and a
+/// bare/unqualified or wrong-namespace `disclose` entry matches nothing and is rejected.
 fn issued_element_identifiers(response: &CborValue) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let documents = get_map_entry(response, "documents").and_then(CborValue::as_array);
@@ -619,10 +644,11 @@ fn issued_element_identifiers(response: &CborValue) -> BTreeSet<String> {
         let name_spaces = get_map_entry(doc, "issuerSigned")
             .and_then(|issuer_signed| get_map_entry(issuer_signed, "nameSpaces"))
             .and_then(CborValue::as_map);
-        for (_ns, items) in name_spaces.into_iter().flatten() {
+        for (ns, items) in name_spaces.into_iter().flatten() {
+            let Some(ns) = ns.as_text() else { continue };
             for item in items.as_array().into_iter().flatten() {
                 if let Some(id) = issuer_signed_item_identifier(item) {
-                    ids.insert(id);
+                    ids.insert(qualified_element_id(ns, &id));
                 }
             }
         }
@@ -670,11 +696,13 @@ fn prune_issuer_signed(
 }
 
 /// Prune one `issuerSigned.nameSpaces` map (`{ namespace: [IssuerSignedItemBytes, …] }`) to the
-/// disclosed subset: within each namespace keep only the items whose `elementIdentifier` is in
-/// `disclose`, retaining each kept item's EXACT tagged bytes (the node is cloned verbatim — the inner
-/// `IssuerSignedItem` is never re-encoded, so the verifier's verbatim-bytes digest still matches). A
-/// namespace left with no disclosed items is dropped (its unused MSO `valueDigests` entries are simply
-/// never checked).
+/// disclosed subset: within each namespace keep only the items whose NAMESPACE-QUALIFIED
+/// `"{namespace}/{elementIdentifier}"` is in `disclose` (never a bare id matched across namespaces —
+/// the same id in a sibling namespace stays pruned, FR-007). Kept items retain their EXACT tagged bytes
+/// (the node is cloned verbatim — the inner `IssuerSignedItem` is never re-encoded, so the verifier's
+/// verbatim-bytes digest still matches). A namespace left with no disclosed items is dropped (its unused
+/// MSO `valueDigests` entries are simply never checked); a non-text namespace key can match no qualified
+/// selector, so all its items are pruned.
 fn prune_name_spaces(
     name_spaces: &CborValue,
     disclose: &BTreeSet<String>,
@@ -690,7 +718,11 @@ fn prune_name_spaces(
         let kept: Vec<CborValue> = items
             .iter()
             .filter(|item| {
-                issuer_signed_item_identifier(item).is_some_and(|id| disclose.contains(&id))
+                let Some(ns) = ns_key.as_text() else {
+                    return false;
+                };
+                issuer_signed_item_identifier(item)
+                    .is_some_and(|id| disclose.contains(&qualified_element_id(ns, &id)))
             })
             .cloned()
             .collect();
@@ -752,30 +784,44 @@ fn reencode_device_name_spaces(value: &CborValue) -> Result<Vec<u8>, PresentErro
 /// Splicing the single holder signature into every document would emit `documents[1..]` each carrying a
 /// `DeviceSignature` computed over `documents[0]` — a silently-invalid token; so a `documents` array
 /// with more than one entry is rejected here too (same [`PresentError::MultiDocumentMdoc`]).
+///
+/// The signature MUST be spliced into an EXISTING `deviceAuth`: the `documents`/`deviceSigned`/`deviceAuth`
+/// walk uses [`replace_required_map_entry`] (not the permissive [`replace_map_entry`]), so a
+/// `DeviceResponse` missing any of those splice targets — reachable via a wire-injected `PreparedKind::Mdoc`,
+/// or the pure-Rust path since [`prepare_mdoc`] does not require `deviceAuth` — ERRORS rather than copying an
+/// UNSIGNED response through unchanged. An empty/absent `documents` array is likewise rejected (there is no
+/// document to bind the holder signature to); exactly one document is required.
 fn replace_device_signature(
     response: &CborValue,
     device_signature_cbor: &[u8],
 ) -> Result<CborValue, PresentError> {
     let device_signature_value: CborValue = ciborium::from_reader(device_signature_cbor)
         .map_err(|e| PresentError::Build(e.to_string()))?;
-    // Walk DeviceResponse → documents[] → deviceSigned → deviceAuth, replacing each level's target key
-    // via the single map-key-replace helper (DRY — Principle III; three near-identical
-    // clone-or-transform walks collapse to one-line transforms).
-    replace_map_entry(response, "DeviceResponse", "documents", |documents| {
+    // Walk DeviceResponse → documents[] → deviceSigned → deviceAuth, replacing each level's REQUIRED
+    // target key via the single required-map-key-replace helper (DRY — Principle III): each key is a
+    // splice target that must exist, so an absent one is a Malformed error (never a no-op copy-through).
+    replace_required_map_entry(response, "DeviceResponse", "documents", |documents| {
         let documents = documents
             .as_array()
             .ok_or_else(|| PresentError::Malformed("documents is not an array".to_owned()))?;
-        // Mirror prepare_mdoc's single-document invariant at the splice site (defense-in-depth against a
-        // wire-injected multi-document PreparedKind::Mdoc): one holder signature cannot authenticate more
-        // than one document, so reject rather than emit a token whose extra documents are mis-signed.
-        if documents.len() > 1 {
-            return Err(PresentError::MultiDocumentMdoc(documents.len()));
+        // The present seam signs exactly ONE DeviceSignature: require exactly one document to bind it to.
+        // >1 → MultiDocumentMdoc (mirror prepare_mdoc's guard at the splice site — defense-in-depth
+        // against a wire-injected multi-document PreparedKind::Mdoc, since one holder signature cannot
+        // authenticate more than one document). 0/absent → Malformed (the signature has no document home).
+        match documents.len() {
+            0 => {
+                return Err(PresentError::Malformed(
+                    "DeviceResponse has no document to bind the holder signature to".to_owned(),
+                ))
+            }
+            1 => {}
+            n => return Err(PresentError::MultiDocumentMdoc(n)),
         }
         let rebuilt_docs = documents
             .iter()
             .map(|doc| {
-                replace_map_entry(doc, "Document", "deviceSigned", |device_signed| {
-                    replace_map_entry(device_signed, "deviceSigned", "deviceAuth", |_| {
+                replace_required_map_entry(doc, "Document", "deviceSigned", |device_signed| {
+                    replace_required_map_entry(device_signed, "deviceSigned", "deviceAuth", |_| {
                         Ok(CborValue::Map(vec![(
                             CborValue::Text("deviceSignature".to_owned()),
                             device_signature_value.clone(),
@@ -789,13 +835,17 @@ fn replace_device_signature(
 }
 
 /// Rebuild a CBOR map `value`, replacing the entry under `key` with `transform(old_value)` and leaving
-/// every other entry untouched (a clone-or-transform walk). The **one** map-key-replace primitive the
-/// holder-presentation splice uses at each `DeviceResponse` → `documents` → `deviceSigned` →
-/// `deviceAuth` level (DRY — Principle III). `map_label` names the map in the malformed-shape error.
-/// Pure CBOR re-serialization — no security logic (the signature it splices is validated elsewhere).
+/// every other entry untouched (a clone-or-transform walk). The PERMISSIVE map-key-replace primitive
+/// [`prune_issuer_signed`] uses at each `DeviceResponse` → `documents` → `issuerSigned` → `nameSpaces`
+/// level (DRY — Principle III): a MISSING key is a no-op copy-through, which is correct for pruning
+/// (a document with no `issuerSigned`/`nameSpaces` legitimately has nothing to prune). `map_label`
+/// names the map in the malformed-shape error. Pure CBOR re-serialization — no security logic.
 ///
-/// `transform` is applied to **every** entry whose key matches (matching the prior per-level walks,
-/// which carried no single-use guard); a well-formed `DeviceResponse` carries each key exactly once.
+/// Contrast [`replace_required_map_entry`], used where the entry is a SPLICE TARGET that must already
+/// exist (the holder-signature splice), so a missing key is an error rather than a silent no-op.
+///
+/// `transform` is applied to **every** entry whose key matches; a well-formed `DeviceResponse` carries
+/// each key exactly once.
 ///
 /// # Errors
 ///
@@ -816,6 +866,44 @@ fn replace_map_entry(
         } else {
             out.push((k.clone(), v.clone()));
         }
+    }
+    Ok(CborValue::Map(out))
+}
+
+/// As [`replace_map_entry`], but the entry under `key` MUST be present: returns
+/// [`PresentError::Malformed`] when no such entry exists, rather than copying the map through unchanged.
+/// Used for the holder-signature splice walk (`documents`/`deviceSigned`/`deviceAuth` in
+/// [`replace_device_signature`]), where each key is a SPLICE TARGET the signature is written into — a
+/// no-op copy-through would emit an UNSIGNED `DeviceResponse` (no holder binding). `map_label` names
+/// the map in the malformed-shape error.
+///
+/// # Errors
+///
+/// [`PresentError::Malformed`] if `value` is not a CBOR map or carries no entry under `key`; propagates
+/// any error from `transform`.
+fn replace_required_map_entry(
+    value: &CborValue,
+    map_label: &str,
+    key: &str,
+    transform: impl Fn(&CborValue) -> Result<CborValue, PresentError>,
+) -> Result<CborValue, PresentError> {
+    let map = value
+        .as_map()
+        .ok_or_else(|| PresentError::Malformed(format!("{map_label} is not a map")))?;
+    let mut out = Vec::with_capacity(map.len());
+    let mut found = false;
+    for (k, v) in map {
+        if k.as_text() == Some(key) {
+            found = true;
+            out.push((k.clone(), transform(v)?));
+        } else {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    if !found {
+        return Err(PresentError::Malformed(format!(
+            "{map_label} is missing the required '{key}' entry"
+        )));
     }
     Ok(CborValue::Map(out))
 }

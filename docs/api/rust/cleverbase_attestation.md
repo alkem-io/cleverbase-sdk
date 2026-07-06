@@ -214,11 +214,18 @@ A parsed OpenID4VP 1.0 DCQL query (§6). Carries only the credential/claim/set c
 evaluates; unknown top-level and per-object properties are ignored (§6 *"Implementations MUST ignore
 any unknown properties"*).
 
-[`parse`](Self::parse) is **lenient**: a Credential Query whose `format` this SDK does not support,
-or that is structurally malformed, is dropped from [`Self::credentials`] (it cannot be satisfied by
-either supported format, so it imposes no enforceable in-core constraint) rather than failing the
-whole parse — a single bad entry never disables the gate for the rest. `parse` errors only on a
-non-JSON or non-object input.
+[`parse`](Self::parse) is **lenient** about entries it cannot enforce, but only up to the point that
+leniency stays fail-closed. A Credential Query whose `format` this SDK does not support (or that
+lacks an `id`/`format`) is dropped from [`Self::credentials`] — it cannot be satisfied by either
+supported format, so it imposes no enforceable in-core constraint on a presentation of a supported
+format. But once the `format` IS supported, a structurally-malformed `claims`/`path`/`values`/
+`claim_sets` does NOT drop the query: dropping it would collapse `credentials` toward empty and
+silently disable the "did I get what I requested" gate (`evaluate_single` → `Inactive`) — a
+fail-OPEN. Such a query is kept ALIVE but UNSATISFIABLE (via the never-resolving
+[`PathComponent::Unrepresentable`] / [`ClaimValue::Unrepresentable`] sentinels and never-matching
+`claim_sets` options), so the gate runs and returns `NotSatisfied` (fail closed). A single bad entry
+thus never disables the gate for the rest. `parse` errors only on a non-JSON / non-object input or a
+duplicate credential `id`.
 
 ##### Fields
 
@@ -326,6 +333,15 @@ One component of a Claims Path Pointer (§"Claims Path Pointer").
   - A non-negative-integer component: select this 0-based index of an array.
 - `AllElements`
   - A `null` component: select all elements of the currently selected array(s).
+- `Unrepresentable`
+  - A path component that is NOT a valid Claims Path Pointer element (§"Claims Path Pointer"
+admits only strings, non-negative integers, and `null`) — a JSON float, a negative index, or a
+nested object/array. Mirrors [`ClaimValue::Unrepresentable`]: it is retained as an explicit
+NEVER-resolving sentinel rather than dropped, because dropping it would collapse the whole
+Credential Query (via the lenient parse), leaving `evaluate_single` `Inactive` and the "did I
+get what I requested" gate silently disabled — a fail-OPEN. Keeping it unresolvable keeps the
+query enforced (the claim simply never resolves → `NotSatisfied`, fail closed). Never produced
+from a spec-valid path component.
 
 ## Module `issuance`
 
@@ -881,6 +897,11 @@ The produced [`HolderPresentation`] **verifies under** [`crate::openid4vp::verif
 against the same `request` (the round-trip), revealing only the `disclose` subset. `iat` is the
 holder's signing instant (the KB-JWT `iat`). A thin wrapper over [`prepare_present`] +
 [`PreparedPresentation::finish`] with an in-process [`Signer`].
+
+A `disclose` entry is a `/`-delimited qualified string in BOTH formats: for an SD-JWT VC it is the
+claim's JSON-pointer path (a top-level claim is its bare name, a nested claim is `parent/leaf`); for
+an mdoc it is the namespace-qualified `"{namespace}/{elementIdentifier}"` (see `qualified_element_id`).
+An entry matching no disclosable claim is rejected as [`PresentError::UndisclosableClaim`].
 
 # Errors
 
