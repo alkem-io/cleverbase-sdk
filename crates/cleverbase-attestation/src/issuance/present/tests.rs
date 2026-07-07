@@ -656,6 +656,10 @@ fn map_replace(
             }
         })
         .collect();
+    assert!(
+        f.is_none(),
+        "map_replace: key `{key}` not found in CBOR map"
+    );
     CborValue::Map(entries)
 }
 

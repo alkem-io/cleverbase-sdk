@@ -13,7 +13,7 @@
 # Set CLEVERBASE_LINT_STRICT=1 to also fail on a missing tool (full CI parity).
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 ROOT="$(pwd)"
 FAILED=()
 WARNED=()

@@ -381,7 +381,8 @@ impl MdocBuilder {
 
     /// Add an MSO `status` element whose `status_list` object IS present but MALFORMED (only `idx`, no
     /// `uri`) — the present-but-unusable reference the always-on bar MUST fail closed on
-    /// (`StatusUnavailable`), never falling through to a host-supplied positional `Good`.
+    /// (`StatusUntrusted` — a declared mechanism the core cannot evaluate), never falling through to a
+    /// host-supplied positional `Good`.
     pub(crate) fn malformed_status_reference(mut self) -> Self {
         self.malformed_status_reference = true;
         self

@@ -25,6 +25,9 @@ jobs:
   live-issuance:
     name: Live issuance (eudi-srv-pid-issuer)
     runs-on: ubuntu-latest
+    # Cap the opt-in live job so a hang in docker-compose startup, the readiness wait, or the live
+    # test fails fast instead of holding a runner for GitHub's 360-minute default.
+    timeout-minutes: 15
     env:
       # The reference issuer base URL the Rust live test drives its host effects against. Bringing the
       # stack up exports this; it gates the `live_obtain_against_the_reference_issuer_or_skip` test

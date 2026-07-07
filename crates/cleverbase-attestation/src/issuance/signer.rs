@@ -276,6 +276,23 @@ fn splice_compact_jws(prefix: &str, signature: &[u8]) -> String {
     format!("{prefix}.{sig_b64}")
 }
 
+/// Assemble a compact JWS from a signing input and the host-returned signature — the shared body of
+/// [`PopJwtBuild::assemble`] and [`KbJwtBuild::assemble`] (DRY, Constitution Principle III): validate
+/// the signature length, then splice it onto the signing input verbatim as the `header.payload`
+/// prefix (derived from the one authoritative buffer, not a stored byte-identical copy).
+///
+/// # Errors
+///
+/// [`SignerError::BadSignatureLength`] if the signature is not the algorithm's expected length;
+/// [`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
+/// SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
+fn assemble_compact_jws(input: &SigningInput, signature: &[u8]) -> Result<String, SignerError> {
+    check_sig_len(input.algorithm, signature)?;
+    let prefix = std::str::from_utf8(&input.to_be_signed)
+        .map_err(|e| SignerError::Serialize(e.to_string()))?;
+    Ok(splice_compact_jws(prefix, signature))
+}
+
 /// A built OpenID4VCI proof-of-possession JWT input, plus the splice context to assemble the compact
 /// JWS once the host has signed it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,12 +310,7 @@ impl PopJwtBuild {
     /// [`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
     /// SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
     pub fn assemble(&self, signature: &[u8]) -> Result<String, SignerError> {
-        check_sig_len(self.input.algorithm, signature)?;
-        // The splice prefix is the signing input verbatim (`header.payload`), so derive it from the
-        // one authoritative buffer instead of storing a byte-identical copy.
-        let prefix = std::str::from_utf8(&self.input.to_be_signed)
-            .map_err(|e| SignerError::Serialize(e.to_string()))?;
-        Ok(splice_compact_jws(prefix, signature))
+        assemble_compact_jws(&self.input, signature)
     }
 }
 
@@ -363,12 +375,7 @@ impl KbJwtBuild {
     /// [`SignerError::Serialize`] if the to-be-signed buffer is not valid UTF-8 (impossible for an
     /// SDK-built input — it is ASCII base64url `header.payload` — but checked rather than assumed).
     pub fn assemble(&self, signature: &[u8]) -> Result<String, SignerError> {
-        check_sig_len(self.input.algorithm, signature)?;
-        // The splice prefix is the signing input verbatim (`header.payload`), so derive it from the
-        // one authoritative buffer instead of storing a byte-identical copy.
-        let prefix = std::str::from_utf8(&self.input.to_be_signed)
-            .map_err(|e| SignerError::Serialize(e.to_string()))?;
-        Ok(splice_compact_jws(prefix, signature))
+        assemble_compact_jws(&self.input, signature)
     }
 }
 
