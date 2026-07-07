@@ -83,7 +83,16 @@ const SD_JWT_VC_PID_VCTS: &[&str] = &["urn:eudi:pid:1", "eu.europa.ec.eudi.pid.1
 const MDOC_PID_DOCTYPE: &str = "eu.europa.ec.eudi.pid.1";
 
 /// The OpenID4VP 1.0 Credential Format Identifier for SD-JWT VC (Appendix B). `vc+sd-jwt` is the legacy
-/// value accepted transitionally (mirrors the issuer-JWS `typ` transition in [`crate::sdjwtvc`]).
+/// value accepted transitionally.
+///
+/// These are the same two strings as [`crate::sdjwtvc`]'s issuer-JWS `typ` list (`ACCEPTED_ISSUER_TYP`),
+/// but the coincidence is deliberately NOT single-sourced: this is the OpenID4VP **Credential Format
+/// Identifier** registry (matched against a DCQL query's `format`), a registry DISTINCT from the SD-JWT
+/// VC JWS `typ` media type (RFC 9901 §9.11). Both inherited the `vc+sd-jwt` → `dc+sd-jwt` rename so they
+/// track each other TODAY, but they govern different wire fields under different specs and could
+/// legitimately diverge (e.g. end the `vc+sd-jwt` transition on different schedules); coupling them
+/// would risk a change to one silently altering the other. The two lists are kept in step by hand —
+/// this cross-reference is the reminder.
 const FORMAT_SD_JWT_VC: &[&str] = &["dc+sd-jwt", "vc+sd-jwt"];
 /// The OpenID4VP 1.0 Credential Format Identifier for ISO mdoc (Appendix B).
 const FORMAT_MSO_MDOC: &str = "mso_mdoc";

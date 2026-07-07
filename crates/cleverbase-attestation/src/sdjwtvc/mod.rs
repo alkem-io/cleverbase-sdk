@@ -155,11 +155,22 @@ pub(crate) fn kb_jwt_aud_nonce(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<(String
 /// the handle. Crate-internal (`pub(crate)`) so the parsed-`SdJwt` coupling stays out of the public API.
 #[must_use]
 pub(crate) fn issuer_signing_cert_der(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<Vec<u8>> {
-    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation.
-    let presentation = sd_jwt.presentation();
-    let jws = presentation.split('~').next()?;
-    let header = decode_jws_protected_header(jws)?;
+    let jws = issuer_jws(sd_jwt)?;
+    let header = decode_jws_protected_header(&jws)?;
     issuer_cert_from_header(&header).ok()
+}
+
+/// The issuer JWS: the first `~`-separated segment of the (re-serialized) SD-JWT VC presentation
+/// (`<issuer-JWS>~<disclosure>*~<KB-JWT>`). The single source both [`issuer_signing_cert_der`] and
+/// [`verify_issuer_signature`] read, so the segment-extraction cannot drift between them (DRY —
+/// Principle III).
+///
+/// Returns an OWNED `String` (not `&str`): `sd_jwt_payload`'s `presentation()` hands back an owned
+/// `String`, so a borrowed slice cannot outlive this call. `str::split(..).next()` always yields a
+/// first element, so the result is effectively always `Some`; the `Option` mirrors that call exactly,
+/// leaving each caller's fail-closed `?` / `ok_or` unchanged.
+pub(crate) fn issuer_jws(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
+    sd_jwt.presentation().split('~').next().map(str::to_owned)
 }
 
 /// Extract the issuer-signed `vct` (Verifiable Credential Type) a presented SD-JWT VC asserts, for the
@@ -382,13 +393,10 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
 /// self-signed cert verifies its own signature but is rejected as untrusted unless its path reaches the
 /// configured anchor).
 fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>>, ReasonCode> {
-    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation. It is a
-    // compact JWS of EXACTLY three dot-segments; a non-3-segment framing is a malformed credential.
-    let presentation = sd_jwt.presentation();
-    let jws = presentation
-        .split('~')
-        .next()
-        .ok_or(ReasonCode::MalformedCredential)?;
+    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation (via the
+    // shared [`issuer_jws`]). It is a compact JWS of EXACTLY three dot-segments; a non-3-segment framing
+    // is a malformed credential.
+    let jws = issuer_jws(sd_jwt).ok_or(ReasonCode::MalformedCredential)?;
     // Exactly three dot-segments (header.payload.signature); the real segments are re-split downstream
     // by `decode_jws_protected_header` + `verify_compact_es256`, so here only the framing is checked.
     if jws.split('.').count() != 3 {
@@ -400,7 +408,7 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
     // check use — share the single [`decode_jws_protected_header`] (DRY — Principle III); the framing
     // guard above already established `jws` as a 3-segment compact JWS, so the helper's first-segment
     // split re-reads the header that guard validated.
-    let header = decode_jws_protected_header(jws).ok_or(ReasonCode::MalformedCredential)?;
+    let header = decode_jws_protected_header(&jws).ok_or(ReasonCode::MalformedCredential)?;
     // RFC 7515 §4.1.11: a `crit` header listing any extension the recipient does not understand
     // invalidates the JWS. This verifier implements no critical extension Header Parameter, so any
     // `crit` member is unsupported — reject (shared with the KB-JWT header check; DRY — Principle III).
@@ -426,7 +434,7 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
     // cert is a `Tamper`. Trust is decided separately (step 3) — this only proves the credential signed
     // its own bytes.
     let verifying_key = verifying_key_from_cert_der(cert_der)?;
-    verify_compact_es256(jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
+    verify_compact_es256(&jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
 
     Ok(chain)
 }

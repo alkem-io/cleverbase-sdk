@@ -1486,14 +1486,19 @@ already performs; nothing here changes the verdict (it is the same `Verification
   - The `documents` array length (`0` when the response is too malformed to read it). The OpenID4VP
 replay classifier bounds its `Replay` re-attribution to the single-document case via this count,
 read from the bar's own decode (no separate `DeviceResponse` re-decode).
-- `claimed_issuers: Vec<(Vec<u8>, i64)>`
-  - Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix)` — the Document Signer leaf
-(DER) from `IssuerAuth.x5chain` PAIRED with the MSO `validityInfo.signed` — collected during a
-VALID bar pass (and EMPTY on any INVALID verdict). The opt-in [`crate::qualified`] gate folds
-these (it runs only on a VALID credential), reading EACH document's already-extracted cert + its
-issuance/relevant time rather than re-decoding the response. On a VALID credential `signed` is
-mandatory (the bar requires it), so this is the single source the gate folds — the per-document
-`(leaf, signed)` already paired by the bar pass.
+- `claimed_issuers: Vec<(Vec<u8>, i64, Option<String>)>`
+  - Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix, category)` — the Document
+Signer leaf (DER) from `IssuerAuth.x5chain`, the MSO `validityInfo.signed`, and the ETSI TS
+119 472-1 **`category`** data element (the qualified-EAA type indication in namespace
+`org.etsi.01947201.010101`; `Some(urn)` when the document disclosed the element, else `None`) —
+all collected during a VALID bar pass (and EMPTY on any INVALID verdict). The three are carried
+as ONE tuple per document (no parallel index-aligned arrays to re-correlate — no drift risk). The
+opt-in [`crate::qualified`] gate folds these directly (it runs only on a VALID credential),
+reading EACH document's already-extracted cert, its issuance/relevant time, and its `category`
+(the PRO-4.12.4-03 type indication for that document — `None` ⇒ the precondition is undecidable ⇒
+fail closed, never a false "qualified") rather than re-decoding the response. On a VALID
+credential `signed` is mandatory (the bar requires it), so this is the single source the gate
+folds — the per-document `(leaf, signed, category)` triple the bar pass paired.
 - `doc_types: Vec<String>`
   - Per-document verified `docType` (the signed MSO `docType`, one per document), collected during a
 VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL gate
@@ -1501,18 +1506,14 @@ VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL ga
 `doctype_value`), reading the bar's already-decoded `docType` rather than re-decoding the
 response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
 it), so this is the authoritative type view for the "did I get what I requested" check.
-- `categories: Vec<Option<String>>`
-  - Per-document ETSI TS 119 472-1 **`category`** data element (the qualified-EAA type indication in
-`org.etsi.01947201.010101`), aligned 1:1 with [`Self::claimed_issuers`] — `Some(urn)` when
-the document disclosed the `category` element, else `None`. The opt-in [`crate::qualified`] gate
-reads this as the PRO-4.12.4-03 type indication for each mdoc document (`None` ⇒ the precondition
-is undecidable for that document ⇒ fail closed, never a false "qualified"). Collected during the
-VALID bar pass (EMPTY on any INVALID verdict).
 - `binding_machinery: Option<DeviceBindingMachinery>`
   - The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
-when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
-classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
-(no second `DeviceResponse` decode), and identical to the standalone [`device_binding_machinery`].
+when the verdict is an INVALID [`ReasonCode::HolderBinding`] AND the response is single-document
+(`document_count == 1`), the one case the OpenID4VP replay classifier consults it; `None`
+otherwise (including any multi-document `HolderBinding`, which is never re-attributed to
+`Replay`). Computed from the bar's already-decoded `documents` (no second `DeviceResponse`
+decode), and — when populated — identical to the standalone `device_binding_machinery`
+(a test/`test-vectors`-gated helper).
 
 #### struct `MdocVerifyParams`
 
@@ -1593,28 +1594,6 @@ real holder-binding fault ⇒ `HolderBinding` (never masked as `Replay`).
 unparseable `DeviceKey`, or `DeviceMac`-only) — a transcript-INDEPENDENT holder-binding fault.
 
 ### Functions
-
-#### fn `device_binding_machinery`
-
-```rust
-fn device_binding_machinery(device_response: &[u8]) -> DeviceBindingMachinery
-```
-
-Classify whether the `DeviceAuth` holder-binding **machinery** of every document in a
-`DeviceResponse` is structurally sound (see [`DeviceBindingMachinery`]). Transcript-INDEPENDENT:
-it checks the `DeviceAuth` shape, the `DeviceSignature` algorithm, the MSO `DeviceKey`, and that
-the signature bytes form a well-formed ES256 signature — it deliberately does NOT verify the
-signature against any payload, so it isolates a genuine binding fault (which fails for every
-transcript) from a fresh-nonce mismatch (which fails only because the rebuilt transcript differs).
-
-Used only to refine the failure attribution when [`verify_with_meta`] already returned
-[`ReasonCode::HolderBinding`]; a malformed/absent structure conservatively reports `Faulty` (a
-holder-binding fault is never silently downgraded to a replay).
-
-This is the standalone (bytes-in) entry; [`verify_with_meta`] surfaces the SAME classification from
-its own already-decoded `documents` (no second decode) via [`MdocVerifyMeta::binding_machinery`], so
-the OpenID4VP replay classifier reads that cached value instead of calling this. Both route through
-the shared `classify_binding_machinery` core, so the bytes-in and decoded-in answers are identical.
 
 #### fn `verify_with_meta`
 
@@ -2028,7 +2007,8 @@ credential-TYPE identifier (`vct`/`docType`); the type indication is threaded fr
 - **SD-JWT VC** — the issuer-signed `category` claim (`crate::sdjwtvc::issuer_category`), NOT the
   `vct` (which is the credential type, e.g. `urn:eudi:pid:1`, and never the qualified URN).
 - **ISO mdoc** — the `category` data element in namespace `org.etsi.01947201.010101` (TS 119 472-1
-  cl. 6.2.2), surfaced per document by the always-on bar in `MdocVerifyMeta.categories`.
+  cl. 6.2.2), surfaced per document by the always-on bar in the `MdocVerifyMeta.claimed_issuers`
+  `(leaf, signed, category)` triple.
 
 The precondition is **enforced for both formats**: an ABSENT `category` (an ordinary EAA, which TS
 119 472-1 EAA-5.2.2.1-01 says MUST NOT carry `category`; or an mdoc document that did not disclose
@@ -2247,12 +2227,15 @@ use `now_unix`; only the status read uses `relevant_time_unix`.
 
 ## QEAA type-indication precondition (PRO-4.12.4-03)
 
-`type_indication` is the credential's self-declared type (SD-JWT VC `vct`; `None` for ISO mdoc —
-see the module docs). Per PRO-4.12.4-03 the EAA must self-declare the qualified-EAA type
-([`EAA_EU_QUALIFIED_TYPE`]) before a `Qualified` verdict: a `Some` indication that is **not** that
-URN yields [`QualifiedStatus::Indeterminate`] (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`),
-**before** any service status is read; `None` (a format with no cl. 4.12 URN construct, i.e. mdoc)
-does not enforce it.
+`type_indication` is the credential's issuer-signed **`category`** — the SD-JWT VC `category` claim
+/ the mdoc `category` data element (ETSI TS 119 472-1), NOT the `vct`/`docType` (which is the
+credential-TYPE identifier, e.g. `urn:eudi:pid:1`, and never the qualified URN); see the module
+docs. Per PRO-4.12.4-03 the EAA must self-declare the qualified-EAA type
+([`EAA_EU_QUALIFIED_TYPE`]) before a `Qualified` verdict, and this is enforced for **both** formats:
+any `type_indication` that is not exactly that URN — INCLUDING an absent one (`None` — no /
+undisclosed `category`) — yields [`QualifiedStatus::Indeterminate`]
+(`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) **before** any service status is read (never a false
+"qualified"; fail-closed).
 
 ## Flow
 
@@ -4336,6 +4319,13 @@ host-supplied outcome. The field is `#[serde(default)]` (empty), so an older v5 
 decodes to "no signed tokens ⇒ the positional `statuses` seam alone" — a decode-compatible addition.
 Because this crate is pre-release (0.1.0, unmerged), the addition consolidates into v5 rather than
 minting a v6 for an unreleased shape.
+
+Version 5 further carries the revocation/status seam as the **plural, per-document** positional
+`statuses` ([`WireContext::statuses`], one [`StatusOutcome`] per presented document — a
+multi-document mdoc `DeviceResponse` checks `documents[i]` against `statuses[i]`, never a silent
+reuse of one outcome across documents, SC-002) and hardens both wire structs with
+`#[serde(deny_unknown_fields)]`, so a typo'd/unrecognized key is a hard decode error rather than a
+silently-defaulted field (e.g. a misspelled `qualified_gate` can no longer leave the gate off).
 
 ### Structs
 

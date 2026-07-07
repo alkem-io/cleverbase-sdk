@@ -469,14 +469,12 @@ fn qualified_status_for(
             let Some(meta) = mdoc_meta else {
                 return QualifiedStatus::Indeterminate;
             };
-            fold_qualified(meta.claimed_issuers.iter().enumerate().map(
-                |(index, (cert, issued))| {
-                    // The mdoc `category` data element (TS 119 472-1 cl. 6.2.2), per document, is the
-                    // PRO-4.12.4-03 type indication for mdoc — enforced now (was skipped as `None`).
-                    let category = meta.categories.get(index).and_then(Option::as_deref);
-                    status_of(Some(cert.clone()), Some(*issued), category)
-                },
-            ))
+            fold_qualified(meta.claimed_issuers.iter().map(|(cert, issued, category)| {
+                // Read each document's `(leaf, signed, category)` directly from the one tuple the bar
+                // paired (no `enumerate` + `.get(index)` realignment across parallel arrays). The mdoc
+                // `category` data element (TS 119 472-1 cl. 6.2.2) is the PRO-4.12.4-03 type indication.
+                status_of(Some(cert.clone()), Some(*issued), category.as_deref())
+            }))
         }
     }
 }

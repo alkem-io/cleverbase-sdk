@@ -52,6 +52,13 @@
 //! decodes to "no signed tokens ⇒ the positional `statuses` seam alone" — a decode-compatible addition.
 //! Because this crate is pre-release (0.1.0, unmerged), the addition consolidates into v5 rather than
 //! minting a v6 for an unreleased shape.
+//!
+//! Version 5 further carries the revocation/status seam as the **plural, per-document** positional
+//! `statuses` ([`WireContext::statuses`], one [`StatusOutcome`] per presented document — a
+//! multi-document mdoc `DeviceResponse` checks `documents[i]` against `statuses[i]`, never a silent
+//! reuse of one outcome across documents, SC-002) and hardens both wire structs with
+//! `#[serde(deny_unknown_fields)]`, so a typo'd/unrecognized key is a hard decode error rather than a
+//! silently-defaulted field (e.g. a misspelled `qualified_gate` can no longer leave the gate off).
 
 use std::collections::BTreeMap;
 

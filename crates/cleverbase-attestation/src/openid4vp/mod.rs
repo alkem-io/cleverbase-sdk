@@ -120,9 +120,18 @@ impl PresentationRequest {
     /// The request `nonce` as a base64url-unpadded string (the form an SD-JWT VC KB-JWT echoes).
     #[must_use]
     pub fn nonce_b64(&self) -> String {
-        use base64ct::{Base64UrlUnpadded, Encoding as _};
-        Base64UrlUnpadded::encode_string(&self.nonce)
+        nonce_to_b64url(&self.nonce)
     }
+}
+
+/// Encode request-`nonce` bytes to their canonical base64url-unpadded string — the single source both
+/// [`PresentationRequest::nonce_b64`] (the SD-JWT VC KB-JWT `nonce`) and the mdoc
+/// [`oid4vp_handover_transcript`] draw, so the two formats' nonce-on-the-wire stays byte-identical
+/// (the `OpenID4VPHandoverInfo` nonce text MUST equal the value the KB-JWT echoes — OpenID4VP 1.0
+/// §B.2.6). One definition, so the handover nonce can never drift from `nonce_b64`.
+fn nonce_to_b64url(nonce: &[u8]) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    Base64UrlUnpadded::encode_string(nonce)
 }
 
 /// Build an OpenID4VP presentation request: the DCQL query, a **fresh** nonce drawn from the host
@@ -550,11 +559,10 @@ fn verify_mdoc_bound<A: TrustAnchorSource + ?Sized>(
 ///   `client_id`, so the SDK carries it as the first-class [`PresentationRequest::response_uri`].
 #[must_use]
 pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &str) -> Vec<u8> {
-    use base64ct::{Base64UrlUnpadded, Encoding as _};
-
     // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri] (OpenID4VP 1.0 §B.2.6).
-    // `nonce` is the text `nonce` request parameter; the SDK's bytes map to their base64url form.
-    let nonce_text = Base64UrlUnpadded::encode_string(nonce);
+    // `nonce` is the text `nonce` request parameter; the SDK's bytes map to their base64url form via the
+    // SAME [`nonce_to_b64url`] the SD-JWT VC `nonce_b64` uses, so the two formats' nonce is identical.
+    let nonce_text = nonce_to_b64url(nonce);
     let handover_info = CborValue::Array(vec![
         CborValue::Text(audience.to_owned()),
         CborValue::Text(nonce_text),
@@ -677,7 +685,10 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
         // `Unavailable` (never a single outcome silently reused across credentials/documents — SC-002).
         let credential_statuses = statuses.get(credential_id);
         let mut presentations = Vec::with_capacity(tokens.len());
-        let mut matched = 0usize;
+        // Whether ANY returned Presentation both verified AND matched this Credential Query. Only the
+        // ≥1 fact is used (cardinality is enforced separately by `cardinality_ok`), so a `bool` suffices;
+        // every token is still verified + pushed to `presentations` (no short-circuit).
+        let mut matched = false;
         for (token_index, token) in tokens.iter().enumerate() {
             let token_statuses: &[StatusOutcome] = credential_statuses
                 .and_then(|per_token| per_token.get(token_index))
@@ -723,12 +734,12 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
                     )
                 });
             if matches_query {
-                matched += 1;
+                matched = true;
             }
             presentations.push(result);
         }
 
-        let satisfied = credential_query.is_some() && cardinality_ok && matched >= 1;
+        let satisfied = credential_query.is_some() && cardinality_ok && matched;
         if satisfied {
             satisfied_ids.insert(credential_id.clone());
         }

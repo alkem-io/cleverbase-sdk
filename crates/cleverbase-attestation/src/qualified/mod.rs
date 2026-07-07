@@ -36,7 +36,8 @@
 //! - **SD-JWT VC** — the issuer-signed `category` claim (`crate::sdjwtvc::issuer_category`), NOT the
 //!   `vct` (which is the credential type, e.g. `urn:eudi:pid:1`, and never the qualified URN).
 //! - **ISO mdoc** — the `category` data element in namespace `org.etsi.01947201.010101` (TS 119 472-1
-//!   cl. 6.2.2), surfaced per document by the always-on bar in `MdocVerifyMeta.categories`.
+//!   cl. 6.2.2), surfaced per document by the always-on bar in the `MdocVerifyMeta.claimed_issuers`
+//!   `(leaf, signed, category)` triple.
 //!
 //! The precondition is **enforced for both formats**: an ABSENT `category` (an ordinary EAA, which TS
 //! 119 472-1 EAA-5.2.2.1-01 says MUST NOT carry `category`; or an mdoc document that did not disclose
@@ -556,12 +557,15 @@ impl QualifiedTrustList {
 ///
 /// ## QEAA type-indication precondition (PRO-4.12.4-03)
 ///
-/// `type_indication` is the credential's self-declared type (SD-JWT VC `vct`; `None` for ISO mdoc —
-/// see the module docs). Per PRO-4.12.4-03 the EAA must self-declare the qualified-EAA type
-/// ([`EAA_EU_QUALIFIED_TYPE`]) before a `Qualified` verdict: a `Some` indication that is **not** that
-/// URN yields [`QualifiedStatus::Indeterminate`] (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`),
-/// **before** any service status is read; `None` (a format with no cl. 4.12 URN construct, i.e. mdoc)
-/// does not enforce it.
+/// `type_indication` is the credential's issuer-signed **`category`** — the SD-JWT VC `category` claim
+/// / the mdoc `category` data element (ETSI TS 119 472-1), NOT the `vct`/`docType` (which is the
+/// credential-TYPE identifier, e.g. `urn:eudi:pid:1`, and never the qualified URN); see the module
+/// docs. Per PRO-4.12.4-03 the EAA must self-declare the qualified-EAA type
+/// ([`EAA_EU_QUALIFIED_TYPE`]) before a `Qualified` verdict, and this is enforced for **both** formats:
+/// any `type_indication` that is not exactly that URN — INCLUDING an absent one (`None` — no /
+/// undisclosed `category`) — yields [`QualifiedStatus::Indeterminate`]
+/// (`ERROR_NO_ETSI_QEAA_TYPE_INDICATION_FOUND`) **before** any service status is read (never a false
+/// "qualified"; fail-closed).
 ///
 /// ## Flow
 ///

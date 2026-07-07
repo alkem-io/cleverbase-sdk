@@ -390,7 +390,8 @@ impl MdocBuilder {
     /// Make this a conformant QEAA mdoc: inject the ETSI TS 119 472-1 cl. 6.2.2 **`category`** data
     /// element (value = [`EAA_EU_QUALIFIED_TYPE`]) into a SECOND namespace (`org.etsi.01947201.010101`)
     /// of the SAME (primary) document — alongside the ISO namespace's elements — so the opt-in qualified
-    /// gate reads the PRO-4.12.4-03 type indication for this document (`MdocVerifyMeta.categories`). Both
+    /// gate reads the PRO-4.12.4-03 type indication for this document (surfaced per document in the
+    /// `MdocVerifyMeta.claimed_issuers` `(leaf, signed, category)` triple). Both
     /// the `issuerSigned.nameSpaces` group and a matching MSO `valueDigests` entry are minted.
     pub(crate) fn qeaa_category(mut self) -> Self {
         self.qeaa_category = true;

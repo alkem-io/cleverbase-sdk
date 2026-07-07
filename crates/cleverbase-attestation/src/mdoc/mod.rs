@@ -240,14 +240,19 @@ pub struct MdocVerifyMeta {
     /// replay classifier bounds its `Replay` re-attribution to the single-document case via this count,
     /// read from the bar's own decode (no separate `DeviceResponse` re-decode).
     pub document_count: usize,
-    /// Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix)` — the Document Signer leaf
-    /// (DER) from `IssuerAuth.x5chain` PAIRED with the MSO `validityInfo.signed` — collected during a
-    /// VALID bar pass (and EMPTY on any INVALID verdict). The opt-in [`crate::qualified`] gate folds
-    /// these (it runs only on a VALID credential), reading EACH document's already-extracted cert + its
-    /// issuance/relevant time rather than re-decoding the response. On a VALID credential `signed` is
-    /// mandatory (the bar requires it), so this is the single source the gate folds — the per-document
-    /// `(leaf, signed)` already paired by the bar pass.
-    pub claimed_issuers: Vec<(Vec<u8>, i64)>,
+    /// Per-document **claimed** issuer `(ds_cert_der, issuance_time_unix, category)` — the Document
+    /// Signer leaf (DER) from `IssuerAuth.x5chain`, the MSO `validityInfo.signed`, and the ETSI TS
+    /// 119 472-1 **`category`** data element (the qualified-EAA type indication in namespace
+    /// `org.etsi.01947201.010101`; `Some(urn)` when the document disclosed the element, else `None`) —
+    /// all collected during a VALID bar pass (and EMPTY on any INVALID verdict). The three are carried
+    /// as ONE tuple per document (no parallel index-aligned arrays to re-correlate — no drift risk). The
+    /// opt-in [`crate::qualified`] gate folds these directly (it runs only on a VALID credential),
+    /// reading EACH document's already-extracted cert, its issuance/relevant time, and its `category`
+    /// (the PRO-4.12.4-03 type indication for that document — `None` ⇒ the precondition is undecidable ⇒
+    /// fail closed, never a false "qualified") rather than re-decoding the response. On a VALID
+    /// credential `signed` is mandatory (the bar requires it), so this is the single source the gate
+    /// folds — the per-document `(leaf, signed, category)` triple the bar pass paired.
+    pub claimed_issuers: Vec<(Vec<u8>, i64, Option<String>)>,
     /// Per-document verified `docType` (the signed MSO `docType`, one per document), collected during a
     /// VALID bar pass (and EMPTY on any INVALID verdict). The in-core OpenID4VP DCQL gate
     /// ([`crate::dcql`]) matches these against the query's `meta.doctype_value` (mdoc `docType` ==
@@ -255,17 +260,13 @@ pub struct MdocVerifyMeta {
     /// response. On a VALID document the MSO `docType` equals the document `docType` (the bar enforces
     /// it), so this is the authoritative type view for the "did I get what I requested" check.
     pub doc_types: Vec<String>,
-    /// Per-document ETSI TS 119 472-1 **`category`** data element (the qualified-EAA type indication in
-    /// `org.etsi.01947201.010101`), aligned 1:1 with [`Self::claimed_issuers`] — `Some(urn)` when
-    /// the document disclosed the `category` element, else `None`. The opt-in [`crate::qualified`] gate
-    /// reads this as the PRO-4.12.4-03 type indication for each mdoc document (`None` ⇒ the precondition
-    /// is undecidable for that document ⇒ fail closed, never a false "qualified"). Collected during the
-    /// VALID bar pass (EMPTY on any INVALID verdict).
-    pub categories: Vec<Option<String>>,
     /// The `DeviceAuth` holder-binding **machinery** soundness across every document — populated ONLY
-    /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] (the one case the OpenID4VP replay
-    /// classifier consults it); `None` otherwise. Computed from the bar's already-decoded `documents`
-    /// (no second `DeviceResponse` decode), and identical to the standalone [`device_binding_machinery`].
+    /// when the verdict is an INVALID [`ReasonCode::HolderBinding`] AND the response is single-document
+    /// (`document_count == 1`), the one case the OpenID4VP replay classifier consults it; `None`
+    /// otherwise (including any multi-document `HolderBinding`, which is never re-attributed to
+    /// `Replay`). Computed from the bar's already-decoded `documents` (no second `DeviceResponse`
+    /// decode), and — when populated — identical to the standalone `device_binding_machinery`
+    /// (a test/`test-vectors`-gated helper).
     pub binding_machinery: Option<DeviceBindingMachinery>,
 }
 
@@ -328,6 +329,12 @@ pub enum DeviceBindingMachinery {
 /// its own already-decoded `documents` (no second decode) via [`MdocVerifyMeta::binding_machinery`], so
 /// the OpenID4VP replay classifier reads that cached value instead of calling this. Both route through
 /// the shared `classify_binding_machinery` core, so the bytes-in and decoded-in answers are identical.
+///
+/// The production replay classifier always consumes the cached [`MdocVerifyMeta::binding_machinery`]
+/// (no second `DeviceResponse` decode), so this bytes-in entry has no production caller; it is gated to
+/// test / `test-vectors` builds like the other bytes-in helpers, retaining its coverage of the
+/// unparseable-input path that the decoded-in `classify_binding_machinery` cannot exercise.
+#[cfg(any(test, feature = "test-vectors"))]
 #[must_use]
 pub fn device_binding_machinery(device_response: &[u8]) -> DeviceBindingMachinery {
     let Ok(root) = ciborium::from_reader::<CborValue, _>(device_response) else {
@@ -548,10 +555,14 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
 
     // From here on `documents` is decoded, so every meta carries the document count; the binding
     // machinery is computed (from these SAME decoded documents — no re-decode) only when the bar fails
-    // with `HolderBinding` (the one case the OpenID4VP replay classifier consults it).
+    // with `HolderBinding` AND the response is single-document. The OpenID4VP replay classifier — the
+    // sole consumer — reads `binding_machinery` ONLY for `document_count == 1` (a multi-document
+    // `HolderBinding` keeps `HolderBinding`, never re-attributed to `Replay`), so classifying the
+    // machinery for a multi-document response would be wasted work; leave it `None` there.
     let document_count = documents.len();
     let fail = |failure: VerifyFailure| {
-        let binding_machinery = (failure.reason == ReasonCode::HolderBinding)
+        let binding_machinery = (failure.reason == ReasonCode::HolderBinding
+            && document_count == 1)
             .then(|| classify_binding_machinery(documents));
         (
             failure,
@@ -559,7 +570,6 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
                 document_count,
                 claimed_issuers: Vec::new(),
                 doc_types: Vec::new(),
-                categories: Vec::new(),
                 binding_machinery,
             },
         )
@@ -581,9 +591,9 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     // Each verified document also contributes its claimed-issuer `(cert, issuance_time)` to the meta the
     // qualified gate folds (the gate runs only on the VALID verdict this loop completing produces).
     let mut disclosed: DisclosedByNamespace = BTreeMap::new();
-    let mut claimed_issuers: Vec<(Vec<u8>, i64)> = Vec::with_capacity(document_count);
+    let mut claimed_issuers: Vec<(Vec<u8>, i64, Option<String>)> =
+        Vec::with_capacity(document_count);
     let mut doc_types: Vec<String> = Vec::with_capacity(document_count);
-    let mut categories: Vec<Option<String>> = Vec::with_capacity(document_count);
     // The SessionTranscript is invariant across the whole response; decode it ONCE here rather than
     // once per document (Ef2). `None` here covers BOTH "no transcript supplied" and "supplied but not
     // decodable CBOR": the per-document binding check still distinguishes them (absent →
@@ -614,24 +624,25 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             params,
         )
         .map_err(fail)?;
-        claimed_issuers.push(claimed_issuer);
         // The document's `docType` (verified == the signed MSO `docType` inside `verify_one_document`)
         // is the DCQL `doctype_value` match input the in-core OpenID4VP gate reads from the meta.
         if let Some(doc_type) = get_text(document, "docType") {
             doc_types.push(doc_type);
         }
-        // Surface THIS document's ETSI TS 119 472-1 `category` (the QEAA type indication the opt-in
-        // qualified gate reads), aligned 1:1 with `claimed_issuers`, BEFORE the merge consumes
-        // `doc_disclosed`. `None` when the document did not disclose the element (⇒ gate fails closed).
-        categories.push(
-            doc_disclosed
-                .get(MDOC_QEAA_CATEGORY_NAMESPACE)
-                .and_then(|ns| ns.get(MDOC_QEAA_CATEGORY_ELEMENT))
-                .and_then(|value| match value {
-                    AttributeValue::Text(text) => Some(text.clone()),
-                    _ => None,
-                }),
-        );
+        // THIS document's ETSI TS 119 472-1 `category` (the QEAA type indication the opt-in qualified
+        // gate reads), extracted BEFORE the merge consumes `doc_disclosed`. `None` when the document did
+        // not disclose the element (⇒ gate fails closed). Paired into the claimed-issuer triple so the
+        // gate reads `(leaf, signed, category)` per document — no parallel index-aligned array to
+        // re-correlate.
+        let category = doc_disclosed
+            .get(MDOC_QEAA_CATEGORY_NAMESPACE)
+            .and_then(|ns| ns.get(MDOC_QEAA_CATEGORY_ELEMENT))
+            .and_then(|value| match value {
+                AttributeValue::Text(text) => Some(text.clone()),
+                _ => None,
+            });
+        let (ds_cert_der, signed) = claimed_issuer;
+        claimed_issuers.push((ds_cert_der, signed, category));
         // `doc_disclosed` is namespace-grouped (`{ ns: { id: value } }`); merge each `(namespace, id,
         // value)` triple so the cross-document no-shadow rule is keyed per `(namespace, id)`.
         for (namespace, ns_map) in doc_disclosed {
@@ -659,7 +670,6 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             document_count,
             claimed_issuers,
             doc_types,
-            categories,
             binding_machinery: None,
         },
     ))

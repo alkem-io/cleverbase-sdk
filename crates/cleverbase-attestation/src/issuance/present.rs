@@ -406,49 +406,100 @@ fn object_property_disclosure_paths(
     Ok(paths)
 }
 
-/// Recursively walk `value`, recording the full conceal path of every `_sd` digest whose named
-/// disclosure is in `claim_names`. `pointer` is the JSON pointer to `value` — the object whose `_sd`
-/// array holds the digest — so the concealed property's full path is `pointer/<leaf>`.
+/// Depth-first walk of the issuer-signed claims tree shared by the two disclosure-path collectors
+/// ([`collect_object_property_paths`] and [`collect_array_element_paths`]) — the single definition of
+/// the JSON-pointer escaping/indexing, `_sd`-skipping, and top-level-claim threading skeleton, so the
+/// pointer construction cannot drift between them (DRY — Principle III). Only the per-node emission
+/// differs, supplied as two callbacks:
+///
+/// - `on_object_key` is invoked for EVERY `(key, child)` of every object node, WITH the object's own
+///   `pointer`, at the key's position (so emission order matches an inline walk) — the object-property
+///   collector emits its `_sd` digests here.
+/// - `on_array_item` is invoked for EVERY array element with its `(item, item_pointer, top_level)`; it
+///   returns `true` to treat the element as terminal (skip descending into it) — the array-element
+///   collector emits a matched `{ "...": digest }` redaction and skips its recursion; `false` descends
+///   as usual.
+///
+/// `top_level` is the first object key on the path from the root (the top-level claim a node belongs
+/// to), threaded exactly as the array-element walk needs it. The `_sd` key is never descended into
+/// (its entries are digest strings that `on_object_key` already surfaces; descending would only revisit
+/// scalars), matching both original walks.
+fn walk_disclosure_tree(
+    value: &serde_json::Value,
+    pointer: &str,
+    top_level: Option<&str>,
+    on_object_key: &mut impl FnMut(&str, &serde_json::Value, &str),
+    on_array_item: &mut impl FnMut(&serde_json::Value, &str, Option<&str>) -> bool,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                on_object_key(key, child, pointer);
+                // `_sd` holds object-property digests (surfaced above), never a descent path.
+                if key == "_sd" {
+                    continue;
+                }
+                let child_pointer = format!("{pointer}/{}", escape_json_pointer(key));
+                let child_top_level = top_level.or(Some(key.as_str()));
+                walk_disclosure_tree(
+                    child,
+                    &child_pointer,
+                    child_top_level,
+                    on_object_key,
+                    on_array_item,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let item_pointer = format!("{pointer}/{idx}");
+                if on_array_item(item, &item_pointer, top_level) {
+                    continue;
+                }
+                walk_disclosure_tree(item, &item_pointer, top_level, on_object_key, on_array_item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record the full conceal path of every `_sd` digest whose named disclosure is in `claim_names` by
+/// walking the claims tree ([`walk_disclosure_tree`]). At each object node, each `_sd` entry is a digest
+/// of a named disclosure whose leaf is a property of THAT object (`object_pointer`), so its full path is
+/// `object_pointer/<leaf>`. `pointer` is the JSON pointer to `value`.
 fn collect_object_property_paths(
     value: &serde_json::Value,
     pointer: &str,
     claim_names: &std::collections::BTreeMap<String, String>,
     out: &mut Vec<ObjectPropertyPath>,
 ) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if key == "_sd" {
-                    // Each `_sd` entry is a digest of a named disclosure whose leaf is a property of the
-                    // object AT `pointer`; its full path is `pointer/<leaf>`.
-                    if let serde_json::Value::Array(digests) = child {
-                        for digest in digests {
-                            let Some(digest) = digest.as_str() else {
-                                continue;
-                            };
-                            if let Some(claim_name) = claim_names.get(digest) {
-                                let full = format!("{pointer}/{}", escape_json_pointer(claim_name));
-                                out.push(ObjectPropertyPath {
-                                    selector: full.trim_start_matches('/').to_owned(),
-                                    pointer: full,
-                                });
-                            }
-                        }
-                    }
+    walk_disclosure_tree(
+        value,
+        pointer,
+        None,
+        &mut |key, child, object_pointer| {
+            if key != "_sd" {
+                return;
+            }
+            let serde_json::Value::Array(digests) = child else {
+                return;
+            };
+            for digest in digests {
+                let Some(digest) = digest.as_str() else {
                     continue;
+                };
+                if let Some(claim_name) = claim_names.get(digest) {
+                    let full = format!("{object_pointer}/{}", escape_json_pointer(claim_name));
+                    out.push(ObjectPropertyPath {
+                        selector: full.trim_start_matches('/').to_owned(),
+                        pointer: full,
+                    });
                 }
-                let child_pointer = format!("{pointer}/{}", escape_json_pointer(key));
-                collect_object_property_paths(child, &child_pointer, claim_names, out);
             }
-        }
-        serde_json::Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                let item_pointer = format!("{pointer}/{idx}");
-                collect_object_property_paths(item, &item_pointer, claim_names, out);
-            }
-        }
-        _ => {}
-    }
+        },
+        // Array elements carry no object-property (`_sd`) disclosures; descend into every item unchanged.
+        &mut |_item, _pointer, _top_level| false,
+    );
 }
 
 /// An array-element disclosure located in the issued credential: the JSON-pointer `pointer` the
@@ -489,9 +540,11 @@ fn array_element_disclosure_paths(
     Ok(paths)
 }
 
-/// Recursively walk `value`, recording the conceal path of every `{ "...": digest }` array redaction
-/// whose digest is in `targets`. `pointer` is the JSON pointer to `value`; `top_level` is the first
-/// path segment (the top-level claim the redaction belongs to).
+/// Record the conceal path of every `{ "...": digest }` array redaction whose digest is in `targets` by
+/// walking the claims tree ([`walk_disclosure_tree`]). `pointer` is the JSON pointer to `value`;
+/// `top_level` is the first path segment (the top-level claim the redaction belongs to, so it is
+/// concealed/disclosed in step with that claim). Object-property (`_sd`) digests are handled by the
+/// named-conceal walk; a matched redaction is terminal (its own contents are not descended into).
 fn collect_array_element_paths(
     value: &serde_json::Value,
     pointer: &str,
@@ -499,39 +552,30 @@ fn collect_array_element_paths(
     targets: &BTreeSet<String>,
     out: &mut Vec<ArrayElementPath>,
 ) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                // `_sd` holds object-property digests (handled by named conceal); never an array path.
-                if key == "_sd" {
-                    continue;
-                }
-                let child_pointer = format!("{pointer}/{}", escape_json_pointer(key));
-                let child_top_level = top_level.or(Some(key.as_str()));
-                collect_array_element_paths(child, &child_pointer, child_top_level, targets, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                let item_pointer = format!("{pointer}/{idx}");
-                if let serde_json::Value::Object(obj) = item {
-                    if let Some(serde_json::Value::String(digest)) = obj.get("...") {
-                        if targets.contains(digest) {
-                            if let Some(claim) = top_level {
-                                out.push(ArrayElementPath {
-                                    pointer: item_pointer.clone(),
-                                    top_level_claim: claim.to_owned(),
-                                });
-                            }
-                            continue;
+    walk_disclosure_tree(
+        value,
+        pointer,
+        top_level,
+        // Object-property `_sd` digests are the named-conceal walk's job; nothing to emit per object key.
+        &mut |_key, _child, _object_pointer| {},
+        &mut |item, item_pointer, item_top_level| {
+            if let serde_json::Value::Object(obj) = item {
+                if let Some(serde_json::Value::String(digest)) = obj.get("...") {
+                    if targets.contains(digest) {
+                        if let Some(claim) = item_top_level {
+                            out.push(ArrayElementPath {
+                                pointer: item_pointer.to_owned(),
+                                top_level_claim: claim.to_owned(),
+                            });
                         }
+                        // A matched redaction is terminal — do not descend into it.
+                        return true;
                     }
                 }
-                collect_array_element_paths(item, &item_pointer, top_level, targets, out);
             }
-        }
-        _ => {}
-    }
+            false
+        },
+    );
 }
 
 /// Escape a JSON object key for use as a single JSON-pointer reference token (RFC 6901 §3: `~` → `~0`,
