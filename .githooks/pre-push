@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Pre-push gate: run the same lint / format / type-check checks CI enforces
+# (.github/workflows/lint.yml) BEFORE the push, so a goconst/revive/ruff/prettier
+# violation is caught locally instead of failing CI minutes later.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass in an emergency:  git push --no-verify   (CI still gates the PR)
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+if [ -x "$repo_root/scripts/lint.sh" ]; then
+  echo "pre-push: running scripts/lint.sh (bypass with --no-verify) …"
+  "$repo_root/scripts/lint.sh"
+else
+  echo "pre-push: scripts/lint.sh not found/executable — skipping local lint (CI will still gate)."
+fi

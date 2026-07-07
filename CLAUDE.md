@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at specs/003-ecdsa-and-live-signing/plan.md
+at specs/004-attestation-and-verification/plan.md
 <!-- SPECKIT END -->
 
 ## Engineering rules (MUST)

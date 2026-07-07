@@ -1,0 +1,1318 @@
+//! SD-JWT VC (RFC 9901 / draft-ietf-oauth-sd-jwt-vc-16) verification.
+//!
+//! Verifies a presented SD-JWT VC against the always-on bar (contracts/verifier.md): the
+//! issuer-signed compact JWS, issuer trust (via the pluggable [`crate::trust::TrustAnchorSource`]),
+//! the `nbf`/`exp` validity window, the holder Key-Binding JWT (`aud`/`nonce`/`sd_hash`), and
+//! selective-disclosure integrity (each disclosed claim must match an issuer-signed digest). A
+//! failed check yields `valid = false` with a specific [`ReasonCode`] — never a false-accept
+//! (SC-002).
+//!
+//! ## Layering (research D2/D1)
+//!
+//! - The **format layer** (issuer-JWS framing, disclosures, the optional KB-JWT) is parsed with
+//!   [`sd_jwt_payload`].
+//! - The **crypto** is the SDK's own RustCrypto stack: the issuer ES256 JWS and the holder ES256
+//!   KB-JWT are both verified **in-house** over `p256`/`ecdsa`/`sha2` (the SDK has no JOSE crate, and
+//!   `sd-jwt-payload` parses the KB-JWT but does **not** verify its signature — so the holder-binding
+//!   signature check is built here). No new JOSE dependency, no hand-rolled crypto (Principle IV).
+//! - **Selective-disclosure digests** are recomputed with `sha2` (the `_sd_alg`, `sha-256`) and
+//!   matched against the issuer-signed `_sd` arrays.
+//!
+//! ## Status seam (T014)
+//!
+//! The revocation/status check is owned by [`crate::status`]; this module takes its canonical
+//! [`crate::status::StatusOutcome`] (re-exported here as [`StatusInput`]) so the always-on bar is
+//! honoured without re-implementing the status fetch here — the single authoritative status type
+//! (DRY). The always-on [`verify()`](crate::verify()) entry point resolves the credential's status
+//! reference through the host [`crate::status::StatusSource`] seam and passes the outcome in.
+
+use std::collections::BTreeMap;
+
+use base64ct::{Base64UrlUnpadded, Encoding as _};
+use serde_json::Value;
+
+use crate::datetime::DateRounding;
+use crate::trust::TrustAnchorSource;
+use crate::types::{
+    AttributeValue, IssuerRole, ReasonCode, TrustStatus, Validity, VerificationResult,
+};
+
+/// The JOSE `alg` the EUDI baseline mandates for SD-JWT VC issuer and KB-JWT signatures (ES256 =
+/// ECDSA / P-256 / SHA-256 — HAIP 1.0 §7; research D1). Any other `alg` is rejected as unsupported.
+///
+/// The RFC 7518 algorithm name has **one** authoritative source —
+/// [`SignatureAlgorithm::Es256.jose_alg()`](crate::issuance::signer::SignatureAlgorithm::jose_alg) —
+/// so the verifier's accepted-`alg` literal cannot drift from the one the holder signer-hook stamps
+/// into the JOSE header it builds (DRY — Principle III).
+const ES256: &str = crate::issuance::signer::SignatureAlgorithm::Es256.jose_alg();
+
+/// The SD-JWT VC issuer JWS `typ` (media type) values this verifier accepts — RFC 9901 §9.11 (explicit
+/// typing) + draft-ietf-oauth-sd-jwt-vc-16 §3.2.1. `dc+sd-jwt` is the current SD-JWT VC media type;
+/// `vc+sd-jwt` is the legacy value (used before the Nov-2024 rename away from the W3C-conflicting `vc`)
+/// and is accepted ONLY for the spec-mandated transition ("both `vc+sd-jwt` and `dc+sd-jwt` should be
+/// accepted as the value of the `typ` header for a reasonable transitional period"). Any other value,
+/// or an absent `typ`, is not an SD-JWT VC issuer JWS and is rejected (see [`require_issuer_typ`]).
+const ACCEPTED_ISSUER_TYP: &[&str] = &["dc+sd-jwt", "vc+sd-jwt"];
+
+/// The acceptable clock-skew window (seconds, each direction) for the holder Key Binding JWT's `iat` —
+/// RFC 9901 §7.3 step 5.e: "Check that the creation time of the Key Binding JWT, as determined by the
+/// `iat` claim, is within an acceptable window." A KB-JWT whose `iat` is more than this far in the
+/// FUTURE (a skewed/forged holder clock) or in the PAST (a stale/replayed presentation) relative to the
+/// verification time is rejected. Conservative default; the `nonce`/`aud` challenge is the primary
+/// replay defense and this `iat` window is defense-in-depth freshness (see [`check_holder_binding`]).
+const KB_JWT_IAT_ACCEPTABLE_SKEW_SECS: u64 = 300;
+
+use crate::crypto::{sha256, SHA_256};
+
+/// The revocation/status input to the verifier — the canonical [`crate::status::StatusOutcome`]
+/// (one authoritative status type, DRY). The [`verify()`](crate::verify()) entry point resolves the credential's
+/// status reference through the host status seam and passes the outcome in; this module maps it onto
+/// the always-on bar (revoked → `Revoked`, unreachable-under-fail-closed → `StatusUnavailable`).
+pub use crate::status::StatusOutcome as StatusInput;
+
+/// The verifier inputs for an SD-JWT VC presentation (the per-format slice of the always-on
+/// `verify` entry point that task T016 assembles).
+///
+/// Sans-IO: every input — the presentation, the trust anchors, the holder-binding challenge, and the
+/// status outcome — is passed in; this performs no network I/O.
+#[derive(Debug, Clone, Copy)]
+pub struct SdJwtVcInput<'a, A: TrustAnchorSource + ?Sized> {
+    /// The compact SD-JWT VC presentation: `<issuer-JWS>~<D.1>~…~<D.N>~<optional KB-JWT>`.
+    pub presentation: &'a str,
+    /// The configured trust anchors; the issuer's signing certificate is resolved against these.
+    pub anchors: &'a A,
+    /// The issuer role under which to anchor trust (selects the trust list — research D5).
+    pub role: IssuerRole,
+    /// The holder-binding challenge the KB-JWT must echo (`aud` = verifier `client_id`, `nonce`),
+    /// or `None` to accept a presentation without holder binding (e.g. an issuer-only credential).
+    pub key_binding: Option<KeyBindingChallenge<'a>>,
+    /// The current time (Unix seconds) the `nbf`/`exp` window is checked against.
+    pub now_unix: i64,
+    /// The revocation/status outcome (the T014 seam) — the host-pre-resolved positional outcome used as
+    /// the fallback when the credential declares no Token Status List reference, or declares one for
+    /// which no signed token is supplied in [`Self::status_tokens`].
+    pub status: StatusInput,
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes. When
+    /// this credential's issuer-signed `status` claim declares a `status_list` reference AND a token is
+    /// supplied here for its `uri`, the bar AUTHENTICATES that token in-core (verifying its signature
+    /// against a key authorized by this credential's own trust anchor) and reads the revocation bit
+    /// itself — overriding [`Self::status`] for this credential. Empty
+    /// ([`crate::status::DEFAULT_STATUS_TOKENS`]) ⇒ the positional [`Self::status`] seam alone
+    /// (pre-existing behavior).
+    pub status_tokens: &'a BTreeMap<String, Vec<u8>>,
+}
+
+/// The holder-binding challenge a presented KB-JWT must satisfy (RFC 9901 §4.3).
+#[derive(Debug, Clone, Copy)]
+pub struct KeyBindingChallenge<'a> {
+    /// The expected `aud` — the verifier's `client_id`.
+    pub audience: &'a str,
+    /// The expected fresh `nonce`.
+    pub nonce: &'a str,
+}
+
+/// Verify a presented SD-JWT VC against the always-on bar, returning a [`VerificationResult`].
+///
+/// On any failed check the result has `valid = false` and carries the single specific
+/// [`ReasonCode`] for the **first** check that failed; only a credential that clears every check is
+/// `valid = true`, with the disclosed (and only the disclosed) attributes returned.
+#[must_use]
+pub fn verify_sd_jwt_vc<A: TrustAnchorSource + ?Sized>(
+    input: &SdJwtVcInput<'_, A>,
+) -> VerificationResult {
+    match verify_inner(input) {
+        Ok(ok) => ok,
+        Err(reason) => VerificationResult::invalid(reason),
+    }
+}
+
+/// Extract the `aud` and `nonce` a presented SD-JWT VC's KB-JWT echoes, without verifying anything
+/// (the [`crate::openid4vp`] layer uses this to attribute a request-binding failure to the specific
+/// [`ReasonCode::Replay`] / [`ReasonCode::WrongAudience`] before delegating to the full bar).
+///
+/// Returns `None` when the (already-parsed) presentation carries no KB-JWT. The values are *claimed*
+/// (their cryptographic verification is the always-on holder-binding check in [`verify_sd_jwt_vc`]);
+/// this read is only for failure attribution, never for acceptance.
+///
+/// Takes the presentation ALREADY parsed (`&sd_jwt_payload::SdJwt`): the caller parses ONCE and threads
+/// the handle, so a single verify parses the presentation as few times as possible. Crate-internal
+/// (`pub(crate)`) so the parsed-`SdJwt` coupling is never exposed in the public API.
+#[must_use]
+pub(crate) fn kb_jwt_aud_nonce(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<(String, String)> {
+    let kb = sd_jwt.key_binding_jwt()?;
+    let claims = kb.claims();
+    Some((claims.aud.clone(), claims.nonce.clone()))
+}
+
+/// Extract the issuer signing certificate (DER) a presented SD-JWT VC claims in its JWS `x5c` header,
+/// without verifying anything (the opt-in [`crate::qualified`] gate matches this leaf against the
+/// national Trusted List's `EAA/Q` service entries).
+///
+/// Returns `None` when the (already-parsed) presentation carries no `x5c` leaf. The value is
+/// *claimed* (its trust + signature are decided by the always-on bar in [`verify_sd_jwt_vc`]); this
+/// read is only the gate's cert-matching input, never an acceptance.
+///
+/// Takes the presentation ALREADY parsed (`&sd_jwt_payload::SdJwt`): the caller parses ONCE and threads
+/// the handle. Crate-internal (`pub(crate)`) so the parsed-`SdJwt` coupling stays out of the public API.
+#[must_use]
+pub(crate) fn issuer_signing_cert_der(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<Vec<u8>> {
+    let jws = issuer_jws(sd_jwt)?;
+    let header = decode_jws_protected_header(&jws)?;
+    issuer_cert_from_header(&header).ok()
+}
+
+/// The issuer JWS: the first `~`-separated segment of the (re-serialized) SD-JWT VC presentation
+/// (`<issuer-JWS>~<disclosure>*~<KB-JWT>`). The single source both [`issuer_signing_cert_der`] and
+/// [`verify_issuer_signature`] read, so the segment-extraction cannot drift between them (DRY —
+/// Principle III).
+///
+/// Returns an OWNED `String` (not `&str`): `sd_jwt_payload`'s `presentation()` hands back an owned
+/// `String`, so a borrowed slice cannot outlive this call. `str::split(..).next()` always yields a
+/// first element, so the result is effectively always `Some`; the `Option` mirrors that call exactly,
+/// leaving each caller's fail-closed `?` / `ok_or` unchanged.
+pub(crate) fn issuer_jws(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
+    sd_jwt.presentation().split('~').next().map(str::to_owned)
+}
+
+/// Extract the issuer-signed `vct` (Verifiable Credential Type) a presented SD-JWT VC asserts, for the
+/// in-core OpenID4VP DCQL type match (SD-JWT VC `vct` ∈ DCQL `meta.vct_values` — [`crate::dcql`]).
+///
+/// Returns `None` when the (already-parsed) presentation carries no string `vct`. The value is read
+/// from the issuer-signed clear payload; the [`crate::openid4vp`] DCQL gate calls this **only after**
+/// [`verify_sd_jwt_vc`] returned `valid` (so the same `vct` has already been signature-verified,
+/// trusted, and shape-validated by [`check_vct`]) — this re-read of the same claim is the type-match
+/// input, never an acceptance. Takes the presentation ALREADY parsed (the caller parses ONCE).
+#[must_use]
+pub(crate) fn verified_vct(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
+    sd_jwt
+        .claims()
+        .get("vct")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The issuer-signed **`category`** claim — the ETSI TS 119 472-1 QEAA type-indication carrying the
+/// PRO-4.12.4-03 URN `urn:etsi:esi:eaa:eu:qualified` for a qualified EAA (`None` for an ordinary EAA,
+/// which per TS 119 472-1 EAA-5.2.2.1-01 MUST NOT include `category`). This is the type indication the
+/// opt-in qualified gate ([`crate::qualified`]) checks — NOT `vct` (which is the credential-TYPE
+/// identifier, e.g. `urn:eudi:pid:1`, and never the qualified URN). Read from the issuer-signed clear
+/// payload (a QEAA declares its category in the clear), only after the always-on bar accepted the
+/// presentation. Returns `None` when absent / not a string. Takes the presentation ALREADY parsed
+/// (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
+#[must_use]
+pub(crate) fn issuer_category(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<String> {
+    sd_jwt
+        .claims()
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The FULL set of claims a presented SD-JWT VC actually carries — the issuer-signed **clear** payload
+/// claims MERGED with the selectively-**disclosed** claims ([`collect_presented_claims`]) — for the
+/// in-core OpenID4VP DCQL Claims Query resolution ([`crate::dcql`]).
+///
+/// Unlike [`VerificationResult::disclosed_attributes`] (the privacy-minimal *disclosed* subset the
+/// verifier reports), this includes the always-present clear claims (e.g. a subject claim the issuer
+/// carried outside selective disclosure, plus registered claims), so a DCQL `path` targeting a clear
+/// claim resolves — OpenID4VP 1.0 §8.6 step 2.2 validates the query against the "Claims included in the
+/// presentation", and §6.4 recognises that a presentation legitimately carries non-selectively-
+/// disclosable claims. The SD-JWT machinery / holder-binding control keys (`_sd`, `_sd_alg`, `cnf`,
+/// `...`) are excluded.
+///
+/// The [`crate::openid4vp`] DCQL gate calls this **only after** [`verify_sd_jwt_vc`] returned `valid`
+/// (so the presentation parsed, every disclosure already matched an issuer-signed digest, and the SD
+/// machinery was already validated) — it is the gate's claim-resolution input, never an acceptance.
+/// Returns an empty map when reconstruction fails (defensive; a VALID presentation always reconstructs).
+/// Takes the presentation ALREADY parsed (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
+#[must_use]
+pub(crate) fn presented_claims(sd_jwt: &sd_jwt_payload::SdJwt) -> BTreeMap<String, AttributeValue> {
+    collect_presented_claims(sd_jwt).unwrap_or_default()
+}
+
+/// The issuance/relevant time (Unix seconds) a presented SD-JWT VC asserts: the JWT `iat` (RFC 7519
+/// §4.1.6 — "the time at which the JWT was issued", the credential's issuance instant), falling back
+/// to `nbf` when `iat` is absent (the not-before bound is the earliest instant the issuer asserts the
+/// credential is in force, the closest available proxy for the relevant time).
+///
+/// Returns `None` when the (already-parsed) presentation carries **neither** `iat` nor `nbf` — the
+/// opt-in [`crate::qualified`] gate then fails closed ([`crate::types::QualifiedStatus::Indeterminate`])
+/// rather than read the issuer's status at the verification instant ("now"), which would falsely report
+/// `Qualified` for an issuer granted only AFTER it signed the credential (contracts/qualified-status-
+/// gate.md: the status is read **at the credential's issuance/relevant time, NOT "now"**). A present-
+/// but-non-canonical `iat`/`nbf` (RFC 7519 NumericDate must be a JSON number that fits `i64`) is
+/// likewise treated as absent — the gate must not assert qualification off an unreadable instant. Takes
+/// the presentation ALREADY parsed (the caller parses ONCE and threads the `&sd_jwt_payload::SdJwt`).
+#[must_use]
+pub(crate) fn issuance_time_unix(sd_jwt: &sd_jwt_payload::SdJwt) -> Option<i64> {
+    let claims = sd_jwt.claims();
+    // `iat` is the credential's issuance time; `nbf` (not-before) is the fallback relevant time. Only
+    // a canonical NumericDate (a JSON integer that fits `i64`) is accepted; anything else → `None`.
+    numeric_date(claims.get("iat"), DateRounding::Down)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            numeric_date(claims.get("nbf"), DateRounding::Down)
+                .ok()
+                .flatten()
+        })
+}
+
+/// The verified, accepted view of a presentation, assembled once every always-on check has passed.
+fn accept(disclosed: BTreeMap<String, AttributeValue>) -> VerificationResult {
+    VerificationResult {
+        valid: true,
+        disclosed_attributes: disclosed,
+        trust_status: TrustStatus::Trusted,
+        qualified_status: None,
+        // Request-agnostic bar result; the OpenID4VP layer stamps `request_bound` when a request runs.
+        request_bound: false,
+        reasons: Vec::new(),
+    }
+}
+
+/// The fallible body of the verifier; each `?` short-circuits to the specific reject reason.
+fn verify_inner<A: TrustAnchorSource + ?Sized>(
+    input: &SdJwtVcInput<'_, A>,
+) -> Result<VerificationResult, ReasonCode> {
+    // 1. Format / parse. A structurally invalid presentation is malformed; we never guess.
+    let sd_jwt = sd_jwt_payload::SdJwt::parse(input.presentation)
+        .map_err(|_| ReasonCode::MalformedCredential)?;
+
+    // 2. Issuer signature (in-house ES256 over the compact JWS) + the full signing chain (leaf-first).
+    let issuer_chain = verify_issuer_signature(&sd_jwt)?;
+    let (issuer_cert_der, supplied_intermediates) = issuer_chain
+        .split_first()
+        .ok_or(ReasonCode::MalformedCredential)?;
+
+    // 2a. Role derivation/validation (conformance-audit T4.3). The claimed `vct` (signature-verified in
+    //     step 2; its full shape is validated in step 3a) selects/validates the trust-anchoring role:
+    //     a EUDI PID `vct` MUST anchor under `IssuerRole::Pid`, so a caller role that contradicts the
+    //     credential's claimed type is rejected (`RoleMismatch`) rather than silently anchoring under
+    //     the wrong per-role list. A `vct` with no standardized role mapping keeps the caller's role.
+    //     The reconciled role is what step 3 anchors against (and what the per-role QcStatement leaf-
+    //     purpose floor keys on), so the role is no longer "only as good as the host's input".
+    let claimed_vct = sd_jwt
+        .claims()
+        .get("vct")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let effective_role =
+        crate::dcql::reconcile_role(input.role, crate::types::Format::SdJwtVc, claimed_vct)
+            .map_err(|()| ReasonCode::RoleMismatch)?;
+
+    // 3. Issuer trust — the signing leaf's certification path (leaf + the supplied x5c intermediates)
+    //    must validate to the configured anchor for its role/format (RFC 5280 §6.1 path validation).
+    //    A chain failure carries a coarse-but-accurate `TrustFailure`: an expired/not-yet-valid cert on
+    //    the path → `Expired` (not a misleading `UntrustedIssuer`), any other no-trust → `UntrustedIssuer`.
+    let decision = input.anchors.resolve(
+        effective_role,
+        crate::types::Format::SdJwtVc,
+        issuer_cert_der,
+        supplied_intermediates,
+        // The SD-JWT VC issuer leaf has no distinct signing instant: its validity window is checked at
+        // the verification clock (`None` — the leaf is treated like every other chain certificate).
+        None,
+    );
+    if !decision.trusted {
+        return Err(decision
+            .failure
+            .unwrap_or_else(crate::trust::TrustFailure::not_trusted)
+            .reason_code());
+    }
+
+    // 3a. SD-JWT VC type claim. `vct` is REQUIRED and MUST be a Collision-Resistant Name (RFC 9901 /
+    //     SD-JWT VC §type-claim). It is read from the issuer-signed clear payload, now established as
+    //     issuer-signed (step 2) and trusted (step 3). A missing/empty/non-string/non-CRN `vct` is a
+    //     malformed SD-JWT VC and rejected here (Type Metadata + `vct#integrity` resolution is a
+    //     documented sans-IO scope cut — see [`check_vct`]).
+    check_vct(sd_jwt.claims())?;
+
+    // 4. Validity window (`nbf`/`exp`).
+    check_validity(sd_jwt.claims(), input.now_unix)?;
+
+    // 5. Revocation / status (the T014 seam) — in-core Token Status List authentication (layer 2). The
+    //    credential's OWN issuer-signed `status` claim decides the reference; when it names a Token
+    //    Status List AND a signed token is supplied for that URI, the token is authenticated in-core
+    //    (signature under a key authorized by THIS credential's trust anchor + `sub` binding + freshness
+    //    + bit read) and that outcome OVERRIDES the positional `input.status`. Otherwise (no reference,
+    //    no supplied token, or a CRL) the positional `input.status` is used exactly as before. The
+    //    signer authorization uses the issuer leaf verified in step 2 + the anchors/role/format the bar
+    //    anchored against (step 3), so a status signer is authorized against the credential's own trust.
+    let status_reference = sd_jwt.claims().get("status").map_or(
+        crate::status::StatusReference::None,
+        crate::status::status_reference_from_sd_jwt_claim,
+    );
+    let status_outcome = crate::verify::resolve_status_outcome(
+        &status_reference,
+        input.status,
+        input.status_tokens,
+        input.now_unix,
+        &crate::verify::StatusTrust {
+            issuer_leaf_der: issuer_cert_der,
+            // The SPECIFIC anchor the issuer chained to (the matched entry, present because
+            // `decision.trusted` was checked above) — a distinct status signer must chain to THIS anchor.
+            issuer_anchor_der: decision
+                .entry
+                .as_ref()
+                .map_or(&[][..], |entry| entry.anchor_cert_der.as_slice()),
+            anchors: input.anchors,
+            role: effective_role,
+            format: crate::types::Format::SdJwtVc,
+        },
+    );
+    match status_outcome {
+        StatusInput::NoStatus | StatusInput::Good => {}
+        StatusInput::Revoked => return Err(ReasonCode::Revoked),
+        StatusInput::Unavailable => return Err(ReasonCode::StatusUnavailable),
+        StatusInput::Untrusted => return Err(ReasonCode::StatusUntrusted),
+    }
+
+    // 6. Holder binding (KB-JWT over `aud`/`nonce`/`sd_hash`, verified against the `cnf` key; a present
+    //    KB-JWT's `iat` freshness window is checked against `now`).
+    check_holder_binding(
+        &sd_jwt,
+        input.presentation,
+        input.key_binding.as_ref(),
+        input.now_unix,
+    )?;
+
+    // 7. Selective-disclosure integrity — every disclosed claim matches an issuer-signed digest, and
+    //    the disclosed claim set is what we return (undisclosed attributes are never revealed).
+    let disclosed = collect_disclosed_attributes(&sd_jwt)?;
+
+    Ok(accept(disclosed))
+}
+
+/// Verify the issuer compact-JWS signature in-house and return the full signing chain (DER,
+/// leaf-first).
+///
+/// Framing: `header.payload.signature` (each base64url). The header MUST be `alg=ES256` and carry an
+/// `x5c` whose leaf is the signing certificate; the ES256 signature (raw `r||s`) is verified over the
+/// ASCII `header.payload` signing input with the leaf certificate's P-256 public key. The full chain
+/// (`[leaf, intermediate, …]`) is returned for the trust-anchor resolution step (it is the credential's
+/// own claimed signer + path-building intermediates; trust is decided separately in step 3 — a
+/// self-signed cert verifies its own signature but is rejected as untrusted unless its path reaches the
+/// configured anchor).
+fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>>, ReasonCode> {
+    // The issuer JWS is the first `~`-separated segment of the re-serialized presentation (via the
+    // shared [`issuer_jws`]). It is a compact JWS of EXACTLY three dot-segments; a non-3-segment framing
+    // is a malformed credential.
+    let jws = issuer_jws(sd_jwt).ok_or(ReasonCode::MalformedCredential)?;
+    // Exactly three dot-segments (header.payload.signature); the real segments are re-split downstream
+    // by `decode_jws_protected_header` + `verify_compact_es256`, so here only the framing is checked.
+    if jws.split('.').count() != 3 {
+        return Err(ReasonCode::MalformedCredential);
+    }
+
+    // Issuer-specific header handling: require alg=ES256 and read the x5c leaf certificate. The
+    // protected-header decode (base64url → JSON) is the SAME body the cert read and the KB-JWT alg
+    // check use — share the single [`decode_jws_protected_header`] (DRY — Principle III); the framing
+    // guard above already established `jws` as a 3-segment compact JWS, so the helper's first-segment
+    // split re-reads the header that guard validated.
+    let header = decode_jws_protected_header(&jws).ok_or(ReasonCode::MalformedCredential)?;
+    // RFC 7515 §4.1.11: a `crit` header listing any extension the recipient does not understand
+    // invalidates the JWS. This verifier implements no critical extension Header Parameter, so any
+    // `crit` member is unsupported — reject (shared with the KB-JWT header check; DRY — Principle III).
+    reject_unsupported_crit(&header)?;
+    if header.get("alg").and_then(Value::as_str) != Some(ES256) {
+        return Err(ReasonCode::UnsupportedFormat);
+    }
+    // SD-JWT VC §3.2.1 + RFC 9901 §9.11: the issuer JWS `typ` MUST identify the SD-JWT VC media type
+    // (`dc+sd-jwt`, or transitionally `vc+sd-jwt`); a wrong/absent `typ` is rejected.
+    require_issuer_typ(&header)?;
+    // Read the FULL x5c chain (leaf-first), not just the leaf: eIDAS/EUDI issuers commonly present
+    // [leaf, intermediate, …] where the leaf chains to the trusted root via an intermediate sub-CA, so
+    // the supplied intermediates are path-building material the trust step (step 3) needs.
+    let chain = issuer_chain_from_header(&header)?;
+    // x5c is non-empty (issuer_chain_from_header rejects an empty array), so the leaf is present; use
+    // `.first()` rather than `[0]` (the crate forbids `clippy::indexing_slicing`).
+    let cert_der = chain.first().ok_or(ReasonCode::MalformedCredential)?;
+
+    // The compact-JWS sig decode + `Signature::from_slice` + `header.payload` signing-input + verify is
+    // the SAME body the KB-JWT path uses — share the single [`verify_compact_es256`] (DRY — Principle
+    // III). The 3-segment guard above already established the framing (a malformed framing is
+    // `MalformedCredential`); a signature that does not verify under the credential's claimed signing
+    // cert is a `Tamper`. Trust is decided separately (step 3) — this only proves the credential signed
+    // its own bytes.
+    let verifying_key = verifying_key_from_cert_der(cert_der)?;
+    verify_compact_es256(&jws, &verifying_key).map_err(|()| ReasonCode::Tamper)?;
+
+    Ok(chain)
+}
+
+/// Decode the protected JOSE header of a compact JWS (`header.payload.signature`) into a JSON
+/// [`Value`]: take the first `.`-segment, base64url-decode it (RFC 7515 §2 — the protected header is
+/// `BASE64URL(UTF8(JWS Protected Header))`), and parse the bytes as JSON. Returns `None` when the
+/// string has no first segment, the segment is not base64url, or the bytes are not JSON.
+///
+/// One authoritative header-decode (DRY — Principle III): the issuer cert read
+/// ([`issuer_signing_cert_der`]), the issuer signature path ([`verify_issuer_signature`]), and the
+/// holder KB-JWT header check ([`check_kb_jwt_jose_header`]) all share this body and each wraps the
+/// `None` with its own [`ReasonCode`] and reads its own header field (`x5c` vs `alg`/`typ`/`crit`). The
+/// caller is responsible for any compact-JWS framing guard (e.g. the issuer path's exactly-3-segment
+/// check); this helper only reads the header segment, so a non-JWS string simply yields `None`.
+fn decode_jws_protected_header(jws: &str) -> Option<Value> {
+    decode_json_b64url(jws.split('.').next()?)
+}
+
+/// Base64url-unpadded-decode a compact-JWS **segment** and parse it as JSON. The shared
+/// segment→JSON body of the JWS decoders (DRY — Principle III): [`decode_jws_protected_header`] calls it
+/// after splitting off the header segment, and the in-core status-token JOSE verifier ([`crate::status`])
+/// uses it for both the header and payload segments (each already split from the compact JWS). This
+/// helper does NO framing check — a caller with the wrong number of segments simply passes a segment that
+/// is not valid base64url-JSON and gets `None`.
+pub(crate) fn decode_json_b64url(segment: &str) -> Option<Value> {
+    let raw = Base64UrlUnpadded::decode_vec(segment).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Reject a JWS whose protected JOSE header carries a `crit` (Critical) Header Parameter this verifier
+/// does not understand — RFC 7515 §4.1.11: "If any of the listed extension Header Parameters are not
+/// understood and supported by the recipient, then the JWS is invalid." This verifier implements NO
+/// critical extension Header Parameter, and §4.1.11 forbids a producer from listing the registered
+/// `alg`/`x5c`/`typ` in `crit` ("Producers MUST NOT include Header Parameter names defined by this
+/// specification ... for use with [`crit`]") — so ANY `crit` member is, by definition, one we do not
+/// understand. A present `crit` (of any shape, including the spec-forbidden empty array `[]`) is
+/// therefore rejected as [`ReasonCode::UnsupportedFormat`]; an absent `crit` (the conformant common
+/// case) passes. Shared by the issuer-JWS and KB-JWT header checks (DRY — Principle III).
+fn reject_unsupported_crit(header: &Value) -> Result<(), ReasonCode> {
+    match header.get("crit") {
+        None => Ok(()),
+        Some(_) => Err(ReasonCode::UnsupportedFormat),
+    }
+}
+
+/// Require the issuer JWS protected header `typ` to identify the SD-JWT VC media type — RFC 9901 §9.11
+/// (explicit typing) + draft-ietf-oauth-sd-jwt-vc-16 §3.2.1: `typ` MUST be `dc+sd-jwt`, or the legacy
+/// `vc+sd-jwt` accepted only for the spec-mandated transitional period (see [`ACCEPTED_ISSUER_TYP`]). A
+/// `typ` that is absent, not a string, or any other value is not an SD-JWT VC issuer JWS and is
+/// rejected as [`ReasonCode::UnsupportedFormat`] (symmetric with the non-ES256 `alg` reject). The
+/// KB-JWT's own `typ=kb+jwt` is enforced separately by the pinned `sd_jwt_payload` parser, so it is not
+/// re-checked here.
+fn require_issuer_typ(header: &Value) -> Result<(), ReasonCode> {
+    let typ = header.get("typ").and_then(Value::as_str);
+    if typ.is_some_and(|value| ACCEPTED_ISSUER_TYP.contains(&value)) {
+        Ok(())
+    } else {
+        Err(ReasonCode::UnsupportedFormat)
+    }
+}
+
+/// Extract the FULL signing certificate chain (DER, leaf-first) from a JWS header's `x5c` (RFC 7515
+/// §4.1.6): a JSON array of base64 (standard, **not** url) DER certificates, leaf first. The leaf is
+/// the signing certificate; any further entries are the intermediate sub-CAs the leaf chains through.
+/// An absent or empty `x5c`, or an entry that is not base64 DER, is a malformed credential.
+fn issuer_chain_from_header(header: &Value) -> Result<Vec<Vec<u8>>, ReasonCode> {
+    // The issuer JWS REQUIRES a present, non-empty `x5c` (absent/empty → malformed); the per-entry
+    // base64-DER decode is the shared [`x5c_entries_from_json_array`] (DRY — the in-core status-token
+    // JOSE verifier reuses it, but with its own "absent → empty chain" policy).
+    let entries = header
+        .get("x5c")
+        .and_then(Value::as_array)
+        .filter(|chain| !chain.is_empty())
+        .ok_or(ReasonCode::MalformedCredential)?;
+    x5c_entries_from_json_array(entries).ok_or(ReasonCode::MalformedCredential)
+}
+
+/// Decode the entries of a JWS `x5c` JSON array (RFC 7515 §4.1.6) into a DER certificate chain
+/// (leaf-first): each entry MUST be a base64-**standard** (not url) string. `None` if any entry is not
+/// a base64 string (a malformed chain); an empty input array yields an empty chain. The **presence**
+/// and non-empty policy of `x5c` are the caller's (the issuer JWS requires it; the status verifier
+/// tolerates its absence) — this shared inner helper only decodes an array that IS present.
+pub(crate) fn x5c_entries_from_json_array(entries: &[Value]) -> Option<Vec<Vec<u8>>> {
+    entries
+        .iter()
+        .map(|entry| base64ct::Base64::decode_vec(entry.as_str()?).ok())
+        .collect()
+}
+
+/// Extract just the leaf signing certificate (DER) from a JWS header's `x5c` — the first entry of
+/// [`issuer_chain_from_header`] (DRY — one x5c parser). Used by the opt-in qualified gate, which keys
+/// on the leaf only.
+fn issuer_cert_from_header(header: &Value) -> Result<Vec<u8>, ReasonCode> {
+    let mut chain = issuer_chain_from_header(header)?;
+    Ok(chain.swap_remove(0))
+}
+
+/// Parse a DER certificate and extract its P-256 ECDSA verifying key via the crate's single cert-DER →
+/// key path [`crate::crypto::p256_verifying_key_from_cert_der`] (DRY — Principle III; the mdoc
+/// `IssuerAuth` verifier shares the same helper). A leaf that base64-decoded from `x5c` but does not
+/// yield a usable P-256 key means the issuer signature cannot be verified — a `Tamper`-class reject.
+fn verifying_key_from_cert_der(cert_der: &[u8]) -> Result<p256::ecdsa::VerifyingKey, ReasonCode> {
+    crate::crypto::p256_verifying_key_from_cert_der(cert_der).ok_or(ReasonCode::Tamper)
+}
+
+/// Check the `nbf`/`exp` validity window against `now` (RFC 9901 carries the JWT `nbf`/`exp` claims).
+///
+/// `nbf`/`exp` are JWT `NumericDate`s (RFC 7519 §2): a JSON number of seconds since the epoch (a
+/// fractional value is permitted and rounded **up** for both bounds — see [`DateRounding::Up`] — so the
+/// whole-second `now` comparison reflects the issuer's true sub-second window exactly). A **present**
+/// bound MUST be a
+/// NumericDate this verifier can evaluate; a present-but-unparseable bound (a JSON string `"200"`,
+/// `null`, or a magnitude outside `i64`) is NOT silently ignored — that would let an expired credential
+/// with a non-canonical `exp` be accepted as having unbounded validity (a false-accept). Instead it
+/// rejects: a malformed bound is `MalformedCredential` (we cannot trust a window we cannot read).
+///
+/// ## Validity is read from the issuer-signed clear payload (RFC 9901 §9.7)
+///
+/// `nbf`/`exp` are read from [`sd_jwt_payload::SdJwt::claims`] — the issuer-signed **clear** JWT payload
+/// — never from holder-reconstructed disclosures. RFC 9901 §9.7 requires the Verifier to "ensure that
+/// all claims they deem necessary for checking the validity ... are present", and a validity-
+/// controlling claim belongs in the clear payload, not behind selective disclosure. So a selectively-
+/// disclosable `exp`/`nbf` (one carried only as an `_sd` digest and absent from the clear payload) is
+/// intentionally NOT honoured as a validity bound here: `claims.get("exp")` returns `None` for it and
+/// the credential carries no upper bound, rather than the verifier trusting a holder-controlled expiry.
+/// This is the secure reading — a malicious holder cannot extend validity by withholding a disclosable
+/// `exp` (documented behavior; no behavior change, the clear payload has always been the only source).
+///
+/// A bound that is **absent** is permitted (RFC 9901 / SD-JWT VC make `exp`/`nbf` optional). This is
+/// an intentional, documented policy: a credential with no `exp` carries no upper temporal bound here.
+/// A relying party that requires an upper bound MUST reject a no-`exp` credential at the
+/// [`crate::status`] / policy layer (the seam where reachability/qualified policy already lives); the
+/// always-on bar does not fabricate a bound the issuer did not assert.
+///
+/// ## Boundary convention (per-spec, intentionally asymmetric with mdoc — DO NOT unify blindly)
+///
+/// The upper bound here is **exclusive**: `now >= exp` rejects (a credential is invalid *at and after*
+/// its `exp` instant), per RFC 7519 §4.1.4 ("the current date/time MUST be **before** the expiration
+/// time"). The mdoc verifier's [`crate::mdoc::enforce_validity`] uses an **inclusive** upper bound
+/// (`now > validUntil`), per ISO/IEC 18013-5 (the credential is valid up to and **including**
+/// `validUntil`). This one-second divergence at the boundary is each format's own spec rule, NOT a
+/// bug — a future refactor that "unifies" the two windows would silently change one format's accepted
+/// range, so the two sites cross-reference each other deliberately.
+fn check_validity(claims: &sd_jwt_payload::SdJwtClaims, now: i64) -> Result<Validity, ReasonCode> {
+    // Both validity bounds round UP (`DateRounding::Up`): for the whole-second `now` clock this exactly
+    // reproduces RFC 7519 §4.1.4/§4.1.5's true sub-second comparisons (see [`DateRounding::Up`]) — a
+    // fractional `exp` is no longer clipped a sub-second early, and a fractional `nbf` is honored to its
+    // true instant. (Not flooring `nbf`: flooring it toward the past would accept a credential a
+    // sub-second BEFORE its issuer-asserted not-before — a §4.1.5 violation — whereas `ceil` keeps the
+    // not-yet-valid window exact.)
+    let not_before = numeric_date(claims.get("nbf"), DateRounding::Up)?;
+    let not_after = numeric_date(claims.get("exp"), DateRounding::Up)?;
+    if let Some(nbf) = not_before {
+        if now < nbf {
+            return Err(ReasonCode::Expired);
+        }
+    }
+    if let Some(exp) = not_after {
+        // EXCLUSIVE upper bound (RFC 7519 §4.1.4: now MUST be *before* `exp`). Intentionally differs
+        // from mdoc's INCLUSIVE `now > validUntil` (ISO/IEC 18013-5) — see this fn's doc comment.
+        if now >= exp {
+            return Err(ReasonCode::Expired);
+        }
+    }
+    Ok(Validity {
+        not_before,
+        not_after,
+    })
+}
+
+/// Require the issuer-signed payload's `vct` (Verifiable Credential Type) claim — SD-JWT VC §type-claim
+/// makes `vct` REQUIRED, a case-sensitive string, and (draft-ietf-oauth-sd-jwt-vc-16) its value "MUST be
+/// a Collision-Resistant Name as defined in Section 2 of [RFC7515]". A missing, empty, non-string, or
+/// non-Collision-Resistant `vct` is rejected as [`ReasonCode::MalformedCredential`].
+///
+/// Documented scope cut (research D2, sans-IO core): the always-on bar does NOT fetch the Type Metadata
+/// document nor validate a `vct#integrity` hash — both require network I/O. `vct` is validated for shape
+/// here; surfacing it for DCQL type-matching is a later wave (audit T4.1).
+fn check_vct(claims: &sd_jwt_payload::SdJwtClaims) -> Result<(), ReasonCode> {
+    let vct = claims
+        .get("vct")
+        .and_then(Value::as_str)
+        .ok_or(ReasonCode::MalformedCredential)?;
+    if vct.is_empty() || !is_collision_resistant_name(vct) {
+        return Err(ReasonCode::MalformedCredential);
+    }
+    Ok(())
+}
+
+/// Whether `name` is a plausible Collision-Resistant Name (RFC 7515 §2: "A name in a namespace that
+/// enables names to be allocated in a manner such that they are highly unlikely to collide with other
+/// names" — e.g. Domain Names, OIDs, UUIDs). The two dominant SD-JWT VC `vct` shapes are accepted:
+///
+/// - a **URI** — a value bearing an RFC 3986 §3.1 scheme (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`)
+///   followed by `:` and a non-empty remainder, e.g. `https://credentials.example/id`, `urn:…`,
+///   `did:…` (a URN-wrapped OID/UUID such as `urn:oid:…`/`urn:uuid:…` is covered here); or
+/// - a **reverse-domain-style identifier** — two or more non-empty dot-separated DNS-style labels
+///   (`[A-Za-z0-9-]`), e.g. `com.example.identity` (a bare domain name `example.com` is included).
+///
+/// A bare single token with neither a scheme nor a dotted namespace (e.g. `identity`) is NOT collision-
+/// resistant and is rejected. This is a shape check only — it never resolves or dereferences the name.
+fn is_collision_resistant_name(name: &str) -> bool {
+    // URI: a scheme (letter, then letters/digits/`+`/`-`/`.`) before the first `:`, with a non-empty
+    // remainder after it (RFC 3986 §3.1 `scheme ":" hier-part`).
+    if let Some((scheme, rest)) = name.split_once(':') {
+        let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if scheme_ok && !rest.is_empty() {
+            return true;
+        }
+    }
+    // Reverse-domain-style / domain name: ≥2 non-empty DNS-style labels separated by `.`.
+    let label_ok = |label: &str| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    name.contains('.') && name.split('.').all(label_ok)
+}
+
+/// Read an optional JWT `NumericDate` claim (`nbf`/`exp`/`iat`), distinguishing **absent** from
+/// **present-but-malformed**, and accepting the spec's fractional form.
+///
+/// - `None` (claim absent) → `Ok(None)`: the bound is optional and simply not asserted.
+/// - A JSON number → `Ok(Some(seconds))`: RFC 7519 §2 defines NumericDate as a JSON numeric value and
+///   states "Non-integer values can be represented", so a FRACTIONAL value (e.g. `200.5`) is valid; it
+///   is rounded to whole seconds in the `rounding` direction the caller selects per the claim's role
+///   (see [`crate::datetime::DateRounding`]). An integer that already fits `i64` is taken verbatim (its
+///   `ceil`/`floor` are equal, so the direction is irrelevant for it).
+/// - A claim that is **present** but is not a JSON number (a string, `null`, a boolean, an object/
+///   array), is non-finite, or rounds outside `i64` → `Err(MalformedCredential)`: the bound is
+///   uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential with a
+///   non-canonical `exp` would read as having unbounded validity). We reject anything we cannot
+///   evaluate against `now` rather than ignore it.
+///
+/// The absent→`None` distinction is this function's; the present-value magnitude read (verbatim `i64`,
+/// else the fractional round + `i64` range bound) is the shared [`crate::datetime::json_numeric_date_seconds`]
+/// reader (DRY — the in-core status-token JSON freshness path delegates to the same reader; only the
+/// error carrier differs — a `ReasonCode` here, a fail-closed `None` there).
+fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<i64>, ReasonCode> {
+    let Some(value) = claim else { return Ok(None) };
+    // A present value MUST reduce to whole seconds: a canonical integer verbatim, else a fractional
+    // NumericDate (RFC 7519 §2) rounded in the role-appropriate direction. A non-number, or one that
+    // rounds outside `i64` (a non-finite `NaN`/`±∞` included), is uninterpretable → `MalformedCredential`
+    // (never silently skipped — that would read an expired credential as having unbounded validity).
+    crate::datetime::json_numeric_date_seconds(value, rounding)
+        .map(Some)
+        .ok_or(ReasonCode::MalformedCredential)
+}
+
+/// Verify the holder Key-Binding JWT (RFC 9901 §4.3), distinguishing what is checked **always** from
+/// what is gated on a challenge:
+///
+/// - **A KB-JWT that is PRESENT is ALWAYS cryptographically verified** — its ES256 signature under the
+///   issuer-bound `cnf` key AND its `sd_hash` binding to the presented issuer-JWS-plus-disclosures
+///   prefix — *regardless of whether a challenge is supplied* (RFC 9901 §4.3: a present KB-JWT SHOULD be
+///   verified). A present-but-forged/tampered KB-JWT is therefore rejected on the request-less path too,
+///   not waved through (the false-accept this guards: a structurally-present KB-JWT whose signature or
+///   `sd_hash` does not hold must never read as `valid` just because no challenge was supplied).
+/// - **`aud`/`nonce` AND the KB-JWT `iat` freshness window are checked ONLY when a `challenge` is
+///   supplied** — all three bind the presentation to a specific verifier request. RFC 9901 §7.3 nests
+///   the `iat` acceptable-window check (step 5.e) under step 5 "If Key Binding is required" (the
+///   challenge context); a request-less re-verification (offline / batch / audit / stored presentation)
+///   has no freshness requirement, so enforcing a fixed window there would false-reject an otherwise
+///   valid presentation. A request-less verify thus gives no replay/audience/freshness protection but
+///   still proves holder possession via the always-verified signature + `sd_hash`.
+/// - **A KB-JWT that is ABSENT** is required only when a `challenge` is supplied (holder binding was
+///   demanded → `HolderBinding`); with no challenge an issuer-only presentation is accepted.
+fn check_holder_binding(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+    presentation: &str,
+    challenge: Option<&KeyBindingChallenge<'_>>,
+    now: i64,
+) -> Result<(), ReasonCode> {
+    let Some(kb) = sd_jwt.key_binding_jwt() else {
+        // No KB-JWT present: required only when a challenge demanded holder binding; otherwise the
+        // presentation is issuer-only and accepted.
+        return match challenge {
+            Some(_) => Err(ReasonCode::HolderBinding),
+            None => Ok(()),
+        };
+    };
+    let claims = kb.claims();
+
+    // `aud`/`nonce` AND the `iat` freshness window bind the presentation to a verifier's REQUEST —
+    // checked ONLY when a challenge is supplied (no challenge ⇒ no request to bind to, so no
+    // replay/audience/freshness check). The signature and `sd_hash` below run regardless: a PRESENT
+    // KB-JWT is always cryptographically verified (holder possession), whether or not a request is given.
+    if let Some(challenge) = challenge {
+        // Both the KB-JWT `aud` AND `nonce` must equal the challenge's (compared as a pair so the guard
+        // is one expression and `clippy::nursery`'s field-name heuristic doesn't misread the compare).
+        if (claims.aud.as_str(), claims.nonce.as_str()) != (challenge.audience, challenge.nonce) {
+            return Err(ReasonCode::HolderBinding);
+        }
+        // RFC 9901 §7.3 step 5.e (nested under step 5 "If Key Binding is required"): the KB-JWT `iat`
+        // (its creation time) MUST be within an acceptable window of the verification time — a freshness
+        // bound on the request binding. `iat` is typed `i64` and required-present by the pinned
+        // `sd_jwt_payload` parser; this adds the window bound the dep does not enforce. A KB-JWT minted
+        // far in the future (skewed/forged clock) or absurdly old (stale/replayed) relative to the
+        // request is rejected. `abs_diff` avoids any `i64` subtraction overflow at the timeline extremes.
+        if claims.iat.abs_diff(now) > KB_JWT_IAT_ACCEPTABLE_SKEW_SECS {
+            return Err(ReasonCode::HolderBinding);
+        }
+    }
+
+    // `sd_hash` MUST be the SHA-256 (base64url) digest of the presentation prefix up to and including
+    // the final `~` that precedes the KB-JWT (RFC 9901 §4.3). Always verified for a present KB-JWT.
+    // Recomputed via the crate's single `sd_hash` formula (DRY — the holder builder embeds the same).
+    let kb_compact = kb.to_string();
+    let prefix = presentation
+        .strip_suffix(&kb_compact)
+        .ok_or(ReasonCode::HolderBinding)?;
+    if claims.sd_hash != crate::crypto::sd_hash(prefix) {
+        return Err(ReasonCode::HolderBinding);
+    }
+
+    // The KB-JWT's OWN protected JOSE header MUST declare `alg=ES256` — the verifier accepts ES256 for
+    // BOTH the issuer JWS and the KB-JWT (this module's invariant; HAIP 1.0 §7). This is checked HERE,
+    // before the raw P-256 signature is verified, so a present KB-JWT that lies in its header (`alg`:
+    // ES384/RS256/any non-ES256 value) is rejected even though the holder still signs with P-256 and
+    // the `sd_hash` matches — a JOSE alg-confusion guard. A non-ES256 KB-JWT `alg` maps to
+    // [`ReasonCode::UnsupportedFormat`], SYMMETRIC with the issuer JWS path (which rejects a non-ES256
+    // `alg` with the same reason); a genuine signature/framing failure below stays `HolderBinding`. The
+    // same check also enforces RFC 7515 §4.1.11 `crit` on the KB-JWT (an unsupported critical header).
+    check_kb_jwt_jose_header(&kb_compact)?;
+
+    // Verify the KB-JWT ES256 signature under the holder key bound by the issuer in `cnf`. Always
+    // verified for a present KB-JWT (the holder-possession proof, independent of any challenge).
+    let holder_key = holder_key_from_cnf(sd_jwt)?;
+    verify_compact_es256(&kb_compact, &holder_key).map_err(|()| ReasonCode::HolderBinding)
+}
+
+/// Check the compact KB-JWT's protected JOSE header: it MUST declare `alg=ES256` (RFC 7515 §4.1.1) —
+/// the only signature algorithm this verifier accepts for the holder Key-Binding JWT (HAIP 1.0 §7) —
+/// and MUST NOT carry an unsupported `crit` (RFC 7515 §4.1.11, via [`reject_unsupported_crit`]).
+///
+/// This is the holder-binding counterpart of the issuer JWS header checks in [`verify_issuer_signature`]
+/// and rejects a non-ES256 `alg` (and any present `crit`) with the SAME [`ReasonCode::UnsupportedFormat`],
+/// so the two signature paths are symmetric. Without the `alg` check, a present KB-JWT whose header lies
+/// (`alg`: ES384/RS256/any non-ES256 value) would be waved through as long as the holder still raw-signs
+/// with P-256 and the `sd_hash` matches — a JOSE alg-confusion false-accept that violates this module's
+/// own invariant (ES256 for issuer AND KB-JWT signatures; `sd_jwt_payload`'s parse only rejects
+/// `alg=="none"` and the `typ`, NOT the specific alg). A KB-JWT header that does not decode as JSON with
+/// a string `alg` is a malformed holder binding ([`ReasonCode::HolderBinding`]).
+fn check_kb_jwt_jose_header(kb_compact: &str) -> Result<(), ReasonCode> {
+    // The protected-header decode (first dot-segment → base64url → JSON) is the SAME body the issuer
+    // JWS paths use — share the single [`decode_jws_protected_header`] (DRY — Principle III); only the
+    // holder-binding reason mapping (a header that does not decode is `HolderBinding`) lives here.
+    let header = decode_jws_protected_header(kb_compact).ok_or(ReasonCode::HolderBinding)?;
+    // RFC 7515 §4.1.11: an unsupported `crit` invalidates the JWS — shared with the issuer-JWS path.
+    reject_unsupported_crit(&header)?;
+    if header.get("alg").and_then(Value::as_str) != Some(ES256) {
+        return Err(ReasonCode::UnsupportedFormat);
+    }
+    Ok(())
+}
+
+/// Extract the holder's P-256 verifying key from the issuer-signed `cnf` confirmation (RFC 7800):
+/// `cnf` MUST carry a `jwk` with an EC P-256 public key (`crv=P-256`, base64url `x`/`y`).
+fn holder_key_from_cnf(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<p256::ecdsa::VerifyingKey, ReasonCode> {
+    let cnf = sd_jwt
+        .required_key_bind()
+        .ok_or(ReasonCode::HolderBinding)?;
+    let sd_jwt_payload::RequiredKeyBinding::Jwk(jwk) = cnf else {
+        return Err(ReasonCode::HolderBinding);
+    };
+    verifying_key_from_p256_jwk(&Value::Object(jwk.clone()))
+}
+
+/// Build a P-256 verifying key from a JWK object (`kty=EC`, `crv=P-256`, base64url `x`/`y`),
+/// mapping any deviation to [`ReasonCode::HolderBinding`]. The decode + on-curve check is the shared
+/// [`crate::crypto::p256_verifying_key_from_jwk`] (DRY); only the module-specific reason mapping lives
+/// here.
+fn verifying_key_from_p256_jwk(jwk: &Value) -> Result<p256::ecdsa::VerifyingKey, ReasonCode> {
+    crate::crypto::p256_verifying_key_from_jwk(jwk).ok_or(ReasonCode::HolderBinding)
+}
+
+/// Split a compact JWS into its EXACTLY-three base64url segments `(header, payload, signature)`, or
+/// `None` if it does not have exactly three `.`-separated segments. The single authoritative compact-JWS
+/// framing check (DRY — Principle III): both [`verify_compact_es256`] and the in-core status-token JOSE
+/// verifier ([`crate::status`]) frame a compact JWS through this.
+pub(crate) fn split_compact_jws(jws: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = jws.split('.');
+    let header_b64 = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let sig_b64 = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((header_b64, payload_b64, sig_b64))
+}
+
+/// Verify an ES256 signature over the compact-JWS signing input `header_b64.payload_b64` (the exact
+/// ASCII bytes), with `sig_b64` the base64url signature and `key` the verifying key. `Err(())` on a
+/// non-base64url signature or a failed verification. The shared signing-input construction + raw-`r‖s`
+/// ES256 verify both the SD-JWT VC and the in-core status-token JOSE paths use (DRY — Principle III).
+pub(crate) fn verify_es256_signing_input(
+    header_b64: &str,
+    payload_b64: &str,
+    sig_b64: &str,
+    key: &p256::ecdsa::VerifyingKey,
+) -> Result<(), ()> {
+    let sig_bytes = Base64UrlUnpadded::decode_vec(sig_b64).map_err(|_| ())?;
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    // The raw-`r‖s`-only ES256 parse + verify is the shared [`crate::crypto::p256_verify_es256`]
+    // kernel (DRY — Principle III; the same body the mdoc COSE_Sign1 verifiers use).
+    crate::crypto::p256_verify_es256(key, signing_input.as_bytes(), &sig_bytes)
+}
+
+/// Verify a compact `header.payload.signature` ES256 JWS under `key`. Returns `Err(())` on any
+/// framing/decoding/signature failure (the caller maps this to the relevant [`ReasonCode`]).
+fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<(), ()> {
+    let (header_b64, payload_b64, sig_b64) = split_compact_jws(jws).ok_or(())?;
+    verify_es256_signing_input(header_b64, payload_b64, sig_b64, key)
+}
+
+/// The signature of a top-level claim walk shared by [`reconstruct_claim_set`]: given the issuer-signed
+/// payload object, the digest→disclosure index, and the running `used_digests` set, produce the claim
+/// map for that walk's view (disclosed-only or full presented set). [`disclosed_object`] and
+/// [`reconstruct_object`] both match it, so the two views share one validated preamble (DRY).
+type ClaimWalk = fn(
+    &serde_json::Map<String, Value>,
+    &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode>;
+
+/// Recompute the SD-JWT disclosure digests with `sha2`, match them against the issuer-signed `_sd`
+/// arrays, and reconstruct the **disclosed** claims preserving their nesting (RFC 9901 §7.1).
+///
+/// Selective-disclosure integrity (FR-003): the verifier accepts only disclosed claims whose
+/// disclosure digest appears in an issuer-signed `_sd` array (top-level or nested). A presented
+/// disclosure whose digest is *not* signed is a tampered/forged disclosure → `DisclosureIntegrity`.
+///
+/// The disclosed claims are returned at their **actual positions in the credential structure**, not
+/// flattened onto their leaf name: per RFC 9901 §7.1 a disclosed object property is inserted at the
+/// level of the `_sd` key that referenced it. So `address.locality` and `place_of_birth.locality` are
+/// two *distinct* nested values — `{"address": {"locality": …}, "place_of_birth": {"locality": …}}` —
+/// not a single collapsed `locality` (which both silently lost data *and*, when the leaf-keyed
+/// collision guard was added, false-rejected the legitimate EUDI PID shape as `DisclosureIntegrity`).
+/// Only the disclosed (selectively-disclosable) claims are surfaced; the always-visible registered
+/// claims (`iss`/`vct`/`nbf`/`exp`/…) are not "disclosed attributes" and are not returned here — this
+/// is the privacy-minimal set the verifier reports as [`VerificationResult::disclosed_attributes`]. The
+/// FULL set of claims actually present in the presentation (clear payload + disclosed) is
+/// [`collect_presented_claims`].
+fn collect_disclosed_attributes(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    reconstruct_claim_set(sd_jwt, disclosed_object)
+}
+
+/// Reconstruct the **full set of claims actually present in the presentation** (RFC 9901 §7.1 recursive
+/// processing): the issuer-signed **clear** payload claims MERGED with the selectively-**disclosed**
+/// claims, excluding only the SD-JWT machinery / holder-binding control keys ([`is_sd_reserved_key`]:
+/// `_sd`, `_sd_alg`, `cnf`) and the `{"...": digest}` array-redaction placeholders. This is the
+/// "processed SD-JWT payload" a Verifier obtains after applying the disclosures.
+///
+/// It is a superset of [`collect_disclosed_attributes`] (it additionally keeps the clear, always-present
+/// claims — registered claims such as `iss`/`vct`/`iat`/`exp`/`nbf`/`status` and any clear subject
+/// claim the issuer carried outside selective disclosure). It is the claim set an OpenID4VP DCQL Claims
+/// Query resolves against (OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2: a Verifier validates that
+/// the Credential meets the query's criteria via the "Claims included in the presentation" — §6.4 notes
+/// a presentation legitimately carries non-selectively-disclosable claims), so a clear subject claim
+/// satisfies a query exactly as a disclosed one does. This view is NOT reported to the host (only the
+/// privacy-minimal `disclosed_attributes` is); it is the in-core DCQL gate's resolution input.
+///
+/// Shares the exact validated preamble + global integrity invariants of [`collect_disclosed_attributes`]
+/// via [`reconstruct_claim_set`]; only the top-level walk differs ([`reconstruct_object`] keeps clear
+/// properties, [`disclosed_object`] drops them).
+fn collect_presented_claims(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    reconstruct_claim_set(sd_jwt, reconstruct_object)
+}
+
+/// The validated preamble + global integrity invariants shared by [`collect_disclosed_attributes`] and
+/// [`collect_presented_claims`] (RFC 9901 §7.1): validate `_sd_alg`, index + digest every presented
+/// disclosure (rejecting a repeat), reject a nested `_sd_alg`, run the caller's top-level `walk`, then
+/// enforce the membership rule (every presented disclosure was substituted). The only difference between
+/// the two views is `walk` — both reach the SAME set of disclosures (they recurse into every clear
+/// child and substitute every `_sd`/redaction), so the membership/repeat invariants hold identically.
+fn reconstruct_claim_set(
+    sd_jwt: &sd_jwt_payload::SdJwt,
+    walk: ClaimWalk,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    // The `_sd_alg` MUST be sha-256 (the only registered alg we support); reject otherwise.
+    if let Some(alg) = sd_jwt.claims()._sd_alg.as_deref() {
+        if alg != SHA_256 {
+            return Err(ReasonCode::UnsupportedFormat);
+        }
+    }
+
+    // Index every presented disclosure by its digest. Two presented disclosures hashing to the same
+    // digest are the same disclosure repeated — that digest is then "encountered more than once" and
+    // RFC 9901 §7.1 step 4 invalidates the SD-JWT, so a repeated presented digest is rejected here
+    // (the in-structure repeat — the same digest in two `_sd` arrays — is caught during the walk).
+    // A disclosure whose digest is not referenced by any issuer-signed `_sd`/array-element entry is
+    // never substituted below, so it is rejected as forged by the unused-disclosure check after the
+    // walk (membership / `DisclosureIntegrity`).
+    let mut disclosures_by_digest = BTreeMap::new();
+    for disclosure in sd_jwt.disclosures() {
+        // RFC 9901 §4.1.1: `_sd_alg` is a top-level-only claim. A disclosed value carrying an `_sd_alg`
+        // (anywhere within it) would place `_sd_alg` in a nested position once substituted — reject.
+        if contains_sd_alg_key(&disclosure.claim_value) {
+            return Err(ReasonCode::MalformedCredential);
+        }
+        let digest = Base64UrlUnpadded::encode_string(&sha256(disclosure.as_str().as_bytes()));
+        if disclosures_by_digest.insert(digest, disclosure).is_some() {
+            return Err(ReasonCode::DisclosureIntegrity);
+        }
+    }
+
+    // Reconstruct by substituting digests at their position in the issuer-signed structure (RFC 9901
+    // §7.1): per-object claim-name uniqueness and the global "digest seen more than once" rule are
+    // enforced as we walk. `used_digests` records every digest we substitute, so a presented-but-
+    // unreferenced (forged) disclosure can be detected after the walk.
+    let claims_value =
+        serde_json::to_value(sd_jwt.claims()).map_err(|_| ReasonCode::MalformedCredential)?;
+    // `SdJwtClaims` always serializes to a JSON object; a non-object is a serializer contract break.
+    let claims_object = claims_value
+        .as_object()
+        .ok_or(ReasonCode::MalformedCredential)?;
+
+    // RFC 9901 §4.1.1: `_sd_alg` MUST appear only at the TOP level of the payload, never nested. The
+    // top-level value was already validated above; reject an `_sd_alg` key anywhere inside a top-level
+    // child value (a nested object/array of the issuer-signed payload). The top-level `_sd_alg` key's
+    // own value is a scalar string, so scanning the child VALUES never flags the legitimate top-level
+    // occurrence.
+    if claims_object.values().any(contains_sd_alg_key) {
+        return Err(ReasonCode::MalformedCredential);
+    }
+
+    let mut used_digests = std::collections::BTreeSet::new();
+    let claims = walk(claims_object, &disclosures_by_digest, &mut used_digests)?;
+
+    // Membership (FR-003): every presented disclosure's digest MUST appear in the issuer-signed
+    // structure. Any digest we never substituted is a disclosure the issuer did not sign — forged.
+    if used_digests.len() != disclosures_by_digest.len() {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    Ok(claims)
+}
+
+/// Reconstruct the **disclosed** claims of one object level (RFC 9901 §7.1), preserving nesting.
+///
+/// For each digest in this object's `_sd` array that has a matching presented disclosure, insert the
+/// disclosed object property *at this level* (the level of the `_sd` key — the spec's nesting rule),
+/// recursing into the disclosed value so nested disclosures are reconstructed too. Clear (always-
+/// present) object/array properties are recursed into so a disclosed claim nested under a non-
+/// concealable parent (e.g. `address.locality`) is surfaced under that parent — a property is included
+/// only when it (recursively) yields at least one disclosed claim.
+///
+/// Two RFC 9901 §7.1 invariants are enforced here:
+/// - **Claim-name uniqueness at the level of the `_sd` key** (per-object, *not* a crate-wide leaf
+///   name): a claim name already populated at this level by another disclosure → reject. This is the
+///   real reorder attack — two issuer-signed disclosures for the same claim at the same level let a
+///   malicious holder pick which value the relying party sees by reordering the segments.
+/// - **A digest encountered more than once** (`used_digests`) anywhere in the structure → reject.
+///
+/// Both reject as [`ReasonCode::DisclosureIntegrity`].
+fn disclosed_object(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    // Disclosable object properties: substitute this object's `_sd` entries (DRY with the full-value
+    // reconstruction; this is the shared per-object `_sd`/uniqueness/repeated-digest logic).
+    let mut disclosed = substitute_sd_array(object, disclosures_by_digest, used_digests)?;
+
+    // Clear properties may nest disclosable claims (e.g. a non-concealable `address` carrying a
+    // concealable `locality`); recurse and keep the property only when it yields disclosed claims. A
+    // clear *scalar* holds no disclosure, so it is NOT surfaced here — only the credential's disclosed
+    // claims are returned at top level (the always-visible registered claims are not disclosures).
+    for (key, child) in object {
+        if is_sd_reserved_key(key) {
+            continue;
+        }
+        if let Some(nested) = disclosed_subtree(child, disclosures_by_digest, used_digests)? {
+            insert_unique_at_level(&mut disclosed, key, nested)?;
+        }
+    }
+
+    Ok(disclosed)
+}
+
+/// Substitute the `_sd` array of one object: each digest with a matching *presented* disclosure
+/// becomes that disclosed object property, inserted at this level (RFC 9901 §7.1). A withheld digest
+/// (no presented disclosure) is skipped; a repeated digest or a same-level claim-name collision is
+/// rejected. Shared by the disclosed-only top-level walk and the full disclosed-value reconstruction.
+fn substitute_sd_array(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    let mut out = BTreeMap::new();
+    let Some(Value::Array(sd)) = object.get("_sd") else {
+        return Ok(out);
+    };
+    for entry in sd {
+        // RFC 9901 §7.1: `_sd` MUST be "an array of strings". A non-string entry is a malformed
+        // digest array — reject the SD-JWT (fail-closed) rather than `filter_map`-skip it, which
+        // would silently process a structure the spec forbids. (Issuer-signed, so a conformance gap,
+        // not a forgery vector — but an unreadable `_sd` entry must not be ignored.)
+        let digest = entry.as_str().ok_or(ReasonCode::DisclosureIntegrity)?;
+        let Some(disclosure) = disclosures_by_digest.get(digest) else {
+            // The digest is signed but not disclosed — a withheld claim; nothing to surface.
+            continue;
+        };
+        if !used_digests.insert(digest.to_string()) {
+            // RFC 9901 §7.1 step 4: a digest encountered more than once invalidates the SD-JWT.
+            return Err(ReasonCode::DisclosureIntegrity);
+        }
+        // An `_sd` entry MUST resolve to an object-property disclosure (`[salt, name, value]`); an
+        // array-element disclosure (`[salt, value]`, no claim name) referenced from `_sd` is invalid.
+        let name = disclosure
+            .claim_name
+            .as_deref()
+            .ok_or(ReasonCode::DisclosureIntegrity)?;
+        // RFC 9901 §7.1 step 3.c.ii: if a disclosure's claim name is `_sd` or `...`, the SD-JWT MUST be
+        // rejected — those are SD-JWT machinery names, never legitimate object-property claim names.
+        if matches!(name, "_sd" | "...") {
+            return Err(ReasonCode::DisclosureIntegrity);
+        }
+        let value =
+            reconstruct_value(&disclosure.claim_value, disclosures_by_digest, used_digests)?;
+        insert_unique_at_level(&mut out, name, value)?;
+    }
+    Ok(out)
+}
+
+/// The reserved SD-JWT keys that are never reconstructed as claim values: the `_sd` digest array, the
+/// `_sd_alg` selector, and the `cnf` holder-binding key (RFC 9901 / SD-JWT VC machinery, not claims).
+fn is_sd_reserved_key(key: &str) -> bool {
+    matches!(key, "_sd" | "_sd_alg" | "cnf")
+}
+
+/// Whether a JSON value contains an `_sd_alg` key at this object level or anywhere nested within it.
+/// RFC 9901 §4.1.1: `_sd_alg` "MUST appear at the top level of the SD-JWT payload. It MUST NOT be used
+/// in any object nested within the payload." [`collect_disclosed_attributes`] validates the legitimate
+/// top-level `_sd_alg` separately and uses this scanner to reject a nested occurrence (in a child of the
+/// issuer-signed payload, or inside any disclosed value).
+fn contains_sd_alg_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.contains_key("_sd_alg") || map.values().any(contains_sd_alg_key),
+        Value::Array(items) => items.iter().any(contains_sd_alg_key),
+        _ => false,
+    }
+}
+
+/// Reconstruct a disclosed object value **in full** (RFC 9901 §7.1 recursive processing): keep every
+/// clear property the issuer signed (scalars included), substitute this object's disclosed `_sd`
+/// entries, and recurse into clear object/array properties for their own nested disclosures. This is
+/// the disclosed *value* of a revealed claim, distinct from the disclosed-only top-level walk.
+fn reconstruct_object(
+    object: &serde_json::Map<String, Value>,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, AttributeValue>, ReasonCode> {
+    let mut out = substitute_sd_array(object, disclosures_by_digest, used_digests)?;
+    for (key, child) in object {
+        if is_sd_reserved_key(key) {
+            continue;
+        }
+        // A clear property of a disclosed value is part of that value: keep it, reconstructing any
+        // nested disclosures within it.
+        let value = reconstruct_value(child, disclosures_by_digest, used_digests)?;
+        insert_unique_at_level(&mut out, key, value)?;
+    }
+    Ok(out)
+}
+
+/// Reconstruct any disclosed claims nested under a clear property's value, returning `None` when the
+/// value contains no disclosed claim (so the property is omitted from the disclosed view) and
+/// `Some(value)` carrying only the disclosed nested claims otherwise.
+fn disclosed_subtree(
+    value: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<AttributeValue>, ReasonCode> {
+    match value {
+        Value::Object(object) => {
+            let nested = disclosed_object(object, disclosures_by_digest, used_digests)?;
+            Ok((!nested.is_empty()).then_some(AttributeValue::Map(nested)))
+        }
+        Value::Array(items) => {
+            let disclosed = disclosed_array(items, disclosures_by_digest, used_digests)?;
+            Ok((!disclosed.is_empty()).then_some(AttributeValue::Array(disclosed)))
+        }
+        // A scalar clear property holds no disclosable claim.
+        _ => Ok(None),
+    }
+}
+
+/// Reconstruct the disclosed elements of an array for the **top-level disclosed-only walk** (RFC 9901
+/// §7.1): an `{"...": "<digest>"}` redaction whose disclosure is presented becomes that disclosed
+/// element; an undisclosed redaction is dropped (the element was not revealed). A clear element is
+/// surfaced only when it nests a disclosed claim — a clear scalar carries no disclosure.
+fn disclosed_array(
+    items: &[Value],
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<AttributeValue>, ReasonCode> {
+    let mut disclosed = Vec::new();
+    for item in items {
+        if let Some(element) = disclosed_array_redaction(item, disclosures_by_digest, used_digests)?
+        {
+            // A revealed redacted element.
+            disclosed.push(element);
+        } else if !is_array_redaction(item) {
+            // A clear element: surface it only when it nests a disclosed claim (mirrors a clear
+            // property in the disclosed-only walk).
+            if let Some(nested) = disclosed_subtree(item, disclosures_by_digest, used_digests)? {
+                disclosed.push(nested);
+            }
+        }
+    }
+    Ok(disclosed)
+}
+
+/// Reconstruct an array value **in full** (RFC 9901 §7.1 recursive processing of a disclosed array):
+/// a presented redaction becomes its disclosed element, an undisclosed redaction is dropped, and a
+/// clear element is kept in full (with any nested disclosures within it substituted).
+fn reconstruct_array(
+    items: &[Value],
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<AttributeValue>, ReasonCode> {
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(element) = disclosed_array_redaction(item, disclosures_by_digest, used_digests)?
+        {
+            out.push(element);
+        } else if !is_array_redaction(item) {
+            // A clear element of a disclosed array is part of that value: keep it in full.
+            out.push(reconstruct_value(
+                item,
+                disclosures_by_digest,
+                used_digests,
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an array element is a **well-formed** selective-disclosure redaction object
+/// `{"...": "<digest>"}` (RFC 9901 §4.2.4.2: an object with the single key `...`, that value a string).
+///
+/// An object that carries a `...` key **alongside** other keys is NOT a well-formed redaction — RFC
+/// 9901 §4.2.4.2 mandates "There MUST NOT be any other keys in the object" — so this returns `false`
+/// for it. That malformed shape is rejected as [`ReasonCode::DisclosureIntegrity`] in
+/// [`disclosed_array_redaction`] (the fallible path the array walkers call first), never silently
+/// reinterpreted as a clear array element (which this `false` would otherwise allow).
+fn is_array_redaction(item: &Value) -> bool {
+    item.as_object()
+        .is_some_and(|map| map.len() == 1 && map.get("...").is_some_and(Value::is_string))
+}
+
+/// Resolve an array-element redaction `{"...": "<digest>"}`: `Ok(Some(value))` when the disclosure is
+/// presented (the revealed element value), `Ok(None)` when the element is not a redaction or the
+/// redaction was not disclosed. Enforces the repeated-digest rule and that an array-element disclosure
+/// carries no claim name (`[salt, value]`); both violations reject as [`ReasonCode::DisclosureIntegrity`].
+///
+/// RFC 9901 §4.2.4.2 conformance: an object that has the `...` key but **also** other keys is a
+/// malformed redaction ("There MUST NOT be any other keys in the object") — it is rejected as
+/// [`ReasonCode::DisclosureIntegrity`] here (fail-closed), never silently treated as a clear element.
+/// The check runs whether or not the disclosure is presented, so a withheld malformed redaction is
+/// caught too. (The redaction is issuer-signed, so this is a conformance-strictness gap, not a forgery
+/// vector — but the SD-JWT is rejected rather than processed under an unreadable structure.)
+fn disclosed_array_redaction(
+    item: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<AttributeValue>, ReasonCode> {
+    let Some(object) = item.as_object() else {
+        return Ok(None);
+    };
+    let Some(Value::String(digest)) = object.get("...") else {
+        return Ok(None);
+    };
+    // RFC 9901 §4.2.4.2: a `{"...": digest}` redaction MUST have EXACTLY ONE key. Any extra key
+    // makes the object an invalid redaction → reject the SD-JWT (do not fall through to "clear
+    // element", which would silently process a structure the spec forbids).
+    if object.len() != 1 {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    let Some(disclosure) = disclosures_by_digest.get(digest.as_str()) else {
+        // Undisclosed array element — not revealed in this presentation.
+        return Ok(None);
+    };
+    if !used_digests.insert(digest.clone()) {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    // An array-element disclosure is `[salt, value]` — it MUST NOT carry a claim name.
+    if disclosure.claim_name.is_some() {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    Ok(Some(reconstruct_value(
+        &disclosure.claim_value,
+        disclosures_by_digest,
+        used_digests,
+    )?))
+}
+
+/// Reconstruct a disclosed claim's *value* in full (RFC 9901 §7.1 "recursively process the value").
+///
+/// Unlike the [`disclosed_object`] top-level walk — which surfaces *only* the disclosed claims of the
+/// credential — a disclosed value is revealed in full: when the holder discloses a whole object (e.g.
+/// the entire `address`), every clear sub-property the issuer signed (`country`, …) is part of that
+/// disclosed value and is kept, alongside any nested `_sd`/array-element disclosures substituted in
+/// place. A nested redaction the holder did *not* present is dropped (that sub-claim stays concealed).
+fn reconstruct_value(
+    value: &Value,
+    disclosures_by_digest: &BTreeMap<String, &sd_jwt_payload::Disclosure>,
+    used_digests: &mut std::collections::BTreeSet<String>,
+) -> Result<AttributeValue, ReasonCode> {
+    match value {
+        Value::Object(object) => Ok(AttributeValue::Map(reconstruct_object(
+            object,
+            disclosures_by_digest,
+            used_digests,
+        )?)),
+        Value::Array(items) => Ok(AttributeValue::Array(reconstruct_array(
+            items,
+            disclosures_by_digest,
+            used_digests,
+        )?)),
+        scalar => Ok(json_to_attribute(scalar)),
+    }
+}
+
+/// Insert a disclosed claim at the current object level, enforcing per-level claim-name uniqueness
+/// (RFC 9901 §7.1: "if the claim name already exists at the level of the `_sd` key, the SD-JWT MUST be
+/// rejected"). The check is scoped to **this** level (the `BTreeMap` being built), never a crate-wide
+/// leaf name — so two distinct nested claims sharing a leaf under different parents are both kept.
+///
+/// A genuine same-level collision is the reorder attack (two issuer-signed disclosures populating one
+/// claim name; the holder picks the value by reordering the segments): rejected as
+/// [`ReasonCode::DisclosureIntegrity`]. A clear property and a disclosure cannot both target the same
+/// name at one level under a well-formed issuer payload, so the check fires only on that attack.
+fn insert_unique_at_level(
+    map: &mut BTreeMap<String, AttributeValue>,
+    name: &str,
+    value: AttributeValue,
+) -> Result<(), ReasonCode> {
+    if map.contains_key(name) {
+        return Err(ReasonCode::DisclosureIntegrity);
+    }
+    map.insert(name.to_string(), value);
+    Ok(())
+}
+
+/// Map a disclosed `serde_json::Value` claim into the SDK's closed [`AttributeValue`] (the CBOR wire
+/// type). Numbers that are not integers are surfaced as text (the EUDI claim set is integer/string/
+/// boolean-shaped; a non-integer number is preserved losslessly as its JSON text rather than coerced
+/// to a lossy float).
+fn json_to_attribute(value: &Value) -> AttributeValue {
+    match value {
+        Value::Null => AttributeValue::Null,
+        Value::Bool(b) => AttributeValue::Boolean(*b),
+        Value::Number(n) => n.as_i64().map_or_else(
+            || AttributeValue::Text(n.to_string()),
+            AttributeValue::Integer,
+        ),
+        Value::String(s) => AttributeValue::Text(s.clone()),
+        Value::Array(items) => AttributeValue::Array(items.iter().map(json_to_attribute).collect()),
+        Value::Object(map) => AttributeValue::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_attribute(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(any(test, feature = "test-vectors"))]
+pub(crate) mod test_issuer;
+#[cfg(test)]
+mod tests;

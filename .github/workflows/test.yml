@@ -1,15 +1,25 @@
 name: Tests
 
+# Scope `push` to the protected branches (matching docs.yml / images.yml): a push to a feature branch
+# with an open PR would otherwise run every job TWICE (once for push, once for pull_request). Feature
+# branches are tested via `pull_request`; the concurrency group supersedes an in-flight run on a newer
+# commit to the same PR/ref.
 on:
   push:
+    branches: [develop, main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    name: Rust core + C ABI (test + coverage ≥95%)
+    name: Rust core + attestation + C ABI (test + coverage ≥95%)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -22,11 +32,17 @@ jobs:
       - name: Test (includes OpenSSL independent validation)
         run: cargo test --workspace
       # Constitution Principle VI: unit-test line coverage MUST stay ≥95% per crate. All protocol,
-      # CMS/PAdES, and timestamp logic lives in these two crates (the bindings are thin shims).
+      # CMS/PAdES, timestamp, and EUDI attestation logic lives in these three crates (the bindings are
+      # thin shims). The attestation always-on verify suite is offline with zero external deps (its
+      # trust lists/status/issuer are sans-IO host seams fed by in-crate fixtures), so it runs here
+      # unconditionally alongside the signing core — the gated cross-check/issuance/qualified jobs are
+      # the opt-in workflows.
       - name: Coverage gate — cleverbase-core
         run: cargo llvm-cov --package cleverbase-core --fail-under-lines 95
       - name: Coverage gate — cleverbase-ffi
         run: cargo llvm-cov --package cleverbase-ffi --fail-under-lines 95
+      - name: Coverage gate — cleverbase-attestation
+        run: cargo llvm-cov --package cleverbase-attestation --fail-under-lines 95
 
   python:
     name: Python binding

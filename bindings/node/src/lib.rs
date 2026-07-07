@@ -85,3 +85,51 @@ pub fn resume_http(handle: Buffer, status: u16, body: Buffer, now_unix: f64, ent
     let (handle, step) = resume(h, input, ctx).map_err(e)?;
     Ok(encode_handle_step(&handle, &step).into())
 }
+
+/// Verify an EUDI attestation presentation.
+///
+/// CBOR-through: takes a CBOR-encoded `VerifyRequest` (attestation wire schema v5 — the presented
+/// SD-JWT VC / mdoc, verifier policy, host-resolved trust anchors, and verification context) and
+/// returns a CBOR-encoded `VerifyResponse` (schema v5) carrying the `outcome`. The always-on verdict
+/// (`VerificationResult` — `valid` plus machine-readable reason codes) and any decode/usage error
+/// ride *inside* the response body, not through this call's error channel; a malformed request
+/// fails closed to an `err` outcome rather than throwing. The holder's private key never crosses
+/// this boundary — the verifier only inspects the presentation the holder already produced. All
+/// protocol/crypto logic lives in `cleverbase-attestation` (Constitution Principle III/VIII); this
+/// wrapper is bytes-in / bytes-out only.
+#[napi]
+pub fn attestation_verify(request: Buffer) -> Result<Buffer> {
+    Ok(cleverbase_attestation::wire::process_verify_bytes(&request).into())
+}
+
+/// Verify a set-level OpenID4VP `vp_token` (the multi-credential presentation).
+///
+/// CBOR-through: takes a CBOR-encoded `WireVpTokenRequest` (attestation wire schema v5 — the OpenID4VP
+/// request, the whole `{credential_id: [presentations]}` `vp_token`, verifier policy, host-resolved
+/// trust anchors, per-credential statuses, and any signed Token Status List tokens) and returns a
+/// CBOR-encoded `WireVpTokenResponse` (schema v5) carrying the `outcome`. Unlike `attestation_verify`
+/// (a single presentation), this folds the OpenID4VP set-level DCQL semantics (`credential_sets` +
+/// `multiple` cardinality) AND authenticates supplied status tokens in-core across the set. The
+/// set-level verdict (`satisfied` + per-credential results) and any decode/usage error ride *inside*
+/// the response body, not through this call's error channel; a malformed request fails closed to an
+/// `err` outcome rather than throwing. All protocol/crypto logic lives in `cleverbase-attestation`
+/// (Constitution Principle III/VIII); this wrapper is bytes-in / bytes-out only.
+#[napi]
+pub fn attestation_verify_vp_token(request: Buffer) -> Result<Buffer> {
+    Ok(cleverbase_attestation::wire::process_vp_token_bytes(&request).into())
+}
+
+/// Drive an EUDI attestation issuance / holder-presentation step.
+///
+/// CBOR-through: takes a CBOR-encoded `IssuanceRequest` (issuance wire schema v1 — one `obtain` /
+/// `prepare-present` / `finish-present` operation plus its opaque carried session/prepared handle)
+/// and returns a CBOR-encoded `IssuanceResponse` (schema v1) carrying the `outcome` (the next step,
+/// the produced `vp_token`, or an `err`). As with `attestation_verify`, errors ride inside the
+/// response — a malformed request fails closed to an `err` outcome — and the holder key never
+/// crosses this boundary (the host signs the returned `SigningInput` out-of-band and hands the
+/// signature back on the next step). All protocol/crypto logic lives in `cleverbase-attestation`
+/// (Constitution Principle III/VIII); this wrapper is bytes-in / bytes-out only.
+#[napi]
+pub fn attestation_issuance(request: Buffer) -> Result<Buffer> {
+    Ok(cleverbase_attestation::issuance::wire::process_issuance_bytes(&request).into())
+}

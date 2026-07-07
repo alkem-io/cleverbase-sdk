@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/cleverbase-core", "crates/cleverbase-ffi"]
+members = [
+    "crates/cleverbase-core",
+    "crates/cleverbase-ffi",
+    "crates/cleverbase-attestation",
+]
 
 [workspace.package]
 edition = "2021"
@@ -81,8 +85,13 @@ derive_partial_eq_without_eq = "allow" # several types carry f64 fields (no Eq)
 unnecessary_wraps = "allow"
 manual_let_else = "allow"          # an explicit match reads clearly in the state machine
 format_push_string = "allow"
-# cargo lints: the only finding is a transitive-dependency fact we cannot resolve.
-multiple_crate_versions = "allow"  # rsa/p256 (rand 0.8) vs lopdf (rand 0.9) pull duplicate rand/getrandom
+# cargo lints: the only findings are transitive-dependency facts we cannot resolve.
+#   - rsa/p256 (rand 0.8) vs lopdf (rand 0.9) pull duplicate rand/getrandom/rand_chacha/rand_core
+#   - sd-jwt-payload 0.5 (attestation crate) has not migrated to thiserror 2, so it pulls a
+#     duplicate thiserror/thiserror-impl 1.x alongside the workspace's thiserror 2 — upstream-owned.
+# These cannot be deduplicated without forking/replacing a dependency; the workspace policy permits a
+# cargo lint that reflects a transitive-dependency fact we cannot fix (see the lint-policy note above).
+multiple_crate_versions = "allow"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -102,4 +111,26 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 ecdsa = { version = "0.16", features = ["der"] }
 signature = "2"
 pkcs8 = "0.10"
+# Constant-time Base64 (RustCrypto; already in-tree via pkcs8/spki). Used for the compact-JWS
+# base64url framing in the SD-JWT VC verifier — no general-purpose base64 dep, no hand-rolled codec.
+base64ct = { version = "1", features = ["alloc"] }
 lopdf = "0.36"
+# --- EUDI attestation (feature 004) — pinned per Principle VII (pre-1.0 / mid-rollout standards). ---
+# COSE codec for ISO 18013-5 mdoc (Google, Apache-2.0); pure-Rust, builds on the existing `ciborium`.
+coset = "=0.4.2"
+# SD-JWT / disclosure / KB-JWT format layer (IOTA, Apache-2.0). `default-features = false` drops the
+# `sha`/`iota-crypto` default so hashing is delegated to the SDK's own `sha2` (no second crypto stack,
+# stays pure-Rust/WASM-able — research D1). It still pulls `thiserror 1` (upstream-owned; see the
+# `multiple_crate_versions` note above).
+sd-jwt-payload = { version = "=0.5.1", default-features = false }
+# Trust-list XML (TS 119 612) reader/writer; pure-Rust, no_std-capable.
+quick-xml = "=0.40.1"
+# zlib/DEFLATE (RFC 1950/1951) inflate for the Token Status List `lst` bitstring
+# (draft-ietf-oauth-status-list). PURE-RUST backend REQUIRED (WASM-able, no C/zlib-sys): `miniz_oxide`
+# is exactly the pure-Rust inflate `flate2`'s default `rust_backend` wraps, used here directly to avoid
+# the wrapper. The default `with-alloc` feature (needed for the to-`Vec` decode) is kept. Already in the
+# lock at 0.8.9 (transitively via `flate2`→`lopdf`), so this introduces NO new crate version.
+miniz_oxide = "0.8"
+# `JwsSigner` is an `async_trait` (sd-jwt-payload); the test-only issuer helper that mints SD-JWT VCs
+# implements it. Already in-tree via `sd-jwt-payload`; declared here for the dev-dependency only.
+async-trait = "0.1"

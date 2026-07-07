@@ -1,0 +1,358 @@
+//! Shared domain types for EUDI attestation verification (data-model.md).
+//!
+//! These are the conceptual domain entities of the attestation core. They are **sans-IO** — the core
+//! holds no persistence and no key custody — and are carried across the `cleverbase-ffi` C-ABI as
+//! CBOR (hence the `serde` derives), so they form a versioned wire contract, not just an in-process
+//! API. None of these types carries a private key or other sole-control secret (those stay in the
+//! integrator's HSM via the signer-hook), so deriving `Debug` here exposes only issuer-public and
+//! verifier-side data. `disclosedAttributes` does carry the holder-disclosed subject claims (PII by
+//! nature); a host that logs a [`VerificationResult`] is logging exactly the data it asked the
+//! subject to disclose — no *undisclosed* attribute is ever present.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// The credential format of an attestation. The format determines the encoding (JOSE vs CBOR/COSE)
+/// and the selective-disclosure / holder-binding mechanism (data-model.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Format {
+    /// SD-JWT VC (IETF RFC 9901 / draft-16) — compact JWS with selective-disclosure salts and a
+    /// holder Key-Binding JWT.
+    SdJwtVc,
+    /// ISO/IEC 18013-5 mdoc — a CBOR `DeviceResponse` with a COSE_Sign1 `IssuerAuth` and `DeviceAuth`
+    /// holder binding.
+    Mdoc,
+}
+
+/// The issuer role, which selects the trust anchor for verification (research D5).
+///
+/// EUDI anchors trust **per role** — a qualified-EAA issuer is found on a different list than a PID
+/// provider — so the role is an explicit input to [`crate::trust::TrustAnchorSource::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuerRole {
+    /// Qualified Electronic Attestation of Attributes issuer (EU LOTL + national Trusted Lists,
+    /// ETSI TS 119 612).
+    Qeaa,
+    /// Person Identification Data provider (Commission list under eIDAS Art. 5a(18)).
+    Pid,
+    /// Public-body EAA provider (Commission list under eIDAS Art. 45f(3)).
+    PubEaa,
+    /// Non-qualified EAA issuer (trusted via a configured anchor, but not on a qualified list).
+    NonQualifiedEaa,
+}
+
+/// The issuer's trust status under the always-on bar: present on the configured trust anchor for its
+/// role/format, or not (data-model.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustStatus {
+    /// The issuer is present (and its trust-list entry is currently in-force) on the configured
+    /// anchor.
+    Trusted,
+    /// The issuer is absent, or its entry is expired/withdrawn/revoked, on the configured anchor.
+    Untrusted,
+}
+
+/// The eIDAS qualified status of the issuer, populated **only** by the opt-in TS 119 615 cl. 4.12
+/// gate (otherwise absent — never assumed). See [`crate::qualified`].
+///
+/// Outcome conditions are pinned (tasks T018/T019): `Qualified` iff the issuer's `EAA/Q` service
+/// entry was `granted` at the relevant time; `NotQualified` iff the entry is found but not granted
+/// (withdrawn/suspended) at that time; `Indeterminate` iff the trust-list data is
+/// absent/ambiguous/unreachable. There is no false "qualified" (SC-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualifiedStatus {
+    /// The issuer's qualified-EAA service was `granted` at the relevant time.
+    Qualified,
+    /// The issuer's entry was found but not granted (withdrawn/suspended) at the relevant time.
+    NotQualified,
+    /// The trust-list data needed to decide was absent, ambiguous, or unreachable.
+    Indeterminate,
+}
+
+/// The validity window of an attestation (SD-JWT VC `nbf`/`exp`; mdoc MSO `validityInfo`), as Unix
+/// seconds. Either bound may be absent if the format/credential omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validity {
+    /// Not-valid-before (Unix seconds), if present.
+    pub not_before: Option<i64>,
+    /// Not-valid-after (Unix seconds), if present.
+    pub not_after: Option<i64>,
+}
+
+/// A disclosed attribute value.
+///
+/// Credential claims are heterogeneous (strings, numbers, booleans, nested maps, byte strings — e.g.
+/// an mdoc `portrait`). A closed, self-describing value type keeps the CBOR wire contract explicit
+/// rather than leaning on an untyped `serde_json::Value`/`ciborium::Value` (which would also drag a
+/// `Debug`-via-untyped-value foot-gun into the public API).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributeValue {
+    /// A UTF-8 text claim.
+    Text(String),
+    /// An integer claim.
+    Integer(i64),
+    /// A boolean claim.
+    Boolean(bool),
+    /// A byte-string claim (e.g. an mdoc portrait or a raw value).
+    Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// A nested object claim.
+    Map(BTreeMap<String, Self>),
+    /// An array claim.
+    Array(Vec<Self>),
+    /// An explicitly null claim.
+    Null,
+}
+
+/// The fail-closed-vs-best-effort policy for an unreachable revocation/status endpoint
+/// (data-model.md `VerificationPolicy.statusReachability`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusReachability {
+    /// An unreachable status endpoint yields INVALID `status_unavailable` (the secure default).
+    #[default]
+    FailClosed,
+    /// An unreachable status endpoint is tolerated (the credential is not failed on reachability
+    /// alone) — opt-in, for environments that accept the weaker guarantee.
+    BestEffort,
+}
+
+/// The verifier's policy input (data-model.md `VerificationPolicy`).
+///
+/// Defaults are the secure baseline: both formats accepted, the qualified gate **off**, and status
+/// reachability **fail-closed**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPolicy {
+    /// Which formats to accept. An empty set is treated as "both" (the default).
+    pub formats: Vec<Format>,
+    /// Enable the opt-in TS 119 615 qualified-status determination (default off).
+    pub qualified_gate: bool,
+    /// The fail-closed-vs-best-effort status-reachability policy (default fail-closed).
+    pub status_reachability: StatusReachability,
+}
+
+impl Default for VerificationPolicy {
+    /// The secure baseline: accept both formats, qualified gate off, status reachability
+    /// fail-closed.
+    fn default() -> Self {
+        Self {
+            formats: vec![Format::SdJwtVc, Format::Mdoc],
+            qualified_gate: false,
+            status_reachability: StatusReachability::FailClosed,
+        }
+    }
+}
+
+/// A machine-readable reason for a verification outcome (FR-005 / SC-002).
+///
+/// This is a **closed** enum: every failed always-on check maps to exactly one specific variant, so
+/// an INVALID verdict always carries an actionable, stable reason (no opaque "verification failed").
+/// New reasons are added by SemVer-minor as the verifier grows; consumers MUST treat an unknown
+/// reason conservatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReasonCode {
+    /// The issuer signature did not verify, or the credential was otherwise tampered with.
+    Tamper,
+    /// The credential is outside its validity window at the relevant time (SD-JWT VC `nbf`/`exp`;
+    /// mdoc MSO `validityInfo`).
+    Expired,
+    /// The credential is revoked per its status mechanism (status list / CRL).
+    Revoked,
+    /// The issuer is not on the configured trust anchor for its role/format (absent, or an
+    /// expired/withdrawn trust-list entry).
+    UntrustedIssuer,
+    /// The revocation/status endpoint (or trust list) was unreachable or stale and the policy is
+    /// fail-closed (never a silent VALID).
+    StatusUnavailable,
+    /// A host-supplied **signed** status-list token failed IN-CORE AUTHENTICATION — a stronger,
+    /// likely-adversarial signal than [`Self::StatusUnavailable`]. Distinct from a benign unreachable
+    /// (no token supplied → [`Self::StatusUnavailable`]): here the host DID supply a Token Status List
+    /// token and the core could not authenticate it — its JWS/`COSE_Sign1` signature did not verify
+    /// under an authorized signer, its `sub` did not bind to the credential's list URI, it was
+    /// expired/stale, or its signer was untrusted / cross-issuer. Also carries a present-but-unusable
+    /// status *reference* (a declared `status_list` whose `idx`/`uri` the core cannot evaluate — it
+    /// named a mechanism that failed to resolve, closer to "untrusted" than "unreachable"). Identically
+    /// fail-closed INVALID (SC-002); this only refines the REASON so a SOC can tell a probable attack on
+    /// the revocation path from a transient outage, never the accept/reject.
+    StatusUntrusted,
+    /// The holder binding did not verify (SD-JWT VC KB-JWT; mdoc DeviceAuth).
+    HolderBinding,
+    /// A disclosed attribute did not match an issuer-signed digest (SD-JWT disclosure digest; mdoc
+    /// `valueDigests`).
+    DisclosureIntegrity,
+    /// The presentation was replayed — it did not echo the issued request's fresh `nonce`.
+    Replay,
+    /// The presentation was addressed to a different audience than the verifier's `client_id`.
+    WrongAudience,
+    /// The credential format is unrecognized or not enabled by the policy (never a guess).
+    UnsupportedFormat,
+    /// The credential or presentation was structurally malformed and could not be parsed.
+    MalformedCredential,
+    /// The request binding was required but the presentation carries no material to bind it. This one
+    /// code intentionally covers **three** distinct "the binding cannot be evaluated" conditions
+    /// (deliberately NOT split into separate codes — the verdict is identically INVALID and an
+    /// integrator's response is the same: the holder must re-present with a request-bound token):
+    ///
+    /// 1. **mdoc under an OpenID4VP request, no addressed audience** — the `Presentation::Mdoc` carried
+    ///    `audience: None`, so there is no `client_id` to bind the response to and the OpenID4VP handover
+    ///    cannot be reconstructed ([`mod@crate::verify`]).
+    /// 2. **mdoc without an OpenID4VP request, no `SessionTranscript`** — a `DeviceSignature` is always
+    ///    computed over a real `SessionTranscript` (ISO/IEC 18013-5 §9.1.5); with neither a request nor a
+    ///    supplied transcript the holder binding cannot be verified, and the verifier MUST NOT fabricate a
+    ///    `[null,null,null]` transcript and "pass" it ([`crate::mdoc`]).
+    /// 3. **SD-JWT VC under an OpenID4VP request, no KB-JWT** — the presentation has no Key Binding JWT, so
+    ///    there is nothing carrying the request `aud`/`nonce` to verify ([`crate::openid4vp`]).
+    ///
+    /// All three are "the binding material is absent" — distinct from [`Self::HolderBinding`] (binding
+    /// material is present but its signature did not verify) and [`Self::Replay`]/[`Self::WrongAudience`]
+    /// (binding present and valid, but bound to the wrong `nonce`/`audience`).
+    MissingRequestBinding,
+    /// The presentation verified cryptographically (signature + trust + binding + disclosure integrity)
+    /// but does **not** satisfy the OpenID4VP 1.0 DCQL Credential Query it was requested under — the
+    /// verifier did **not** get what it asked for. This closes the "did I get what I requested" gap
+    /// (conformance-audit T4.1): a trusted, freshly-bound credential of the **wrong** `vct`/`docType`,
+    /// missing a requested claim, or carrying a claim value outside the query's `values`, is rejected
+    /// rather than waved through as VALID (OpenID4VP 1.0 §"VP Token Validation" step 2.2; §6 DCQL —
+    /// <https://openid.net/specs/openid-4-verifiable-presentations-1_0.html>). It is attributed AFTER
+    /// the always-on crypto/trust bar passes, so it is distinct from [`Self::Tamper`] /
+    /// [`Self::UntrustedIssuer`] / [`Self::HolderBinding`] (those are the credential being unsound) — the
+    /// credential is sound, it is simply not the one the DCQL query requested.
+    QueryNotSatisfied,
+    /// The caller-supplied [`crate::types::IssuerRole`] is inconsistent with the credential's claimed
+    /// type — e.g. a credential whose `vct`/`docType` is a EUDI **PID** type presented under a non-PID
+    /// trust-anchoring role (conformance-audit T4.3: per-role trust anchoring is only as good as the
+    /// role input, so the role is derived from / validated against the credential's claimed type and a
+    /// contradiction is rejected rather than silently anchoring under the wrong per-role list). A type
+    /// with no standardized role mapping keeps the caller-supplied role (no mismatch).
+    RoleMismatch,
+}
+
+/// The verdict of a verification (data-model.md `VerificationResult`).
+///
+/// No **false-accept** (SC-002): any failed always-on check yields `valid = false` with at least one
+/// specific [`ReasonCode`]. `qualified_status` is `Some` only when the opt-in gate ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationResult {
+    /// The always-on bar: signature + trust-list membership + validity + status + holder binding +
+    /// disclosure integrity + (when a request was supplied) request binding all passed.
+    pub valid: bool,
+    /// Only the disclosed subset of attributes; undisclosed attributes are neither revealed nor
+    /// required.
+    pub disclosed_attributes: BTreeMap<String, AttributeValue>,
+    /// The issuer trust status.
+    pub trust_status: TrustStatus,
+    /// The eIDAS qualified status, present only when the opt-in gate ran.
+    pub qualified_status: Option<QualifiedStatus>,
+    /// Whether **request binding** (the OpenID4VP nonce/audience/replay + KB-JWT freshness checks) was
+    /// evaluated — `true` iff a `request` was supplied to [`crate::verify::verify`]. A request-less
+    /// verification (offline / batch / stored re-verification) is a legitimate mode but provides NO
+    /// replay/audience protection, so a `valid = true` with `request_bound = false` means "the credential
+    /// is cryptographically sound + trusted + in-window, but NOT bound to any request". An integrator that
+    /// intended bound verification MUST assert this is `true` — it is the observable signal that a
+    /// silently-omitted `request` (an envelope-construction slip) did not downgrade the check.
+    pub request_bound: bool,
+    /// The machine-readable reasons for the verdict (especially for INVALID — FR-005); empty for a
+    /// clean VALID.
+    pub reasons: Vec<ReasonCode>,
+}
+
+impl VerificationResult {
+    /// Construct an INVALID verdict carrying a single specific reason, with no disclosed attributes
+    /// and an `Untrusted` issuer — the safe default for an early reject (e.g. an unsupported format
+    /// or a malformed credential), before the issuer or its disclosures are even established.
+    #[must_use]
+    pub fn invalid(reason: ReasonCode) -> Self {
+        Self {
+            valid: false,
+            disclosed_attributes: BTreeMap::new(),
+            trust_status: TrustStatus::Untrusted,
+            qualified_status: None,
+            // Request binding is stamped by the OpenID4VP layer when a request runs; an early/bare
+            // INVALID never bound to a request.
+            request_bound: false,
+            reasons: vec![reason],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AttributeValue, Format, ReasonCode, StatusReachability, TrustStatus, VerificationPolicy,
+        VerificationResult,
+    };
+    use std::collections::BTreeMap;
+
+    /// Round-trip a value through the CBOR codec the C-ABI uses, asserting it survives unchanged.
+    fn cbor_roundtrip<T>(value: &T) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf).expect("CBOR encode");
+        ciborium::from_reader(&buf[..]).expect("CBOR decode")
+    }
+
+    #[test]
+    fn verification_policy_default_is_the_secure_baseline() {
+        let policy = VerificationPolicy::default();
+        assert_eq!(policy.formats, vec![Format::SdJwtVc, Format::Mdoc]);
+        assert!(!policy.qualified_gate);
+        assert_eq!(policy.status_reachability, StatusReachability::FailClosed);
+    }
+
+    #[test]
+    fn verification_result_round_trips_through_cbor() {
+        let mut disclosed = BTreeMap::new();
+        disclosed.insert("given_name".to_string(), AttributeValue::Text("Ada".into()));
+        let result = VerificationResult {
+            valid: true,
+            disclosed_attributes: disclosed,
+            trust_status: TrustStatus::Trusted,
+            qualified_status: None,
+            request_bound: true,
+            reasons: Vec::new(),
+        };
+        assert_eq!(cbor_roundtrip(&result), result);
+    }
+
+    #[test]
+    fn reason_codes_round_trip_through_cbor() {
+        for reason in [
+            ReasonCode::Tamper,
+            ReasonCode::Expired,
+            ReasonCode::Revoked,
+            ReasonCode::UntrustedIssuer,
+            ReasonCode::StatusUnavailable,
+            ReasonCode::StatusUntrusted,
+            ReasonCode::HolderBinding,
+            ReasonCode::DisclosureIntegrity,
+            ReasonCode::Replay,
+            ReasonCode::WrongAudience,
+            ReasonCode::UnsupportedFormat,
+            ReasonCode::MalformedCredential,
+            ReasonCode::MissingRequestBinding,
+            ReasonCode::QueryNotSatisfied,
+            ReasonCode::RoleMismatch,
+        ] {
+            assert_eq!(cbor_roundtrip(&reason), reason);
+        }
+    }
+
+    #[test]
+    fn invalid_helper_carries_the_specific_reason_and_no_disclosures() {
+        let result = VerificationResult::invalid(ReasonCode::UnsupportedFormat);
+        assert!(!result.valid);
+        assert_eq!(result.reasons, vec![ReasonCode::UnsupportedFormat]);
+        assert!(result.disclosed_attributes.is_empty());
+        assert_eq!(result.trust_status, TrustStatus::Untrusted);
+        assert!(result.qualified_status.is_none());
+    }
+}

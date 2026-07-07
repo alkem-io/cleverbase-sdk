@@ -25,3 +25,21 @@ def resume_redirect_error(handle: bytes, error: str, state: str, now_unix: int, 
 ```python
 def resume_http(handle: bytes, status: int, body: bytes, now_unix: int, entropy: bytes) -> bytes
 ```
+
+## `attestation_verify`
+
+```python
+def attestation_verify(request: bytes) -> bytes
+```
+
+## `attestation_verify_vp_token`
+
+```python
+def attestation_verify_vp_token(request: bytes) -> bytes
+```
+
+## `attestation_issuance`
+
+```python
+def attestation_issuance(request: bytes) -> bytes
+```

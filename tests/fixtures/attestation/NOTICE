@@ -1,0 +1,66 @@
+Cleverbase SDK — EUDI attestation test fixtures (feature 004)
+=============================================================
+
+ALL key material in this directory is SYNTHETIC and generated solely for tests by `gen.sh`.
+It contains NO real keys, NO real secrets, and is NOT for any production use.
+
+Tier B — self-generated test backbone (this directory, minted by gen.sh)
+------------------------------------------------------------------------
+  ca-iaca.*        self-signed test CA / ISO 18013-5 IACA root (EC P-256)
+  sdjwt-issuer.*   PID SD-JWT VC issuer leaf (JOSE ES256, QcStatement QcType id-etsi-qct-pid), ca-iaca-issued
+  qc-qeaa-issuer.* QEAA SD-JWT VC issuer leaf (QcCompliance + QcType id-etsi-qct-eseal), ca-iaca-issued
+  mdoc-ds.*        mdoc Document Signer leaf (COSE ES256, EKU id-mso-mdl-DS), issued by ca-iaca
+  holder.*         EC P-256 holder key (+ public JWK) for holder binding / KB-JWT / DeviceAuth
+  wrong-issuer.*   self-signed issuer that does NOT chain to ca-iaca (wrong-issuer negative path)
+  expired-ca.*     EXPIRED issuing CA (CA:TRUE, keyCertSign; past validity window) for the chain
+  expired-ca-leaf.*  leaf issued by expired-ca whose OWN window is current (anchor-validity reject path)
+  non-ca.*         NON-CA issuer (CA:FALSE, no keyCertSign) for the "any cert is a CA" reject path
+  non-ca-leaf.*    leaf issued by non-ca (CA-constraint reject path)
+  mt-root.*        independent multi-tier root (CA:TRUE,pathlen:1) anchoring the sub-CA path fixtures
+  mt-intermediate.*  sub-CA issued by mt-root (critical CA:TRUE + keyCertSign) — multi-tier path
+  mt-leaf.*        end-entity issued by mt-intermediate (2-tier happy path: leaf→sub-CA→root)
+  mt-noca-intermediate.*  CA:FALSE "intermediate" issued by mt-root (multi-tier NotACa reject path)
+  mt-noca-leaf.*   leaf issued by the non-CA intermediate
+  mt-expired-intermediate.*  EXPIRED sub-CA issued by mt-root (multi-tier AnchorExpired reject path)
+  mt-expired-leaf.*  leaf (in-window) issued by the expired intermediate
+  attacker-ca.*    self-signed rogue CA that chains to no configured anchor (attacker-intermediate)
+  attacker-leaf.*  leaf issued by attacker-ca (supplied chain terminates at a non-anchor → untrusted)
+  nolen-ca.*       self-signed CA with NO pathLenConstraint (path-length DoS-cap / PathTooLong fixture)
+  nolen-leaf.*     leaf issued by nolen-ca
+  mt-mdoc-ds.*     mt-root-issued mdoc DS leaf WITH the correct mdlDS EKU (1.0.18013.5.1.2) — purpose OK
+  mt-mdoc-ds-serverauth.*  mt-root-issued leaf with a FOREIGN serverAuth EKU (wrong mdoc DS purpose)
+  mt-mdoc-ds-no-eku.*  mt-root-issued leaf with NO EKU (mandatory mdoc DS EKU missing → wrong purpose)
+  mt-mdoc-ds-catrue.*  mt-root-issued DS leaf with cA=TRUE (Table B.3 basicConstraints mc → wrong purpose)
+  mt-mdoc-ds-wrongku.* mt-root-issued DS leaf with keyUsage=keyEncipherment (Table B.3 keyUsage mc → wrong purpose)
+  mt-crit-unknown-leaf.*  mt-root-issued leaf with an unrecognized CRITICAL extension (RFC 5280 §6.1.5(f) reject)
+  nc-intermediate.*  name-constrained sub-CA (permitted dirName C=NL,O=Alkemio Test; excluded …,OU=Forbidden)
+  nc-leaf-in.*     leaf within nc-intermediate's permitted directoryName subtree → trusted
+  nc-leaf-out.*    leaf outside the permitted subtree (C=DE) → rejected (name-constraint violation)
+  nc-leaf-excluded.*  leaf within an EXCLUDED subtree (OU=Forbidden) → rejected (name-constraint violation)
+  xc-key.*         the EC key SHARED by the two cross-certificates below (one committed pk8)
+  xc-intermediate.* cross-cert sub-CA (subject S, key xc-key) issued by mt-root → reaches the anchor
+  xc-deadend.*     cross-cert sub-CA (SAME subject S + key) issued by the rogue attacker-ca → dead-end
+  xc-leaf.*        end-entity issued by the shared sub-CA (both cross-certs validly issue it → backtrack)
+  si-root.*        self-signed root (pathlen:1) for the self-issued key-rollover path fixtures
+  si-rollover.*    SELF-ISSUED key-rollover cert (subject DN == issuer DN, pathlen:1) signed by si-root
+  si-subca.*       the one NON-self-issued sub-CA (issued by si-rollover) — the only pathLen-counted hop
+  si-leaf.*        end-entity issued by si-subca (path validates only when the rollover is NOT counted)
+  trust-list.json  minimal per-role/format test trust anchor for the trust-list engine (T009/T013)
+  qualified-trust-list.json
+                   minimal national Trusted List with EAA/Q services + per-service status history
+                   for the opt-in qualified-status gate (TS 119 615 cl.4.12 — T018/T019)
+
+Tier A — vendored upstream conformance vectors (vectors/, see vectors/README.md)
+--------------------------------------------------------------------------------
+  vectors/sd-jwt-vc/arf-pid-specification.yml
+  vectors/sd-jwt-vc/ietf-examples-settings.yml
+      Source: IETF oauth-wg/oauth-sd-jwt-vc, examples/03-pid + examples/settings.yml.
+      The arf-pid SD-JWT VC conformance example INPUTS (the rendered SD-JWT is reproduced
+      deterministically from these with random_seed:0). IETF Trust Legal Provisions (BCP 78/79);
+      code components under the Simplified BSD License (TLP §4). Upstream commits only the YAML
+      inputs (rendered outputs are .gitignore'd upstream), so these inputs are the vendored form.
+
+  vectors/mdoc/multipaz-TestVectors.kt
+      Source: OpenWallet Foundation `multipaz` (org.multipaz.mdoc.TestVectors), originally
+      The Android Open Source Project. Licensed under the Apache License, Version 2.0.
+      The ISO/IEC 18013-5 Annex-D worked-example mdoc vectors (DeviceResponse, MSO, etc.).

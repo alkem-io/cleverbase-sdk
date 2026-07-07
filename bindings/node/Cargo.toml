@@ -21,6 +21,7 @@ crate-type = ["cdylib"]
 napi = { version = "2", default-features = false, features = ["napi6"] }
 napi-derive = "2"
 cleverbase-core = { path = "../../crates/cleverbase-core" }
+cleverbase-attestation = { path = "../../crates/cleverbase-attestation" }
 
 [build-dependencies]
 napi-build = "2"

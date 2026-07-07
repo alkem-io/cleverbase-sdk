@@ -1,0 +1,71 @@
+[package]
+name = "cleverbase-attestation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/cleverbase-attestation"
+description = "Sans-IO EUDI attestation core for the Cleverbase SDK: SD-JWT VC + ISO 18013-5 mdoc verification, EU trust-list anchoring, and OpenID4VP binding."
+
+[dependencies]
+# NOTE: this crate deliberately does NOT depend on `cleverbase-core`. It once did, solely to reuse
+# the ~20-line redacting `Secret` newtype for the OAuth bearer token — but that dragged the whole
+# signing stack (incl. `lopdf`, a PDF library) into this otherwise pure-Rust / WASM-able / minimal
+# verifier (`cargo tree -i lopdf -p cleverbase-attestation` flagged it), contradicting the `lib.rs`
+# posture. For a trivial leaf type the correct call is a local copy, not a heavy cross-crate
+# dependency, so `Secret` now lives in `src/secret.rs`.
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# X.509 / trust stack reused from the signing core (DRY — one authoritative crypto stack).
+der.workspace = true
+const-oid.workspace = true
+spki.workspace = true
+x509-cert.workspace = true
+# Signature verification reused from the signing core (no hand-rolled crypto — Principle IV). The
+# `ecdsa` / `signature` traits this crate uses are re-exported through `p256` (`p256::ecdsa::*` /
+# `p256::ecdsa::signature::*`), so they are NOT declared as direct dependencies here (every use goes
+# through `p256`) — adding them back would be a dead direct dep flagged by `-W unused-crate-dependencies`.
+rsa.workspace = true
+p256.workspace = true
+base64ct.workspace = true
+# EUDI format/trust-list layers (pinned in [workspace.dependencies]).
+coset.workspace = true
+sd-jwt-payload.workspace = true
+quick-xml.workspace = true
+# Pure-Rust zlib inflate for the in-core Token Status List `lst` bitstring (no C/zlib-sys — WASM-able).
+miniz_oxide.workspace = true
+# Optional, enabled only by the `test-vectors` feature (the shared test-issuer minters): a downstream
+# crate (e.g. `cleverbase-ffi`) enables them as a dev-dependency to drive a VALID end-to-end smoke
+# test through the C-ABI without re-implementing the issuer side (DRY). Otherwise dev-only.
+pkcs8 = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+
+[features]
+# Exposes `crate::test_vectors` (and compiles the shared test-issuer minters outside `cfg(test)`) so a
+# downstream crate can build a conformant VALID request envelope for an end-to-end C-ABI smoke test.
+# Not part of the production verification surface.
+test-vectors = ["dep:pkcs8", "dep:async-trait"]
+
+[dev-dependencies]
+pkcs8.workspace = true
+async-trait.workspace = true
+
+# The cross-check artifact exporter (T030) builds only with the shared test-issuer minters, which
+# live behind `test-vectors`; require that feature so a default `cargo test` neither builds nor runs
+# it (it self-skips on a missing ATT_EXPORT_DIR anyway). The opt-in cross-check workflow runs it with
+# `--features test-vectors`.
+[[test]]
+name = "export_artifacts"
+path = "tests/export_artifacts.rs"
+required-features = ["test-vectors"]
+
+[lints]
+workspace = true

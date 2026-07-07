@@ -14,7 +14,7 @@ CI fails otherwise (see [Staleness check](#staleness-check)).
 
 | Language   | Source                                               | Generator                          | Output             |
 | ---------- | ---------------------------------------------------- | ---------------------------------- | ------------------ |
-| Rust       | `crates/cleverbase-core` + `crates/cleverbase-ffi`   | rustdoc JSON → Markdown (own conv.) | `docs/api/rust/`   |
+| Rust       | `crates/cleverbase-core` + `crates/cleverbase-attestation` + `crates/cleverbase-ffi` | rustdoc JSON → Markdown (own conv.) | `docs/api/rust/`   |
 | Go         | `bindings/go` (the public binding package)           | `gomarkdoc`                        | `docs/api/go.md`   |
 | Python     | `bindings/python/cleverbase.pyi` (the public stub)   | `pydoc-markdown`                   | `docs/api/python.md` |
 | TypeScript | `frontend/helper-ts/src/index.ts` (no-crypto helper) | `typedoc` + `typedoc-plugin-markdown` | `docs/api/ts/`     |
@@ -66,8 +66,8 @@ fails loudly if a toolchain bump changes it. It walks the crate's modules and em
 by kind — modules, structs (fields + inherent methods), enums (variants + inherent methods), traits,
 functions, constants, type aliases — each with its rustdoc comment and a Rust-rendered signature,
 following `pub use` re-exports without duplicating items. The crate-level `//!` overview heads the
-page. Output: `docs/api/rust/cleverbase_core.md` and `cleverbase_ffi.md`, indexed by
-`docs/api/rust/README.md`.
+page. Output: `docs/api/rust/cleverbase_core.md`, `cleverbase_attestation.md`, and `cleverbase_ffi.md`,
+indexed by `docs/api/rust/README.md`.
 
 ### Why the Python generator targets the `.pyi` stub (not the compiled module)
 

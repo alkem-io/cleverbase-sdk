@@ -15,6 +15,9 @@ package cleverbase
 #include <stdint.h>
 #include <stdlib.h>
 int cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
+int cleverbase_attestation_verify(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
+int cleverbase_attestation_verify_vp_token(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
+int cleverbase_attestation_issuance(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 void cleverbase_free(uint8_t* out, size_t out_len);
 */
 import "C"
@@ -35,14 +38,15 @@ const schemaVersion = 1
 // Wire-envelope keys shared across the op requests, factored out so the request shape has a single
 // authoritative spelling (Constitution Principle III).
 const (
-	keyOp      = "op"
-	keyHandle  = "handle"
-	keyInput   = "input"
-	keyCtx     = "ctx"
-	keyKind    = "kind"
-	keyEntropy = "entropy"
-	keyNowUnix = "now_unix"
-	opResume   = "resume"
+	keyOp            = "op"
+	keyHandle        = "handle"
+	keyInput         = "input"
+	keyCtx           = "ctx"
+	keyKind          = "kind"
+	keyEntropy       = "entropy"
+	keyNowUnix       = "now_unix"
+	opResume         = "resume"
+	keySchemaVersion = "schema_version"
 )
 
 // decMode decodes nested CBOR maps as map[string]any (not the default map[any]any), so callers can
@@ -142,28 +146,82 @@ type wireResponse struct {
 	Result        wireResult `cbor:"result"`
 }
 
-// process calls the Rust core with a CBOR request envelope and returns the CBOR response.
-func process(input []byte) ([]byte, error) {
+// callAbi invokes one of the Cleverbase C-ABI CBOR-in / CBOR-out entry points, applying the shared
+// out-ptr/out-len + cleverbase_free discipline, and returns the response bytes. The specific entry
+// point is supplied as a closure so all three (signing, attestation verify, attestation issuance)
+// share one marshaling + free path (Constitution Principle III). A non-nil error means the FFI call
+// itself failed (null arg, contained panic, or an oversized buffer) — protocol/verdict outcomes ride
+// inside the returned CBOR.
+func callAbi(name string, input []byte, call func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int) ([]byte, error) {
 	if len(input) == 0 {
 		return nil, errors.New("empty input")
 	}
 	var outPtr *C.uint8_t
 	var outLen C.size_t
-	//nolint:gocritic // dupSubExpr: cgo expands the C.cleverbase_process call into a macro form gocritic misreads as an identical LHS==RHS comparison.
-	rc := C.cleverbase_process((*C.uint8_t)(unsafe.Pointer(&input[0])), C.size_t(len(input)), &outPtr, &outLen)
+	rc := call((*C.uint8_t)(unsafe.Pointer(&input[0])), C.size_t(len(input)), &outPtr, &outLen)
 	if rc != 0 {
-		return nil, fmt.Errorf("cleverbase_process returned a non-zero status: %d", int(rc))
+		return nil, fmt.Errorf("%s returned a non-zero status: %d", name, int(rc))
 	}
 	defer C.cleverbase_free(outPtr, outLen)
 	// C.GoBytes takes an int length; guard the size_t→int narrowing against overflow.
 	if uint64(outLen) > uint64(math.MaxInt32) {
-		return nil, fmt.Errorf("cleverbase_process output too large: %d bytes", uint64(outLen))
+		return nil, fmt.Errorf("%s output too large: %d bytes", name, uint64(outLen))
 	}
 	return C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen)), nil
 }
 
+// process calls the signing C-ABI entry point with a CBOR request envelope and returns the response.
+func process(input []byte) ([]byte, error) {
+	return callAbi("cleverbase_process", input, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
+		return C.cleverbase_process(in, inLen, out, outLen)
+	})
+}
+
+// AttestationVerify runs the EUDI attestation verifier over a CBOR VerifyRequest envelope
+// (attestation schema version 5) and returns the CBOR VerifyResponse. Unlike the signing surface,
+// the attestation surface is CBOR-in / CBOR-out: the caller builds the VerifyRequest and decodes the
+// VerifyResponse per the documented wire schema (see
+// specs/004-attestation-and-verification/standards-conformance.md). The VALID/INVALID verdict (and any
+// decode error) rides inside the VerifyResponse `outcome`; a non-nil error here means the FFI call
+// itself failed (null/oversized/contained-panic), never a mere INVALID verdict.
+func AttestationVerify(request []byte) ([]byte, error) {
+	return callAbi("cleverbase_attestation_verify", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
+		return C.cleverbase_attestation_verify(in, inLen, out, outLen)
+	})
+}
+
+// AttestationVerifyVpToken runs the EUDI attestation SET-LEVEL OpenID4VP verifier over a CBOR
+// WireVpTokenRequest envelope (attestation schema version 5) and returns the CBOR WireVpTokenResponse.
+// Unlike AttestationVerify (a single presentation), this carries the whole multi-credential vp_token
+// (`{credential_id: [presentations]}`) so the core folds the OpenID4VP set-level DCQL semantics
+// (`credential_sets` required option-sets + `multiple` cardinality) AND authenticates supplied signed
+// Token Status List tokens in-core across the set. Like AttestationVerify it is CBOR-in / CBOR-out: the
+// overall `satisfied` verdict + per-credential results (and any decode error) ride inside the response
+// `outcome`; a non-nil error here means the FFI call itself failed (null/oversized/contained-panic),
+// never a mere unsatisfied verdict.
+//
+// The set-level surface does NOT run the opt-in eIDAS qualified-status gate: a request with
+// policy.qualified_gate = true is rejected with an `err` outcome (verify each presentation via
+// AttestationVerify if the qualified gate is required).
+func AttestationVerifyVpToken(request []byte) ([]byte, error) {
+	return callAbi("cleverbase_attestation_verify_vp_token", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
+		return C.cleverbase_attestation_verify_vp_token(in, inLen, out, outLen)
+	})
+}
+
+// AttestationIssuance drives the EUDI attestation issuance / presentation sans-IO state machine over
+// a CBOR IssuanceRequest envelope (issuance schema version 1) and returns the CBOR IssuanceResponse.
+// Like AttestationVerify it is CBOR-in / CBOR-out (see the wire schema). The holder's private key
+// never crosses this boundary: a `sign` step surfaces a signing input the host signs out-of-process
+// and feeds back via a follow-up op (finish_present / resume_obtain).
+func AttestationIssuance(request []byte) ([]byte, error) {
+	return callAbi("cleverbase_attestation_issuance", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
+		return C.cleverbase_attestation_issuance(in, inLen, out, outLen)
+	})
+}
+
 func dispatch(op map[string]any) (*Session, error) {
-	req := map[string]any{"schema_version": schemaVersion, keyOp: op}
+	req := map[string]any{keySchemaVersion: schemaVersion, keyOp: op}
 	in, err := cbor.Marshal(req)
 	if err != nil {
 		return nil, err
