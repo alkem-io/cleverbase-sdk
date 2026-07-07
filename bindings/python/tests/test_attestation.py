@@ -15,7 +15,9 @@ def test_verify_round_trip_runs_verifier() -> None:
     # full CBOR round-trip) and returns an INVALID verdict rather than an error.
     req = {
         "schema_version": 5,
-        "presentation": {"sd_jwt_vc": {"presentation": "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~"}},
+        "presentation": {
+            "sd_jwt_vc": {"presentation": "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~"}
+        },
         "policy": {"formats": [], "qualified_gate": False, "status_reachability": "fail_closed"},
         "anchors": [],
         "context": {"now_unix": 0, "role": "pid", "statuses": ["no_status"]},
@@ -39,13 +41,17 @@ def test_verify_garbage_yields_err_outcome() -> None:
 
 
 def test_verify_vp_token_round_trip_runs_set_level_verifier() -> None:
-    # A well-formed set-level WireVpTokenRequest with a bogus presentation and no anchors: the set-level
-    # verifier RUNS (proving the round-trip through the new symbol) and returns an UNSATISFIED verdict.
+    # A well-formed set-level WireVpTokenRequest with a bogus presentation and no anchors: the
+    # set-level verifier RUNS (proving the round-trip through the new symbol) and returns an
+    # UNSATISFIED verdict.
     req = {
         "schema_version": 5,
         "request": {
             "dcql": {
-                "query_json": '{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}'
+                "query_json": (
+                    '{"credentials":[{"id":"pid","format":"dc+sd-jwt",'
+                    '"meta":{"vct_values":["urn:eudi:pid:1"]}}]}'
+                )
             },
             "nonce": bytes([7] * 16),
             "audience": "https://verifier.example/cb",

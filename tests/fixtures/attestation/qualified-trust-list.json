@@ -9,7 +9,10 @@
       "serviceTypeIdentifier": "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q",
       "signingCertDerB64": "MIICJjCCAcugAwIBAgIUFZo86p75GxjG95ySWtnXZ7A5dugwCgYIKoZIzj0EAwIwTDEmMCQGA1UEAwwdQ2xldmVyYmFzZSBTREsgVGVzdCBJQUNBIFJvb3QxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwHhcNMjYwNjMwMTE1OTA5WhcNMjcwOTI4MTE1OTA5WjBTMS0wKwYDVQQDDCRDbGV2ZXJiYXNlIFNESyBUZXN0IFNELUpXVCBWQyBJc3N1ZXIxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATCd6w7UOmEd+H8fwGVmzCdguGqt7JzpkOOLePxEMqYbXeMmBLfppI5Cm9vdKzaHywtPTqJaVYyYQW7JpGiETF1o4GDMIGAMAkGA1UdEwQCMAAwDgYDVR0PAQH/BAQDAgeAMCMGCCsGAQUFBwEDBBcwFTATBgYEAI5GAQYwCQYHBACL7E4BATAdBgNVHQ4EFgQUs4zcbO47kP4rrDLHtfPVlcSP6sEwHwYDVR0jBBgwFoAUo2P+OltBQsAURM6t0tjdFJQyqSMwCgYIKoZIzj0EAwIDSQAwRgIhAPNYoF6VJDgrrX05GGjKIC5OucWpF1jNIc+jTf3OPF0MAiEAjA0TuWGVsXXr0sbjf0I4ojHjHb4H2PR0W1R49opZvUc=",
       "statusHistory": [
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2026-07-01T00:00:00Z" }
+        {
+          "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted",
+          "startingTime": "2026-07-01T00:00:00Z"
+        }
       ]
     },
     {
@@ -17,8 +20,14 @@
       "serviceTypeIdentifier": "http://uri.etsi.org/TrstSvc/Svctype/EAA/Q",
       "signingCertDerB64": "MIICGDCCAb+gAwIBAgIUFZo86p75GxjG95ySWtnXZ7A5duowCgYIKoZIzj0EAwIwTDEmMCQGA1UEAwwdQ2xldmVyYmFzZSBTREsgVGVzdCBJQUNBIFJvb3QxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwHhcNMjYwNjMwMTE1OTA5WhcNMjcwOTI4MTE1OTA5WjBXMTEwLwYDVQQDDChDbGV2ZXJiYXNlIFNESyBUZXN0IG1kb2MgRG9jdW1lbnQgU2lnbmVyMRUwEwYDVQQKDAxBbGtlbWlvIFRlc3QxCzAJBgNVBAYTAk5MMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEABLeuh+2KWxah92WWk9wklW5bHMHOWIjJ48avfGyGrMUa90ozqSgiUPvnriIadP9swzEQADjugcovdP+6BxquaN0MHIwCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwFQYDVR0lAQH/BAswCQYHKIGMXQUBAjAdBgNVHQ4EFgQUNiDZoAxYbKnIpQ/JMDrQQ0tZ8fgwHwYDVR0jBBgwFoAUo2P+OltBQsAURM6t0tjdFJQyqSMwCgYIKoZIzj0EAwIDRwAwRAIga6XcmNIH5MWnUW2R1y9yT00+Lq3mwKQ1Jr24+QtwlC0CIFAc+wAUEy0k2YzOXps9D4AkRjQAsaU1bXXgHNwHfztQ",
       "statusHistory": [
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2026-07-01T00:00:00Z" },
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn", "startingTime": "2027-03-01T00:00:00Z" }
+        {
+          "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted",
+          "startingTime": "2026-07-01T00:00:00Z"
+        },
+        {
+          "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn",
+          "startingTime": "2027-03-01T00:00:00Z"
+        }
       ]
     },
     {
@@ -26,7 +35,10 @@
       "serviceTypeIdentifier": "http://uri.etsi.org/TrstSvc/Svctype/EAA",
       "signingCertDerB64": "MIICMTCCAdigAwIBAgIUQVEc1TqS1YO91ZmecZHSKBvvj8swCgYIKoZIzj0EAwIwTDEmMCQGA1UEAwwdQ2xldmVyYmFzZSBTREsgVGVzdCBJQUNBIFJvb3QxFTATBgNVBAoMDEFsa2VtaW8gVGVzdDELMAkGA1UEBhMCTkwwHhcNMjYwNjMwMTE1OTA5WhcNMzYwNjI3MTE1OTA5WjBMMSYwJAYDVQQDDB1DbGV2ZXJiYXNlIFNESyBUZXN0IElBQ0EgUm9vdDEVMBMGA1UECgwMQWxrZW1pbyBUZXN0MQswCQYDVQQGEwJOTDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEIfrmBzxMsJydjMBk4xw99VvJ8JNbG6knhqYWTZ8YIK+y76sZBLUTyeKHodkDXQuiVPX0yvn5DW9eFMx/1qi2ijgZcwgZQwHQYDVR0OBBYEFKNj/jpbQULAFETOrdLY3RSUMqkjMB8GA1UdIwQYMBaAFKNj/jpbQULAFETOrdLY3RSUMqkjMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMC4GA1UdHwQnMCUwI6AhoB+GHWh0dHBzOi8vdGVzdC5pbnZhbGlkL2lhY2EuY3JsMAoGCCqGSM49BAMCA0cAMEQCIGHoO02HX7QVkNntxhnvAtNw/3ZLVi9Uz9JWCUsVJNWvAiB7KncfxZ36INE83dFRCBppFxl7ZNITMsy79071e5sqfg==",
       "statusHistory": [
-        { "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted", "startingTime": "2020-01-01T00:00:00Z" }
+        {
+          "status": "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted",
+          "startingTime": "2020-01-01T00:00:00Z"
+        }
       ]
     }
   ]

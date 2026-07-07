@@ -13,7 +13,10 @@ const { attestationVerify, attestationVerifyVpToken, attestationIssuance } = req
 function assertOneOf(outcome, a, b) {
   const hasA = Object.prototype.hasOwnProperty.call(outcome, a);
   const hasB = Object.prototype.hasOwnProperty.call(outcome, b);
-  assert.ok(hasA !== hasB, `expected exactly one of ${a}/${b}, got ${JSON.stringify(Object.keys(outcome))}`);
+  assert.ok(
+    hasA !== hasB,
+    `expected exactly one of ${a}/${b}, got ${JSON.stringify(Object.keys(outcome))}`,
+  );
 }
 
 test("attestationVerify runs the verifier end-to-end (bogus presentation ⇒ INVALID verdict)", () => {
@@ -48,12 +51,17 @@ test("attestationVerifyVpToken runs the set-level verifier end-to-end (bogus ⇒
   const req = {
     schema_version: 5,
     request: {
-      dcql: { query_json: '{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}' },
+      dcql: {
+        query_json:
+          '{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}',
+      },
       nonce: Buffer.from([7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]),
       audience: "https://verifier.example/cb",
       response_uri: "https://verifier.example/cb/response",
     },
-    vp_token: { pid: [{ sd_jwt_vc: { presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~" } }] },
+    vp_token: {
+      pid: [{ sd_jwt_vc: { presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~" } }],
+    },
     policy: { formats: [], qualified_gate: false, status_reachability: "fail_closed" },
     anchors: [],
     now_unix: 0,
