@@ -23,7 +23,7 @@ takes host-supplied bytes — trust lists, status documents, presentations — a
 evaluates them. This keeps the cores deterministic, auditable, and testable against recorded
 exchanges, and lets every language binding stay thin.
 
-```
+```text
 crates/cleverbase-core         sans-IO signing state machine, CSC/OIDC client, CAdES/PAdES CMS, RFC 3161
 crates/cleverbase-attestation  sans-IO EUDI verify (SD-JWT VC + mdoc), OpenID4VP/DCQL, status, OpenID4VCI issuance
 crates/cleverbase-ffi          stable C ABI (CBOR in / result out) — consumed by Go
