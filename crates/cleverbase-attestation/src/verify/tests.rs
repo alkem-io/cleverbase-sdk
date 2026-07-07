@@ -15,7 +15,7 @@ use crate::sdjwtvc::test_issuer::{
     Sha2Hasher, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW, WRONG_ISSUER_KEY_PK8,
 };
 use crate::status::StatusOutcome;
-use crate::trust::StaticTestAnchors;
+use crate::trust::{ChainValidatingAnchors, StaticTestAnchors};
 use crate::types::{
     Format, IssuerRole, QualifiedStatus, ReasonCode, TrustStatus, VerificationPolicy,
 };
@@ -1228,6 +1228,329 @@ fn sd_jwt_status_token_signed_by_untrusted_key_is_rejected() {
         None,
     );
     assert!(!result.valid);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+}
+
+// --- Same-issuer authorization by KEY (B3): kid-only + rolled-over cert -----------------------------
+//
+// The same-issuer path is keyed on the issuer's PUBLIC KEY, not the token's cert-DER bytes. Two shapes
+// a routine deployment produces — a `kid`-only token (no embedded chain) and a rolled-over issuer cert
+// (a new certificate DER carrying the SAME key at renewal) — were both false-rejected by the previous
+// cert-DER byte-equality (B3). These prove the key-based authorization accepts them (issuer-signed →
+// VALID), while the untrusted-key negative above still rejects (the token must be signed by that key).
+
+/// The rolled-over issuer certificate: a DIFFERENT DER than `sdjwt-issuer.cert.der` but carrying the
+/// SAME P-256 public key (a renewal roll-over). Used to prove same-issuer authorization is by KEY.
+const SDJWT_ISSUER_ROLLOVER_CERT_DER: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/sdjwt-issuer-rollover.cert.der");
+
+/// Mint a `statuslist+jwt` compact-JWS Status List Token signed by `signer_pk8` carrying only a `kid`
+/// header (NO `x5c` chain), `sub` bound to the list URI, fresh `iat`/`exp`, entry 0 per `revoked`.
+fn mint_status_jwt_kid_only(
+    signer_pk8: &[u8],
+    kid: &str,
+    sub: &str,
+    now: i64,
+    revoked: bool,
+) -> Vec<u8> {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+    use pkcs8::DecodePrivateKey as _;
+
+    let sk = SigningKey::from_pkcs8_der(signer_pk8).expect("valid PKCS#8 P-256 key");
+    let header = serde_json::json!({ "alg": "ES256", "typ": "statuslist+jwt", "kid": kid });
+    let payload = serde_json::json!({
+        "sub": sub,
+        "iat": now - 100,
+        "exp": now + 1_000,
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&one_bit_lst(revoked))),
+        },
+    });
+    let h = Base64UrlUnpadded::encode_string(&serde_json::to_vec(&header).unwrap());
+    let p = Base64UrlUnpadded::encode_string(&serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{h}.{p}");
+    let sig: Signature = sk.sign(signing_input.as_bytes());
+    let s = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    format!("{signing_input}.{s}").into_bytes()
+}
+
+#[test]
+fn sd_jwt_status_kid_only_token_from_the_issuer_key_verifies_in_core() {
+    // B3 (kid-only): a status token with NO x5chain (a bare `kid`), signed by the credential's OWN
+    // issuer key. Same-issuer authorization resolves the issuer key from the verified issuer leaf and
+    // authorizes it for a chain-less token — which then verifies iff the issuer's key produced the
+    // signature (the `kid` grants nothing on its own). Entry 0 is VALID → Good → VALID, overriding the
+    // positional Unavailable. BEFORE the fix the empty-x5chain `split_first().ok_or(())?` rejected it
+    // outright → StatusUnavailable → INVALID.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let token =
+        mint_status_jwt_kid_only(ISSUER_KEY_PK8, "issuer-key-1", STATUS_LIST_URI, NOW, false);
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a kid-only issuer-signed status token must verify (same-issuer by KEY): {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn sd_jwt_status_token_from_a_rolled_over_issuer_cert_verifies_in_core() {
+    // B3 (roll-over): the token's x5chain leaf is a DIFFERENT certificate DER than the credential's
+    // issuer leaf but carries the SAME public key (a routine renewal), and the token is signed by the
+    // issuer key. Same-issuer authorization is by KEY, so the leaf-key == issuer-key match authorizes it
+    // → Good → VALID. BEFORE the fix the cert-DER byte-equality missed (different DER) → distinct path →
+    // the exact-pin test anchors authorize no distinct signer → StatusUnavailable → INVALID.
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    // Signed by the ISSUER key, but the x5c leaf is the rolled-over cert (same key, different DER).
+    let token = mint_status_jwt(
+        ISSUER_KEY_PK8,
+        SDJWT_ISSUER_ROLLOVER_CERT_DER,
+        STATUS_LIST_URI,
+        NOW,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a rolled-over-cert (same key, new DER) issuer-signed token must verify: {:?}",
+        result.reasons
+    );
+}
+
+// --- Distinct status-signer authorization (B1 root binding + B2 exact EKU) --------------------------
+//
+// A status signer whose key differs from the issuer's is authorized ONLY if it (a) chains to the
+// credential's issuer's SAME SPECIFIC ROOT and (b) bears EXACTLY the placeholder status-signing EKU.
+// These use a chain-validating source (the exact-pin test anchors authorize no distinct signer) and a
+// 2026 instant inside the sdjwt-issuer + minted-signer validity windows (the shared test `NOW` predates
+// the fixture PKI, which only the validity-skipping `StaticTestAnchors` tolerates).
+
+/// A distinct status signer that chains to `ca-iaca` and bears EXACTLY the placeholder status-signing
+/// EKU (`1.3.6.1.5.5.7.3.0`). (`CA_IACA` — the shared root — is defined at the top of this module.)
+const STATUS_SIGNER_CERT_DER: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer.cert.der");
+const STATUS_SIGNER_KEY_PK8: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer.key.pk8");
+/// A distinct signer that chains to `ca-iaca` but bears the FOREIGN `serverAuth` EKU
+/// (`1.3.6.1.5.5.7.3.1`) — the B2 exact-OID guard must reject it.
+const STATUS_SIGNER_SERVERAUTH_CERT_DER: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer-serverauth.cert.der");
+const STATUS_SIGNER_SERVERAUTH_KEY_PK8: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer-serverauth.key.pk8");
+/// A distinct signer with the placeholder EKU that chains to a DIFFERENT root (`attacker-ca`) — the B1
+/// same-root binding must reject it (no cross-issuer un-revocation).
+const STATUS_SIGNER_OTHERROOT_CERT_DER: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer-otherroot.cert.der");
+const STATUS_SIGNER_OTHERROOT_KEY_PK8: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/status-signer-otherroot.key.pk8");
+/// The DIFFERENT root the other-root signer chains to (a real, CA-constrained root in the anchor set).
+const ATTACKER_CA: &[u8] =
+    include_bytes!("../../../../tests/fixtures/attestation/attacker-ca.cert.der");
+/// A verification/issuance instant inside BOTH the `sdjwt-issuer` window (2026-06-30..2027-09-28) and
+/// the minted status-signer windows: 2026-09-01. Required because a chain-validating source enforces
+/// the leaf validity window (unlike `StaticTestAnchors`), and the shared `NOW` (2025) predates the PKI.
+const STATUS_NOW_2026: i64 = 1_788_220_800;
+
+/// Mint an SD-JWT VC signed by the trusted `sdjwt-issuer` (chains to `ca-iaca`) with a caller-chosen
+/// validity window AND an issuer-signed Token Status List reference, so the distinct-signer tests can
+/// verify it under a chain-validating source at a 2026 instant (the shared `mint_sd_jwt_with_status`
+/// hard-codes the 2025 `NOW` window; the `crate::sdjwtvc` helpers must not be modified for this task).
+fn mint_windowed_status_sd_jwt(nbf: i64, exp: i64, uri: &str) -> sd_jwt_payload::SdJwt {
+    use base64ct::Encoding as _;
+    use sd_jwt_payload::SdJwtBuilder;
+    let cert_b64 = base64ct::Base64::encode_string(ISSUER_CERT_DER);
+    let claims = serde_json::json!({
+        "iss": "https://issuer.example/cb",
+        "vct": "urn:eudi:pid:1",
+        "given_name": "Ada",
+        "family_name": "Lovelace",
+        "nbf": nbf,
+        "exp": exp,
+        "status": { "status_list": { "idx": 0, "uri": uri } },
+    });
+    let signer = Es256Signer::from_pkcs8(ISSUER_KEY_PK8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .expect("builder")
+            .header("x5c", serde_json::json!([cert_b64]))
+            .header("typ", serde_json::json!("dc+sd-jwt"))
+            .make_concealable("/family_name")
+            .expect("concealable")
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
+#[test]
+fn sd_jwt_status_token_from_a_distinct_signer_chaining_to_the_issuer_root_verifies() {
+    // B1 (distinct signer ACCEPT): a token signed by a DISTINCT cert (its own key ≠ the issuer key) that
+    // (i) chains to the SAME ROOT (ca-iaca) as the credential's issuer AND (ii) bears EXACTLY the
+    // placeholder status-signing EKU → authorized → Good → VALID (overriding the positional Unavailable).
+    // BEFORE the fix the same-root check compared the signer leaf against the issuer LEAF (never the
+    // root) in the distinct branch (only reached when they differ) → always false → StatusUnavailable →
+    // INVALID (the distinct-signer feature was 100% inert).
+    let sd_jwt = mint_windowed_status_sd_jwt(
+        STATUS_NOW_2026 - 1_000_000,
+        STATUS_NOW_2026 + 1_000_000,
+        STATUS_LIST_URI,
+    );
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(
+        STATUS_SIGNER_KEY_PK8,
+        STATUS_SIGNER_CERT_DER,
+        STATUS_LIST_URI,
+        STATUS_NOW_2026,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let anchors = ChainValidatingAnchors::new(STATUS_NOW_2026).trust(
+        IssuerRole::Pid,
+        Format::SdJwtVc,
+        CA_IACA,
+    );
+    let ctx = VerifyContext {
+        now_unix: STATUS_NOW_2026,
+        role: IssuerRole::Pid,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a distinct status signer chaining to the issuer's root with the placeholder EKU must verify: {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn sd_jwt_status_token_from_a_distinct_signer_with_a_foreign_eku_is_rejected() {
+    // B2 guard: a distinct signer that chains to the SAME root (ca-iaca) but bears the FOREIGN
+    // `serverAuth` EKU (1.3.6.1.5.5.7.3.1) instead of the placeholder status-signing OID. The exact-OID
+    // EKU gate rejects it → StatusUnavailable. The previous `starts_with("1.3.6.1.5.5.7.3.")` prefix
+    // match (B2) would have ACCEPTED serverAuth once the root binding was fixed — this test proves that
+    // hole is closed (never accepted off a TLS/other-purpose cert under a shared root).
+    let sd_jwt = mint_windowed_status_sd_jwt(
+        STATUS_NOW_2026 - 1_000_000,
+        STATUS_NOW_2026 + 1_000_000,
+        STATUS_LIST_URI,
+    );
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(
+        STATUS_SIGNER_SERVERAUTH_KEY_PK8,
+        STATUS_SIGNER_SERVERAUTH_CERT_DER,
+        STATUS_LIST_URI,
+        STATUS_NOW_2026,
+        false, // even a "valid" bit must not rescue a signer with the wrong purpose
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let anchors = ChainValidatingAnchors::new(STATUS_NOW_2026).trust(
+        IssuerRole::Pid,
+        Format::SdJwtVc,
+        CA_IACA,
+    );
+    let ctx = VerifyContext {
+        now_unix: STATUS_NOW_2026,
+        role: IssuerRole::Pid,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "a distinct signer with a foreign (serverAuth) EKU must be rejected"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+}
+
+#[test]
+fn sd_jwt_status_token_from_a_distinct_signer_chaining_to_a_different_root_is_rejected() {
+    // B1 (root-binding proof): a distinct signer WITH the placeholder EKU that chains to a DIFFERENT
+    // root (attacker-ca) than the credential's issuer (ca-iaca). Both roots are trusted for (Pid,
+    // SdJwtVc), so the signer DOES chain (to attacker-ca) and carries the correct EKU — yet its matched
+    // root ≠ the credential's root, so the same-root binding rejects it → StatusUnavailable. This is the
+    // cross-issuer un-revocation the leaf/root confusion (B1) would have permitted once the branch was
+    // reachable. The credential issuer still resolves to ca-iaca (its own issuing root).
+    let sd_jwt = mint_windowed_status_sd_jwt(
+        STATUS_NOW_2026 - 1_000_000,
+        STATUS_NOW_2026 + 1_000_000,
+        STATUS_LIST_URI,
+    );
+    let presentation = sd_jwt.presentation();
+    let token = mint_status_jwt(
+        STATUS_SIGNER_OTHERROOT_KEY_PK8,
+        STATUS_SIGNER_OTHERROOT_CERT_DER,
+        STATUS_LIST_URI,
+        STATUS_NOW_2026,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    // Trust BOTH roots for (Pid, SdJwtVc): the signer chains (to attacker-ca), but to the WRONG root.
+    let anchors = ChainValidatingAnchors::new(STATUS_NOW_2026)
+        .trust(IssuerRole::Pid, Format::SdJwtVc, CA_IACA)
+        .trust(IssuerRole::Pid, Format::SdJwtVc, ATTACKER_CA);
+    let ctx = VerifyContext {
+        now_unix: STATUS_NOW_2026,
+        role: IssuerRole::Pid,
+        status_tokens: &status_tokens,
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &anchors,
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "a distinct signer chaining to a DIFFERENT root than the issuer must be rejected"
+    );
     assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
 }
 

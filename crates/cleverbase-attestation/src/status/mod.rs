@@ -284,16 +284,21 @@ const MAX_STATUS_LIST_BYTES: usize = 64 * 1024 * 1024;
 /// The X.509 Extended Key Usage `KeyPurposeId` that authorizes a certificate to sign a Token Status
 /// List — `id-kp-oauthStatusSigning` (draft-ietf-oauth-status-list-21 §13).
 ///
-/// **PROVISIONAL — pending IANA.** The draft defines this as `{ id-kp TBD }`: the PKIX `id-kp` arc
-/// (OID `1.3.6.1.5.5.7.3` = `iso(1) identified-organization(3) dod(6) internet(1) security(5)
-/// mechanisms(5) pkix(7) kp(3)`) with a FINAL sub-arc that IANA has **not yet assigned**. The full
-/// dotted OID is therefore `1.3.6.1.5.5.7.3.<TBD>`; this constant records the known arc prefix so the
-/// eventual assignment is a one-line update in a single place (DRY).
+/// **PLACEHOLDER — `id-kp-oauthStatusSigning` is IANA-TBD.** The draft defines this as `{ id-kp TBD }`:
+/// the PKIX `id-kp` arc (OID `1.3.6.1.5.5.7.3` = `iso(1) identified-organization(3) dod(6) internet(1)
+/// security(5) mechanisms(5) pkix(7) kp(3)`) with a FINAL sub-arc that IANA has **not yet assigned**.
+/// The real id-kp sub-arcs start at `.1` (serverAuth=`.1`, clientAuth=`.2`, …), so this placeholder uses
+/// the **`.0`** terminal arc — a syntactically valid OID that matches **NO** real certificate
+/// (fail-closed). It keeps the distinct status-signer authorization path wired + testable via an EXACT
+/// OID match (never a prefix/arc match, which would unsoundly accept serverAuth/clientAuth as
+/// status-signing). Replace this ONE constant with the assigned OID when IANA publishes — a single-line,
+/// single-place update (DRY); the exact-match consumer needs no other change.
 ///
 /// The EKU authorization DECISION is **not** made in this sans-IO module — it lives in `crate::trust`
-/// (layer 2), which consumes this constant to check whether a status-list signer's leaf certificate
-/// bears the status-signing purpose. It is exposed here only so the value has one authoritative home.
-pub const STATUS_SIGNING_EKU_ID_KP_ARC: &str = "1.3.6.1.5.5.7.3";
+/// (layer 2), whose `leaf_has_status_signing_eku` consumes this constant to check
+/// whether a status-list signer's leaf certificate bears EXACTLY the status-signing purpose. It is
+/// exposed here only so the value has one authoritative home.
+pub const STATUS_SIGNING_EKU_OID_PLACEHOLDER: &str = "1.3.6.1.5.5.7.3.0";
 
 /// The signer-identifying material a Status List Token embeds, handed to the caller's key-resolution
 /// closure ([`verify_status_list_token`]'s `resolve_key`) so that `crate::trust` (layer 2) can

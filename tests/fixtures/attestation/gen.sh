@@ -510,6 +510,48 @@ der_and_pk8 si-subca
 issue_under si-leaf "/CN=Cleverbase SDK Test Self-Issued Path Leaf/O=Alkemio Test/C=NL" \
   si-subca "${EE_EXTS}"
 
+# --- In-core Token Status List SIGNER authorization fixtures ---------------------------------------
+# The in-core Token Status List verifier authorizes a status-list signer against the credential's OWN
+# trust context (crate::verify::authorize_status_signer). Two authorization paths:
+#   (1) SAME-ISSUER by KEY: the token is signed by the credential issuer's key — either a kid-only token
+#       (no embedded chain) or a ROLLED-OVER certificate (a new DER carrying the SAME key at renewal).
+#   (2) DISTINCT signer: a different key that (a) chains to the credential issuer's SAME SPECIFIC ROOT
+#       AND (b) bears EXACTLY the placeholder status-signing EKU id-kp-oauthStatusSigning (IANA-TBD).
+# These fixtures exercise both paths + the fail-closed negatives. Pinned to the sdjwt-issuer window
+# (2026-06-30 .. 2027-09-28) so they are valid at the tests' 2026-09-01 verification instant regardless
+# of when gen.sh runs (the same fixed-window approach the expired-* fixtures use).
+#
+#   status-signer            distinct EC P-256 signer, issued by ca-iaca (the credential issuer's root),
+#                            EKU = the PLACEHOLDER id-kp-oauthStatusSigning OID 1.3.6.1.5.5.7.3.0 →
+#                            authorized on the distinct-signer path (same root + exact EKU).
+#   status-signer-serverauth same key-shape + root (ca-iaca) but EKU = serverAuth 1.3.6.1.5.5.7.3.1 →
+#                            REJECTED (the exact-OID EKU gate; a prefix/arc match would have wrongly
+#                            accepted it — the closed B2 hole).
+#   status-signer-otherroot  placeholder EKU but issued by attacker-ca (a DIFFERENT root) → REJECTED
+#                            (the same-root binding; no cross-issuer un-revocation — the closed B1 hole).
+#   sdjwt-issuer-rollover    a SELF-SIGNED cert carrying sdjwt-issuer's SAME public key but a different
+#                            subject/serial (⇒ different DER) → authorized on the same-issuer-by-KEY path
+#                            (key match, not cert-DER byte match — the closed B3 hole). No .pk8 (the token
+#                            is signed with the existing sdjwt-issuer key; this only supplies the SPKI).
+EKU_OAUTH_STATUS="1.3.6.1.5.5.7.3.0" # PLACEHOLDER id-kp-oauthStatusSigning (IANA-TBD; .0 matches no real cert)
+STATUS_NB="20260630000000Z"          # == sdjwt-issuer notBefore (fixed window; valid at 2026-09-01)
+STATUS_NA="20270928000000Z"          # == sdjwt-issuer notAfter
+issue_under status-signer "/CN=Cleverbase SDK Test status-signer/O=Alkemio Test/C=NL" \
+  ca-iaca "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=${EKU_OAUTH_STATUS}\n" \
+  "${STATUS_NB}" "${STATUS_NA}"
+issue_under status-signer-serverauth "/CN=Cleverbase SDK Test status-signer-serverauth/O=Alkemio Test/C=NL" \
+  ca-iaca "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=${EKU_SERVER_AUTH}\n" \
+  "${STATUS_NB}" "${STATUS_NA}"
+issue_under status-signer-otherroot "/CN=Cleverbase SDK Test status-signer-otherroot/O=Alkemio Test/C=NL" \
+  attacker-ca "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=${EKU_OAUTH_STATUS}\n" \
+  "${STATUS_NB}" "${STATUS_NA}"
+# Rolled-over issuer cert: REUSE sdjwt-issuer's key (so the public key matches), self-signed with a
+# different subject ⇒ a different DER. Only the DER is loaded (SPKI); no .pk8 is committed for it.
+openssl req -x509 -new -key sdjwt-issuer.key.pem -sha256 -not_before "${STATUS_NB}" -not_after "${STATUS_NA}" \
+  -subj "/CN=Cleverbase SDK Test SD-JWT VC Issuer (rolled-over)/O=Alkemio Test/C=NL" \
+  -out sdjwt-issuer-rollover.cert.pem
+openssl x509 -in sdjwt-issuer-rollover.cert.pem -outform DER -out sdjwt-issuer-rollover.cert.der
+
 # --- Minimal test trust-list anchor (JSON manifest for T009/T013) ----------------------------------
 # The native EU trust-list engine (T013) fetches/authenticates signed TS 119 612 XML in production;
 # for the OFFLINE suite the configured test anchor (StaticTestAnchors) is seeded from this manifest:

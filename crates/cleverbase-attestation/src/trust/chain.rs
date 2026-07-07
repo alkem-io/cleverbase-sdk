@@ -410,6 +410,14 @@ impl SigAlg {
 /// path length is capped at [`MAX_PATH_LEN`] ([`ChainError::PathTooLong`]) to bound the work an
 /// attacker-supplied chain can demand. Returns the most specific [`ChainError`] when no path validates.
 ///
+/// ## Returns
+///
+/// On success, `Ok(anchor_der)` is the DER of the **trust anchor the path terminated at** — for a
+/// chain-to-root path, the matched configured root; for a direct DER-equal pin, that pinned certificate
+/// (which IS the anchor). Callers that anchor a downstream trust decision to the credential's SAME
+/// specific root (`resolve_chain` storing it as [`crate::trust::TrustListEntry::anchor_cert_der`],
+/// consumed by the in-core status-signer authorization) rely on this being the ROOT, not the leaf.
+///
 /// # Errors
 ///
 /// Returns [`ChainError`] when the supplied chain is empty or a certificate is malformed, the leaf has
@@ -424,7 +432,7 @@ pub fn verify_chain(
     now_unix: i64,
     leaf_validity_time: Option<i64>,
     leaf_purpose: LeafPurpose,
-) -> Result<(), ChainError> {
+) -> Result<Vec<u8>, ChainError> {
     // The leaf is the head of the supplied chain; the tail are candidate path-building intermediates.
     let (leaf_der, intermediates_der) = supplied_chain
         .split_first()
@@ -502,11 +510,19 @@ pub fn verify_chain(
         // critical extensions + RFC 5280 name constraints) over the processed certificates (leaf +
         // intermediates) top-down, with the terminating anchor (the trust-anchor INPUT) prepended so its
         // own name constraints are absorbed but its subject/extensions are not themselves checked.
-        WalkResult::Reached { processed, anchor } => {
+        WalkResult::Reached {
+            processed,
+            anchor,
+            anchor_der,
+        } => {
             let mut path_top_down: Vec<&Certificate> = Vec::with_capacity(processed.len() + 1);
             path_top_down.push(anchor);
             path_top_down.extend(processed.iter().rev());
-            enforce_path_constraints(&path_top_down)
+            enforce_path_constraints(&path_top_down)?;
+            // The path validated: surface the DER of the trust anchor it terminated at (the matched
+            // root, or the pinned cert for a direct pin) so the caller can bind a downstream decision
+            // to the credential's SAME specific root (fixes the leaf/root confusion — see the fn docs).
+            Ok(anchor_der.to_vec())
         }
         WalkResult::DeadEnd => Err(state.last_err),
         WalkResult::TooLong => Err(ChainError::PathTooLong),
@@ -561,10 +577,13 @@ impl WalkState<'_> {
 enum WalkResult<'c> {
     /// A configured anchor was reached on this branch — the path is trusted, pending the per-path
     /// extension checks. `processed` is the leaf-first list of processed certs; `anchor` is the trust
-    /// anchor the path terminated at (a direct pin or an issuing anchor).
+    /// anchor the path terminated at (a direct pin or an issuing anchor), and `anchor_der` is that
+    /// anchor's DER slice (borrowed from the pre-parsed anchor set) so [`verify_chain`] can return the
+    /// matched ROOT to the caller.
     Reached {
         processed: Vec<&'c Certificate>,
         anchor: &'c Certificate,
+        anchor_der: &'c [u8],
     },
     /// This branch dead-ended (no anchor, every candidate issuer exhausted); `last_err` records why.
     DeadEnd,
@@ -619,11 +638,14 @@ fn walk<'c>(
     state: &mut WalkState<'_>,
 ) -> WalkResult<'c> {
     // (a) Direct pin: `current` is byte-equal to a configured anchor → terminate as trusted. `current`
-    // is the trust anchor itself (not a processed path cert), so `processed` is empty.
-    if ctx.anchors.iter().any(|(a, _)| *a == current_der) {
+    // is the trust anchor itself (not a processed path cert), so `processed` is empty. Surface the
+    // matched anchor's own DER slice (lifetime `'c`, from the pre-parsed anchor set) as `anchor_der` —
+    // for a direct pin the pinned cert IS the anchor.
+    if let Some(anchor_entry) = ctx.anchors.iter().find(|(a, _)| *a == current_der) {
         return WalkResult::Reached {
             processed: Vec::new(),
             anchor: current,
+            anchor_der: anchor_entry.0,
         };
     }
 
@@ -647,7 +669,9 @@ fn walk<'c>(
         );
         return WalkResult::DeadEnd;
     };
-    for (_, anchor) in ctx.anchors {
+    for anchor_entry in ctx.anchors {
+        let anchor_der = anchor_entry.0;
+        let anchor = &anchor_entry.1;
         // Global work budget: charge one unit per issued-by ATTEMPT (the signature verify is the
         // dominant cost). Exhausting it means the supplied chain × anchors forced more path-building
         // work than any conformant credential needs → a denial-of-service reject.
@@ -659,6 +683,7 @@ fn walk<'c>(
                 return WalkResult::Reached {
                     processed: vec![current],
                     anchor,
+                    anchor_der,
                 }
             }
             Err(e) => record_more_specific(&mut state.last_err, e),
@@ -732,9 +757,14 @@ fn walk<'c>(
             WalkResult::Reached {
                 mut processed,
                 anchor,
+                anchor_der,
             } => {
                 processed.insert(0, current);
-                return WalkResult::Reached { processed, anchor };
+                return WalkResult::Reached {
+                    processed,
+                    anchor,
+                    anchor_der,
+                };
             }
             WalkResult::TooLong => saw_too_long = true,
             WalkResult::DeadEnd => {}
@@ -968,15 +998,19 @@ fn leaf_has_required_qc_statements(leaf: &Certificate, role: IssuerRole) -> Resu
 /// in-core status verifier ([`crate::status::verify_status_list_token`]) trusts its signature.
 ///
 /// **PROVISIONAL — pending IANA (this is the single update point).** The draft defines the purpose as
-/// `{ id-kp TBD }`: the PKIX `id-kp` arc ([`crate::status::STATUS_SIGNING_EKU_ID_KP_ARC`] =
-/// `1.3.6.1.5.5.7.3`) with a terminal sub-arc IANA has **not yet assigned**. Enforcing the (unknown)
-/// terminal OID would reject every real certificate, so — fail-closed but not vacuous — this requires
-/// the leaf to carry an `extendedKeyUsage` extension listing at least one key purpose UNDER the id-kp
-/// arc (`1.3.6.1.5.5.7.3.*`), NOT merely equal to the arc. When IANA assigns the terminal arc, tighten
-/// this to the exact OID (change ONLY [`crate::status::STATUS_SIGNING_EKU_ID_KP_ARC`] to the full dotted
-/// value and drop the trailing-dot prefix trick below). A leaf with NO `extendedKeyUsage`, an
-/// unparsable/duplicate one, or only foreign (non-id-kp) purposes is rejected (`false`). The EKU is NOT
-/// silently skipped — the provisional nature is explicit and localized.
+/// `{ id-kp TBD }`: the PKIX `id-kp` arc (`1.3.6.1.5.5.7.3`) with a terminal sub-arc IANA has **not yet
+/// assigned**. Enforcing an arbitrary sub-arc under `id-kp` (the previous `starts_with("1.3.6.1.5.5.7.3.")`
+/// prefix match) was **unsound**: it accepted `serverAuth` (`…3.1`), `clientAuth` (`…3.2`), and every
+/// other real id-kp purpose as if it authorized status signing — a latent false-accept (a TLS cert
+/// under a shared root could sign a status token → un-revocation). This now requires the leaf's
+/// `extendedKeyUsage` to assert **EXACTLY** the single documented placeholder OID
+/// [`crate::status::STATUS_SIGNING_EKU_OID_PLACEHOLDER`] (`1.3.6.1.5.5.7.3.0`). id-kp sub-arcs start at
+/// `.1`, so `.0` matches **NO** real certificate (fail-closed), while keeping the distinct-signer path
+/// wired and testable. When IANA publishes `id-kp-oauthStatusSigning`, change ONLY that ONE constant to
+/// the assigned dotted OID — this exact-match check then enforces the real purpose with no further edit.
+/// A leaf with NO `extendedKeyUsage`, an unparsable/duplicate one, or that does not list exactly the
+/// placeholder OID is rejected (`false`). The EKU is NOT silently skipped — the provisional nature is
+/// explicit and localized.
 ///
 /// `pub(crate)` — consumed by the status-signer authorization glue in [`crate::verify`], which pairs it
 /// with a chain-to-anchor check (the structural §6.1 path, via
@@ -986,14 +1020,14 @@ pub(crate) fn leaf_has_status_signing_eku(leaf_der: &[u8]) -> bool {
     let Ok(leaf) = Certificate::from_der(leaf_der) else {
         return false; // a status signer whose cert cannot be parsed is not trusted (fail-closed)
     };
-    // The id-kp arc, with a trailing dot so `starts_with` matches only OIDs strictly UNDER the arc
-    // (`1.3.6.1.5.5.7.3.<n>`), never the bare arc itself nor a sibling arc like `1.3.6.1.5.5.7.30`.
-    let arc_prefix = format!("{}.", crate::status::STATUS_SIGNING_EKU_ID_KP_ARC);
     match leaf.tbs_certificate.get::<ExtendedKeyUsage>() {
+        // EKU present and parsable: it MUST list EXACTLY the status-signing purpose OID — an exact
+        // match against the single placeholder OID, never a prefix/arc match (which would accept
+        // serverAuth/clientAuth/etc. — the B2 false-accept this replaces).
         Ok(Some((_critical, eku))) => eku
             .0
             .iter()
-            .any(|oid| oid.to_string().starts_with(&arc_prefix)),
+            .any(|oid| oid.to_string() == crate::status::STATUS_SIGNING_EKU_OID_PLACEHOLDER),
         // Absent / unparsable (duplicate) EKU ⇒ not a conformant status signer (fail-closed).
         _ => false,
     }

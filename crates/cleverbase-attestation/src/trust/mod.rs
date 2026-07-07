@@ -66,7 +66,12 @@ pub struct TrustListEntry {
     pub role: IssuerRole,
     /// The credential format this anchor covers.
     pub format: Format,
-    /// The DER-encoded issuer/anchor certificate that the credential's signer chained to.
+    /// The DER-encoded **trust anchor** the credential's signer chained to: for a chain-validating
+    /// source ([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) the matched ROOT the path terminated
+    /// at (or, for a direct DER-equal pin, that pinned certificate — which IS the anchor); for the
+    /// exact-pin [`StaticTestAnchors`] the pinned leaf certificate (the pin is the anchor). This is the
+    /// specific root a distinct in-core Token Status List signer must ALSO chain to (see
+    /// the [`mod@crate::verify`] status-signer authorization) — so it MUST be the anchor, not the leaf.
     pub anchor_cert_der: Vec<u8>,
 }
 
@@ -193,9 +198,11 @@ impl TrustDecision {
 /// [`crate::trust::chain::verify_chain`] (name chaining + signature + CA constraints + validity at
 /// every hop, or a direct DER-equal pin). The supplied intermediates are attacker-controlled
 /// path-building material — the path is trusted only if it reaches a configured anchor. An empty/absent
-/// anchor set is untrusted (fail-closed). On success the matched [`TrustListEntry`] carries the **leaf**
-/// as its `anchor_cert_der` (matching the other sources; the entry is informational — the bar reads
-/// only `trusted`).
+/// anchor set is untrusted (fail-closed). On success the matched [`TrustListEntry`] carries the matched
+/// **trust anchor** (the ROOT the path terminated at — or the pinned cert for a direct pin) as its
+/// `anchor_cert_der`, surfaced by [`verify_chain`]'s `Ok` payload. The always-on bar reads only
+/// `trusted`, but the in-core status-signer authorization binds a distinct status signer to THIS exact
+/// root, so it MUST be the anchor, not the leaf.
 ///
 /// On failure the specific [`crate::trust::chain::ChainError`] is folded to a coarse-but-accurate
 /// [`TrustFailure`] on the returned [`TrustDecision`] (NOT widened to the verdict, which stays INVALID):
@@ -252,10 +259,14 @@ fn resolve_chain(
     // is the caller's separate gate). `leaf.validity_time` (Some for the mdoc DS leaf at the MSO `signed`
     // time, None elsewhere) is the seam for ISO §9.3.1.
     match verify_chain(&chain, anchors, now_unix, leaf.validity_time, leaf.purpose) {
-        Ok(()) => TrustDecision::trusted(TrustListEntry {
+        // `verify_chain` returns the DER of the trust anchor the path terminated at (the matched ROOT
+        // for a chain-to-root path; the pinned cert for a direct pin). Store THAT as the entry's
+        // `anchor_cert_der` — NOT the leaf: the in-core status-signer authorization binds a distinct
+        // status signer to the credential's SAME specific root, which only works if this is the root.
+        Ok(anchor_der) => TrustDecision::trusted(TrustListEntry {
             role,
             format,
-            anchor_cert_der: issuer_cert_der.to_vec(),
+            anchor_cert_der: anchor_der,
         }),
         // Map the specific ChainError to the coarse-but-accurate TrustFailure the verifier needs: a
         // cert outside its validity window on the path (the leaf, an intermediate, or the anchor) is an
@@ -541,6 +552,9 @@ impl TrustAnchorSource for StaticTestAnchors {
             TrustDecision::trusted(TrustListEntry {
                 role,
                 format,
+                // Exact-DER pin: the pinned leaf IS the trust anchor here, so storing `issuer_cert_der`
+                // as `anchor_cert_der` is correct (the anchor == the leaf for a direct pin — the same
+                // invariant a chain-validating source records for its own direct-pin termination).
                 anchor_cert_der: issuer_cert_der.to_vec(),
             })
         } else {

@@ -290,6 +290,9 @@ impl XmlTrustList {
             None,
             crate::trust::chain::LeafPurpose::TrustListSigner,
         )
+        // `verify_chain` now returns the matched-anchor DER on success; this authentication only needs
+        // the pass/fail, so discard the payload (behavior unchanged).
+        .map(|_| ())
         .map_err(XmlTrustListError::SignerUntrusted)
     }
 

@@ -563,14 +563,17 @@ pub(crate) fn resolve_status_outcome<A: TrustAnchorSource + ?Sized>(
 /// the anchors/role/format the bar anchored the credential against (for the distinct-signer chain check).
 pub(crate) struct StatusTrust<'a, A: TrustAnchorSource + ?Sized> {
     /// The credential's already signature- and trust-verified issuer leaf (SD-JWT VC `x5c` leaf / mdoc
-    /// DS cert). The same-issuer path resolves the key from this leaf on a byte-equal match.
+    /// DS cert). The same-issuer path resolves the issuer's public KEY from this leaf and authorizes a
+    /// status signer whose key equals it (kid-only, or a rolled-over cert) — a KEY match, not a cert-DER
+    /// byte match.
     pub issuer_leaf_der: &'a [u8],
-    /// The SPECIFIC trust anchor (DER) the credential's issuer chained to (the matched
-    /// [`crate::trust::TrustListEntry::anchor_cert_der`]). A distinct status signer must chain to THIS
-    /// SAME anchor — not merely any anchor in the `(role, format)` set: in a federated set holding
-    /// several issuers' roots, binding only to the set would let a status signer trusted under issuer
-    /// A's root sign a list for issuer B's credential (cross-issuer un-revocation). Empty when the
-    /// issuer's matched entry carried no anchor (then the distinct-signer path cannot match → fail-closed).
+    /// The SPECIFIC trust anchor (DER) the credential's issuer chained to: the matched ROOT the path
+    /// terminated at (or the pinned cert for a direct pin), carried as
+    /// [`crate::trust::TrustListEntry::anchor_cert_der`]. A distinct status signer must chain to THIS
+    /// SAME root — not merely any anchor in the `(role, format)` set: in a federated set holding several
+    /// issuers' roots, binding only to the set would let a status signer trusted under issuer A's root
+    /// sign a list for issuer B's credential (cross-issuer un-revocation). Empty when the issuer's
+    /// matched entry carried no anchor (then the distinct-signer path cannot match → fail-closed).
     pub issuer_anchor_der: &'a [u8],
     /// The trust anchors the credential's issuer chained to — a distinct status signer must chain to the
     /// SAME set for `(role, format)`, AND (see [`Self::issuer_anchor_der`]) to the same specific anchor.
@@ -588,30 +591,43 @@ pub(crate) struct StatusTrust<'a, A: TrustAnchorSource + ?Sized> {
 ///
 /// Two authorization paths (a key is NEVER authorized merely because it is embedded in the token —
 /// self-authorization would defeat the check):
-/// 1. **Same-issuer key reuse (primary path).** If the token's `x5chain` leaf DER byte-equals the
-///    credential's already-verified issuer leaf (`issuer_leaf_der` — the SD-JWT VC `x5c` leaf / the mdoc
-///    DS cert), the issuer signs its own status list: resolve the key straight from that leaf. No EKU /
-///    chain check — it IS the credential's issuer, already signature- and trust-verified by the bar.
-/// 2. **Distinct status-signer.** Otherwise the token's leaf must BOTH (a) chain to the SAME anchor the
-///    credential's issuer chained to — [`TrustAnchorSource::resolve_status_signer`] for the same
-///    `(role, format)`, WITHOUT the credential-leaf purpose — AND (b) bear the status-signing EKU
-///    ([`crate::trust::chain::leaf_has_status_signing_eku`], provisional id-kp arc). Only then is the key
-///    resolved from the (authorized) leaf.
+/// 1. **Same-issuer key reuse (primary path), keyed on the KEY (not the cert DER).** The credential's
+///    issuer public key is resolved ONCE from the already-verified issuer leaf (`issuer_leaf_der`). The
+///    issuer signs its own status list when EITHER: the token carries **no** chain (empty `x5chain` — a
+///    `kid`-only token) — resolved to the issuer key, so the token then verifies iff the issuer's key
+///    produced its signature; OR the token's `x5chain` leaf parses to a public key **equal** to the
+///    issuer key — the SAME key, possibly a ROLLED-OVER certificate (a different DER at renewal). Either
+///    case authorizes the issuer key with no EKU / chain check — it IS the credential's issuer, already
+///    signature- and trust-verified by the bar. This replaces the earlier cert-DER byte-equality, which
+///    false-rejected both a kid-only token and a routine cert roll-over (same key, new DER).
+/// 2. **Distinct status-signer.** Otherwise (the token's leaf key differs from the issuer key) the leaf
+///    must BOTH (a) chain to the credential's issuer's SAME SPECIFIC ROOT —
+///    [`TrustAnchorSource::resolve_status_signer`] for the same `(role, format)`, WITHOUT the
+///    credential-leaf purpose, with the matched-root DER equal to `issuer_anchor_der` — AND (b) bear
+///    EXACTLY the status-signing EKU ([`crate::trust::chain::leaf_has_status_signing_eku`], the
+///    placeholder id-kp OID). Only then is the key resolved from the (authorized) leaf.
 fn authorize_status_signer<A: TrustAnchorSource + ?Sized>(
     material: &crate::status::SignerKeyMaterial,
     trust: &StatusTrust<'_, A>,
 ) -> Result<p256::ecdsa::VerifyingKey, ()> {
-    // A status list token carries its signer chain leaf-first; with no chain there is nothing to
-    // authorize (a bare `kid` is not, by itself, an authorization) → fail-closed.
-    let (leaf, intermediates) = material.x5chain.split_first().ok_or(())?;
+    // Resolve the credential issuer's public key ONCE (the same-issuer paths all authorize THIS key).
+    let issuer_key =
+        crate::crypto::p256_verifying_key_from_cert_der(trust.issuer_leaf_der).ok_or(())?;
 
-    // (1) Same-issuer key reuse: the issuer signs its own status list. Byte-equal leaf ⇒ resolve the
-    // key from the credential's already-verified issuer leaf (no EKU / chain — it IS that issuer).
-    if leaf.as_slice() == trust.issuer_leaf_der {
-        return crate::crypto::p256_verifying_key_from_cert_der(leaf).ok_or(());
+    // (1) Same-issuer key reuse (by KEY, not DER). A token with NO chain (`kid`-only) is authorized to
+    // the issuer key — it then verifies ONLY if the issuer's key produced the signature (a bare `kid`
+    // grants nothing on its own; the signature is the real gate). This handles kid-only tokens the old
+    // `split_first().ok_or(())?` fail-closed rejected outright.
+    let Some((leaf, intermediates)) = material.x5chain.split_first() else {
+        return Ok(issuer_key);
+    };
+    // A leaf whose public key EQUALS the issuer key is the same signer — possibly a rolled-over cert
+    // (different DER, same key). `p256::ecdsa::VerifyingKey: PartialEq` compares the actual key.
+    if crate::crypto::p256_verifying_key_from_cert_der(leaf) == Some(issuer_key) {
+        return Ok(issuer_key);
     }
 
-    // (2) Distinct status-signer: (a) chain to the credential's issuer's SAME SPECIFIC anchor (not just
+    // (2) Distinct status-signer: (a) chain to the credential's issuer's SAME SPECIFIC ROOT (not just
     // any anchor in the (role, format) set — see `issuer_anchor_der`), structural (no credential-leaf
     // purpose), AND (b) bear the status-signing EKU. Either check failing is fail-closed (`Err`), NEVER a
     // fall-through that would authorize an embedded-but-untrusted key.
@@ -619,14 +635,15 @@ fn authorize_status_signer<A: TrustAnchorSource + ?Sized>(
         trust
             .anchors
             .resolve_status_signer(trust.role, trust.format, leaf, intermediates);
-    // Bind to the issuer's OWN anchor: the signer must chain to the exact anchor the credential chained
-    // to. A signer chaining to a DIFFERENT root in the same set (a federated cross-issuer signer) is
+    // Bind to the issuer's OWN ROOT: the signer must chain to the exact anchor the credential chained to.
+    // Both sides are now the matched ROOT (the leaf/root confusion that made this branch dead is fixed).
+    // A signer chaining to a DIFFERENT root in the same set (a federated cross-issuer signer) is
     // rejected. An empty `issuer_anchor_der` (issuer entry carried no anchor) matches nothing → Err.
-    let same_anchor = decision
+    let same_root = decision
         .entry
         .as_ref()
         .is_some_and(|entry| entry.anchor_cert_der == trust.issuer_anchor_der);
-    if !(decision.trusted && same_anchor) {
+    if !(decision.trusted && same_root) {
         return Err(());
     }
     if !crate::trust::chain::leaf_has_status_signing_eku(leaf) {
