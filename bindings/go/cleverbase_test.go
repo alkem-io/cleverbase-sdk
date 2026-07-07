@@ -201,21 +201,46 @@ func TestInvalidDocumentFails(t *testing.T) {
 
 // ---- EUDI attestation surface (CBOR-in / CBOR-out) ----------------------------------------------
 
-// attestationVerifyResponse decodes a VerifyResponse envelope (attestation schema version 5). The
+// The attestation response envelopes are decoded with NAMED types at every level (no inline nested
+// structs) to satisfy revive's nested-structs rule; errOutcome is shared across verify / vp_token /
+// issuance so the `{message}` err payload has one spelling.
+
+// errOutcome is the shared `{message}` payload of a wire Err outcome.
+type errOutcome struct {
+	Message string `cbor:"message"`
+}
+
+type verifyResult struct {
+	Valid bool `cbor:"valid"`
+}
+
+type verifyOk struct {
+	Result verifyResult `cbor:"result"`
+}
+
+type verifyOutcome struct {
+	Ok  *verifyOk   `cbor:"ok"`
+	Err *errOutcome `cbor:"err"`
+}
+
+// attestationVerifyResponse decodes a VerifyResponse envelope (attestation schema version 5): the
 // externally-tagged `outcome` is `{ok:{result:{...}}}` for a completed verification (any verdict) or
 // `{err:{message}}` for a malformed request.
 type attestationVerifyResponse struct {
-	SchemaVersion int `cbor:"schema_version"`
-	Outcome       struct {
-		Ok *struct {
-			Result struct {
-				Valid bool `cbor:"valid"`
-			} `cbor:"result"`
-		} `cbor:"ok"`
-		Err *struct {
-			Message string `cbor:"message"`
-		} `cbor:"err"`
-	} `cbor:"outcome"`
+	SchemaVersion int           `cbor:"schema_version"`
+	Outcome       verifyOutcome `cbor:"outcome"`
+}
+
+// issuanceOutcome/issuanceSkipResponse decode just the Err arm of an issuance response envelope — the
+// skip test only asserts the schema version + a clean (non-Err) outcome. Named types (not an inline
+// nested struct) to satisfy revive's nested-structs rule; reuses the shared errOutcome.
+type issuanceOutcome struct {
+	Err *errOutcome `cbor:"err"`
+}
+
+type issuanceSkipResponse struct {
+	SchemaVersion int             `cbor:"schema_version"`
+	Outcome       issuanceOutcome `cbor:"outcome"`
 }
 
 func TestAttestationVerifyRoundTripReachesTheVerifier(t *testing.T) {
@@ -223,7 +248,7 @@ func TestAttestationVerifyRoundTripReachesTheVerifier(t *testing.T) {
 	// runs and returns an INVALID VerificationResult (Ok outcome) — proving the full FFI round-trip
 	// (marshal in → verifier → marshal out), not merely a malformed-envelope reject.
 	req := map[string]any{
-		"schema_version": 5,
+		keySchemaVersion: 5,
 		"presentation":   map[string]any{"sd_jwt_vc": map[string]any{"presentation": "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~"}},
 		"policy":         map[string]any{"formats": []any{}, "qualified_gate": false, "status_reachability": "fail_closed"},
 		"anchors":        []any{},
@@ -281,21 +306,27 @@ func TestAttestationVerifyMalformedRequestIsErr(t *testing.T) {
 // vpTokenResponse decodes a WireVpTokenResponse envelope (attestation schema version 5). The
 // externally-tagged `outcome` is `{ok:{result:{satisfied, credentials}}}` for a completed set-level
 // evaluation (any verdict) or `{err:{message}}` for a malformed request.
+type credentialResult struct {
+	Satisfied bool `cbor:"satisfied"`
+}
+
+type vpTokenResult struct {
+	Satisfied   bool                        `cbor:"satisfied"`
+	Credentials map[string]credentialResult `cbor:"credentials"`
+}
+
+type vpTokenOk struct {
+	Result vpTokenResult `cbor:"result"`
+}
+
+type vpTokenOutcome struct {
+	Ok  *vpTokenOk  `cbor:"ok"`
+	Err *errOutcome `cbor:"err"`
+}
+
 type vpTokenResponse struct {
-	SchemaVersion int `cbor:"schema_version"`
-	Outcome       struct {
-		Ok *struct {
-			Result struct {
-				Satisfied   bool `cbor:"satisfied"`
-				Credentials map[string]struct {
-					Satisfied bool `cbor:"satisfied"`
-				} `cbor:"credentials"`
-			} `cbor:"result"`
-		} `cbor:"ok"`
-		Err *struct {
-			Message string `cbor:"message"`
-		} `cbor:"err"`
-	} `cbor:"outcome"`
+	SchemaVersion int            `cbor:"schema_version"`
+	Outcome       vpTokenOutcome `cbor:"outcome"`
 }
 
 func TestAttestationVerifyVpTokenRoundTripReachesTheVerifier(t *testing.T) {
@@ -303,7 +334,7 @@ func TestAttestationVerifyVpTokenRoundTripReachesTheVerifier(t *testing.T) {
 	// set-level verifier RUNS (proving the full FFI round-trip through the new symbol) and returns an
 	// UNSATISFIED verdict inside a well-formed ok outcome — not a malformed-envelope reject.
 	req := map[string]any{
-		"schema_version": 5,
+		keySchemaVersion: 5,
 		"request": map[string]any{
 			"dcql":         map[string]any{"query_json": `{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}`},
 			"nonce":        []byte{7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7},
@@ -379,14 +410,7 @@ func TestAttestationIssuanceMalformedRequestIsErr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AttestationIssuance FFI error: %v", err)
 	}
-	var resp struct {
-		SchemaVersion int `cbor:"schema_version"`
-		Outcome       struct {
-			Err *struct {
-				Message string `cbor:"message"`
-			} `cbor:"err"`
-		} `cbor:"outcome"`
-	}
+	var resp issuanceSkipResponse
 	if err := decMode().Unmarshal(out, &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}

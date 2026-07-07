@@ -38,14 +38,15 @@ const schemaVersion = 1
 // Wire-envelope keys shared across the op requests, factored out so the request shape has a single
 // authoritative spelling (Constitution Principle III).
 const (
-	keyOp      = "op"
-	keyHandle  = "handle"
-	keyInput   = "input"
-	keyCtx     = "ctx"
-	keyKind    = "kind"
-	keyEntropy = "entropy"
-	keyNowUnix = "now_unix"
-	opResume   = "resume"
+	keyOp            = "op"
+	keyHandle        = "handle"
+	keyInput         = "input"
+	keyCtx           = "ctx"
+	keyKind          = "kind"
+	keyEntropy       = "entropy"
+	keyNowUnix       = "now_unix"
+	opResume         = "resume"
+	keySchemaVersion = "schema_version"
 )
 
 // decMode decodes nested CBOR maps as map[string]any (not the default map[any]any), so callers can
@@ -220,7 +221,7 @@ func AttestationIssuance(request []byte) ([]byte, error) {
 }
 
 func dispatch(op map[string]any) (*Session, error) {
-	req := map[string]any{"schema_version": schemaVersion, keyOp: op}
+	req := map[string]any{keySchemaVersion: schemaVersion, keyOp: op}
 	in, err := cbor.Marshal(req)
 	if err != nil {
 		return nil, err
