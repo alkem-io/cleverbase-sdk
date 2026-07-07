@@ -965,7 +965,9 @@ fn credential_without_any_issuance_time_fails_closed_to_indeterminate() {
 
 use std::collections::BTreeMap;
 
-use crate::sdjwtvc::test_issuer::{mint_sd_jwt_with_status, WRONG_ISSUER_CERT_DER};
+use crate::sdjwtvc::test_issuer::{
+    mint_sd_jwt_with_malformed_status, mint_sd_jwt_with_status, WRONG_ISSUER_CERT_DER,
+};
 
 /// The credential's Token Status List URI (its `status.status_list.uri` / MSO `status` uri).
 const STATUS_LIST_URI: &str = "https://issuer.example/statuslists/verify-1";
@@ -1195,6 +1197,38 @@ fn sd_jwt_declared_status_with_a_host_pre_resolved_positional_outcome_is_honored
         result.valid,
         "a host-pre-resolved Good positional outcome is honored for a declared list with no token"
     );
+}
+
+#[test]
+fn sd_jwt_malformed_status_list_fails_closed_over_a_positional_good() {
+    // The issuer-signed `status.status_list` object IS present but malformed (a `uri`, no `idx`). A
+    // present-but-uninterpretable status reference MUST NOT fall through to the host-supplied positional
+    // `Good`: the credential declared a revocation mechanism the core cannot evaluate, so it fails closed
+    // to StatusUnavailable (SC-002). Contrast the well-formed-declared + positional-Good case above,
+    // which IS honored — this proves the malformed case is treated distinctly (not as "no status").
+    let sd_jwt =
+        mint_sd_jwt_with_malformed_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, STATUS_LIST_URI);
+    let presentation = sd_jwt.presentation();
+    let empty = BTreeMap::new();
+    let ctx = VerifyContext {
+        now_unix: NOW,
+        status_tokens: &empty,
+        // The host says the credential is current — but a malformed declared reference overrides it.
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::SdJwtVc(&presentation),
+        &VerificationPolicy::default(),
+        &sd_jwt_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "a present-but-malformed status_list must fail closed, not verify VALID off a positional Good"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
 }
 
 #[test]
@@ -1632,6 +1666,83 @@ fn mdoc_status_list_revoked_bit_is_rejected_in_core() {
     );
     assert!(!result.valid);
     assert_eq!(result.reasons, vec![ReasonCode::Revoked]);
+}
+
+#[test]
+fn mdoc_two_documents_referencing_the_same_status_uri_verify_with_a_shared_inflate() {
+    // The "replay one credential twice" shape: two byte-identical valid documents BOTH referencing the
+    // same status-list URI. The per-URI inflate memo authenticates + inflates the shared list ONCE (not
+    // once per document — the DoS-amplification cap), and the identical documents merge cleanly, so the
+    // verdict is unchanged (VALID). Entry 0 is VALID (bit 0) in the same-issuer CWT.
+    let response = MdocBuilder::new()
+        .status_reference(0, STATUS_LIST_URI)
+        .append_duplicate_document()
+        .build();
+    let transcript = default_session_transcript();
+    let token = mint_status_cwt(
+        MDOC_DS_KEY_PK8,
+        mdoc_ds_cert_der(),
+        STATUS_LIST_URI,
+        MDOC_NOW,
+        false,
+    );
+    let status_tokens = tokens(STATUS_LIST_URI, token);
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        status_tokens: &status_tokens,
+        // One positional entry per document; both Unavailable, so the in-core authenticated token (shared
+        // per URI) must override BOTH to Good.
+        statuses: &[StatusOutcome::Unavailable, StatusOutcome::Unavailable],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &mdoc_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        result.valid,
+        "a two-document response referencing one status URI must verify (shared inflate, clean merge): {:?}",
+        result.reasons
+    );
+}
+
+#[test]
+fn mdoc_malformed_status_list_fails_closed_over_a_positional_good() {
+    // The issuer-signed MSO `status.status_list` object IS present but malformed (an `idx`, no `uri`). A
+    // present-but-uninterpretable reference MUST fail closed to StatusUnavailable, never falling through
+    // to the host-supplied positional `Good` (SC-002 — the mdoc mirror of the SD-JWT case).
+    let response = MdocBuilder::new().malformed_status_reference().build();
+    let transcript = default_session_transcript();
+    let ctx = VerifyContext {
+        now_unix: MDOC_NOW,
+        role: IssuerRole::Pid,
+        session_transcript: Some(&transcript),
+        statuses: &[StatusOutcome::Good],
+        ..VerifyContext::default()
+    };
+    let result = verify(
+        &Presentation::Mdoc {
+            device_response: &response,
+            audience: None,
+        },
+        &VerificationPolicy::default(),
+        &mdoc_anchors(),
+        &ctx,
+        None,
+    );
+    assert!(
+        !result.valid,
+        "a present-but-malformed mdoc status_list must fail closed, not verify off a positional Good"
+    );
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
 }
 
 #[test]

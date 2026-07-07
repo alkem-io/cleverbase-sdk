@@ -163,9 +163,88 @@ fn civil_to_unix(
         .checked_add(second)
 }
 
+/// The rounding direction for a **fractional** NumericDate (RFC 7519 §2 / RFC 8392 permit non-integer
+/// NumericDates), chosen per the claim's role so that reducing a sub-second value to a whole-second
+/// clock never falsely rejects a conformant credential/token at the boundary instant.
+///
+/// This is the single authoritative rounding enum (DRY — Principle III): the SD-JWT VC credential
+/// validity path ([`crate::sdjwtvc`]) and the in-core Token Status List freshness path
+/// ([`crate::status`]) both round through [`round_numeric_date_seconds`] with a direction chosen here.
+#[derive(Clone, Copy)]
+pub(crate) enum DateRounding {
+    /// Round toward **+∞** (`ceil`) — the correct direction for a VALIDITY/freshness bound compared
+    /// against a whole-second clock. For integer `now` and a real bound `b`, `now < b ⇔ now < ceil(b)`
+    /// and `now ≥ b ⇔ now ≥ ceil(b)`, so rounding a bound UP reproduces the RFC's true sub-second
+    /// comparison with whole-second arithmetic — a credential/token with `exp = T.5` stays valid through
+    /// second `T` (the false-reject this fixes) while never accepting an instant strictly past the bound.
+    Up,
+    /// Round toward **−∞** (`floor`, toward the past) — the conservative direction for an
+    /// issuance/relevant-time lookup (flooring `iat`/`nbf` never reads a later instant than issuance).
+    Down,
+}
+
+/// Round a **fractional** NumericDate's `f64` seconds to whole `i64` seconds in `rounding`'s direction,
+/// or `None` if it rounds outside `i64` (a non-finite `NaN`/`±∞` is out of range too, so it also yields
+/// `None`). The shared numeric-date rounding core (DRY — Principle III): both the credential-validity
+/// path and the status-token freshness path reduce a spec-permitted fractional NumericDate to the
+/// whole-second clock through this one function.
+pub(crate) fn round_numeric_date_seconds(seconds: f64, rounding: DateRounding) -> Option<i64> {
+    let rounded = match rounding {
+        DateRounding::Up => seconds.ceil(),
+        DateRounding::Down => seconds.floor(),
+    };
+    // 2^63 is exactly representable in f64; bound the saturating f64→i64 cast against overflow without
+    // an `i64::MAX as f64` cast (`cast_precision_loss`) or a 2^63 literal (`lossy_float_literal`). The
+    // accepted range is `[-2^63, 2^63)` = `[i64::MIN, i64::MAX + 1)`; a `NaN` fails the `contains` check.
+    let limit = 2.0_f64.powi(63);
+    if !(-limit..limit).contains(&rounded) {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{civil_to_unix, days_in_month, is_leap_year, parse_rfc3339_utc};
+    use super::{
+        civil_to_unix, days_in_month, is_leap_year, parse_rfc3339_utc, round_numeric_date_seconds,
+        DateRounding,
+    };
+
+    #[test]
+    fn round_numeric_date_seconds_rounds_per_direction_and_bounds_i64() {
+        // A fractional value rounds UP (ceil) or DOWN (floor) per the direction.
+        assert_eq!(
+            round_numeric_date_seconds(200.5, DateRounding::Up),
+            Some(201)
+        );
+        assert_eq!(
+            round_numeric_date_seconds(200.5, DateRounding::Down),
+            Some(200)
+        );
+        // An exact integer is unchanged in either direction.
+        assert_eq!(
+            round_numeric_date_seconds(200.0, DateRounding::Up),
+            Some(200)
+        );
+        assert_eq!(
+            round_numeric_date_seconds(-1.0, DateRounding::Down),
+            Some(-1)
+        );
+        // Out of `i64` range and non-finite values fail closed to `None` (never a wrapped instant).
+        assert_eq!(
+            round_numeric_date_seconds(2f64.powi(63), DateRounding::Up),
+            None
+        );
+        assert_eq!(
+            round_numeric_date_seconds(-2f64.powi(63) - 2048.0, DateRounding::Down),
+            None
+        );
+        assert_eq!(round_numeric_date_seconds(f64::NAN, DateRounding::Up), None);
+        assert_eq!(
+            round_numeric_date_seconds(f64::INFINITY, DateRounding::Up),
+            None
+        );
+    }
 
     #[test]
     fn days_in_month_is_total_over_every_month_and_returns_none_out_of_range() {

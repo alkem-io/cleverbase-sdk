@@ -41,13 +41,14 @@
 
 use std::collections::BTreeMap;
 
-use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
+use base64ct::{Base64UrlUnpadded, Encoding as _};
 use ciborium::value::Value as CborValue;
-use coset::{iana, CoseSign1, Label, RegisteredLabelWithPrivate, TaggedCborSerializable as _};
+use coset::{CoseSign1, Label, TaggedCborSerializable as _};
 use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::datetime::{round_numeric_date_seconds, DateRounding};
 use crate::types::StatusReachability;
 
 /// The default per-document/per-credential status seam: a single [`StatusOutcome::NoStatus`] entry.
@@ -103,6 +104,13 @@ pub enum StatusOutcome {
 pub enum StatusReference {
     /// The credential declares no status mechanism.
     None,
+    /// The credential declares a status mechanism (a `status_list` object IS present) but it is
+    /// **unusable**: an empty/absent `uri`, a non-integer/absent `idx`, or the wrong CBOR/JSON types.
+    /// This is DISTINCT from [`Self::None`] (no status claim at all): a present-but-malformed status
+    /// reference MUST fail closed ([`StatusOutcome::Unavailable`]) — never fall through to a
+    /// host-supplied positional `Good` — because the credential DID declare a revocation mechanism the
+    /// core cannot evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
+    Malformed,
     /// A Token Status List reference: the index of this credential's entry and the list URI the host
     /// fetches.
     StatusList {
@@ -160,6 +168,8 @@ pub trait StatusSource {
 /// fail-closed reachability policy.
 ///
 /// - [`StatusReference::None`] → [`StatusOutcome::NoStatus`].
+/// - [`StatusReference::Malformed`] → [`StatusOutcome::Unavailable`] (a declared-but-uninterpretable
+///   status reference fails closed regardless of reachability — never a silent VALID).
 /// - A reachable status list / CRL → [`StatusOutcome::Revoked`] if the entry is revoked, else
 ///   [`StatusOutcome::Good`].
 /// - An **unreachable** status document → [`StatusOutcome::Unavailable`] under
@@ -175,6 +185,9 @@ pub fn check_status<S: StatusSource + ?Sized>(
 ) -> StatusOutcome {
     match reference {
         StatusReference::None => StatusOutcome::NoStatus,
+        // A present-but-uninterpretable status reference fails closed (never reachability-dependent):
+        // the credential declared a mechanism the core cannot evaluate, so it cannot be proven current.
+        StatusReference::Malformed => StatusOutcome::Unavailable,
         StatusReference::StatusList { index, uri } => source.fetch_status_list(uri).map_or_else(
             || unreachable_outcome(reachability),
             |list| evaluate_status_list(&list, *index),
@@ -246,12 +259,6 @@ const COSE_HEADER_TYP_LABEL: i64 = 16;
 /// mdoc baseline form.
 const COSE_TYP_VALUE: &str = "application/statuslist+cwt";
 
-/// The COSE `x5chain` header label (RFC 9360) — the signer certificate chain hint, leaf-first, as a
-/// single `bstr` or an array of `bstr`. Read as a signer HINT only (handed to the caller's key
-/// resolver); this module performs no trust decision on it. Same label the mdoc `IssuerAuth` verifier
-/// reads (kept local since this module is edited in isolation).
-const COSE_HEADER_X5CHAIN_LABEL: i64 = 33;
-
 // --- CWT claim keys (integer labels). Standard claims are RFC 8392; the status-list claims are ------
 //     PROVISIONAL per draft-ietf-oauth-status-list-21 (marked TBD, pending IANA registration) and are
 //     single-sourced here so an eventual reassignment is a one-line change.
@@ -309,12 +316,14 @@ pub const STATUS_SIGNING_EKU_OID_PLACEHOLDER: &str = "1.3.6.1.5.5.7.3.0";
 pub struct SignerKeyMaterial {
     /// The signer's X.509 certificate chain (DER, **leaf-first**), from the token's `x5c` (JOSE, RFC
     /// 7515 §4.1.6 — base64 *standard*) or `x5chain` (COSE label 33, RFC 9360 — `bstr`/array of
-    /// `bstr`) header. Empty when the token carries no chain (the closure may then resolve by
-    /// [`Self::kid`], or reject).
+    /// `bstr`) header. Empty when the token carries no chain (a `kid`-only token — the closure then
+    /// resolves against the credential's own issuer key, or rejects).
+    ///
+    /// A `kid` header is intentionally NOT surfaced: the reworked signer authorization
+    /// (`authorize_status_signer`) grants nothing off a `kid` — a chain-less token is authorized ONLY
+    /// to the credential's own issuer key (and then only if the signature verifies under it), so the
+    /// raw `kid` bytes carry no authorization weight and are not parsed.
     pub x5chain: Vec<Vec<u8>>,
-    /// The token's key identifier from the `kid` header — the UTF-8 bytes of the JOSE string value, or
-    /// the raw COSE label-4 `bstr`. `None` when absent.
-    pub kid: Option<Vec<u8>>,
 }
 
 /// Authenticate a *signed* Token Status List Token and read this credential's status bit from it,
@@ -350,16 +359,73 @@ pub fn verify_status_list_token<F>(
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
 {
+    // The public entry authenticates + inflates afresh (no shared memo — a single-token caller). The
+    // multi-document mdoc path uses [`verify_status_list_token_cached`] to share the inflate per URI.
+    verify_status_list_token_cached(
+        token,
+        expected_uri,
+        idx,
+        now_unix,
+        resolve_key,
+        &mut StatusListInflateCache::new(),
+    )
+}
+
+/// A per-verify memo of the zlib-inflated Token Status List bytes, keyed by the credential's list URI.
+///
+/// Threaded through a multi-document mdoc verify so the (attacker-multipliable) up-to-
+/// [`MAX_STATUS_LIST_BYTES`] inflate runs ONCE per distinct list URI rather than once per document that
+/// references it: a `DeviceResponse` replaying one credential N times inflates the shared list ONCE,
+/// not N times (a decompression-DoS-amplification cap). The stored `Option` also caches a FAILED inflate
+/// (a cap-exceeding / corrupt `lst` → `None`) so a re-referenced bad list is not re-inflated per document.
+///
+/// **Soundness (no false-accept).** Memoizing by URI is safe because the inflate is a pure function of
+/// the single, host-fetched-by-URI token — trust-context-INDEPENDENT. Every document still independently
+/// runs the signer authorization, the ES256 signature verification, the `sub` binding, and the freshness
+/// check BEFORE this memo is consulted (it is reached only inside [`evaluate_status_claims`], after those
+/// pass), so a document whose token fails to authenticate returns `Unavailable` without ever reaching
+/// (or benefiting from) the cache. Each document then reads its OWN `idx` from the shared decompressed
+/// bytes (the bit read is per-`idx`; only the verify-preceding inflate is shared per URI).
+pub(crate) type StatusListInflateCache = BTreeMap<String, Option<Vec<u8>>>;
+
+/// [`verify_status_list_token`] threading a per-verify [`StatusListInflateCache`] so a status list that
+/// several documents of one `DeviceResponse` reference is zlib-inflated ONCE per URI (see the cache's
+/// soundness note). Identical semantics to the public entry for any single document; only the inflate is
+/// shared. The form detection + all fail-closed checks are unchanged.
+#[must_use]
+pub(crate) fn verify_status_list_token_cached<F>(
+    token: &[u8],
+    expected_uri: &str,
+    idx: u64,
+    now_unix: i64,
+    resolve_key: F,
+    inflate_cache: &mut StatusListInflateCache,
+) -> StatusOutcome
+where
+    F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
+{
     // Form detection: a compact JWS is entirely ASCII (the base64url alphabet + `.`), whereas a tagged
     // `COSE_Sign1` CWT is binary CBOR whose first byte is the tag-18 marker `0xD2` (non-ASCII). So an
     // all-ASCII token takes the JOSE path and everything else the COSE path; a blob that matches
     // neither form's structure fails its path and folds to `Unavailable` below (never re-tried as the
     // other form — a mis-shaped token is simply rejected, fail-closed).
     let outcome = match core::str::from_utf8(token) {
-        Ok(text) if token.is_ascii() => {
-            verify_jwt_status_list(text, expected_uri, idx, now_unix, resolve_key)
-        }
-        _ => verify_cwt_status_list(token, expected_uri, idx, now_unix, resolve_key),
+        Ok(text) if token.is_ascii() => verify_jwt_status_list(
+            text,
+            expected_uri,
+            idx,
+            now_unix,
+            resolve_key,
+            inflate_cache,
+        ),
+        _ => verify_cwt_status_list(
+            token,
+            expected_uri,
+            idx,
+            now_unix,
+            resolve_key,
+            inflate_cache,
+        ),
     };
     // Any hard failure (`None`) OR an unknown status value collapses to the fail-closed outcome; only a
     // fully authenticated token with a known status value yields `Good`/`Revoked`.
@@ -386,18 +452,14 @@ fn verify_jwt_status_list<F>(
     idx: u64,
     now_unix: i64,
     resolve_key: F,
+    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome>
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
 {
-    // Compact JWS framing: EXACTLY three `.`-segments (header.payload.signature).
-    let mut parts = token.split('.');
-    let header_b64 = parts.next()?;
-    let payload_b64 = parts.next()?;
-    let sig_b64 = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
+    // Compact JWS framing: EXACTLY three `.`-segments (header.payload.signature) — the shared framing
+    // check ([`crate::sdjwtvc::split_compact_jws`], DRY — the SD-JWT VC issuer path uses the same).
+    let (header_b64, payload_b64, sig_b64) = crate::sdjwtvc::split_compact_jws(token)?;
 
     // Protected header (base64url → JSON) + the mandated header gates.
     let header: JsonValue = decode_json_b64url(header_b64)?;
@@ -414,17 +476,17 @@ where
     }
 
     // Parse the signer hint, let the caller authorize + resolve the key, THEN verify the signature over
-    // the ASCII `header.payload` signing input (raw `r‖s` ES256 — the crate's shared kernel).
+    // the ASCII `header.payload` signing input (the shared [`crate::sdjwtvc::verify_es256_signing_input`]
+    // — raw `r‖s` ES256, the crate's one JOSE signing-input verify). The header gate + key resolution
+    // still precede the signature exactly as before.
     let material = jose_signer_material(&header)?;
     let key = resolve_key(&material).ok()?;
-    let sig_bytes = Base64UrlUnpadded::decode_vec(sig_b64).ok()?;
-    let signing_input = format!("{header_b64}.{payload_b64}");
-    crate::crypto::p256_verify_es256(&key, signing_input.as_bytes(), &sig_bytes).ok()?;
+    crate::sdjwtvc::verify_es256_signing_input(header_b64, payload_b64, sig_b64, &key).ok()?;
 
     // Only now (authenticated) parse the payload claims + evaluate.
     let payload: JsonValue = decode_json_b64url(payload_b64)?;
     let claims = jose_status_claims(&payload)?;
-    evaluate_status_claims(&claims, expected_uri, idx, now_unix)
+    evaluate_status_claims(&claims, expected_uri, idx, now_unix, inflate_cache)
 }
 
 /// Base64url-unpadded-decode a compact-JWS segment and parse it as JSON.
@@ -434,31 +496,38 @@ fn decode_json_b64url(segment: &str) -> Option<JsonValue> {
 }
 
 /// Parse the JOSE signer hint from a Status List Token header: the `x5c` chain (base64 *standard* DER,
-/// leaf-first — RFC 7515 §4.1.6) and/or the `kid` string. A present-but-malformed `x5c` (not an array,
-/// or an entry that is not base64) → `None` (fail-closed); an absent `x5c` yields an empty chain (the
-/// closure may resolve by `kid`).
+/// leaf-first — RFC 7515 §4.1.6). A present-but-malformed `x5c` (not an array, or an entry that is not
+/// base64) → `None` (fail-closed); an absent `x5c` yields an empty chain (a chain-less token — the
+/// closure resolves against the credential's own issuer key). The per-entry base64-DER decode is the
+/// shared [`crate::sdjwtvc::x5c_entries_from_json_array`] (DRY — the SD-JWT VC issuer path uses the same,
+/// with its own present-and-non-empty-required policy).
 fn jose_signer_material(header: &JsonValue) -> Option<SignerKeyMaterial> {
-    let mut x5chain = Vec::new();
-    if let Some(x5c) = header.get("x5c") {
-        for entry in x5c.as_array()? {
-            x5chain.push(Base64::decode_vec(entry.as_str()?).ok()?);
-        }
-    }
-    let kid = header
-        .get("kid")
-        .and_then(JsonValue::as_str)
-        .map(|s| s.as_bytes().to_vec());
-    Some(SignerKeyMaterial { x5chain, kid })
+    let x5chain = match header.get("x5c") {
+        None => Vec::new(),
+        Some(x5c) => crate::sdjwtvc::x5c_entries_from_json_array(x5c.as_array()?)?,
+    };
+    Some(SignerKeyMaterial { x5chain })
 }
 
 /// Parse the Status List Token JSON payload claims. `sub` and `status_list` are REQUIRED; `iat` is a
-/// REQUIRED integer NumericDate; `exp`/`ttl` are OPTIONAL but, when present, MUST be integers (a
-/// present-but-non-integer bound is malformed → `None`, fail-closed — never silently ignored).
+/// REQUIRED NumericDate; `exp`/`ttl` are OPTIONAL but, when present, MUST be numbers (a present-but-
+/// non-numeric bound is malformed → `None`, fail-closed — never silently ignored). RFC 7519 §2 permits
+/// a FRACTIONAL NumericDate, so `iat`/`exp`/`ttl` accept a JSON number and round it to whole seconds
+/// through the shared [`round_numeric_date_seconds`] core (a conformant `"exp": 1893456000.5` is no
+/// longer false-rejected). All three round **up** ([`DateRounding::Up`]): `exp` keeps the exclusive-
+/// upper `now >= exp` semantics against the whole-second clock, and rounding both `iat` and `ttl` up
+/// keeps the freshness deadline `iat + ttl >= now` from prematurely marking a conformant token stale.
 fn jose_status_claims(payload: &JsonValue) -> Option<StatusListClaims> {
     let sub = payload.get("sub").and_then(JsonValue::as_str)?.to_owned();
-    let iat = payload.get("iat").and_then(JsonValue::as_i64)?;
-    let exp = optional_json_int(payload.get("exp")).ok()?;
-    let ttl = optional_json_int(payload.get("ttl")).ok()?;
+    let iat = json_numeric_seconds(payload.get("iat")?, DateRounding::Up)?;
+    let exp = optional_numeric_date(payload.get("exp"), |v| {
+        json_numeric_seconds(v, DateRounding::Up)
+    })
+    .ok()?;
+    let ttl = optional_numeric_date(payload.get("ttl"), |v| {
+        json_numeric_seconds(v, DateRounding::Up)
+    })
+    .ok()?;
     let status_list = payload.get("status_list")?;
     let bits = status_list
         .get("bits")
@@ -476,12 +545,29 @@ fn jose_status_claims(payload: &JsonValue) -> Option<StatusListClaims> {
     })
 }
 
-/// Read an OPTIONAL integer JSON claim, distinguishing all three states: `Ok(None)` when absent,
-/// `Ok(Some(v))` when a valid integer, `Err(())` when present-but-not-an-integer (malformed → the call
-/// site's `.ok()?` turns that into the fail-closed reject). A `Result` (not `Option<Option>`) so the
-/// "absent vs malformed" distinction is explicit.
-fn optional_json_int(value: Option<&JsonValue>) -> Result<Option<i64>, ()> {
-    value.map_or(Ok(None), |v| v.as_i64().map(Some).ok_or(()))
+/// Read an OPTIONAL numeric claim, distinguishing all three states: `Ok(None)` when absent,
+/// `Ok(Some(v))` when `extract` yields a value, `Err(())` when present-but-`extract`-rejected (malformed
+/// → the call site's `.ok()?` turns that into the fail-closed reject). A `Result` (not `Option<Option>`)
+/// so the "absent vs malformed" distinction is explicit. Generic over the value type so the JOSE
+/// (`JsonValue`, via [`json_numeric_seconds`]) and CWT (`CborValue`, via [`cbor_numeric_seconds`]) paths
+/// share one shape (DRY — Principle III).
+fn optional_numeric_date<T>(
+    value: Option<&T>,
+    extract: impl FnOnce(&T) -> Option<i64>,
+) -> Result<Option<i64>, ()> {
+    value.map_or(Ok(None), |v| extract(v).map(Some).ok_or(()))
+}
+
+/// Reduce a present JSON NumericDate value to whole `i64` seconds (RFC 7519 §2 permits a FRACTIONAL
+/// NumericDate): a canonical integer that fits `i64` is taken verbatim; any other JSON number is
+/// rounded in `rounding`'s direction through the shared [`round_numeric_date_seconds`] core; a
+/// non-number (or one that rounds outside `i64`) → `None` (the caller fails closed).
+fn json_numeric_seconds(value: &JsonValue, rounding: DateRounding) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_f64()
+            .and_then(|s| round_numeric_date_seconds(s, rounding))
+    })
 }
 
 /// Verify a tagged `COSE_Sign1` (CWT) Status List Token. Returns `None` on ANY deviation (the caller
@@ -492,6 +578,7 @@ fn verify_cwt_status_list<F>(
     idx: u64,
     now_unix: i64,
     resolve_key: F,
+    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome>
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
@@ -516,26 +603,23 @@ where
     let payload = sign1.payload.as_ref()?;
     let claims_cbor: CborValue = ciborium::from_reader(payload.as_slice()).ok()?;
     let claims = cwt_status_claims(&claims_cbor)?;
-    evaluate_status_claims(&claims, expected_uri, idx, now_unix)
+    evaluate_status_claims(&claims, expected_uri, idx, now_unix, inflate_cache)
 }
 
 /// Enforce the CWT Status List Token protected-header gates: `alg` MUST be ES256 (COSE −7); `crit` MUST
 /// list nothing beyond `alg` (any other critical header is unprocessed → fatal, RFC 9052 §3.1); and the
 /// `typ` parameter (label 16) MUST be present in the PROTECTED header holding [`COSE_TYP_VALUE`].
+///
+/// The `alg`==ES256 gate and the `crit` enforcement are the crate's shared
+/// [`crate::mdoc::cose_alg_is_es256`] + [`crate::mdoc::reject_unprocessed_crit`] (DRY — the mdoc
+/// `IssuerAuth`/`DeviceSignature` verifiers gate identically); only the status-list-specific `typ`
+/// check is local.
 fn cose_header_ok(sign1: &CoseSign1) -> Option<()> {
-    if !matches!(
-        sign1.protected.header.alg,
-        Some(RegisteredLabelWithPrivate::Assigned(iana::Algorithm::ES256))
-    ) {
+    if !crate::mdoc::cose_alg_is_es256(sign1) {
         return None;
     }
-    let crit_all_understood = sign1.protected.header.crit.iter().all(|label| {
-        matches!(
-            label,
-            RegisteredLabelWithPrivate::Assigned(iana::HeaderParameter::Alg)
-        )
-    });
-    if !crit_all_understood {
+    // RFC 9052 §3.1: any critical header beyond the understood `alg` is fatal (the shared predicate).
+    if !crate::mdoc::cose_crit_all_understood(sign1) {
         return None;
     }
     let typ = sign1
@@ -550,19 +634,22 @@ fn cose_header_ok(sign1: &CoseSign1) -> Option<()> {
     }
 }
 
-/// Parse the COSE signer hint: the `x5chain` (label 33, protected or unprotected) and/or `kid` (label
-/// 4). A present-but-malformed `x5chain` → `None`; an absent one yields an empty chain.
+/// Parse the COSE signer hint: the `x5chain` (label 33, protected or unprotected). A present-but-
+/// malformed `x5chain` → `None`; an absent one yields an empty chain (a chain-less token — the closure
+/// resolves against the credential's own issuer key). No `kid` is surfaced (see [`SignerKeyMaterial`]).
 fn cose_signer_material(sign1: &CoseSign1) -> Option<SignerKeyMaterial> {
     let x5chain = cose_x5chain(sign1)?;
-    let kid = cose_kid(sign1);
-    Some(SignerKeyMaterial { x5chain, kid })
+    Some(SignerKeyMaterial { x5chain })
 }
 
-/// Resolve the `x5chain` (DER, leaf-first) from a `COSE_Sign1` header — a single `bstr`, or an array of
-/// `bstr`. `Some(empty)` when absent, `Some(chain)` when well-formed, `None` when present-but-malformed
-/// (a non-`bstr` entry, or an empty array).
+/// Resolve the `x5chain` (DER, leaf-first) from a `COSE_Sign1` header — a single `bstr`, or a non-empty
+/// array of `bstr`. `Some(empty)` when absent, `Some(chain)` when well-formed, `None` when present-but-
+/// malformed. The `bstr`|array-of-`bstr` parse is the shared [`crate::mdoc::x5chain_entries_from_cbor`]
+/// (DRY — the mdoc DS `x5chain` reader uses the same); this status reader additionally scans BOTH the
+/// protected and unprotected headers and treats absent as an empty chain (the mdoc DS path is
+/// unprotected-only and treats absent as malformed).
 fn cose_x5chain(sign1: &CoseSign1) -> Option<Vec<Vec<u8>>> {
-    let label = Label::Int(COSE_HEADER_X5CHAIN_LABEL);
+    let label = Label::Int(crate::mdoc::COSE_HEADER_X5CHAIN);
     let value = sign1
         .protected
         .header
@@ -570,29 +657,7 @@ fn cose_x5chain(sign1: &CoseSign1) -> Option<Vec<Vec<u8>>> {
         .iter()
         .chain(sign1.unprotected.rest.iter())
         .find_map(|(l, v)| (*l == label).then_some(v));
-    match value {
-        None => Some(Vec::new()),
-        Some(CborValue::Bytes(b)) => Some(vec![b.clone()]),
-        Some(CborValue::Array(certs)) if !certs.is_empty() => {
-            certs.iter().map(|c| c.as_bytes().cloned()).collect()
-        }
-        Some(_) => None,
-    }
-}
-
-/// Resolve the `kid` (label 4) from a `COSE_Sign1` header — protected preferred, then unprotected;
-/// `None` when neither carries one. coset parses label 4 into `Header::key_id` (empty `Vec` if absent).
-fn cose_kid(sign1: &CoseSign1) -> Option<Vec<u8>> {
-    let protected = &sign1.protected.header.key_id;
-    if !protected.is_empty() {
-        return Some(protected.clone());
-    }
-    let unprotected = &sign1.unprotected.key_id;
-    if unprotected.is_empty() {
-        None
-    } else {
-        Some(unprotected.clone())
-    }
+    value.map_or(Some(Vec::new()), crate::mdoc::x5chain_entries_from_cbor)
 }
 
 /// Parse the CWT Claims Set (a CBOR map, optionally `#6.61`-tagged) into [`StatusListClaims`]. `sub`
@@ -606,14 +671,26 @@ fn cwt_status_claims(value: &CborValue) -> Option<StatusListClaims> {
     };
     let map = claims_value.as_map()?;
     let sub = cbor_int_key(map, CWT_CLAIM_SUB)?.as_text()?.to_owned();
-    let iat = cbor_int_key(map, CWT_CLAIM_IAT).and_then(cbor_i64)?;
-    let exp = optional_cbor_int(cbor_int_key(map, CWT_CLAIM_EXP)).ok()?;
-    let ttl = optional_cbor_int(cbor_int_key(map, CWT_CLAIM_TTL)).ok()?;
+    // `iat`/`exp`/`ttl` accept a FRACTIONAL NumericDate (RFC 8392) — a CBOR float — and round to whole
+    // seconds through the shared core, all UP ([`DateRounding::Up`]) for the same reason as the JOSE
+    // path (exclusive-upper `exp`; a non-prematurely-stale `iat + ttl` freshness deadline).
+    let iat = cbor_numeric_seconds(cbor_int_key(map, CWT_CLAIM_IAT)?, DateRounding::Up)?;
+    let exp = optional_numeric_date(cbor_int_key(map, CWT_CLAIM_EXP), |v| {
+        cbor_numeric_seconds(v, DateRounding::Up)
+    })
+    .ok()?;
+    let ttl = optional_numeric_date(cbor_int_key(map, CWT_CLAIM_TTL), |v| {
+        cbor_numeric_seconds(v, DateRounding::Up)
+    })
+    .ok()?;
     let status_list = cbor_int_key(map, CWT_CLAIM_STATUS_LIST)?;
-    let bits = cbor_text_key(status_list, "bits")
+    // The `status_list` sub-map uses TEXT keys — read via the shared [`crate::mdoc::get_map_entry`] (3a).
+    let bits = crate::mdoc::get_map_entry(status_list, "bits")
         .and_then(cbor_u64)
         .and_then(validate_bits)?;
-    let lst = cbor_text_key(status_list, "lst")?.as_bytes()?.clone();
+    let lst = crate::mdoc::get_map_entry(status_list, "lst")?
+        .as_bytes()?
+        .clone();
     Some(StatusListClaims {
         sub,
         iat,
@@ -624,15 +701,21 @@ fn cwt_status_claims(value: &CborValue) -> Option<StatusListClaims> {
     })
 }
 
-/// Read an OPTIONAL integer CWT claim, distinguishing all three states: `Ok(None)` when absent,
-/// `Ok(Some(v))` when a valid integer, `Err(())` when present-but-not-an-integer (malformed → the call
-/// site's `.ok()?` turns that into the fail-closed reject). A `Result` (not `Option<Option>`) so the
-/// "absent vs malformed" distinction is explicit.
-fn optional_cbor_int(value: Option<&CborValue>) -> Result<Option<i64>, ()> {
-    value.map_or(Ok(None), |v| cbor_i64(v).map(Some).ok_or(()))
+/// Reduce a present CBOR NumericDate value to whole `i64` seconds (RFC 8392 permits a FRACTIONAL
+/// NumericDate): a CBOR integer that fits `i64` is taken verbatim; a CBOR float is rounded in
+/// `rounding`'s direction through the shared [`round_numeric_date_seconds`] core; any other CBOR type
+/// (or a value that rounds outside `i64`) → `None` (the caller fails closed).
+fn cbor_numeric_seconds(value: &CborValue, rounding: DateRounding) -> Option<i64> {
+    match value {
+        // The integer→`i64` read is the crate's shared [`crate::mdoc::integer_label`] (DRY).
+        CborValue::Integer(_) => crate::mdoc::integer_label(value),
+        CborValue::Float(f) => round_numeric_date_seconds(*f, rounding),
+        _ => None,
+    }
 }
 
-/// Find an INTEGER-keyed entry in a CBOR association-list map.
+/// Find an INTEGER-keyed entry in a CBOR association-list map (the CWT claim keys are integers — RFC
+/// 8392; distinct from the text-keyed [`crate::mdoc::get_map_entry`] used for the `status_list` sub-map).
 fn cbor_int_key(map: &[(CborValue, CborValue)], label: i128) -> Option<&CborValue> {
     map.iter().find_map(|(k, v)| match k {
         CborValue::Integer(i) if i128::from(*i) == label => Some(v),
@@ -640,23 +723,10 @@ fn cbor_int_key(map: &[(CborValue, CborValue)], label: i128) -> Option<&CborValu
     })
 }
 
-/// Find a TEXT-keyed entry in a CBOR map value (the `status_list` sub-map uses text keys).
-fn cbor_text_key<'a>(value: &'a CborValue, key: &str) -> Option<&'a CborValue> {
-    value.as_map()?.iter().find_map(|(k, v)| match k {
-        CborValue::Text(t) if t == key => Some(v),
-        _ => None,
-    })
-}
-
-/// A CBOR integer value as `i64`, or `None` if it is not an integer / out of `i64` range.
-fn cbor_i64(value: &CborValue) -> Option<i64> {
-    match value {
-        CborValue::Integer(i) => i64::try_from(i128::from(*i)).ok(),
-        _ => None,
-    }
-}
-
-/// A CBOR integer value as `u64`, or `None` if it is not an integer / out of `u64` range.
+/// A CBOR integer value as `u64`, or `None` if it is not an integer / out of `u64` range. (The `i64`
+/// counterpart is the shared [`crate::mdoc::integer_label`]; a `u64` reader is kept local because
+/// `integer_label` is `i64`-typed and a status `idx`/`bits` is an unsigned CBOR uint whose full `u64`
+/// range must be preserved — narrowing it to `i64` would reclassify a huge-but-valid `idx`.)
 fn cbor_u64(value: &CborValue) -> Option<u64> {
     match value {
         CborValue::Integer(i) => u64::try_from(i128::from(*i)).ok(),
@@ -673,6 +743,7 @@ fn evaluate_status_claims(
     expected_uri: &str,
     idx: u64,
     now_unix: i64,
+    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome> {
     // D.2 — bind THIS signed list to THIS credential: `sub` MUST byte-exactly equal the credential's
     // `status_list.uri`. A validly-signed list for a different URI is rejected (defeats a swap attack).
@@ -681,11 +752,30 @@ fn evaluate_status_claims(
     }
     // D.3 — temporal validity of the token itself.
     check_status_token_time(claims.iat, claims.exp, claims.ttl, now_unix)?;
-    // B — inflate the zlib bitstring, then read the `bits`-wide LSB-first entry at `idx`.
-    let bytes = decompress_status_list(&claims.lst)?;
-    let value = extract_status_value(&bytes, idx, claims.bits)?;
+    // B — inflate the zlib bitstring (memoized per URI within this verify — see the cache's soundness
+    // note; the sub-binding + freshness above are re-checked per document, so the memo is only consulted
+    // for a token THIS document already authenticated), then read the `bits`-wide LSB-first entry at `idx`.
+    let bytes = decompress_status_list_memoized(expected_uri, &claims.lst, inflate_cache)?;
+    let value = extract_status_value(bytes, idx, claims.bits)?;
     // C — status registry → canonical outcome.
     Some(status_value_to_outcome(value))
+}
+
+/// Return the zlib-inflated status-list bytes for `uri`, inflating (through
+/// [`decompress_status_list`]) at most ONCE per URI within a single verify and caching the result — a
+/// success (`Some(bytes)`) or a fail-closed failure (`None`, e.g. cap-exceeding/corrupt `lst`) — in
+/// `inflate_cache`. The compressed `lst` is invariant for a given URI (the host supplies ONE token per
+/// URI), so the memo is keyed by URI alone. See [`StatusListInflateCache`] for why this preserves exact
+/// per-document semantics (each document re-runs signature/`sub`/freshness before reaching here).
+fn decompress_status_list_memoized<'a>(
+    uri: &str,
+    compressed: &[u8],
+    inflate_cache: &'a mut StatusListInflateCache,
+) -> Option<&'a [u8]> {
+    inflate_cache
+        .entry(uri.to_owned())
+        .or_insert_with(|| decompress_status_list(compressed))
+        .as_deref()
 }
 
 /// Enforce the Status List Token's own temporal validity (draft-ietf-oauth-status-list-21 §5): a present
@@ -761,9 +851,12 @@ fn validate_bits(n: u64) -> Option<u8> {
 /// Parse the Token Status List reference an **SD-JWT VC** declares, from its already-parsed `status`
 /// claim value (draft-ietf-oauth-status-list-21 §8): `status → status_list → { idx, uri }`. Note the
 /// wire key is **`idx`** (not `index`); it maps onto [`StatusReference::StatusList`]'s `index` field.
-/// Returns [`StatusReference::None`] when no usable `status_list` reference is present (absent, or a
-/// missing/ill-typed `idx`/`uri`); the caller applies its own (fail-closed) policy to an absent
-/// reference. This is a pure parser — it reaches into no other module (layer 2 threads the claim in).
+/// Returns [`StatusReference::None`] when NO `status_list` object is present at all (genuinely no Token
+/// Status List mechanism — the caller applies its own policy to the absent reference), but
+/// [`StatusReference::Malformed`] when a `status_list` object IS present yet unusable (empty/absent
+/// `uri`, absent/non-integer `idx`, or wrong types): a declared-but-uninterpretable reference MUST fail
+/// closed, never fall through to a positional `Good`. This is a pure parser — it reaches into no other
+/// module (layer 2 threads the claim in).
 #[must_use]
 pub fn status_reference_from_sd_jwt_claim(status_claim: &serde_json::Value) -> StatusReference {
     let Some(status_list) = status_claim.get("status_list") else {
@@ -777,30 +870,36 @@ pub fn status_reference_from_sd_jwt_claim(status_claim: &serde_json::Value) -> S
             index,
             uri: uri.to_owned(),
         },
-        _ => StatusReference::None,
+        // A `status_list` object IS present but its `idx`/`uri` are absent/ill-typed/empty — a declared
+        // status mechanism the core cannot evaluate → fail closed (never a positional `Good` fall-through).
+        _ => StatusReference::Malformed,
     }
 }
 
 /// Parse the Token Status List reference an **mdoc** declares, from the already-parsed MSO `status`
 /// element (draft-ietf-oauth-status-list-21 §8): a CBOR map `status_list → { idx (uint), uri (tstr) }`
 /// with TEXT keys. As with the SD-JWT VC form the wire key is **`idx`**; it maps onto
-/// [`StatusReference::StatusList`]'s `index`. Returns [`StatusReference::None`] when no usable
-/// `status_list` reference is present. Pure parser — reaches into no other module (layer 2 threads the
-/// element in).
+/// [`StatusReference::StatusList`]'s `index`. Returns [`StatusReference::None`] when NO `status_list`
+/// element is present at all, but [`StatusReference::Malformed`] when a `status_list` element IS present
+/// yet unusable (empty/absent `uri`, absent/non-integer `idx`, or wrong types): a declared-but-
+/// uninterpretable reference MUST fail closed, never fall through to a positional `Good`. Pure parser —
+/// reaches into no other module (layer 2 threads the element in).
 #[must_use]
 pub fn status_reference_from_mdoc_status(status_cbor: &ciborium::value::Value) -> StatusReference {
-    let Some(status_list) = cbor_text_key(status_cbor, "status_list") else {
+    // The MSO `status` element uses TEXT keys — read via the shared [`crate::mdoc::get_map_entry`] (3a).
+    let Some(status_list) = crate::mdoc::get_map_entry(status_cbor, "status_list") else {
         return StatusReference::None;
     };
     match (
-        cbor_text_key(status_list, "idx").and_then(cbor_u64),
-        cbor_text_key(status_list, "uri").and_then(CborValue::as_text),
+        crate::mdoc::get_map_entry(status_list, "idx").and_then(cbor_u64),
+        crate::mdoc::get_map_entry(status_list, "uri").and_then(CborValue::as_text),
     ) {
         (Some(index), Some(uri)) if !uri.is_empty() => StatusReference::StatusList {
             index,
             uri: uri.to_owned(),
         },
-        _ => StatusReference::None,
+        // A `status_list` element IS present but its `idx`/`uri` are absent/ill-typed/empty → fail closed.
+        _ => StatusReference::Malformed,
     }
 }
 

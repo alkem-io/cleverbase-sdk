@@ -201,6 +201,15 @@ pub(crate) struct MdocBuilder {
     /// The reference is inside the issuer-signed MSO, so the bar reads it authentically; the verifier
     /// then authenticates the host-supplied signed token for `uri` in-core and reads the bit at `idx`.
     status_reference: Option<(u64, String)>,
+    /// When set, add an MSO `status` element whose `status_list` object IS present but MALFORMED (only
+    /// an `idx`, no `uri`) — the present-but-unusable status reference the bar MUST fail closed on
+    /// (`StatusUnavailable`), never falling through to a host-supplied positional `Good`.
+    malformed_status_reference: bool,
+    /// When set, append a SECOND document that is a byte-identical CLONE of the first (the "replay one
+    /// credential twice" shape). Combined with [`Self::status_reference`], BOTH documents reference the
+    /// same status-list URI — the per-URI inflate-memoization probe (the shared list is authenticated +
+    /// inflated ONCE, and the identical documents merge cleanly to an unchanged VALID verdict).
+    duplicate_first_document: bool,
 }
 
 /// A forged `IssuerSignedItem` to splice into the on-wire `nameSpaces` array (the false-accept probe):
@@ -356,6 +365,8 @@ impl MdocBuilder {
             append_forged_item: None,
             qeaa_category: false,
             status_reference: None,
+            malformed_status_reference: false,
+            duplicate_first_document: false,
         }
     }
 
@@ -364,6 +375,23 @@ impl MdocBuilder {
     /// verifier reads it authentically and then authenticates the host-supplied signed token for `uri`.
     pub(crate) fn status_reference(mut self, idx: u64, uri: &str) -> Self {
         self.status_reference = Some((idx, uri.to_owned()));
+        self
+    }
+
+    /// Add an MSO `status` element whose `status_list` object IS present but MALFORMED (only `idx`, no
+    /// `uri`) — the present-but-unusable reference the always-on bar MUST fail closed on
+    /// (`StatusUnavailable`), never falling through to a host-supplied positional `Good`.
+    pub(crate) fn malformed_status_reference(mut self) -> Self {
+        self.malformed_status_reference = true;
+        self
+    }
+
+    /// Append a SECOND document that is a byte-identical CLONE of the first (the "replay one credential
+    /// twice" shape). With [`Self::status_reference`] set, BOTH documents reference the same status-list
+    /// URI — the per-URI inflate-memoization probe. The identical documents merge cleanly, so the verdict
+    /// is unchanged (VALID).
+    pub(crate) fn append_duplicate_document(mut self) -> Self {
+        self.duplicate_first_document = true;
         self
     }
 
@@ -965,6 +993,17 @@ impl MdocBuilder {
                 ]),
             )]);
             append_map_entry(mso, "status", status)
+        } else if self.malformed_status_reference {
+            // A `status_list` object that IS present but unusable (an `idx`, no `uri`) — the
+            // present-but-malformed reference the bar must fail closed on.
+            let status = CborValue::Map(vec![(
+                CborValue::Text("status_list".to_owned()),
+                CborValue::Map(vec![(
+                    CborValue::Text("idx".to_owned()),
+                    CborValue::Integer(0u64.into()),
+                )]),
+            )]);
+            append_map_entry(mso, "status", status)
         } else {
             mso
         };
@@ -1162,6 +1201,11 @@ impl MdocBuilder {
         } else {
             vec![document.clone()]
         };
+        if self.duplicate_first_document {
+            // A byte-identical clone (both documents reference the same status-list URI when
+            // `status_reference` is set) — the per-URI inflate-memoization probe.
+            documents.push(document.clone());
+        }
         if self.append_forged_document {
             documents.push(forge_document_with_broken_issuer_auth(&document));
         }

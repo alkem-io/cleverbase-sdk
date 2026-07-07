@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 use serde_json::Value;
 
+use crate::datetime::{round_numeric_date_seconds, DateRounding};
 use crate::trust::TrustAnchorSource;
 use crate::types::{
     AttributeValue, IssuerRole, ReasonCode, TrustStatus, Validity, VerificationResult,
@@ -359,6 +360,8 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             role: effective_role,
             format: crate::types::Format::SdJwtVc,
         },
+        // A single credential — a throwaway inflate memo (there is no second document to share with).
+        &mut crate::status::StatusListInflateCache::new(),
     );
     match status_outcome {
         StatusInput::NoStatus | StatusInput::Good => {}
@@ -493,17 +496,26 @@ fn require_issuer_typ(header: &Value) -> Result<(), ReasonCode> {
 /// the signing certificate; any further entries are the intermediate sub-CAs the leaf chains through.
 /// An absent or empty `x5c`, or an entry that is not base64 DER, is a malformed credential.
 fn issuer_chain_from_header(header: &Value) -> Result<Vec<Vec<u8>>, ReasonCode> {
+    // The issuer JWS REQUIRES a present, non-empty `x5c` (absent/empty → malformed); the per-entry
+    // base64-DER decode is the shared [`x5c_entries_from_json_array`] (DRY — the in-core status-token
+    // JOSE verifier reuses it, but with its own "absent → empty chain" policy).
     let entries = header
         .get("x5c")
         .and_then(Value::as_array)
         .filter(|chain| !chain.is_empty())
         .ok_or(ReasonCode::MalformedCredential)?;
+    x5c_entries_from_json_array(entries).ok_or(ReasonCode::MalformedCredential)
+}
+
+/// Decode the entries of a JWS `x5c` JSON array (RFC 7515 §4.1.6) into a DER certificate chain
+/// (leaf-first): each entry MUST be a base64-**standard** (not url) string. `None` if any entry is not
+/// a base64 string (a malformed chain); an empty input array yields an empty chain. The **presence**
+/// and non-empty policy of `x5c` are the caller's (the issuer JWS requires it; the status verifier
+/// tolerates its absence) — this shared inner helper only decodes an array that IS present.
+pub(crate) fn x5c_entries_from_json_array(entries: &[Value]) -> Option<Vec<Vec<u8>>> {
     entries
         .iter()
-        .map(|entry| {
-            let b64 = entry.as_str().ok_or(ReasonCode::MalformedCredential)?;
-            base64ct::Base64::decode_vec(b64).map_err(|_| ReasonCode::MalformedCredential)
-        })
+        .map(|entry| base64ct::Base64::decode_vec(entry.as_str()?).ok())
         .collect()
 }
 
@@ -638,29 +650,6 @@ fn is_collision_resistant_name(name: &str) -> bool {
     name.contains('.') && name.split('.').all(label_ok)
 }
 
-/// The rounding direction for a **fractional** NumericDate, chosen per the claim's role so that
-/// reducing a sub-second value to the whole-second `now` clock never falsely rejects a conformant
-/// credential at the boundary instant (RFC 7519 §2 permits non-integer NumericDates; `now` here is
-/// whole Unix seconds).
-#[derive(Clone, Copy)]
-enum DateRounding {
-    /// Round toward **+∞** (`ceil`) — the correct direction for a VALIDITY bound (`nbf`/`exp`) compared
-    /// against a whole-second `now`. For integer `now` and a real bound `b`, the spec comparisons
-    /// `now < exp` (RFC 7519 §4.1.4) and `now < nbf` → not-yet-valid (the negation of §4.1.5's
-    /// `now ≥ nbf`) are each *exactly equivalent* to the same comparison against `ceil(b)`: `now < b`
-    /// ⇔ `now < ceil(b)` and `now ≥ b` ⇔ `now ≥ ceil(b)` for integer `now`. So rounding **both** bounds
-    /// up reproduces the RFC's true sub-second window with whole-second arithmetic — a credential with
-    /// `exp = T.5` stays valid through second `T` (the false-reject this fixes) and `nbf = T.5` is
-    /// not-yet-valid at second `T`, while never accepting an instant strictly past the real bound. (The
-    /// `exp` upper bound stays EXCLUSIVE — `now >= exp` rejects — matching §4.1.4; see [`check_validity`]
-    /// for the documented mdoc divergence.)
-    Up,
-    /// Round toward **−∞** (`floor`, toward the past) — the conservative direction for the
-    /// issuance/relevant-time lookup ([`issuance_time_unix`]): the qualified-status gate reads the
-    /// issuer's status *at* issuance, so flooring `iat`/`nbf` never reads a later instant.
-    Down,
-}
-
 /// Read an optional JWT `NumericDate` claim (`nbf`/`exp`/`iat`), distinguishing **absent** from
 /// **present-but-malformed**, and accepting the spec's fractional form.
 ///
@@ -668,13 +657,17 @@ enum DateRounding {
 /// - A JSON number → `Ok(Some(seconds))`: RFC 7519 §2 defines NumericDate as a JSON numeric value and
 ///   states "Non-integer values can be represented", so a FRACTIONAL value (e.g. `200.5`) is valid; it
 ///   is rounded to whole seconds in the `rounding` direction the caller selects per the claim's role
-///   (see [`DateRounding`]). An integer that already fits `i64` is taken verbatim (its `ceil`/`floor`
-///   are equal, so the direction is irrelevant for it).
+///   (see [`crate::datetime::DateRounding`]). An integer that already fits `i64` is taken verbatim (its
+///   `ceil`/`floor` are equal, so the direction is irrelevant for it).
 /// - A claim that is **present** but is not a JSON number (a string, `null`, a boolean, an object/
 ///   array), is non-finite, or rounds outside `i64` → `Err(MalformedCredential)`: the bound is
 ///   uninterpretable and MUST NOT be skipped (skipping is a false-accept — an expired credential with a
 ///   non-canonical `exp` would read as having unbounded validity). We reject anything we cannot
 ///   evaluate against `now` rather than ignore it.
+///
+/// The fractional-seconds rounding + `i64` range bound is the shared
+/// [`crate::datetime::round_numeric_date_seconds`] core (DRY — the in-core status-token freshness path
+/// reduces its own fractional NumericDates through the same function).
 fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<i64>, ReasonCode> {
     let Some(value) = claim else { return Ok(None) };
     // A canonical integer NumericDate that already fits `i64` is taken verbatim.
@@ -682,21 +675,12 @@ fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<
         return Ok(Some(int));
     }
     // RFC 7519 §2: "Non-integer values can be represented." Accept any JSON number and round it to
-    // whole seconds in the role-appropriate direction; reject a non-number, or one that rounds outside
-    // `i64` (a non-finite value is not in range either, so the range check below also rejects NaN/±∞).
+    // whole seconds in the role-appropriate direction through the shared core; reject a non-number, or
+    // one that rounds outside `i64` (a non-finite value is out of range too, so it also rejects NaN/±∞).
     let seconds = value.as_f64().ok_or(ReasonCode::MalformedCredential)?;
-    let rounded = match rounding {
-        DateRounding::Up => seconds.ceil(),
-        DateRounding::Down => seconds.floor(),
-    };
-    // 2^63 is exactly representable in f64; bound the saturating f64→i64 cast against overflow without
-    // an `i64::MAX as f64` cast (`cast_precision_loss`) or a 2^63 literal (`lossy_float_literal`). The
-    // accepted range is `[-2^63, 2^63)` = `[i64::MIN, i64::MAX + 1)`.
-    let limit = 2.0_f64.powi(63);
-    if !(-limit..limit).contains(&rounded) {
-        return Err(ReasonCode::MalformedCredential);
-    }
-    Ok(Some(rounded as i64))
+    round_numeric_date_seconds(seconds, rounding)
+        .map(Some)
+        .ok_or(ReasonCode::MalformedCredential)
 }
 
 /// Verify the holder Key-Binding JWT (RFC 9901 §4.3), distinguishing what is checked **always** from
@@ -828,21 +812,43 @@ fn verifying_key_from_p256_jwk(jwk: &Value) -> Result<p256::ecdsa::VerifyingKey,
     crate::crypto::p256_verifying_key_from_jwk(jwk).ok_or(ReasonCode::HolderBinding)
 }
 
-/// Verify a compact `header.payload.signature` ES256 JWS under `key`. Returns `Err(())` on any
-/// framing/decoding/signature failure (the caller maps this to the relevant [`ReasonCode`]).
-fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<(), ()> {
+/// Split a compact JWS into its EXACTLY-three base64url segments `(header, payload, signature)`, or
+/// `None` if it does not have exactly three `.`-separated segments. The single authoritative compact-JWS
+/// framing check (DRY — Principle III): both [`verify_compact_es256`] and the in-core status-token JOSE
+/// verifier ([`crate::status`]) frame a compact JWS through this.
+pub(crate) fn split_compact_jws(jws: &str) -> Option<(&str, &str, &str)> {
     let mut parts = jws.split('.');
-    let header_b64 = parts.next().ok_or(())?;
-    let payload_b64 = parts.next().ok_or(())?;
-    let sig_b64 = parts.next().ok_or(())?;
+    let header_b64 = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let sig_b64 = parts.next()?;
     if parts.next().is_some() {
-        return Err(());
+        return None;
     }
+    Some((header_b64, payload_b64, sig_b64))
+}
+
+/// Verify an ES256 signature over the compact-JWS signing input `header_b64.payload_b64` (the exact
+/// ASCII bytes), with `sig_b64` the base64url signature and `key` the verifying key. `Err(())` on a
+/// non-base64url signature or a failed verification. The shared signing-input construction + raw-`r‖s`
+/// ES256 verify both the SD-JWT VC and the in-core status-token JOSE paths use (DRY — Principle III).
+pub(crate) fn verify_es256_signing_input(
+    header_b64: &str,
+    payload_b64: &str,
+    sig_b64: &str,
+    key: &p256::ecdsa::VerifyingKey,
+) -> Result<(), ()> {
     let sig_bytes = Base64UrlUnpadded::decode_vec(sig_b64).map_err(|_| ())?;
     let signing_input = format!("{header_b64}.{payload_b64}");
     // The raw-`r‖s`-only ES256 parse + verify is the shared [`crate::crypto::p256_verify_es256`]
     // kernel (DRY — Principle III; the same body the mdoc COSE_Sign1 verifiers use).
     crate::crypto::p256_verify_es256(key, signing_input.as_bytes(), &sig_bytes)
+}
+
+/// Verify a compact `header.payload.signature` ES256 JWS under `key`. Returns `Err(())` on any
+/// framing/decoding/signature failure (the caller maps this to the relevant [`ReasonCode`]).
+fn verify_compact_es256(jws: &str, key: &p256::ecdsa::VerifyingKey) -> Result<(), ()> {
+    let (header_b64, payload_b64, sig_b64) = split_compact_jws(jws).ok_or(())?;
+    verify_es256_signing_input(header_b64, payload_b64, sig_b64, key)
 }
 
 /// The signature of a top-level claim walk shared by [`reconstruct_claim_set`]: given the issuer-signed

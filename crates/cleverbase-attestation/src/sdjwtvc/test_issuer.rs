@@ -143,7 +143,7 @@ pub(crate) const DEFAULT_VCT: &str = "https://credentials.example/identity_crede
 
 /// Mint an SD-JWT VC with caller-supplied `nbf`/`exp` JSON values — used to exercise
 /// [`super::check_validity`] / [`super::numeric_date`] across the spectrum: a canonical integer, a
-/// spec-valid FRACTIONAL number (RFC 7519 §2; a validity bound rounds up — see `super::DateRounding`),
+/// spec-valid FRACTIONAL number (RFC 7519 §2; a validity bound rounds up — see `crate::datetime::DateRounding`),
 /// and a *non-canonical* bound (a JSON string or an out-of-`i64`-range integer) that must reject. A
 /// `null` value omits the claim (the absent case).
 /// The bound is signed by the real issuer key, so the credential clears the signature/trust checks and
@@ -247,6 +247,41 @@ pub(crate) fn mint_sd_jwt_with_status(
         "exp": NOW + 1_000_000,
         // The Token Status List pointer — issuer-signed, in the clear (§8: `status.status_list`).
         "status": { "status_list": { "idx": idx, "uri": uri } },
+    });
+    let signer = Es256Signer::from_pkcs8(issuer_pk8);
+    block_on(
+        SdJwtBuilder::new_with_hasher(claims, Sha2Hasher)
+            .unwrap()
+            .header("x5c", json!([cert_b64]))
+            .header("typ", json!("dc+sd-jwt"))
+            .make_concealable("/family_name")
+            .unwrap()
+            .require_key_binding(holder_cnf())
+            .finish(&signer, "ES256"),
+    )
+    .expect("issuer signing succeeds")
+}
+
+/// Mint an SD-JWT VC whose issuer-signed clear `status` claim carries a `status_list` object that IS
+/// present but MALFORMED (only a `uri`, no `idx`) — the present-but-unusable reference the always-on
+/// bar MUST fail closed on (`StatusUnavailable`), never falling through to a host-supplied positional
+/// `Good`. Everything else (trusted issuer signature + window + `cnf` binding) is sound, so it reaches
+/// the status step where the malformed reference is caught.
+pub(crate) fn mint_sd_jwt_with_malformed_status(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    uri: &str,
+) -> SdJwt {
+    let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
+    let claims = json!({
+        "iss": "https://issuer.example/cb",
+        "vct": DEFAULT_VCT,
+        "given_name": "Ada",
+        "family_name": "Lovelace",
+        "nbf": NOW - 1_000,
+        "exp": NOW + 1_000_000,
+        // A `status_list` object IS present but has no `idx` — a declared-but-uninterpretable reference.
+        "status": { "status_list": { "uri": uri } },
     });
     let signer = Es256Signer::from_pkcs8(issuer_pk8);
     block_on(

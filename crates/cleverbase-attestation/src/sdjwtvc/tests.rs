@@ -323,7 +323,7 @@ fn fractional_bounds_round_up_so_a_sub_second_window_is_honored_exactly() {
     // FALSE-REJECT FIX (#2): a fractional NumericDate must reflect the issuer's true sub-second window
     // when compared against the whole-second `now` clock, never clip it a second early. Rounding BOTH
     // bounds UP reproduces RFC 7519 §4.1.4 (`now < exp`) and §4.1.5 (`now >= nbf`) exactly for integer
-    // `now` — see `super::DateRounding::Up`. (`check_validity` reports a not-yet-valid `nbf` failure with
+    // `now` — see `crate::datetime::DateRounding::Up`. (`check_validity` reports a not-yet-valid `nbf` failure with
     // the same `Expired` reason as an `exp` failure.)
     use super::check_validity;
     use sd_jwt_payload::SdJwtClaims;

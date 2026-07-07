@@ -519,6 +519,9 @@ where
 ///   positional one (the core no longer trusts a host-supplied *outcome* for a token it can check).
 /// - **`StatusList` with NO supplied token, or `Crl`, or `None`** — the positional `positional` outcome
 ///   (host pre-resolved via [`crate::status::check_status`]) is used, exactly as before.
+/// - **`Malformed`** (a `status_list` object IS declared but its `idx`/`uri` are unusable) →
+///   [`StatusOutcome::Unavailable`], fail-closed: the credential declared a revocation mechanism the
+///   core cannot evaluate, so it never falls through to a positional `Good`.
 ///
 /// Fail-closed: a supplied-but-unverifiable token yields [`StatusOutcome::Unavailable`]
 /// ([`crate::status::verify_status_list_token`] never returns `Good` on any doubt), which the bars map to
@@ -530,6 +533,7 @@ pub(crate) fn resolve_status_outcome<A: TrustAnchorSource + ?Sized>(
     status_tokens: &std::collections::BTreeMap<String, Vec<u8>>,
     now_unix: i64,
     trust: &StatusTrust<'_, A>,
+    inflate_cache: &mut crate::status::StatusListInflateCache,
 ) -> StatusOutcome {
     use crate::status::StatusReference;
     match reference {
@@ -544,13 +548,27 @@ pub(crate) fn resolve_status_outcome<A: TrustAnchorSource + ?Sized>(
                 StatusOutcome::NoStatus => StatusOutcome::Unavailable,
                 resolved => resolved,
             },
-            // A signed token supplied for THIS list is authenticated in-core (authoritative).
+            // A signed token supplied for THIS list is authenticated in-core (authoritative). The
+            // per-URI `inflate_cache` shares only the trust-context-independent zlib inflate across a
+            // multi-document response's documents; the authorization + signature + `sub` + freshness are
+            // re-checked per document (see [`crate::status::StatusListInflateCache`]).
             |token| {
-                crate::status::verify_status_list_token(token, uri, *index, now_unix, |material| {
-                    authorize_status_signer(material, trust)
-                })
+                crate::status::verify_status_list_token_cached(
+                    token,
+                    uri,
+                    *index,
+                    now_unix,
+                    |material| authorize_status_signer(material, trust),
+                    inflate_cache,
+                )
             },
         ),
+        // A present-but-malformed status reference (a `status_list` object IS declared but its
+        // `idx`/`uri` are unusable) fails closed: the credential declared a revocation mechanism the
+        // core cannot evaluate, so it MUST NOT fall through to a host-supplied positional `Good`
+        // (a well-formed-but-untokened declared list already fails closed via the `NoStatus` arm above;
+        // a malformed one must too — SC-002).
+        StatusReference::Malformed => StatusOutcome::Unavailable,
         // CRL is host-resolved; `None` → the host's NoStatus. Positional either way (unchanged).
         StatusReference::Crl { .. } | StatusReference::None => positional,
     }

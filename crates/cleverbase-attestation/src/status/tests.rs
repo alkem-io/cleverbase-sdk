@@ -55,6 +55,30 @@ fn no_status_reference_is_no_status() {
 }
 
 #[test]
+fn malformed_status_reference_fails_closed_regardless_of_reachability() {
+    // A present-but-uninterpretable status reference is NEVER a silent VALID: it fails closed to
+    // `Unavailable` under BOTH reachability policies (the credential declared a mechanism the core
+    // cannot evaluate). This is what stops a malformed `status_list` falling through to a host `Good`.
+    let source = TestStatusSource::default();
+    assert_eq!(
+        check_status(
+            &StatusReference::Malformed,
+            &source,
+            StatusReachability::FailClosed
+        ),
+        StatusOutcome::Unavailable
+    );
+    assert_eq!(
+        check_status(
+            &StatusReference::Malformed,
+            &source,
+            StatusReachability::BestEffort
+        ),
+        StatusOutcome::Unavailable
+    );
+}
+
+#[test]
 fn current_entry_in_a_reachable_status_list_is_good() {
     // Entry 2 holds 0 (valid).
     let source = TestStatusSource::default().with_status_list(URI, vec![1, 0, 0, 1]);
@@ -576,6 +600,117 @@ fn jwt_stale_ttl_is_unavailable() {
     assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
 }
 
+// --- (5b) Fractional NumericDate `exp`/`iat`/`ttl` verify (RFC 7519 §2 / RFC 8392) ---------------
+
+#[test]
+fn jwt_fractional_exp_and_iat_verify_not_false_rejected() {
+    // RFC 7519 §2 permits a FRACTIONAL NumericDate. A conformant token whose `iat`/`exp` carry a
+    // sub-second fraction must NOT be false-rejected (it was, when the parser demanded an integer):
+    // `iat`/`exp`/`ttl` now round through the shared numeric-date core.
+    // Exact-in-f64 literals tied to `NOW` (1_700_000_000): iat = NOW-100+0.5, exp = NOW+1000+0.5.
+    let payload = json!({
+        "sub": LIST_URI,
+        "iat": 1_699_999_900.5f64, // NOW - 100 + 0.5 (fractional iat)
+        "exp": 1_700_001_000.5f64, // NOW + 1000 + 0.5 (fractional exp, well after `now`)
+        "ttl": 3_600.5f64,         // fractional ttl (deadline iat+ttl is well after `now`)
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&[0b0000_0000])),
+        },
+    });
+    let token = sign_jws(&signer(), &jwt_header(), &payload);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Good);
+}
+
+#[test]
+fn cwt_fractional_exp_and_iat_verify_not_false_rejected() {
+    // The CWT mirror: `iat`/`exp` as CBOR floats (RFC 8392 fractional NumericDate) must verify.
+    let status_list = CborValue::Map(vec![
+        (
+            CborValue::Text("bits".to_owned()),
+            CborValue::Integer(1.into()),
+        ),
+        (
+            CborValue::Text("lst".to_owned()),
+            CborValue::Bytes(zlib(&[0b0000_0000])),
+        ),
+    ]);
+    let claims = CborValue::Map(vec![
+        (cbor_int(2), CborValue::Text(LIST_URI.to_owned())),
+        (cbor_int(6), CborValue::Float(1_699_999_900.5)), // NOW - 100 + 0.5 (fractional iat)
+        (cbor_int(4), CborValue::Float(1_700_001_000.5)), // NOW + 1000 + 0.5 (fractional exp)
+        (cbor_int(65_533), status_list),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::into_writer(&claims, &mut buf).unwrap();
+    let token = sign_cwt(&signer(), "application/statuslist+cwt", buf);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Good);
+}
+
+// --- (5c) Per-URI inflate memoization (DoS-amplification cap) -------------------------------------
+
+#[test]
+fn inflate_is_memoized_per_uri_and_each_read_uses_its_own_idx() {
+    // Within one verify sharing an inflate cache, a status list several documents reference is
+    // zlib-inflated ONCE per URI (the amplification cap), while each read applies its OWN idx.
+    // bits=1 byte 0b0000_0010: entry0 = VALID, entry1 = INVALID (revoked).
+    let token = valid_jwt(1, &[0b0000_0010]);
+    let mut cache = super::StatusListInflateCache::new();
+
+    // First document (idx 0) inflates + caches; returns Good, leaving exactly one cached URI.
+    let out0 = super::verify_status_list_token_cached(
+        token.as_bytes(),
+        LIST_URI,
+        0,
+        NOW,
+        accept(*signer().verifying_key()),
+        &mut cache,
+    );
+    assert_eq!(out0, StatusOutcome::Good);
+    assert_eq!(
+        cache.len(),
+        1,
+        "the URI's inflated list is cached after the first document"
+    );
+
+    // Second document (idx 1, SAME uri) reuses the cached inflate; its OWN idx reads Revoked, and the
+    // cache still holds exactly one entry (the same URI was not re-inflated).
+    let out1 = super::verify_status_list_token_cached(
+        token.as_bytes(),
+        LIST_URI,
+        1,
+        NOW,
+        accept(*signer().verifying_key()),
+        &mut cache,
+    );
+    assert_eq!(out1, StatusOutcome::Revoked);
+    assert_eq!(cache.len(), 1, "the same URI is not re-inflated");
+}
+
+#[test]
+fn a_cache_hit_short_circuits_the_inflate() {
+    // Proof the memo genuinely REPLACES the inflate on a hit (not just tracks it): pre-seed the cache
+    // for the URI with a DIFFERENT decompressed list (entry0 = INVALID) and verify a token whose real
+    // `lst` has entry0 = VALID. A cache hit returns Revoked (the seeded bytes); a re-inflate would
+    // return Good. The token still passes signature/`sub`/freshness before the memo is consulted.
+    let token = valid_jwt(1, &[0b0000_0000]); // real list: entry0 = VALID
+    let mut seeded = super::StatusListInflateCache::new();
+    seeded.insert(LIST_URI.to_owned(), Some(vec![0b0000_0001])); // seeded: entry0 = INVALID
+    let out = super::verify_status_list_token_cached(
+        token.as_bytes(),
+        LIST_URI,
+        0,
+        NOW,
+        accept(*signer().verifying_key()),
+        &mut seeded,
+    );
+    assert_eq!(
+        out,
+        StatusOutcome::Revoked,
+        "a cache hit short-circuits the inflate: the bit is read from the cached bytes"
+    );
+}
+
 // --- (6) Out-of-range `idx` → Unavailable (never Good) -------------------------------------------
 
 #[test]
@@ -738,9 +873,11 @@ fn resolve_key_rejection_is_unavailable() {
 // --- The signer hint is parsed and handed to the closure -----------------------------------------
 
 #[test]
-fn jose_signer_material_carries_kid_and_x5c() {
+fn jose_signer_material_carries_x5c_and_ignores_kid() {
     let cert_a = vec![0xDE, 0xAD, 0xBE, 0xEF];
     let cert_b = vec![0x01, 0x02, 0x03];
+    // The header carries a `kid` — which the reworked authorization ignores; only the `x5c` chain is
+    // surfaced in `SignerKeyMaterial` (the `kid` grants no authorization, so it is not parsed).
     let header = json!({
         "alg": "ES256",
         "typ": "statuslist+jwt",
@@ -769,17 +906,17 @@ fn jose_signer_material_carries_kid_and_x5c() {
     });
     assert_eq!(outcome, StatusOutcome::Good);
     let material = seen.into_inner().expect("closure invoked");
-    assert_eq!(material.kid.as_deref(), Some(b"key-42".as_slice()));
     assert_eq!(material.x5chain, vec![cert_a, cert_b]);
 }
 
 #[test]
-fn cose_signer_material_carries_kid_and_x5chain() {
+fn cose_signer_material_carries_x5chain_and_ignores_kid() {
     let cert = vec![0xCA, 0xFE, 0xBA, 0xBE];
     let protected = HeaderBuilder::new()
         .algorithm(iana::Algorithm::ES256)
         .value(16, CborValue::Text("application/statuslist+cwt".to_owned()))
         .build();
+    // A `kid` (label 4) is present in the unprotected header but is NOT surfaced — only the `x5chain`.
     let unprotected = HeaderBuilder::new()
         .key_id(b"cose-kid".to_vec())
         .value(33, CborValue::Bytes(cert.clone()))
@@ -809,7 +946,6 @@ fn cose_signer_material_carries_kid_and_x5chain() {
     });
     assert_eq!(outcome, StatusOutcome::Good);
     let material = seen.into_inner().expect("closure invoked");
-    assert_eq!(material.kid.as_deref(), Some(b"cose-kid".as_slice()));
     assert_eq!(material.x5chain, vec![cert]);
 }
 
@@ -892,6 +1028,149 @@ fn corrupt_zlib_lst_fails_closed() {
     assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
 }
 
+// --- (11) Fine-grained fail-closed branch coverage (coverage-review gaps) ------------------------
+
+#[test]
+fn negative_ttl_is_unavailable() {
+    // A `ttl` is a non-negative number of seconds; a negative one is malformed → fail closed.
+    let token = sign_jws(
+        &signer(),
+        &jwt_header(),
+        &jwt_payload(
+            LIST_URI,
+            NOW - 100,
+            Some(NOW + 1000),
+            Some(-1),
+            1,
+            &zlib(&[0b0000_0000]),
+        ),
+    );
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+}
+
+#[test]
+fn iat_plus_ttl_overflow_is_unavailable() {
+    // `iat + ttl` overflowing `i64` is malformed (a `checked_add` failure) → fail closed, never a panic.
+    // `exp` is checked before `ttl`, so a far-future `exp` lets the freshness (ttl) branch run.
+    let token = sign_jws(
+        &signer(),
+        &jwt_header(),
+        &jwt_payload(
+            LIST_URI,
+            i64::MAX,
+            Some(NOW + 1000),
+            Some(1),
+            1,
+            &zlib(&[0b0000_0000]),
+        ),
+    );
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+}
+
+#[test]
+fn genuinely_non_numeric_exp_is_unavailable() {
+    // With fractional NumericDates now accepted (1b), a PRESENT `exp`/`ttl` that is not a number at all
+    // (e.g. a JSON string) is still malformed → the bound is uninterpretable → fail closed (never
+    // silently ignored, which would read as unbounded validity — a false-accept).
+    let payload = json!({
+        "sub": LIST_URI,
+        "iat": NOW - 100,
+        "exp": "not-a-number",
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&[0b0000_0000])),
+        },
+    });
+    let token = sign_jws(&signer(), &jwt_header(), &payload);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+
+    // A non-numeric `ttl` likewise.
+    let payload = json!({
+        "sub": LIST_URI,
+        "iat": NOW - 100,
+        "exp": NOW + 1000,
+        "ttl": ["not", "a", "number"],
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&[0b0000_0000])),
+        },
+    });
+    let token = sign_jws(&signer(), &jwt_header(), &payload);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+}
+
+#[test]
+fn cwt_wrong_alg_is_rejected() {
+    // The CWT protected `alg` MUST be ES256 (COSE −7); an ES384 header is rejected on the algorithm
+    // alone (before any signature math), even though the signature bytes are a valid ES256 signature.
+    let protected = HeaderBuilder::new()
+        .algorithm(iana::Algorithm::ES384)
+        .value(16, CborValue::Text("application/statuslist+cwt".to_owned()))
+        .build();
+    let token = CoseSign1Builder::new()
+        .protected(protected)
+        .payload(cwt_claims(
+            LIST_URI,
+            NOW - 100,
+            Some(NOW + 1000),
+            None,
+            1,
+            &zlib(&[0b0000_0000]),
+        ))
+        .create_signature(&[], |tbs| {
+            let sig: Signature = signer().sign(tbs);
+            sig.to_bytes().as_slice().to_vec()
+        })
+        .build()
+        .to_tagged_vec()
+        .unwrap();
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+}
+
+#[test]
+fn cwt_present_crit_is_rejected() {
+    // A protected `crit` (label 2) listing a header beyond `alg` is an unprocessed critical header
+    // (RFC 9052 §3.1) → fatal → fail closed.
+    let protected = HeaderBuilder::new()
+        .algorithm(iana::Algorithm::ES256)
+        .add_critical(iana::HeaderParameter::ContentType)
+        .value(16, CborValue::Text("application/statuslist+cwt".to_owned()))
+        .build();
+    let token = CoseSign1Builder::new()
+        .protected(protected)
+        .payload(cwt_claims(
+            LIST_URI,
+            NOW - 100,
+            Some(NOW + 1000),
+            None,
+            1,
+            &zlib(&[0b0000_0000]),
+        ))
+        .create_signature(&[], |tbs| {
+            let sig: Signature = signer().sign(tbs);
+            sig.to_bytes().as_slice().to_vec()
+        })
+        .build()
+        .to_tagged_vec()
+        .unwrap();
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+}
+
+#[test]
+fn decompression_beyond_the_cap_fails_closed() {
+    // The zlib bomb guard: an `lst` that would inflate beyond `MAX_STATUS_LIST_BYTES` (64 MiB) fails
+    // closed to Unavailable rather than risking OOM — even though everything else (signature, `sub`,
+    // freshness) is valid. A highly-compressible over-cap bitstring compresses to a tiny `lst`.
+    let over_cap = vec![0u8; super::MAX_STATUS_LIST_BYTES + 1];
+    let compressed = zlib(&over_cap);
+    let token = sign_jws(
+        &signer(),
+        &jwt_header(),
+        &jwt_payload(LIST_URI, NOW - 100, Some(NOW + 1000), None, 1, &compressed),
+    );
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+}
+
 // --- (10) The two `status_reference_of` parsers on sample claims ---------------------------------
 
 #[test]
@@ -906,20 +1185,35 @@ fn sd_jwt_status_reference_parser() {
         }
     );
 
-    // Absent / malformed references → None (no usable status mechanism).
+    // No `status_list` object at all → None (genuinely no Token Status List mechanism).
     assert_eq!(
         status_reference_from_sd_jwt_claim(&json!({ "other": true })),
         StatusReference::None
     );
+
+    // A `status_list` object IS present but unusable → Malformed (MUST fail closed, never fall through
+    // to a positional `Good`): missing idx, empty uri, non-integer idx, non-object status_list.
     assert_eq!(
         status_reference_from_sd_jwt_claim(&json!({ "status_list": { "uri": LIST_URI } })),
-        StatusReference::None,
-        "missing idx → None"
+        StatusReference::Malformed,
+        "missing idx → Malformed"
     );
     assert_eq!(
         status_reference_from_sd_jwt_claim(&json!({ "status_list": { "idx": 1, "uri": "" } })),
-        StatusReference::None,
-        "empty uri → None"
+        StatusReference::Malformed,
+        "empty uri → Malformed"
+    );
+    assert_eq!(
+        status_reference_from_sd_jwt_claim(
+            &json!({ "status_list": { "idx": "1", "uri": LIST_URI } })
+        ),
+        StatusReference::Malformed,
+        "idx as a string → Malformed"
+    );
+    assert_eq!(
+        status_reference_from_sd_jwt_claim(&json!({ "status_list": "nonsense" })),
+        StatusReference::Malformed,
+        "status_list not an object → Malformed"
     );
 }
 
@@ -951,5 +1245,44 @@ fn mdoc_status_reference_parser() {
     assert_eq!(
         status_reference_from_mdoc_status(&empty),
         StatusReference::None
+    );
+
+    // A `status_list` element IS present but unusable → Malformed (fail closed): idx a text string
+    // (non-integer), and an empty uri.
+    let idx_is_text = CborValue::Map(vec![(
+        CborValue::Text("status_list".to_owned()),
+        CborValue::Map(vec![
+            (
+                CborValue::Text("idx".to_owned()),
+                CborValue::Text("7".to_owned()),
+            ),
+            (
+                CborValue::Text("uri".to_owned()),
+                CborValue::Text(LIST_URI.to_owned()),
+            ),
+        ]),
+    )]);
+    assert_eq!(
+        status_reference_from_mdoc_status(&idx_is_text),
+        StatusReference::Malformed,
+        "non-integer idx → Malformed"
+    );
+    let empty_uri = CborValue::Map(vec![(
+        CborValue::Text("status_list".to_owned()),
+        CborValue::Map(vec![
+            (
+                CborValue::Text("idx".to_owned()),
+                CborValue::Integer(7u64.into()),
+            ),
+            (
+                CborValue::Text("uri".to_owned()),
+                CborValue::Text(String::new()),
+            ),
+        ]),
+    )]);
+    assert_eq!(
+        status_reference_from_mdoc_status(&empty_uri),
+        StatusReference::Malformed,
+        "empty uri → Malformed"
     );
 }

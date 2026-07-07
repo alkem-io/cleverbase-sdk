@@ -53,8 +53,9 @@ type DisclosedByNamespace = BTreeMap<String, BTreeMap<String, AttributeValue>>;
 use crate::TAG_ENCODED_CBOR;
 
 /// The COSE header label for an X.509 certificate chain (`x5chain`), RFC 9360 — carried in the
-/// `IssuerAuth` unprotected header as the DS certificate (or chain, leaf-first).
-const COSE_HEADER_X5CHAIN: i64 = 33;
+/// `IssuerAuth` unprotected header as the DS certificate (or chain, leaf-first). The single
+/// authoritative label for the crate (DRY — the in-core status-token verifier reads the same header).
+pub(crate) const COSE_HEADER_X5CHAIN: i64 = 33;
 
 /// The COSE `crv` value for the NIST P-256 curve (IANA COSE Elliptic Curves registry).
 const COSE_CRV_P256: i64 = 1;
@@ -465,6 +466,7 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
             .first()
             .copied()
             .unwrap_or(StatusOutcome::Unavailable);
+        // Single-document conformance path — a throwaway inflate memo (no cross-document sharing needed).
         let verified = verify_issuer_signed(
             issuer_signed,
             raw_items.first(),
@@ -472,6 +474,7 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
             &doc_type,
             status,
             params,
+            &mut crate::status::StatusListInflateCache::new(),
         )?;
         // Project the internal nested disclosure to the public namespace-grouped wire shape
         // (`{ ns: AttributeValue::Map({ id: value }) }`) — the same shape `verify` returns.
@@ -602,6 +605,11 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let session_transcript = params
         .session_transcript
         .and_then(|bytes| decode_session_transcript_value(bytes).ok());
+    // Per-response Token Status List inflate memo: a status list several documents reference (e.g. one
+    // credential replayed N times) is authenticated + zlib-inflated ONCE per URI, not once per document
+    // — a decompression-DoS-amplification cap. Sound because the inflate is trust-context-independent and
+    // each document still re-runs signature/`sub`/freshness (see `status::StatusListInflateCache`).
+    let mut inflate_cache = crate::status::StatusListInflateCache::new();
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
@@ -622,6 +630,7 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             doc_status,
             session_transcript.as_ref(),
             params,
+            &mut inflate_cache,
         )
         .map_err(fail)?;
         // The document's `docType` (verified == the signed MSO `docType` inside `verify_one_document`)
@@ -718,14 +727,22 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     status: StatusOutcome,
     session_transcript: Option<&CborValue>,
     params: &MdocVerifyParams<'_>,
+    inflate_cache: &mut crate::status::StatusListInflateCache,
 ) -> Result<(DisclosedByNamespace, (Vec<u8>, i64)), VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
 
     // --- Issuer-side bar: IssuerAuth signature + DS trust + MSO validity + valueDigests integrity. --
-    let issuer_verified =
-        verify_issuer_signed(issuer_signed, raw_items, anchors, &doc_type, status, params)?;
+    let issuer_verified = verify_issuer_signed(
+        issuer_signed,
+        raw_items,
+        anchors,
+        &doc_type,
+        status,
+        params,
+        inflate_cache,
+    )?;
 
     // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
     verify_device_binding(
@@ -775,6 +792,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     doc_type: &str,
     status: StatusOutcome,
     params: &MdocVerifyParams<'_>,
+    inflate_cache: &mut crate::status::StatusListInflateCache,
 ) -> Result<IssuerVerified, VerifyFailure> {
     // --- Parse the IssuerAuth COSE_Sign1 and the MSO it carries. -----------------------------------
     let issuer_auth_value =
@@ -888,6 +906,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
             role: effective_role,
             format: crate::types::Format::Mdoc,
         },
+        inflate_cache,
     );
     match status_outcome {
         StatusOutcome::NoStatus | StatusOutcome::Good => {}
@@ -1408,18 +1427,26 @@ fn parse_cose_sign1(value: &CborValue) -> Result<CoseSign1, VerifyFailure> {
 /// `coset` already parses `crit` into `protected.header.crit`; this only enforces it. Rejected as
 /// [`ReasonCode::MalformedCredential`] (a structurally-unprocessable message).
 fn reject_unprocessed_crit(sign1: &CoseSign1) -> Result<(), VerifyFailure> {
-    let all_understood = sign1.protected.header.crit.iter().all(|label| {
+    if cose_crit_all_understood(sign1) {
+        Ok(())
+    } else {
+        Err(VerifyFailure::malformed())
+    }
+}
+
+/// Whether EVERY `crit` (label 2) protected-header parameter of `sign1` is one this crate processes —
+/// i.e. only the standard `alg` (label 1). Any other listed critical header is unprocessed. The shared
+/// predicate behind the `crit` gate (DRY — Principle III): [`reject_unprocessed_crit`] (mdoc
+/// `IssuerAuth`/`DeviceSignature`) and the in-core status-token CWT verifier ([`crate::status`]) both
+/// enforce `crit` through this, differing only in the reject type they map a `false` to.
+pub(crate) fn cose_crit_all_understood(sign1: &CoseSign1) -> bool {
+    sign1.protected.header.crit.iter().all(|label| {
         // The sole protected header parameter this verifier processes is `alg` (label 1).
         matches!(
             label,
             RegisteredLabelWithPrivate::Assigned(coset::iana::HeaderParameter::Alg)
         )
-    });
-    if all_understood {
-        Ok(())
-    } else {
-        Err(VerifyFailure::malformed())
-    }
+    })
 }
 
 /// Resolve the full Document Signer certificate chain (DER, leaf-first) from a COSE_Sign1's `x5chain`
@@ -1434,16 +1461,24 @@ fn ds_chain_from_x5chain(sign1: &CoseSign1) -> Result<Vec<Vec<u8>>, VerifyFailur
         .iter()
         .find_map(|(l, v)| (*l == label).then_some(v))
         .ok_or_else(VerifyFailure::malformed)?;
+    // The `bstr` | non-empty-array-of-`bstr` → chain parse is the shared [`x5chain_entries_from_cbor`]
+    // (DRY — the in-core status-token COSE verifier reuses it). This DS path additionally requires the
+    // header to be PRESENT (absent → malformed, above), unlike the status verifier's "absent → empty".
+    x5chain_entries_from_cbor(value).ok_or_else(VerifyFailure::malformed)
+}
+
+/// Parse a COSE `x5chain` header VALUE (RFC 9360) — a single `bstr`, or a non-empty array of `bstr` —
+/// into the DER certificate chain (leaf-first). `None` when the value is neither a `bstr` nor a
+/// non-empty array of `bstr` (a malformed chain). The **presence** of the header and the "absent"
+/// policy are the caller's (the mdoc DS path treats absent as malformed; the status verifier treats
+/// absent as an empty chain), so this shared inner helper only parses a value that IS present.
+pub(crate) fn x5chain_entries_from_cbor(value: &CborValue) -> Option<Vec<Vec<u8>>> {
     match value {
-        Value::Bytes(b) => Ok(vec![b.clone()]),
-        Value::Array(certs) if !certs.is_empty() => certs
-            .iter()
-            .map(|c| match c {
-                Value::Bytes(b) => Ok(b.clone()),
-                _ => Err(VerifyFailure::malformed()),
-            })
-            .collect(),
-        _ => Err(VerifyFailure::malformed()),
+        CborValue::Bytes(b) => Some(vec![b.clone()]),
+        CborValue::Array(certs) if !certs.is_empty() => {
+            certs.iter().map(|c| c.as_bytes().cloned()).collect()
+        }
+        _ => None,
     }
 }
 
@@ -1452,7 +1487,7 @@ fn ds_chain_from_x5chain(sign1: &CoseSign1) -> Result<Vec<Vec<u8>>, VerifyFailur
 /// verifiers gate on this BEFORE any signature math runs, so a non-ES256 header is rejected on the
 /// algorithm alone (never via a failed ES256 verification of differently-signed bytes). Factored out
 /// (DRY) so the gate has one definition and can be probed in isolation.
-fn cose_alg_is_es256(sign1: &CoseSign1) -> bool {
+pub(crate) fn cose_alg_is_es256(sign1: &CoseSign1) -> bool {
     matches!(
         sign1.protected.header.alg,
         Some(RegisteredLabelWithPrivate::Assigned(
@@ -1746,8 +1781,9 @@ fn get_integer(value: &CborValue, key: &str) -> Option<i64> {
 }
 
 /// Read a CBOR integer value as `i64` (the digest IDs and ints; `ciborium` models all ints as a
-/// 128-bit `Integer`).
-fn integer_label(value: &CborValue) -> Option<i64> {
+/// 128-bit `Integer`). The single authoritative CBOR-integer→`i64` reader (DRY — the in-core
+/// status-token CWT verifier reuses it for its integer NumericDates).
+pub(crate) fn integer_label(value: &CborValue) -> Option<i64> {
     match value {
         CborValue::Integer(i) => i128::from(*i).try_into().ok(),
         _ => None,

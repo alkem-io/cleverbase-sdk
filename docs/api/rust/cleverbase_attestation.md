@@ -2481,11 +2481,13 @@ the closure returns; the trust/EKU policy is entirely the closure's.
 - `x5chain: Vec<Vec<u8>>`
   - The signer's X.509 certificate chain (DER, **leaf-first**), from the token's `x5c` (JOSE, RFC
 7515 §4.1.6 — base64 *standard*) or `x5chain` (COSE label 33, RFC 9360 — `bstr`/array of
-`bstr`) header. Empty when the token carries no chain (the closure may then resolve by
-[`Self::kid`], or reject).
-- `kid: Option<Vec<u8>>`
-  - The token's key identifier from the `kid` header — the UTF-8 bytes of the JOSE string value, or
-the raw COSE label-4 `bstr`. `None` when absent.
+`bstr`) header. Empty when the token carries no chain (a `kid`-only token — the closure then
+resolves against the credential's own issuer key, or rejects).
+
+A `kid` header is intentionally NOT surfaced: the reworked signer authorization
+(`authorize_status_signer`) grants nothing off a `kid` — a chain-less token is authorized ONLY
+to the credential's own issuer key (and then only if the signature verifies under it), so the
+raw `kid` bytes carry no authorization weight and are not parsed.
 
 ### Enums
 
@@ -2535,6 +2537,13 @@ supplies it via the [`StatusSource`] seam; the core then evaluates `idx`/serial 
 
 - `None`
   - The credential declares no status mechanism.
+- `Malformed`
+  - The credential declares a status mechanism (a `status_list` object IS present) but it is
+**unusable**: an empty/absent `uri`, a non-integer/absent `idx`, or the wrong CBOR/JSON types.
+This is DISTINCT from [`Self::None`] (no status claim at all): a present-but-malformed status
+reference MUST fail closed ([`StatusOutcome::Unavailable`]) — never fall through to a
+host-supplied positional `Good` — because the credential DID declare a revocation mechanism the
+core cannot evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
 - `StatusList { index: u64, uri: String }`
   - A Token Status List reference: the index of this credential's entry and the list URI the host
 fetches.
@@ -2602,6 +2611,8 @@ Evaluate a credential's status against the host-supplied status documents, apply
 fail-closed reachability policy.
 
 - [`StatusReference::None`] → [`StatusOutcome::NoStatus`].
+- [`StatusReference::Malformed`] → [`StatusOutcome::Unavailable`] (a declared-but-uninterpretable
+  status reference fails closed regardless of reachability — never a silent VALID).
 - A reachable status list / CRL → [`StatusOutcome::Revoked`] if the entry is revoked, else
   [`StatusOutcome::Good`].
 - An **unreachable** status document → [`StatusOutcome::Unavailable`] under
@@ -2619,9 +2630,11 @@ fn status_reference_from_mdoc_status(status_cbor: &Value) -> StatusReference
 Parse the Token Status List reference an **mdoc** declares, from the already-parsed MSO `status`
 element (draft-ietf-oauth-status-list-21 §8): a CBOR map `status_list → { idx (uint), uri (tstr) }`
 with TEXT keys. As with the SD-JWT VC form the wire key is **`idx`**; it maps onto
-[`StatusReference::StatusList`]'s `index`. Returns [`StatusReference::None`] when no usable
-`status_list` reference is present. Pure parser — reaches into no other module (layer 2 threads the
-element in).
+[`StatusReference::StatusList`]'s `index`. Returns [`StatusReference::None`] when NO `status_list`
+element is present at all, but [`StatusReference::Malformed`] when a `status_list` element IS present
+yet unusable (empty/absent `uri`, absent/non-integer `idx`, or wrong types): a declared-but-
+uninterpretable reference MUST fail closed, never fall through to a positional `Good`. Pure parser —
+reaches into no other module (layer 2 threads the element in).
 
 #### fn `status_reference_from_sd_jwt_claim`
 
@@ -2632,9 +2645,12 @@ fn status_reference_from_sd_jwt_claim(status_claim: &Value) -> StatusReference
 Parse the Token Status List reference an **SD-JWT VC** declares, from its already-parsed `status`
 claim value (draft-ietf-oauth-status-list-21 §8): `status → status_list → { idx, uri }`. Note the
 wire key is **`idx`** (not `index`); it maps onto [`StatusReference::StatusList`]'s `index` field.
-Returns [`StatusReference::None`] when no usable `status_list` reference is present (absent, or a
-missing/ill-typed `idx`/`uri`); the caller applies its own (fail-closed) policy to an absent
-reference. This is a pure parser — it reaches into no other module (layer 2 threads the claim in).
+Returns [`StatusReference::None`] when NO `status_list` object is present at all (genuinely no Token
+Status List mechanism — the caller applies its own policy to the absent reference), but
+[`StatusReference::Malformed`] when a `status_list` object IS present yet unusable (empty/absent
+`uri`, absent/non-integer `idx`, or wrong types): a declared-but-uninterpretable reference MUST fail
+closed, never fall through to a positional `Good`. This is a pure parser — it reaches into no other
+module (layer 2 threads the claim in).
 
 #### fn `verify_status_list_token`
 
@@ -2681,24 +2697,29 @@ document: an mdoc `DeviceResponse` carrying MORE than one document needs one [`S
 document (the per-document revocation check is positional), so an under-supplied multi-document
 response fails closed to [`StatusOutcome::Unavailable`] rather than reusing one outcome for all.
 
-#### const `STATUS_SIGNING_EKU_ID_KP_ARC`
+#### const `STATUS_SIGNING_EKU_OID_PLACEHOLDER`
 
 ```rust
-const STATUS_SIGNING_EKU_ID_KP_ARC: &str = "1.3.6.1.5.5.7.3"
+const STATUS_SIGNING_EKU_OID_PLACEHOLDER: &str = "1.3.6.1.5.5.7.3.0"
 ```
 
 The X.509 Extended Key Usage `KeyPurposeId` that authorizes a certificate to sign a Token Status
 List — `id-kp-oauthStatusSigning` (draft-ietf-oauth-status-list-21 §13).
 
-**PROVISIONAL — pending IANA.** The draft defines this as `{ id-kp TBD }`: the PKIX `id-kp` arc
-(OID `1.3.6.1.5.5.7.3` = `iso(1) identified-organization(3) dod(6) internet(1) security(5)
-mechanisms(5) pkix(7) kp(3)`) with a FINAL sub-arc that IANA has **not yet assigned**. The full
-dotted OID is therefore `1.3.6.1.5.5.7.3.<TBD>`; this constant records the known arc prefix so the
-eventual assignment is a one-line update in a single place (DRY).
+**PLACEHOLDER — `id-kp-oauthStatusSigning` is IANA-TBD.** The draft defines this as `{ id-kp TBD }`:
+the PKIX `id-kp` arc (OID `1.3.6.1.5.5.7.3` = `iso(1) identified-organization(3) dod(6) internet(1)
+security(5) mechanisms(5) pkix(7) kp(3)`) with a FINAL sub-arc that IANA has **not yet assigned**.
+The real id-kp sub-arcs start at `.1` (serverAuth=`.1`, clientAuth=`.2`, …), so this placeholder uses
+the **`.0`** terminal arc — a syntactically valid OID that matches **NO** real certificate
+(fail-closed). It keeps the distinct status-signer authorization path wired + testable via an EXACT
+OID match (never a prefix/arc match, which would unsoundly accept serverAuth/clientAuth as
+status-signing). Replace this ONE constant with the assigned OID when IANA publishes — a single-line,
+single-place update (DRY); the exact-match consumer needs no other change.
 
 The EKU authorization DECISION is **not** made in this sans-IO module — it lives in `crate::trust`
-(layer 2), which consumes this constant to check whether a status-list signer's leaf certificate
-bears the status-signing purpose. It is exposed here only so the value has one authoritative home.
+(layer 2), whose `leaf_has_status_signing_eku` consumes this constant to check
+whether a status-list signer's leaf certificate bears EXACTLY the status-signing purpose. It is
+exposed here only so the value has one authoritative home.
 
 ## Module `trust`
 
@@ -2939,7 +2960,7 @@ signer chains to a configured scheme-operator anchor (the structural §6.1 path)
 ##### fn `verify_chain`
 
 ```rust
-fn verify_chain(supplied_chain: &[&[u8]], anchor_certs_der: &[Vec<u8>], now_unix: i64, leaf_validity_time: Option<i64>, leaf_purpose: LeafPurpose) -> Result<(), ChainError>
+fn verify_chain(supplied_chain: &[&[u8]], anchor_certs_der: &[Vec<u8>], now_unix: i64, leaf_validity_time: Option<i64>, leaf_purpose: LeafPurpose) -> Result<Vec<u8>, ChainError>
 ```
 
 Whether the supplied certification path `supplied_chain` (leaf-first: `[leaf, intermediate₁, …]`)
@@ -3001,6 +3022,14 @@ The supplied intermediates are **attacker-controlled**: they are honoured only a
 issuers, never as trust roots, so a path that never reaches a configured anchor is rejected. The
 path length is capped at [`MAX_PATH_LEN`] ([`ChainError::PathTooLong`]) to bound the work an
 attacker-supplied chain can demand. Returns the most specific [`ChainError`] when no path validates.
+
+## Returns
+
+On success, `Ok(anchor_der)` is the DER of the **trust anchor the path terminated at** — for a
+chain-to-root path, the matched configured root; for a direct DER-equal pin, that pinned certificate
+(which IS the anchor). Callers that anchor a downstream trust decision to the credential's SAME
+specific root (`resolve_chain` storing it as [`crate::trust::TrustListEntry::anchor_cert_der`],
+consumed by the in-core status-signer authorization) rely on this being the ROOT, not the leaf.
 
 # Errors
 
@@ -3598,7 +3627,12 @@ Carries only issuer-public trust-list data (no secret), so deriving `Debug` is s
 - `format: Format`
   - The credential format this anchor covers.
 - `anchor_cert_der: Vec<u8>`
-  - The DER-encoded issuer/anchor certificate that the credential's signer chained to.
+  - The DER-encoded **trust anchor** the credential's signer chained to: for a chain-validating
+source ([`ChainValidatingAnchors`] / [`NativeTrustEngine`]) the matched ROOT the path terminated
+at (or, for a direct DER-equal pin, that pinned certificate — which IS the anchor); for the
+exact-pin [`StaticTestAnchors`] the pinned leaf certificate (the pin is the anchor). This is the
+specific root a distinct in-core Token Status List signer must ALSO chain to (see
+the [`mod@crate::verify`] status-signer authorization) — so it MUST be the anchor, not the leaf.
 
 ### Enums
 

@@ -314,7 +314,7 @@ fn anchors_from_wire(entries: &[WireTrustAnchor], now_unix: i64) -> ChainValidat
 #[must_use]
 pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
     let outcome = match decode_verify_request(input) {
-        Ok(req) => {
+        Ok(mut req) => {
             // Chain-validate the credential's leaf against the host-supplied anchors at the
             // verification instant (the leaf-validity window is enforced at `now_unix`).
             let anchors = anchors_from_wire(&req.anchors, req.context.now_unix);
@@ -336,13 +336,14 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
                 .collect();
             // Convert the wire `BTreeMap<String, ByteBuf>` to the typed `BTreeMap<String, Vec<u8>>` the
             // sans-IO `VerifyContext` borrows (the raw signed Token Status List token bytes, keyed by
-            // list URI). Empty (the `#[serde(default)]`) ⇒ the positional `statuses` seam alone.
-            let status_tokens: BTreeMap<String, Vec<u8>> = req
-                .context
-                .status_tokens
-                .iter()
-                .map(|(uri, token)| (uri.clone(), token.clone().into_vec()))
-                .collect();
+            // list URI). Empty (the `#[serde(default)]`) ⇒ the positional `statuses` seam alone. The
+            // owned request is consumed here — `mem::take` MOVES the map out (leaving an empty one) and
+            // each `ByteBuf` is `into_vec`'d, so the attacker-sized token buffers are never cloned.
+            let status_tokens: BTreeMap<String, Vec<u8>> =
+                std::mem::take(&mut req.context.status_tokens)
+                    .into_iter()
+                    .map(|(uri, token)| (uri, token.into_vec()))
+                    .collect();
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,

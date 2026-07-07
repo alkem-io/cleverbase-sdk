@@ -900,16 +900,37 @@ fn replace_map_entry(
     key: &str,
     transform: impl Fn(&CborValue) -> Result<CborValue, PresentError>,
 ) -> Result<CborValue, PresentError> {
+    replace_map_entry_inner(value, map_label, key, false, transform)
+}
+
+/// The shared re-serialize-map-replacing-one-entry core behind [`replace_map_entry`] (permissive:
+/// `required = false`, a missing key copies through) and [`replace_required_map_entry`] (strict:
+/// `required = true`, a missing key is [`PresentError::Malformed`]) — DRY, Principle III. Rebuilds the
+/// map applying `transform` to every entry whose key matches; a non-map `value` is malformed.
+fn replace_map_entry_inner(
+    value: &CborValue,
+    map_label: &str,
+    key: &str,
+    required: bool,
+    transform: impl Fn(&CborValue) -> Result<CborValue, PresentError>,
+) -> Result<CborValue, PresentError> {
     let map = value
         .as_map()
         .ok_or_else(|| PresentError::Malformed(format!("{map_label} is not a map")))?;
     let mut out = Vec::with_capacity(map.len());
+    let mut found = false;
     for (k, v) in map {
         if k.as_text() == Some(key) {
+            found = true;
             out.push((k.clone(), transform(v)?));
         } else {
             out.push((k.clone(), v.clone()));
         }
+    }
+    if required && !found {
+        return Err(PresentError::Malformed(format!(
+            "{map_label} is missing the required '{key}' entry"
+        )));
     }
     Ok(CborValue::Map(out))
 }
@@ -931,25 +952,7 @@ fn replace_required_map_entry(
     key: &str,
     transform: impl Fn(&CborValue) -> Result<CborValue, PresentError>,
 ) -> Result<CborValue, PresentError> {
-    let map = value
-        .as_map()
-        .ok_or_else(|| PresentError::Malformed(format!("{map_label} is not a map")))?;
-    let mut out = Vec::with_capacity(map.len());
-    let mut found = false;
-    for (k, v) in map {
-        if k.as_text() == Some(key) {
-            found = true;
-            out.push((k.clone(), transform(v)?));
-        } else {
-            out.push((k.clone(), v.clone()));
-        }
-    }
-    if !found {
-        return Err(PresentError::Malformed(format!(
-            "{map_label} is missing the required '{key}' entry"
-        )));
-    }
-    Ok(CborValue::Map(out))
+    replace_map_entry_inner(value, map_label, key, true, transform)
 }
 
 #[cfg(test)]
