@@ -99,6 +99,23 @@ fn attestation_verify(request: Vec<u8>) -> PyResult<Vec<u8>> {
     Ok(cleverbase_attestation::wire::process_verify_bytes(&request))
 }
 
+/// Run the EUDI attestation SET-LEVEL OpenID4VP verifier over a CBOR `WireVpTokenRequest` envelope
+/// (attestation schema version 5) and return the CBOR `WireVpTokenResponse`.
+///
+/// Unlike [`attestation_verify`] (a single presentation), this carries the whole multi-credential
+/// `vp_token` (`{credential_id: [presentations]}`) so the core folds the OpenID4VP set-level DCQL
+/// semantics (`credential_sets` required option-sets + `multiple` cardinality) AND authenticates
+/// supplied signed Token Status List tokens in-core across the set. CBOR-in / CBOR-out: the set-level
+/// verdict (`satisfied` + per-credential results) and any decode/usage error ride *inside* the
+/// response envelope — a malformed request yields a well-formed response carrying an `err` outcome
+/// rather than raising. The holder key never crosses this boundary.
+#[pyfunction]
+// CBOR-through: every outcome rides inside the response envelope (see [`attestation_verify`]).
+#[allow(clippy::unnecessary_wraps)]
+fn attestation_verify_vp_token(request: Vec<u8>) -> PyResult<Vec<u8>> {
+    Ok(cleverbase_attestation::wire::process_vp_token_bytes(&request))
+}
+
 /// Drive the EUDI attestation issuance / presentation sans-IO state machine over a CBOR
 /// `IssuanceRequest` envelope (issuance schema version 1) and return the CBOR `IssuanceResponse`.
 ///
@@ -121,6 +138,7 @@ fn cleverbase(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resume_redirect_error, m)?)?;
     m.add_function(wrap_pyfunction!(resume_http, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(attestation_verify_vp_token, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_issuance, m)?)?;
     Ok(())
 }

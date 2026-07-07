@@ -16,6 +16,7 @@ package cleverbase
 #include <stdlib.h>
 int cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 int cleverbase_attestation_verify(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
+int cleverbase_attestation_verify_vp_token(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 int cleverbase_attestation_issuance(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 void cleverbase_free(uint8_t* out, size_t out_len);
 */
@@ -185,6 +186,21 @@ func process(input []byte) ([]byte, error) {
 func AttestationVerify(request []byte) ([]byte, error) {
 	return callAbi("cleverbase_attestation_verify", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
 		return C.cleverbase_attestation_verify(in, inLen, out, outLen)
+	})
+}
+
+// AttestationVerifyVpToken runs the EUDI attestation SET-LEVEL OpenID4VP verifier over a CBOR
+// WireVpTokenRequest envelope (attestation schema version 5) and returns the CBOR WireVpTokenResponse.
+// Unlike AttestationVerify (a single presentation), this carries the whole multi-credential vp_token
+// (`{credential_id: [presentations]}`) so the core folds the OpenID4VP set-level DCQL semantics
+// (`credential_sets` required option-sets + `multiple` cardinality) AND authenticates supplied signed
+// Token Status List tokens in-core across the set. Like AttestationVerify it is CBOR-in / CBOR-out: the
+// overall `satisfied` verdict + per-credential results (and any decode error) ride inside the response
+// `outcome`; a non-nil error here means the FFI call itself failed (null/oversized/contained-panic),
+// never a mere unsatisfied verdict.
+func AttestationVerifyVpToken(request []byte) ([]byte, error) {
+	return callAbi("cleverbase_attestation_verify_vp_token", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
+		return C.cleverbase_attestation_verify_vp_token(in, inLen, out, outLen)
 	})
 }
 

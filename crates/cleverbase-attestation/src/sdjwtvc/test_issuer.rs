@@ -237,14 +237,38 @@ pub(crate) fn mint_sd_jwt_with_status(
     idx: u64,
     uri: &str,
 ) -> SdJwt {
+    mint_sd_jwt_with_status_and_validity(
+        issuer_pk8,
+        issuer_cert_der,
+        idx,
+        uri,
+        NOW - 1_000,
+        NOW + 1_000_000,
+    )
+}
+
+/// Like [`mint_sd_jwt_with_status`] but with caller-chosen `nbf`/`exp` — the chain-validating C-ABI
+/// verify path enforces the issuer LEAF cert's own validity window at the verification instant, so a
+/// status-bearing credential driven through the wire must be minted IN-WINDOW (a 2026 instant), which
+/// the canonical [`NOW`]-fixed [`mint_sd_jwt_with_status`] cannot express. The Token Status List
+/// reference (issuer-signed, in the clear) is otherwise identical, so the in-core status authentication
+/// runs the same on either.
+pub(crate) fn mint_sd_jwt_with_status_and_validity(
+    issuer_pk8: &[u8],
+    issuer_cert_der: &[u8],
+    idx: u64,
+    uri: &str,
+    nbf: i64,
+    exp: i64,
+) -> SdJwt {
     let cert_b64 = base64ct::Base64::encode_string(issuer_cert_der);
     let claims = json!({
         "iss": "https://issuer.example/cb",
         "vct": DEFAULT_VCT,
         "given_name": "Ada",
         "family_name": "Lovelace",
-        "nbf": NOW - 1_000,
-        "exp": NOW + 1_000_000,
+        "nbf": nbf,
+        "exp": exp,
         // The Token Status List pointer — issuer-signed, in the clear (§8: `status.status_list`).
         "status": { "status_list": { "idx": idx, "uri": uri } },
     });
@@ -260,6 +284,52 @@ pub(crate) fn mint_sd_jwt_with_status(
             .finish(&signer, "ES256"),
     )
     .expect("issuer signing succeeds")
+}
+
+/// Mint a signed **Token Status List Token** (compact JWS, `statuslist+jwt` — the SD-JWT VC baseline
+/// form; draft-ietf-oauth-status-list §5.1) over a 1-bit-per-entry bitstring, signed by `issuer_pk8`.
+///
+/// Signed with the SAME issuer key the credential's issuer uses and carrying NO `x5c` chain (a
+/// `kid`-only token), so the in-core status authenticator's same-issuer key-reuse path
+/// ([`crate::verify::authorize_status_signer`]) resolves it to the credential's already-verified issuer
+/// key and the signature then verifies — the authoritative in-core path, no host-supplied outcome.
+/// `sub` binds to `list_uri` (the credential's `status.status_list.uri`); `revoked` sets the entry at
+/// `idx` (bit `1` = INVALID/revoked, `0` = VALID). `iat`/`exp` bracket `now` so the token is fresh.
+pub(crate) fn mint_status_list_jwt(
+    issuer_pk8: &[u8],
+    list_uri: &str,
+    idx: u64,
+    revoked: bool,
+    now: i64,
+) -> String {
+    // A bits=1, LSB-first bitstring long enough to cover `idx`: leading zero bytes for `idx / 8`, then a
+    // final byte with the `idx % 8` bit set iff `revoked` (built by push, never index — the test-issuer
+    // module does not re-allow `indexing_slicing`).
+    let bit = u32::try_from(idx % 8).expect("bit position < 8 fits u32");
+    let final_byte = if revoked { 1u8 << bit } else { 0u8 };
+    let mut lst = vec![0u8; usize::try_from(idx / 8).expect("byte index fits usize")];
+    lst.push(final_byte);
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&lst, 6);
+
+    let header = json!({ "alg": "ES256", "typ": "statuslist+jwt", "kid": "status-key-1" });
+    let payload = json!({
+        "sub": list_uri,
+        "iat": now - 100,
+        "exp": now + 100_000,
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&compressed),
+        },
+    });
+    let header_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&header).unwrap().as_slice());
+    let payload_b64 =
+        Base64UrlUnpadded::encode_string(serde_json::to_vec(&payload).unwrap().as_slice());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = p256::ecdsa::SigningKey::from_pkcs8_der(issuer_pk8).expect("valid PKCS#8 P-256 key");
+    let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(sig.to_bytes().as_slice());
+    format!("{signing_input}.{sig_b64}")
 }
 
 /// Mint an SD-JWT VC whose issuer-signed clear `status` claim carries a `status_list` object that IS

@@ -15,8 +15,9 @@ use super::{
 };
 use crate::mdoc::test_issuer::MdocBuilder;
 use crate::sdjwtvc::test_issuer::{
-    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_clear_subject_claim, mint_sd_jwt_with_vct,
-    HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8, NOW,
+    attach_kb_jwt, mint_sd_jwt, mint_sd_jwt_with_clear_subject_claim, mint_sd_jwt_with_status,
+    mint_sd_jwt_with_vct, mint_status_list_jwt, HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8,
+    NOW,
 };
 use crate::status::StatusOutcome;
 use crate::trust::StaticTestAnchors;
@@ -986,6 +987,14 @@ fn all_no_status(
         .collect()
 }
 
+/// The empty signed-token map: the set-level tests below drive the positional `statuses` seam (host
+/// pre-resolved), matching the pre-existing behavior. The in-core Token Status List authentication path
+/// on this surface is exercised separately by
+/// [`verify_vp_token_authenticates_a_supplied_status_token`].
+fn no_status_tokens() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::new()
+}
+
 #[test]
 fn verify_vp_token_revoked_credential_does_not_satisfy_a_required_set() {
     // SC-002 (per-credential status): a vp_token with TWO credentials where the REQUIRED one ("a") is
@@ -1012,6 +1021,7 @@ fn verify_vp_token_revoked_credential_does_not_satisfy_a_required_set() {
         NOW,
         IssuerRole::Pid,
         &statuses,
+        &no_status_tokens(),
     );
     assert!(
         !outcome.satisfied,
@@ -1035,6 +1045,7 @@ fn verify_vp_token_revoked_credential_does_not_satisfy_a_required_set() {
         NOW,
         IssuerRole::Pid,
         &statuses,
+        &no_status_tokens(),
     );
     assert!(
         ok.satisfied,
@@ -1058,6 +1069,7 @@ fn verify_vp_token_required_set_satisfied_by_one_option() {
         NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(
         outcome.satisfied,
@@ -1084,6 +1096,7 @@ fn verify_vp_token_wrong_vct_under_an_id_is_unsatisfied() {
         NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(!outcome.satisfied);
     let credential = outcome.credentials.get("a").expect("entry for id a");
@@ -1112,6 +1125,7 @@ fn verify_vp_token_optional_set_absent_does_not_block() {
         NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(
         outcome.satisfied,
@@ -1137,6 +1151,7 @@ fn verify_vp_token_required_optional_set_unsatisfied_when_required_missing() {
         NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(
         !outcome.satisfied,
@@ -1167,6 +1182,7 @@ fn verify_vp_token_multiple_false_rejects_two_presentations() {
         NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(
         !outcome.satisfied,
@@ -1194,7 +1210,79 @@ fn verify_vp_token_mdoc_credential_is_satisfied() {
         MDOC_NOW,
         IssuerRole::Pid,
         &all_no_status(&vp_token),
+        &no_status_tokens(),
     );
     assert!(outcome.satisfied, "the mdoc matches its DCQL query");
     assert!(outcome.credentials.get("mdl").is_some_and(|c| c.satisfied));
+}
+
+#[test]
+fn verify_vp_token_authenticates_a_supplied_status_token() {
+    // The set-level path AUTHENTICATES a supplied signed Token Status List token IN-CORE — exactly like
+    // the single-presentation `verify()` path — so a REVOKED bit in an issuer-signed, in-core-authenticated
+    // token makes the credential fail its per-credential check and the required set is NOT satisfied.
+    // Before `status_tokens` reached this entry it hardcoded the empty token map, so in-core status
+    // authentication was UNREACHABLE on the set-level path; this proves it now runs.
+    const LIST_URI: &str = "https://issuer.example/statuslists/set-level";
+    const IDX: u64 = 3;
+    // A single REQUIRED credential "a" of the default vct, declaring the Token Status List reference.
+    let dcql = format!(
+        r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{"vct_values":["{SD_JWT_VCT}"]}}}}],"credential_sets":[{{"options":[["a"]],"required":true}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, IDX, LIST_URI);
+    let presentation = attach_kb_jwt(sd_jwt, HOLDER_KEY_PK8, AUDIENCE, &request.nonce_b64());
+    let mut vp_token = BTreeMap::new();
+    vp_token.insert("a".to_owned(), vec![VpToken::SdJwtVc(&presentation)]);
+    // Positional NoStatus — but a declared list WITH a supplied token is resolved from the TOKEN, not this.
+    let statuses = all_no_status(&vp_token);
+
+    // A REVOKED signed token (issuer-signed, kid-only) for the list URI → in-core auth reads Revoked.
+    let mut revoked_tokens = BTreeMap::new();
+    revoked_tokens.insert(
+        LIST_URI.to_owned(),
+        mint_status_list_jwt(ISSUER_KEY_PK8, LIST_URI, IDX, true, NOW).into_bytes(),
+    );
+    let revoked = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &statuses,
+        &revoked_tokens,
+    );
+    assert!(
+        !revoked.satisfied,
+        "a required credential revoked by an in-core-authenticated status token must not satisfy the set"
+    );
+    assert_eq!(
+        revoked.credentials["a"].presentations[0].reasons,
+        vec![ReasonCode::Revoked],
+        "the revocation is read from the authenticated token, not the positional NoStatus"
+    );
+
+    // Control: a CURRENT (VALID bit) token for the SAME list → the set IS satisfied, proving the signed
+    // token (not the positional seam) is authoritative on the set-level path.
+    let mut current_tokens = BTreeMap::new();
+    current_tokens.insert(
+        LIST_URI.to_owned(),
+        mint_status_list_jwt(ISSUER_KEY_PK8, LIST_URI, IDX, false, NOW).into_bytes(),
+    );
+    let current = verify_vp_token(
+        &request,
+        &vp_token,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &statuses,
+        &current_tokens,
+    );
+    assert!(
+        current.satisfied,
+        "with a current status token the required credential satisfies the set: {:?}",
+        current.credentials["a"].presentations[0].reasons
+    );
 }

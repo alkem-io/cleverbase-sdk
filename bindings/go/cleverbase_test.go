@@ -278,6 +278,100 @@ func TestAttestationVerifyMalformedRequestIsErr(t *testing.T) {
 	}
 }
 
+// vpTokenResponse decodes a WireVpTokenResponse envelope (attestation schema version 5). The
+// externally-tagged `outcome` is `{ok:{result:{satisfied, credentials}}}` for a completed set-level
+// evaluation (any verdict) or `{err:{message}}` for a malformed request.
+type vpTokenResponse struct {
+	SchemaVersion int `cbor:"schema_version"`
+	Outcome       struct {
+		Ok *struct {
+			Result struct {
+				Satisfied   bool `cbor:"satisfied"`
+				Credentials map[string]struct {
+					Satisfied bool `cbor:"satisfied"`
+				} `cbor:"credentials"`
+			} `cbor:"result"`
+		} `cbor:"ok"`
+		Err *struct {
+			Message string `cbor:"message"`
+		} `cbor:"err"`
+	} `cbor:"outcome"`
+}
+
+func TestAttestationVerifyVpTokenRoundTripReachesTheVerifier(t *testing.T) {
+	// A well-formed set-level WireVpTokenRequest with a bogus presentation and NO trust anchors: the
+	// set-level verifier RUNS (proving the full FFI round-trip through the new symbol) and returns an
+	// UNSATISFIED verdict inside a well-formed ok outcome — not a malformed-envelope reject.
+	req := map[string]any{
+		"schema_version": 5,
+		"request": map[string]any{
+			"dcql":         map[string]any{"query_json": `{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}`},
+			"nonce":        []byte{7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7},
+			"audience":     "https://verifier.example/cb",
+			"response_uri": "https://verifier.example/cb/response",
+		},
+		"vp_token": map[string]any{
+			"pid": []any{map[string]any{"sd_jwt_vc": map[string]any{"presentation": "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~"}}},
+		},
+		"policy":   map[string]any{"formats": []any{}, "qualified_gate": false, "status_reachability": "fail_closed"},
+		"anchors":  []any{},
+		"now_unix": 0,
+		"role":     "pid",
+		"statuses": map[string]any{"pid": []any{[]any{"no_status"}}},
+	}
+	in, err := cbor.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := AttestationVerifyVpToken(in)
+	if err != nil {
+		t.Fatalf("AttestationVerifyVpToken FFI error: %v", err)
+	}
+	var resp vpTokenResponse
+	if err := decMode().Unmarshal(out, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SchemaVersion != 5 {
+		t.Fatalf("schema_version = %d, want 5", resp.SchemaVersion)
+	}
+	if (resp.Outcome.Ok == nil) == (resp.Outcome.Err == nil) {
+		t.Fatal("exactly one of ok/err must be present")
+	}
+	if resp.Outcome.Ok == nil {
+		t.Fatalf("a well-formed set-level request must produce an ok outcome, got err: %v", resp.Outcome.Err)
+	}
+	if resp.Outcome.Ok.Result.Satisfied {
+		t.Fatal("a bogus presentation with no trust anchors must NOT satisfy the set")
+	}
+	// The per-credential entry for the returned id is present (and unsatisfied) — the set-level fold ran.
+	if pid, ok := resp.Outcome.Ok.Result.Credentials["pid"]; !ok || pid.Satisfied {
+		t.Fatalf("expected an unsatisfied per-credential entry for \"pid\", got %+v", resp.Outcome.Ok.Result.Credentials)
+	}
+}
+
+func TestAttestationVerifyVpTokenMalformedRequestIsErr(t *testing.T) {
+	// A well-formed CBOR value that is not a WireVpTokenRequest fails the envelope decode → an `err`
+	// outcome (never a status code — the schema version is still surfaced).
+	in, err := cbor.Marshal(0)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out, err := AttestationVerifyVpToken(in)
+	if err != nil {
+		t.Fatalf("AttestationVerifyVpToken FFI error: %v", err)
+	}
+	var resp vpTokenResponse
+	if err := decMode().Unmarshal(out, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.SchemaVersion != 5 {
+		t.Fatalf("schema_version = %d, want 5", resp.SchemaVersion)
+	}
+	if resp.Outcome.Err == nil {
+		t.Fatal("a malformed WireVpTokenRequest must yield an err outcome")
+	}
+}
+
 func TestAttestationIssuanceMalformedRequestIsErr(t *testing.T) {
 	// A malformed IssuanceRequest fails closed to an `err` outcome under the issuance schema version 1,
 	// proving the issuance round-trip is wired.

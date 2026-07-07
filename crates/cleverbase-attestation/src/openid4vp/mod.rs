@@ -594,7 +594,11 @@ pub fn oid4vp_handover_transcript(audience: &str, nonce: &[u8], response_uri: &s
 /// at least one returned Presentation both verified (always-on bar + binding) AND matched this query
 /// (format + `meta` + claims), honoring the `multiple` cardinality (a `multiple:false` query MUST carry
 /// at most one Presentation — OpenID4VP 1.0 §"Response Parameters").
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so the set-level result crosses the C-ABI wire ([`crate::wire::WireVpTokenResponse`])
+/// without a parallel re-implementation of the shape (DRY — Principle III): the per-credential
+/// [`VerificationResult`]s serialize exactly as the single-presentation `verify` outcome does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialVerification {
     /// The verification result of each Presentation returned under this Credential Query `id`.
     pub presentations: Vec<VerificationResult>,
@@ -610,7 +614,10 @@ pub struct CredentialVerification {
 /// Credentials"): with no `credential_sets`, EVERY Credential Query in `credentials` must be satisfied;
 /// otherwise EVERY **required** Credential Set Query must have at least one fully-satisfied `option`
 /// (non-required sets are optional).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so it is the payload of [`crate::wire::WireVpTokenResponse`] over the C-ABI (DRY —
+/// Principle III: the wire response carries this exact type, not a parallel mirror).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpTokenVerification {
     /// Whether the returned set of Presentations satisfies the request's set-level requirements.
     pub satisfied: bool,
@@ -640,12 +647,26 @@ pub struct VpTokenVerification {
 /// one outcome is never silently reused across credentials or documents (SC-002). A credential id /
 /// token / document with no supplied outcome fails closed to [`StatusOutcome::Unavailable`].
 ///
+/// `status_tokens` is the host-fetched **signed** Token Status List tokens (uri → raw token bytes),
+/// shared across every presentation exactly as the single-presentation [`crate::verify::verify()`] path
+/// takes them: when a presented credential declares a Token Status List reference AND a token is supplied
+/// for its URI, the core AUTHENTICATES that token in-core (signature under a key authorized by the
+/// credential's own trust anchor + `sub` binding + freshness + bit read) and that outcome OVERRIDES the
+/// positional `statuses` entry — so the set-level path performs the SAME in-core status authentication as
+/// the single-presentation path (the map is uri→bytes, resolved identically per credential referencing a
+/// list). An empty map ⇒ the positional `statuses` seam alone (host pre-resolved), unchanged.
+///
 /// This is the ONLY entry that enforces the **set-level** DCQL semantics (`credential_sets` required
 /// option-sets + `multiple` cardinality); the single-presentation [`verify_response`] / the C-ABI
-/// `verify()` surface enforce only the per-presentation single-query match. It is native-Rust-only (no
-/// C-ABI wire shape carries the multi-credential `{credential_id: [presentations]}` map). Like
-/// [`verify_response`], it NEVER populates `qualified_status` — the opt-in qualified gate runs only via
-/// [`crate::verify::verify()`].
+/// `verify()` surface enforce only the per-presentation single-query match. Reachable over the C-ABI via
+/// [`crate::wire::process_vp_token_bytes`] (the `{credential_id: [presentations]}` map + the signed
+/// status tokens now cross the wire). Like [`verify_response`], it NEVER populates `qualified_status` —
+/// the opt-in qualified gate runs only via [`crate::verify::verify()`].
+// The public set-level verifier entry: its inputs are all semantically distinct (the request, the whole
+// `vp_token`, policy, anchors, instant, role, the positional statuses, and the signed status-token seam)
+// and mirror the single-presentation `verify_response`'s input list plus the in-core status-token map —
+// bundling them behind a params struct would only obscure the wire mapping in `process_vp_token_bytes`.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     request: &PresentationRequest,
     vp_token: &BTreeMap<String, Vec<VpToken<'_>>>,
@@ -654,6 +675,7 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     now_unix: i64,
     role: IssuerRole,
     statuses: &BTreeMap<String, Vec<Vec<StatusOutcome>>>,
+    status_tokens: &BTreeMap<String, Vec<u8>>,
 ) -> VpTokenVerification {
     // Parse the DCQL once. An unparseable query has no enforceable structure → nothing is satisfied
     // (the explicit multi-credential entry needs a real query; the single-presentation gate is the
@@ -700,12 +722,14 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
                 anchors,
                 now_unix,
                 credential_role,
-                // The native multi-credential entry carries only host-pre-resolved positional statuses
-                // (no per-credential signed-token map on this surface); the in-core token seam is empty
-                // here, so the positional outcome stays authoritative — unchanged behavior.
+                // Thread BOTH the per-credential/-token positional outcomes AND the shared signed
+                // Token Status List token map: when this credential declares a list URI a supplied
+                // token covers, the bound bar authenticates it in-core (overriding the positional
+                // outcome) exactly as the single-presentation `verify()` path does. An empty
+                // `status_tokens` ⇒ the positional outcome stays authoritative (unchanged behavior).
                 StatusInputs {
                     positional: token_statuses,
-                    tokens: &crate::status::DEFAULT_STATUS_TOKENS,
+                    tokens: status_tokens,
                 },
             );
             // The Presentation counts toward THIS Credential Query only if it both verified AND matches

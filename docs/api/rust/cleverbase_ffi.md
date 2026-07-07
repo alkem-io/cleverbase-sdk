@@ -62,18 +62,44 @@ a malformed/unsupported-version one returns `VerifyOutcome::Err` — both with s
 # Safety
 `in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
 
+### fn `cleverbase_attestation_verify_vp_token`
+
+```rust
+unsafe extern "C" fn cleverbase_attestation_verify_vp_token(in_ptr: *const u8, in_len: usize, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32
+```
+
+Verify a **set-level** OpenID4VP `vp_token` (the multi-credential `{credential_id: [presentations]}`
+map — contracts/openid4vp-verifier.md).
+
+CBOR-in / CBOR-out, identical envelope discipline to [`cleverbase_attestation_verify`]: on success
+writes a heap buffer to `*out_ptr`/`*out_len` (free it with [`cleverbase_free`]) and returns `0`;
+returns non-zero only for null arguments (`1`) or a contained panic (`2`). The set-level outcome (the
+overall `satisfied` verdict + per-credential results, or any decode error) is carried *inside* the
+CBOR response (a `cleverbase_attestation::wire::WireVpTokenResponse`), never via the status code.
+
+This is the only surface that folds the OpenID4VP **set-level** DCQL semantics (`credential_sets`
+required option-sets + `multiple` cardinality) AND authenticates supplied signed Token Status List
+tokens in-core across the whole `vp_token`; the single-presentation [`cleverbase_attestation_verify`]
+enforces only the per-presentation single-query match. All protocol logic lives in the core; this
+layer only does the pointer/length/free dance (Principle III).
+
+# Safety
+`in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
+
 ### fn `cleverbase_free`
 
 ```rust
 unsafe extern "C" fn cleverbase_free(ptr: *mut u8, len: usize)
 ```
 
-Free a buffer previously returned by [`cleverbase_process`], [`cleverbase_attestation_verify`], or
-[`cleverbase_attestation_issuance`] (all hand back an identically shaped boxed slice).
+Free a buffer previously returned by [`cleverbase_process`], [`cleverbase_attestation_verify`],
+[`cleverbase_attestation_verify_vp_token`], or [`cleverbase_attestation_issuance`] (all hand back an
+identically shaped boxed slice).
 
 # Safety
 `ptr`/`len` must be exactly what a prior `cleverbase_process` / `cleverbase_attestation_verify` /
-`cleverbase_attestation_issuance` call wrote, freed at most once.
+`cleverbase_attestation_verify_vp_token` / `cleverbase_attestation_issuance` call wrote, freed at
+most once.
 
 ### fn `cleverbase_process`
 

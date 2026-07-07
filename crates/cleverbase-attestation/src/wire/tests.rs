@@ -4,15 +4,18 @@
 //! malformed request or a wrong schema version is rejected with a clear message.
 
 use super::{
-    decode_verify_request, encode_verify_response, process_verify_bytes, VerifyOutcome,
-    VerifyRequest, VerifyResponse, WireContext, WirePresentation, WireSchemeAnchor,
-    WireTrustAnchor, ATTESTATION_SCHEMA_VERSION,
+    decode_verify_request, decode_vp_token_request, encode_verify_response, process_verify_bytes,
+    process_vp_token_bytes, VerifyOutcome, VerifyRequest, VerifyResponse, WireContext,
+    WirePresentation, WireSchemeAnchor, WireTrustAnchor, WireVpTokenOutcome, WireVpTokenRequest,
+    WireVpTokenResponse, ATTESTATION_SCHEMA_VERSION,
 };
 use crate::mdoc::test_issuer::{default_session_transcript, MdocBuilder};
+use crate::openid4vp::{Dcql, PresentationRequest};
 use crate::qualified::EAA_EU_QUALIFIED_TYPE;
 use crate::sdjwtvc::test_issuer::{
-    block_on, holder_cnf, mint_sd_jwt_with_validity, Es256Signer, Sha2Hasher, ISSUER_CERT_DER,
-    ISSUER_KEY_PK8,
+    attach_kb_jwt_with_iat, block_on, holder_cnf, mint_sd_jwt_with_status_and_validity,
+    mint_sd_jwt_with_validity, mint_status_list_jwt, Es256Signer, Sha2Hasher, DEFAULT_VCT,
+    HOLDER_KEY_PK8, ISSUER_CERT_DER, ISSUER_KEY_PK8,
 };
 use crate::status::StatusOutcome;
 use crate::types::{Format, IssuerRole, VerificationPolicy};
@@ -439,4 +442,325 @@ fn opt_in_gate_over_the_c_abi_without_a_scheme_anchor_is_indeterminate() {
         }
         VerifyOutcome::Err { message } => panic!("must not error: {message}"),
     }
+}
+
+// =================================================================================================
+// Set-level `verify_vp_token` wire envelope (schema v5, additive) — the multi-credential surface.
+//
+// These drive `process_vp_token_bytes` end-to-end: a well-formed 2-credential request satisfying a
+// `credential_sets` required option verifies SATISFIED with per-credential VALID; a required credential
+// REVOKED via an in-core-AUTHENTICATED signed status token is NOT satisfied (proving in-core status auth
+// runs on the set-level path); and the envelope's decode discipline (`deny_unknown_fields` + schema
+// version) matches `VerifyRequest`. The credentials are minted IN-WINDOW (the C-ABI trust path is
+// chain-validating) and request-bound (a KB-JWT over the request `aud`/`nonce`, `iat` in-window).
+// =================================================================================================
+
+/// The set-level tests' OpenID4VP request parameters (distinct `client_id` vs `response_uri`, a fixed
+/// nonce so the KB-JWT binds deterministically).
+const VP_AUDIENCE: &str = "https://verifier.example/cb";
+const VP_RESPONSE_URI: &str = "https://verifier.example/cb/response";
+const VP_NONCE: &[u8] = &[7u8; 16];
+
+/// Build the set-level OpenID4VP request carrying `dcql_json`, bound to the shared audience/nonce.
+fn vp_request(dcql_json: &str) -> PresentationRequest {
+    PresentationRequest {
+        dcql: Dcql::from_json(dcql_json),
+        nonce: VP_NONCE.to_vec(),
+        audience: VP_AUDIENCE.to_owned(),
+        response_uri: VP_RESPONSE_URI.to_owned(),
+    }
+}
+
+/// A 2-SD-JWT-credential DCQL (`a`, `b` both of [`DEFAULT_VCT`]) whose single REQUIRED credential set
+/// option demands BOTH — so the request is satisfied only when `a` AND `b` are.
+fn two_credential_vp_dcql() -> String {
+    format!(
+        r#"{{"credentials":[{{"id":"a","format":"dc+sd-jwt","meta":{{"vct_values":["{DEFAULT_VCT}"]}}}},{{"id":"b","format":"dc+sd-jwt","meta":{{"vct_values":["{DEFAULT_VCT}"]}}}}],"credential_sets":[{{"options":[["a","b"]],"required":true}}]}}"#
+    )
+}
+
+/// Mint an in-window (nbf 2026-08-01, exp inside the leaf window), request-bound SD-JWT VC of the
+/// default vct — the KB-JWT `iat` at [`IN_WINDOW_NOW`] so it is within the freshness window.
+fn bound_sd_jwt(request: &PresentationRequest) -> String {
+    let sd_jwt = mint_sd_jwt_with_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        serde_json::json!(1_785_542_400),
+        serde_json::json!(1_790_000_000),
+    );
+    attach_kb_jwt_with_iat(
+        sd_jwt,
+        HOLDER_KEY_PK8,
+        VP_AUDIENCE,
+        &request.nonce_b64(),
+        IN_WINDOW_NOW,
+    )
+}
+
+/// Like [`bound_sd_jwt`] but the credential declares a Token Status List reference at `idx`/`uri`.
+fn bound_status_sd_jwt(request: &PresentationRequest, idx: u64, uri: &str) -> String {
+    let sd_jwt = mint_sd_jwt_with_status_and_validity(
+        ISSUER_KEY_PK8,
+        ISSUER_CERT_DER,
+        idx,
+        uri,
+        1_785_542_400,
+        1_790_000_000,
+    );
+    attach_kb_jwt_with_iat(
+        sd_jwt,
+        HOLDER_KEY_PK8,
+        VP_AUDIENCE,
+        &request.nonce_b64(),
+        IN_WINDOW_NOW,
+    )
+}
+
+/// A one-`NoStatus`-document positional statuses map for each `(id, [tokens])` — the positional seam a
+/// non-status-declaring credential (or the fallback) reads.
+fn vp_no_status(
+    vp_token: &std::collections::BTreeMap<String, Vec<WirePresentation>>,
+) -> std::collections::BTreeMap<String, Vec<Vec<StatusOutcome>>> {
+    vp_token
+        .iter()
+        .map(|(id, presentations)| {
+            (
+                id.clone(),
+                presentations
+                    .iter()
+                    .map(|_| vec![StatusOutcome::NoStatus])
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Assemble a `WireVpTokenRequest` at the current schema version, pinning the issuing IACA root and the
+/// in-window instant (the fields the set-level tests share).
+fn vp_envelope(
+    request: PresentationRequest,
+    vp_token: std::collections::BTreeMap<String, Vec<WirePresentation>>,
+    statuses: std::collections::BTreeMap<String, Vec<Vec<StatusOutcome>>>,
+    status_tokens: std::collections::BTreeMap<String, serde_bytes::ByteBuf>,
+) -> WireVpTokenRequest {
+    WireVpTokenRequest {
+        schema_version: ATTESTATION_SCHEMA_VERSION,
+        request,
+        vp_token,
+        policy: VerificationPolicy::default(),
+        anchors: vec![WireTrustAnchor {
+            role: IssuerRole::Pid,
+            format: Format::SdJwtVc,
+            cert_der: CA_IACA.to_vec(),
+        }],
+        now_unix: IN_WINDOW_NOW,
+        role: IssuerRole::Pid,
+        statuses,
+        status_tokens,
+    }
+}
+
+fn encode_vp(req: &WireVpTokenRequest) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::into_writer(req, &mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn wire_vp_token_request_round_trips_through_cbor() {
+    // A skeletal request (a bogus presentation is enough — this asserts the CBOR shape, not a verdict)
+    // survives an encode → decode unchanged, including the additive `status_tokens` map.
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~".to_owned(),
+        }],
+    );
+    let mut status_tokens = std::collections::BTreeMap::new();
+    status_tokens.insert(
+        "https://issuer.example/statuslists/1".to_owned(),
+        serde_bytes::ByteBuf::from(vec![1u8, 2, 3]),
+    );
+    let req = vp_envelope(
+        vp_request(&two_credential_vp_dcql()),
+        vp_token.clone(),
+        vp_no_status(&vp_token),
+        status_tokens,
+    );
+    let decoded: WireVpTokenRequest = ciborium::from_reader(&encode_vp(&req)[..]).unwrap();
+    assert_eq!(
+        decoded, req,
+        "WireVpTokenRequest must round-trip through CBOR"
+    );
+}
+
+#[test]
+fn process_vp_token_bytes_satisfied_set_end_to_end() {
+    // A well-formed set-level request: two trusted, in-window, request-bound credentials satisfying the
+    // required option [["a","b"]] → SATISFIED, each per-credential VALID.
+    let request = vp_request(&two_credential_vp_dcql());
+    let pres_a = bound_sd_jwt(&request);
+    let pres_b = bound_sd_jwt(&request);
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_a,
+        }],
+    );
+    vp_token.insert(
+        "b".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_b,
+        }],
+    );
+    let statuses = vp_no_status(&vp_token);
+    let req = vp_envelope(
+        request,
+        vp_token,
+        statuses,
+        std::collections::BTreeMap::new(),
+    );
+
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    assert_eq!(resp.schema_version, ATTESTATION_SCHEMA_VERSION);
+    match resp.outcome {
+        WireVpTokenOutcome::Ok { result } => {
+            assert!(result.satisfied, "the required set [a,b] is satisfied");
+            for id in ["a", "b"] {
+                let credential = &result.credentials[id];
+                assert!(
+                    credential.satisfied,
+                    "credential {id} must satisfy its query"
+                );
+                assert!(
+                    credential.presentations[0].valid,
+                    "credential {id} presentation must be VALID: {:?}",
+                    credential.presentations[0].reasons
+                );
+            }
+        }
+        WireVpTokenOutcome::Err { message } => panic!("unexpected error: {message}"),
+    }
+}
+
+#[test]
+fn process_vp_token_bytes_revoked_via_in_core_status_token_is_unsatisfied() {
+    // The set-level path AUTHENTICATES a supplied signed Token Status List token IN-CORE: required
+    // credential "a" declares a list AND a REVOKED, issuer-signed token is supplied for its URI → "a"
+    // fails (Revoked) → the required option [["a","b"]] is NOT satisfied, even though "b" is current.
+    // Proves in-core status authentication runs on the set-level wire path (not just the positional seam).
+    const LIST_URI: &str = "https://issuer.example/statuslists/wire-set-level";
+    const IDX: u64 = 5;
+    let request = vp_request(&two_credential_vp_dcql());
+    let pres_a = bound_status_sd_jwt(&request, IDX, LIST_URI);
+    let pres_b = bound_sd_jwt(&request);
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_a,
+        }],
+    );
+    vp_token.insert(
+        "b".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_b,
+        }],
+    );
+    let statuses = vp_no_status(&vp_token);
+    // A REVOKED signed token (issuer-signed, kid-only) for "a"'s list URI, fresh at the verify instant.
+    let mut status_tokens = std::collections::BTreeMap::new();
+    status_tokens.insert(
+        LIST_URI.to_owned(),
+        serde_bytes::ByteBuf::from(
+            mint_status_list_jwt(ISSUER_KEY_PK8, LIST_URI, IDX, true, IN_WINDOW_NOW).into_bytes(),
+        ),
+    );
+    let req = vp_envelope(request, vp_token, statuses, status_tokens);
+
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        WireVpTokenOutcome::Ok { result } => {
+            assert!(
+                !result.satisfied,
+                "a required credential revoked by an in-core-authenticated status token must not \
+                 satisfy the set"
+            );
+            let a = &result.credentials["a"];
+            assert!(
+                !a.satisfied,
+                "the revoked credential must not satisfy its query"
+            );
+            assert_eq!(
+                a.presentations[0].reasons,
+                vec![crate::types::ReasonCode::Revoked],
+                "the revocation is read from the in-core-authenticated token"
+            );
+            assert!(
+                result.credentials["b"].satisfied,
+                "the current credential b still satisfies its query"
+            );
+        }
+        WireVpTokenOutcome::Err { message } => panic!("unexpected error: {message}"),
+    }
+}
+
+#[test]
+fn wire_vp_token_misspelled_key_fails_closed_deny_unknown_fields() {
+    // A typo'd top-level key must be a hard decode error (`deny_unknown_fields`), never silently
+    // ignored — the same footgun guard as `VerifyRequest`.
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~".to_owned(),
+        }],
+    );
+    let req = vp_envelope(
+        vp_request(&two_credential_vp_dcql()),
+        vp_token.clone(),
+        vp_no_status(&vp_token),
+        std::collections::BTreeMap::new(),
+    );
+    // Round-trip through a generic CBOR value to inject a misspelled key the struct cannot express.
+    let mut value: ciborium::value::Value =
+        ciborium::de::from_reader(&encode_vp(&req)[..]).unwrap();
+    if let ciborium::value::Value::Map(entries) = &mut value {
+        entries.push((
+            ciborium::value::Value::Text("vp_tokenn".to_owned()), // deliberate typo of `vp_token`
+            ciborium::value::Value::Null,
+        ));
+    } else {
+        panic!("WireVpTokenRequest must encode as a CBOR map");
+    }
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&value, &mut bytes).unwrap();
+    assert!(
+        decode_vp_token_request(&bytes).is_err(),
+        "an unknown/misspelled top-level key must fail the decode (deny_unknown_fields)"
+    );
+}
+
+#[test]
+fn wire_vp_token_wrong_schema_version_is_rejected() {
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~".to_owned(),
+        }],
+    );
+    let mut req = vp_envelope(
+        vp_request(&two_credential_vp_dcql()),
+        vp_token.clone(),
+        vp_no_status(&vp_token),
+        std::collections::BTreeMap::new(),
+    );
+    req.schema_version = ATTESTATION_SCHEMA_VERSION + 1;
+    let err = decode_vp_token_request(&encode_vp(&req)).unwrap_err();
+    assert!(err.contains("unsupported attestation schema_version"));
 }

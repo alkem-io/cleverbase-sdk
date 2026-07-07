@@ -166,6 +166,43 @@ pub unsafe extern "C" fn cleverbase_attestation_verify(
     }
 }
 
+/// Verify a **set-level** OpenID4VP `vp_token` (the multi-credential `{credential_id: [presentations]}`
+/// map — contracts/openid4vp-verifier.md).
+///
+/// CBOR-in / CBOR-out, identical envelope discipline to [`cleverbase_attestation_verify`]: on success
+/// writes a heap buffer to `*out_ptr`/`*out_len` (free it with [`cleverbase_free`]) and returns `0`;
+/// returns non-zero only for null arguments (`1`) or a contained panic (`2`). The set-level outcome (the
+/// overall `satisfied` verdict + per-credential results, or any decode error) is carried *inside* the
+/// CBOR response (a `cleverbase_attestation::wire::WireVpTokenResponse`), never via the status code.
+///
+/// This is the only surface that folds the OpenID4VP **set-level** DCQL semantics (`credential_sets`
+/// required option-sets + `multiple` cardinality) AND authenticates supplied signed Token Status List
+/// tokens in-core across the whole `vp_token`; the single-presentation [`cleverbase_attestation_verify`]
+/// enforces only the per-presentation single-query match. All protocol logic lives in the core; this
+/// layer only does the pointer/length/free dance (Principle III).
+///
+/// # Safety
+/// `in_ptr` must point to `in_len` readable bytes; `out_ptr`/`out_len` must be valid for writes.
+#[no_mangle]
+pub unsafe extern "C" fn cleverbase_attestation_verify_vp_token(
+    in_ptr: *const u8,
+    in_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    // The pointer/null/catch_unwind/free dance is the shared `run_cbor_abi`; this entry only names the
+    // attestation set-level verifier core as the CBOR-in / CBOR-out body (DRY — Principle III).
+    unsafe {
+        run_cbor_abi(
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_len,
+            cleverbase_attestation::wire::process_vp_token_bytes,
+        )
+    }
+}
+
 /// Drive one issuance operation (the gated OpenID4VCI `obtain` / OpenID4VP holder `present` flow —
 /// contracts/holder-signer-hook.md, US2).
 ///
@@ -204,12 +241,14 @@ pub unsafe extern "C" fn cleverbase_attestation_issuance(
     }
 }
 
-/// Free a buffer previously returned by [`cleverbase_process`], [`cleverbase_attestation_verify`], or
-/// [`cleverbase_attestation_issuance`] (all hand back an identically shaped boxed slice).
+/// Free a buffer previously returned by [`cleverbase_process`], [`cleverbase_attestation_verify`],
+/// [`cleverbase_attestation_verify_vp_token`], or [`cleverbase_attestation_issuance`] (all hand back an
+/// identically shaped boxed slice).
 ///
 /// # Safety
 /// `ptr`/`len` must be exactly what a prior `cleverbase_process` / `cleverbase_attestation_verify` /
-/// `cleverbase_attestation_issuance` call wrote, freed at most once.
+/// `cleverbase_attestation_verify_vp_token` / `cleverbase_attestation_issuance` call wrote, freed at
+/// most once.
 #[no_mangle]
 pub unsafe extern "C" fn cleverbase_free(ptr: *mut u8, len: usize) {
     unsafe {
@@ -447,6 +486,50 @@ mod tests {
         let out = drive_attestation_verify(&[0xffu8, 0x00, 0x13, 0x37]);
         let resp: VerifyResponse = ciborium::from_reader(&out[..]).unwrap();
         assert!(matches!(resp.outcome, VerifyOutcome::Err { .. }));
+    }
+
+    /// Drive the given CBOR set-level `verify_vp_token` request through the C-ABI and return the bytes.
+    fn drive_attestation_verify_vp_token(input: &[u8]) -> Vec<u8> {
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        // SAFETY: valid input slice and out pointers.
+        let rc = unsafe {
+            cleverbase_attestation_verify_vp_token(
+                input.as_ptr(),
+                input.len(),
+                &raw mut out_ptr,
+                &raw mut out_len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(!out_ptr.is_null());
+        assert!(out_len > 0);
+        let out = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
+        unsafe { cleverbase_free(out_ptr, out_len) };
+        out
+    }
+
+    #[test]
+    fn attestation_verify_vp_token_null_args_return_nonzero() {
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe {
+            cleverbase_attestation_verify_vp_token(
+                std::ptr::null(),
+                0,
+                &raw mut out_ptr,
+                &raw mut out_len,
+            )
+        };
+        assert_ne!(rc, 0);
+    }
+
+    #[test]
+    fn attestation_verify_vp_token_garbage_input_returns_err_outcome() {
+        use cleverbase_attestation::wire::{WireVpTokenOutcome, WireVpTokenResponse};
+        let out = drive_attestation_verify_vp_token(&[0xffu8, 0x00, 0x13, 0x37]);
+        let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+        assert!(matches!(resp.outcome, WireVpTokenOutcome::Err { .. }));
     }
 
     /// Drive the given CBOR issuance request through the C-ABI and return the response bytes.

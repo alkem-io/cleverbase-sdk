@@ -59,12 +59,23 @@
 //! reuse of one outcome across documents, SC-002) and hardens both wire structs with
 //! `#[serde(deny_unknown_fields)]`, so a typo'd/unrecognized key is a hard decode error rather than a
 //! silently-defaulted field (e.g. a misspelled `qualified_gate` can no longer leave the gate off).
+//!
+//! Version 5 ALSO adds a NEW, SEPARATE **set-level** OpenID4VP envelope
+//! ([`WireVpTokenRequest`]/[`WireVpTokenResponse`], decoded by [`process_vp_token_bytes`]) that carries
+//! the full multi-credential `vp_token` (`{credential_id: [presentations]}`) so the set-level DCQL
+//! semantics ([`crate::openid4vp::verify_vp_token`] — `credential_sets` required option-sets +
+//! `multiple` cardinality) AND in-core Token Status List authentication are reachable over the C-ABI
+//! (previously native-Rust-only). It is a distinct entry point on the SAME schema version — the
+//! single-presentation [`VerifyRequest`]/[`process_verify_bytes`] envelope is untouched — so this is an
+//! additive addition, not a shape change to an existing envelope (no bump; this crate is pre-release).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::openid4vp::PresentationRequest;
+use crate::openid4vp::{
+    verify_vp_token, MdocVpToken, PresentationRequest, VpToken, VpTokenVerification,
+};
 use crate::status::StatusOutcome;
 use crate::trust::ChainValidatingAnchors;
 use crate::types::{Format, IssuerRole, VerificationPolicy, VerificationResult};
@@ -376,6 +387,177 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
         Err(message) => VerifyOutcome::Err { message },
     };
     encode_verify_response(outcome)
+}
+
+// =================================================================================================
+// Set-level OpenID4VP envelope (schema v5, additive) — the multi-credential `vp_token` surface.
+//
+// The single-presentation `VerifyRequest` above enforces only the per-presentation single-query match.
+// This SEPARATE envelope carries the whole `vp_token` map so the C-ABI reaches the ONLY entry that folds
+// the **set-level** DCQL semantics ([`verify_vp_token`] — `credential_sets` required option-sets +
+// `multiple` cardinality) AND performs in-core Token Status List authentication across the set. Its
+// discipline mirrors `VerifyRequest`/`process_verify_bytes` exactly (versioned + `deny_unknown_fields`
+// + fail-closed decode); it reuses `WirePresentation`/`WireTrustAnchor`/`decode_versioned`/
+// `anchors_from_wire` (DRY — Principle III).
+// =================================================================================================
+
+/// A **set-level** `verify_vp_token` request: the OpenID4VP request the presentations must be bound to,
+/// the whole multi-credential `vp_token` (`{credential_id: [presentations]}`), the policy, the
+/// configured anchors, the verification instant/role, the host-resolved per-credential/-token/-document
+/// positional `statuses`, and (additively) the host-fetched signed Token Status List `status_tokens`.
+///
+/// `deny_unknown_fields` for the same reason as [`VerifyRequest`]: a misspelled key is a hard decode
+/// error, never a silent default (a typo'd `status_tokens` must not silently drop in-core status
+/// authentication). Reuses [`WirePresentation`] per presentation and [`WireTrustAnchor`] per anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireVpTokenRequest {
+    /// Wire schema version of this envelope.
+    pub schema_version: u32,
+    /// The OpenID4VP request (DCQL query + fresh nonce + audience + `response_uri`) the presentations
+    /// must be bound to — the SAME [`PresentationRequest`] carried by [`VerifyRequest::request`].
+    pub request: PresentationRequest,
+    /// The returned `vp_token`: each Credential Query `id` → the Presentations returned under it
+    /// (OpenID4VP 1.0 §"Response Parameters"). Reuses [`WirePresentation`] per presentation.
+    pub vp_token: BTreeMap<String, Vec<WirePresentation>>,
+    /// The verifier policy.
+    pub policy: VerificationPolicy,
+    /// The configured trust anchors (resolved + passed in by the host's trust-refresh step).
+    pub anchors: Vec<WireTrustAnchor>,
+    /// The verification instant (Unix seconds), shared across every presentation.
+    pub now_unix: i64,
+    /// The default issuer role trust is anchored under (per-credential a query's expected PID type may
+    /// override it — see [`verify_vp_token`]).
+    pub role: IssuerRole,
+    /// The host-resolved revocation/status outcomes, keyed by credential id → per **token**
+    /// (presentation) → per **document** (positional). A credential id / token / document with no
+    /// covering entry fails closed to [`StatusOutcome::Unavailable`] — never a silent reuse (SC-002).
+    pub statuses: BTreeMap<String, Vec<Vec<StatusOutcome>>>,
+    /// The host-fetched **signed** Token Status List tokens, keyed by list URI → raw token bytes,
+    /// shared across every presentation. When a presented credential declares a Token Status List
+    /// reference AND a token is supplied for its URI, the core AUTHENTICATES that token in-core and its
+    /// outcome OVERRIDES the positional [`Self::statuses`] entry (identically to the single-presentation
+    /// [`WireContext::status_tokens`]). Absent (the `#[serde(default)]` empty map) ⇒ the positional
+    /// `statuses` seam alone. `ByteBuf` so the raw token round-trips through ciborium without a lossy
+    /// text re-encode.
+    #[serde(default)]
+    pub status_tokens: BTreeMap<String, serde_bytes::ByteBuf>,
+}
+
+impl HasSchemaVersion for WireVpTokenRequest {
+    fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+}
+
+/// The outcome of a set-level `verify_vp_token` operation (mirrors [`VerifyOutcome`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireVpTokenOutcome {
+    /// The set-level verdict: the overall `satisfied` decision + the per-credential outcomes (each
+    /// carrying its per-Presentation [`VerificationResult`]s + its own `satisfied` flag).
+    Ok {
+        /// The set-level verification result (carries the full [`VpTokenVerification`] as-is — DRY).
+        result: VpTokenVerification,
+    },
+    /// A decode/usage error rendered as a message (e.g. an unsupported schema version).
+    Err {
+        /// Human-readable error message.
+        message: String,
+    },
+}
+
+/// A versioned set-level `verify_vp_token` response envelope (mirrors [`VerifyResponse`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireVpTokenResponse {
+    /// Wire schema version of this envelope.
+    pub schema_version: u32,
+    /// The operation outcome.
+    pub outcome: WireVpTokenOutcome,
+}
+
+/// Decode a set-level `verify_vp_token` request envelope, rejecting unknown schema versions.
+///
+/// # Errors
+///
+/// Returns the decode error (or a schema-version mismatch message) as a `String`.
+pub fn decode_vp_token_request(bytes: &[u8]) -> Result<WireVpTokenRequest, String> {
+    decode_versioned(bytes, ATTESTATION_SCHEMA_VERSION, "attestation")
+}
+
+/// Encode a set-level `verify_vp_token` response envelope at the current schema version.
+#[must_use]
+pub fn encode_vp_token_response(outcome: WireVpTokenOutcome) -> Vec<u8> {
+    let resp = WireVpTokenResponse {
+        schema_version: ATTESTATION_SCHEMA_VERSION,
+        outcome,
+    };
+    // Infallible: the shared `cbor_to_vec` encodes a plain serde value into an in-memory Vec (DRY).
+    crate::cbor_to_vec(&resp)
+}
+
+/// Decode → [`verify_vp_token`] → encode for the set-level `vp_token` surface. Pure; shared by the
+/// C-ABI, language bindings, and tests (single source of truth — Principle III). A well-formed request
+/// folds the complete OpenID4VP set-level DCQL semantics (`credential_sets` + `multiple`) AND
+/// authenticates any supplied signed Token Status List token in-core; a malformed one yields
+/// [`WireVpTokenOutcome::Err`] (fail-closed, same discipline as [`process_verify_bytes`]).
+#[must_use]
+pub fn process_vp_token_bytes(input: &[u8]) -> Vec<u8> {
+    let outcome = match decode_vp_token_request(input) {
+        Ok(mut req) => {
+            // Chain-validate every credential's leaf against the host-supplied anchors at the
+            // verification instant (reuses `anchors_from_wire` — DRY).
+            let anchors = anchors_from_wire(&req.anchors, req.now_unix);
+            // MOVE the signed Token Status List tokens out (leaving an empty map) and `into_vec` each
+            // `ByteBuf`, so the attacker-sized token buffers are never cloned — exactly as
+            // `process_verify_bytes` does for `WireContext::status_tokens`.
+            let status_tokens: BTreeMap<String, Vec<u8>> = std::mem::take(&mut req.status_tokens)
+                .into_iter()
+                .map(|(uri, token)| (uri, token.into_vec()))
+                .collect();
+            // Build the BORROWED `{credential_id: [VpToken]}` map referencing the owned `req.vp_token`
+            // (VpToken borrows the presentation string / device-response bytes — held live in `req`
+            // through the `verify_vp_token` call). The `WirePresentation`→`VpToken` mapping mirrors the
+            // single-presentation `WirePresentation`→`Presentation` mapping in `process_verify_bytes`; an
+            // mdoc with no addressed audience defaults to `""`, which cannot match the request audience →
+            // `WrongAudience` (fail-closed — a set-level flow is always request-bound).
+            let vp_token: BTreeMap<String, Vec<VpToken<'_>>> = req
+                .vp_token
+                .iter()
+                .map(|(id, presentations)| {
+                    let tokens = presentations
+                        .iter()
+                        .map(|presentation| match presentation {
+                            WirePresentation::SdJwtVc { presentation } => {
+                                VpToken::SdJwtVc(presentation)
+                            }
+                            WirePresentation::Mdoc {
+                                device_response,
+                                audience,
+                            } => VpToken::Mdoc(MdocVpToken {
+                                audience: audience.as_deref().unwrap_or_default(),
+                                device_response,
+                            }),
+                        })
+                        .collect();
+                    (id.clone(), tokens)
+                })
+                .collect();
+            let result = verify_vp_token(
+                &req.request,
+                &vp_token,
+                &req.policy,
+                &anchors,
+                req.now_unix,
+                req.role,
+                &req.statuses,
+                &status_tokens,
+            );
+            WireVpTokenOutcome::Ok { result }
+        }
+        Err(message) => WireVpTokenOutcome::Err { message },
+    };
+    encode_vp_token_response(outcome)
 }
 
 #[cfg(test)]

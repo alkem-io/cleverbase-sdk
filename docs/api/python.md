@@ -32,6 +32,12 @@ def resume_http(handle: bytes, status: int, body: bytes, now_unix: int, entropy:
 def attestation_verify(request: bytes) -> bytes
 ```
 
+## `attestation_verify_vp_token`
+
+```python
+def attestation_verify_vp_token(request: bytes) -> bytes
+```
+
 ## `attestation_issuance`
 
 ```python

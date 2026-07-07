@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const cbor = require("cbor");
-const { attestationVerify, attestationIssuance } = require("../index.js");
+const { attestationVerify, attestationVerifyVpToken, attestationIssuance } = require("../index.js");
 
 // The attestation surface is CBOR-through: a CBOR VerifyRequest / IssuanceRequest goes in and a
 // CBOR VerifyResponse / IssuanceResponse comes out. The verdict and any error ride *inside* the
@@ -37,6 +37,39 @@ test("attestationVerify runs the verifier end-to-end (bogus presentation ⇒ INV
 
 test("attestationVerify fails closed on garbage input (non-map ⇒ err outcome, schema 5)", () => {
   const resp = cbor.decodeFirstSync(attestationVerify(cbor.encode(0)));
+  assert.strictEqual(resp.schema_version, 5);
+  assertOneOf(resp.outcome, "ok", "err");
+  assert.ok(Object.prototype.hasOwnProperty.call(resp.outcome, "err"));
+});
+
+test("attestationVerifyVpToken runs the set-level verifier end-to-end (bogus ⇒ UNSATISFIED)", () => {
+  // A well-formed set-level WireVpTokenRequest with a bogus presentation and no anchors: the verifier
+  // RUNS (proving the round-trip through the new symbol) and returns an UNSATISFIED ok outcome.
+  const req = {
+    schema_version: 5,
+    request: {
+      dcql: { query_json: '{"credentials":[{"id":"pid","format":"dc+sd-jwt","meta":{"vct_values":["urn:eudi:pid:1"]}}]}' },
+      nonce: Buffer.from([7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]),
+      audience: "https://verifier.example/cb",
+      response_uri: "https://verifier.example/cb/response",
+    },
+    vp_token: { pid: [{ sd_jwt_vc: { presentation: "eyJhbGciOiJFUzI1NiJ9.eyJ2Y3QiOiJ4In0.AAAA~" } }] },
+    policy: { formats: [], qualified_gate: false, status_reachability: "fail_closed" },
+    anchors: [],
+    now_unix: 0,
+    role: "pid",
+    statuses: { pid: [["no_status"]] },
+  };
+  const resp = cbor.decodeFirstSync(attestationVerifyVpToken(cbor.encode(req)));
+  assert.strictEqual(resp.schema_version, 5);
+  assertOneOf(resp.outcome, "ok", "err");
+  assert.ok(Object.prototype.hasOwnProperty.call(resp.outcome, "ok"));
+  // A bogus presentation + no anchors cannot satisfy the required credential → not satisfied.
+  assert.strictEqual(resp.outcome.ok.result.satisfied, false);
+});
+
+test("attestationVerifyVpToken fails closed on garbage input (non-map ⇒ err outcome, schema 5)", () => {
+  const resp = cbor.decodeFirstSync(attestationVerifyVpToken(cbor.encode(0)));
   assert.strictEqual(resp.schema_version, 5);
   assertOneOf(resp.outcome, "ok", "err");
   assert.ok(Object.prototype.hasOwnProperty.call(resp.outcome, "err"));

@@ -14,6 +14,7 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 
 - [func AttestationIssuance\(request \[\]byte\) \(\[\]byte, error\)](<#AttestationIssuance>)
 - [func AttestationVerify\(request \[\]byte\) \(\[\]byte, error\)](<#AttestationVerify>)
+- [func AttestationVerifyVpToken\(request \[\]byte\) \(\[\]byte, error\)](<#AttestationVerifyVpToken>)
 - [type Appearance](<#Appearance>)
 - [type AppearanceShow](<#AppearanceShow>)
 - [type Config](<#Config>)
@@ -46,6 +47,15 @@ func AttestationVerify(request []byte) ([]byte, error)
 ```
 
 AttestationVerify runs the EUDI attestation verifier over a CBOR VerifyRequest envelope \(attestation schema version 5\) and returns the CBOR VerifyResponse. Unlike the signing surface, the attestation surface is CBOR\-in / CBOR\-out: the caller builds the VerifyRequest and decodes the VerifyResponse per the documented wire schema \(see specs/004\-attestation\-and\-verification/standards\-conformance.md\). The VALID/INVALID verdict \(and any decode error\) rides inside the VerifyResponse \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere INVALID verdict.
+
+<a name="AttestationVerifyVpToken"></a>
+## func AttestationVerifyVpToken
+
+```go
+func AttestationVerifyVpToken(request []byte) ([]byte, error)
+```
+
+AttestationVerifyVpToken runs the EUDI attestation SET\-LEVEL OpenID4VP verifier over a CBOR WireVpTokenRequest envelope \(attestation schema version 5\) and returns the CBOR WireVpTokenResponse. Unlike AttestationVerify \(a single presentation\), this carries the whole multi\-credential vp\_token \(\`\{credential\_id: \[presentations\]\}\`\) so the core folds the OpenID4VP set\-level DCQL semantics \(\`credential\_sets\` required option\-sets \+ \`multiple\` cardinality\) AND authenticates supplied signed Token Status List tokens in\-core across the set. Like AttestationVerify it is CBOR\-in / CBOR\-out: the overall \`satisfied\` verdict \+ per\-credential results \(and any decode error\) ride inside the response \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere unsatisfied verdict.
 
 <a name="Appearance"></a>
 ## type Appearance
