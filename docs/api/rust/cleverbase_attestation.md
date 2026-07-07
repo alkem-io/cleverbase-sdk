@@ -2501,12 +2501,14 @@ The canonical outcome of the revocation/status check, consumed by both per-forma
 status seam (the single authoritative status type — DRY, Principle III).
 
 The per-format `verify` paths translate this into their reject reason: [`Self::Revoked`] →
-[`ReasonCode::Revoked`], [`Self::Unavailable`] → [`ReasonCode::StatusUnavailable`], and
-[`Self::NoStatus`]/[`Self::Good`] continue the bar. Carried across the C-ABI as CBOR (the host
-resolves it through [`check_status`] and passes the outcome in), hence the `serde` derives.
+[`ReasonCode::Revoked`], [`Self::Unavailable`] → [`ReasonCode::StatusUnavailable`], [`Self::Untrusted`]
+→ [`ReasonCode::StatusUntrusted`], and [`Self::NoStatus`]/[`Self::Good`] continue the bar. Carried
+across the C-ABI as CBOR (the host resolves it through [`check_status`] and passes the outcome in),
+hence the `serde` derives.
 
 [`ReasonCode::Revoked`]: crate::types::ReasonCode::Revoked
 [`ReasonCode::StatusUnavailable`]: crate::types::ReasonCode::StatusUnavailable
+[`ReasonCode::StatusUntrusted`]: crate::types::ReasonCode::StatusUntrusted
 
 ##### Variants
 
@@ -2517,8 +2519,22 @@ resolves it through [`check_status`] and passes the outcome in), hence the `serd
 - `Revoked`
   - The status mechanism says the credential is revoked or suspended.
 - `Unavailable`
-  - The status document was unreachable (or unparseable) and the policy is fail-closed — never a
-silent VALID.
+  - The status document was genuinely absent / unreachable (no token supplied), or a SUPPLIED and
+AUTHENTICATED token had a post-auth data problem the core could not read past (its `lst` would not
+zlib-inflate, or the entry at this credential's `idx` is outside the list, or the status value is
+not in the registry). Fail-closed — never a silent VALID. This is the *benign / transient* status
+failure (distinct from [`Self::Untrusted`], the adversarial one).
+- `Untrusted`
+  - A SUPPLIED signed status-list token FAILED IN-CORE AUTHENTICATION — a stronger, likely-adversarial
+signal than [`Self::Unavailable`]. Returned by [`verify_status_list_token`] when a token that WAS
+supplied fails any authentication check: its JWS/`COSE_Sign1` signature did not verify under the
+authorized key, a header gate (`typ`/`alg`/`crit`/`COSE_Mac0`) or structural/claims parse failed,
+its `sub` did not byte-bind to the credential's list URI, it was expired/stale, or the signer was
+not authorized. Also the mapping for a present-but-unusable status *reference*
+([`StatusReference::Malformed`]): a declared mechanism the core cannot evaluate is closer to
+"untrusted" than "unreachable". Identically fail-closed INVALID — this only refines the reason
+(`ReasonCode::StatusUntrusted`) so a SOC can tell a probable revocation-path attack from a
+transient outage; it never changes the accept/reject.
 
 #### enum `StatusReference`
 
@@ -2611,8 +2627,9 @@ Evaluate a credential's status against the host-supplied status documents, apply
 fail-closed reachability policy.
 
 - [`StatusReference::None`] → [`StatusOutcome::NoStatus`].
-- [`StatusReference::Malformed`] → [`StatusOutcome::Unavailable`] (a declared-but-uninterpretable
-  status reference fails closed regardless of reachability — never a silent VALID).
+- [`StatusReference::Malformed`] → [`StatusOutcome::Untrusted`] (a declared-but-uninterpretable
+  status reference fails closed regardless of reachability — never a silent VALID; it named a
+  mechanism the core cannot evaluate, closer to "untrusted" than "unreachable").
 - A reachable status list / CRL → [`StatusOutcome::Revoked`] if the entry is revoked, else
   [`StatusOutcome::Good`].
 - An **unreachable** status document → [`StatusOutcome::Unavailable`] under
@@ -2665,17 +2682,22 @@ tagged `COSE_Sign1` CWT (`application/statuslist+cwt`, mdoc baseline — binary 
 the tag-18 byte `0xD2`). The host fetched `token` by URI (sans-IO — the network is the host's); this
 verifies it in-core.
 
-Fail-closed contract: EVERY check must hold, else the result is [`StatusOutcome::Unavailable`],
-NEVER [`StatusOutcome::Good`]. In order:
+Fail-closed contract: EVERY check must hold, else the result is a fail-closed INVALID outcome, NEVER
+[`StatusOutcome::Good`]. The FAILING outcome distinguishes an AUTHENTICATION failure of the supplied
+token ([`StatusOutcome::Untrusted`] — the adversarial-leaning signal) from a post-auth DATA problem
+of an authenticated token ([`StatusOutcome::Unavailable`] — benign). In order:
 1. **Signature** — JWS ES256 / `COSE_Sign1` ES256 under the key `resolve_key` authorizes; a bad
-   signature, non-ES256 `alg`, wrong `typ`, present `crit`, or `COSE_Mac0` (tag 17) → `Unavailable`.
+   signature, non-ES256 `alg`, wrong `typ`, present `crit`, `COSE_Mac0` (tag 17), or a malformed
+   structure/claims → `Untrusted` (authentication failed).
 2. **Subject binding** — the token's `sub` MUST byte-exactly equal `expected_uri` (the credential's
-   `status_list.uri`); a validly-signed list for a *different* URI is rejected.
+   `status_list.uri`); a validly-signed list for a *different* URI → `Untrusted`.
 3. **Freshness** — a present `exp` MUST be `> now_unix`; a present `ttl` requires `iat + ttl >=
-   now_unix` (else the cached token is stale). `iat` is REQUIRED.
+   now_unix` (else the cached token is stale). `iat` is REQUIRED. Expired/stale → `Untrusted`.
 4. **Bit** — the `lst` bitstring is zlib-inflated and the `bits`-wide, LSB-first entry at `idx` is
-   read (an out-of-range `idx` → `Unavailable`, never `Good`) and mapped through the status
-   registry (0=VALID→`Good`, 1=INVALID→`Revoked`, 2=SUSPENDED→`Revoked`, else→`Unavailable`).
+   read and mapped through the status registry (0=VALID→`Good`, 1=INVALID→`Revoked`,
+   2=SUSPENDED→`Revoked`). This step runs only AFTER authentication (1–3) holds, so its failures are
+   post-auth DATA problems → `Unavailable`, never `Good`: a `lst` that will not inflate, an
+   out-of-range `idx`, or an unknown/reserved status value.
 
 `resolve_key` receives the token's parsed [`SignerKeyMaterial`] and returns the [`VerifyingKey`] to
 verify under (or `Err(())` to reject). The signing-key TRUST/EKU decision is the closure's — layer 2
@@ -2960,7 +2982,7 @@ signer chains to a configured scheme-operator anchor (the structural §6.1 path)
 ##### fn `verify_chain`
 
 ```rust
-fn verify_chain(supplied_chain: &[&[u8]], anchor_certs_der: &[Vec<u8>], now_unix: i64, leaf_validity_time: Option<i64>, leaf_purpose: LeafPurpose) -> Result<Vec<u8>, ChainError>
+fn verify_chain<'a>(supplied_chain: &[&[u8]], anchor_certs_der: &'a [Vec<u8>], now_unix: i64, leaf_validity_time: Option<i64>, leaf_purpose: LeafPurpose) -> Result<&'a [u8], ChainError>
 ```
 
 Whether the supplied certification path `supplied_chain` (leaf-first: `[leaf, intermediate₁, …]`)
@@ -3025,11 +3047,14 @@ attacker-supplied chain can demand. Returns the most specific [`ChainError`] whe
 
 ## Returns
 
-On success, `Ok(anchor_der)` is the DER of the **trust anchor the path terminated at** — for a
-chain-to-root path, the matched configured root; for a direct DER-equal pin, that pinned certificate
-(which IS the anchor). Callers that anchor a downstream trust decision to the credential's SAME
-specific root (`resolve_chain` storing it as [`crate::trust::TrustListEntry::anchor_cert_der`],
-consumed by the in-core status-signer authorization) rely on this being the ROOT, not the leaf.
+On success, `Ok(anchor_der)` is a **borrow** (with the input `anchor_certs_der` lifetime) of the DER
+of the **trust anchor the path terminated at** — for a chain-to-root path, the matched configured
+root; for a direct DER-equal pin, that pinned certificate (which IS the anchor). Returning a borrow
+keeps `verify_chain` allocation-free: a caller that must OWN the anchor DER clones at its own boundary
+(`resolve_chain` does, storing it as [`crate::trust::TrustListEntry::anchor_cert_der`], consumed by
+the in-core status-signer authorization), while the pass/fail-only callers clone nothing. Callers that
+anchor a downstream trust decision to the credential's SAME specific root rely on this being the ROOT,
+not the leaf.
 
 # Errors
 
@@ -4036,6 +4061,17 @@ expired/withdrawn trust-list entry).
 - `StatusUnavailable`
   - The revocation/status endpoint (or trust list) was unreachable or stale and the policy is
 fail-closed (never a silent VALID).
+- `StatusUntrusted`
+  - A host-supplied **signed** status-list token failed IN-CORE AUTHENTICATION — a stronger,
+likely-adversarial signal than [`Self::StatusUnavailable`]. Distinct from a benign unreachable
+(no token supplied → [`Self::StatusUnavailable`]): here the host DID supply a Token Status List
+token and the core could not authenticate it — its JWS/`COSE_Sign1` signature did not verify
+under an authorized signer, its `sub` did not bind to the credential's list URI, it was
+expired/stale, or its signer was untrusted / cross-issuer. Also carries a present-but-unusable
+status *reference* (a declared `status_list` whose `idx`/`uri` the core cannot evaluate — it
+named a mechanism that failed to resolve, closer to "untrusted" than "unreachable"). Identically
+fail-closed INVALID (SC-002); this only refines the REASON so a SOC can tell a probable attack on
+the revocation path from a transient outage, never the accept/reject.
 - `HolderBinding`
   - The holder binding did not verify (SD-JWT VC KB-JWT; mdoc DeviceAuth).
 - `DisclosureIntegrity`

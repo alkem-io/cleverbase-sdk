@@ -259,14 +259,16 @@ fn resolve_chain(
     // is the caller's separate gate). `leaf.validity_time` (Some for the mdoc DS leaf at the MSO `signed`
     // time, None elsewhere) is the seam for ISO §9.3.1.
     match verify_chain(&chain, anchors, now_unix, leaf.validity_time, leaf.purpose) {
-        // `verify_chain` returns the DER of the trust anchor the path terminated at (the matched ROOT
-        // for a chain-to-root path; the pinned cert for a direct pin). Store THAT as the entry's
-        // `anchor_cert_der` — NOT the leaf: the in-core status-signer authorization binds a distinct
-        // status signer to the credential's SAME specific root, which only works if this is the root.
+        // `verify_chain` returns a BORROW of the trust anchor the path terminated at (the matched ROOT
+        // for a chain-to-root path; the pinned cert for a direct pin), into the caller-supplied anchor
+        // set. Clone it HERE (`.to_vec()`) to OWN it in the entry's `anchor_cert_der` — NOT the leaf: the
+        // in-core status-signer authorization binds a distinct status signer to the credential's SAME
+        // specific root, which only works if this is the root. (Alloc-neutral: `verify_chain` no longer
+        // clones; the single `.to_vec()` moved here — the two discarding callers now allocate nothing.)
         Ok(anchor_der) => TrustDecision::trusted(TrustListEntry {
             role,
             format,
-            anchor_cert_der: anchor_der,
+            anchor_cert_der: anchor_der.to_vec(),
         }),
         // Map the specific ChainError to the coarse-but-accurate TrustFailure the verifier needs: a
         // cert outside its validity window on the path (the leaf, an intermediate, or the anchor) is an

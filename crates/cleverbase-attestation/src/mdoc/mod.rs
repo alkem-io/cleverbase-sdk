@@ -466,7 +466,6 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
             .first()
             .copied()
             .unwrap_or(StatusOutcome::Unavailable);
-        // Single-document conformance path — a throwaway inflate memo (no cross-document sharing needed).
         let verified = verify_issuer_signed(
             issuer_signed,
             raw_items.first(),
@@ -474,7 +473,6 @@ pub fn verify_issuer_auth_against_vector<A: TrustAnchorSource + ?Sized>(
             &doc_type,
             status,
             params,
-            &mut crate::status::StatusListInflateCache::new(),
         )?;
         // Project the internal nested disclosure to the public namespace-grouped wire shape
         // (`{ ns: AttributeValue::Map({ id: value }) }`) — the same shape `verify` returns.
@@ -605,11 +603,6 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
     let session_transcript = params
         .session_transcript
         .and_then(|bytes| decode_session_transcript_value(bytes).ok());
-    // Per-response Token Status List inflate memo: a status list several documents reference (e.g. one
-    // credential replayed N times) is authenticated + zlib-inflated ONCE per URI, not once per document
-    // — a decompression-DoS-amplification cap. Sound because the inflate is trust-context-independent and
-    // each document still re-runs signature/`sub`/freshness (see `status::StatusListInflateCache`).
-    let mut inflate_cache = crate::status::StatusListInflateCache::new();
     for (index, document) in documents.iter().enumerate() {
         // The raw-item capture is positional + best-effort; an out-of-range/absent entry yields an
         // empty map, so `verify_value_digests` fails that document's items closed (never a re-encode).
@@ -630,7 +623,6 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             doc_status,
             session_transcript.as_ref(),
             params,
-            &mut inflate_cache,
         )
         .map_err(fail)?;
         // The document's `docType` (verified == the signed MSO `docType` inside `verify_one_document`)
@@ -727,22 +719,14 @@ fn verify_one_document<A: TrustAnchorSource + ?Sized>(
     status: StatusOutcome,
     session_transcript: Option<&CborValue>,
     params: &MdocVerifyParams<'_>,
-    inflate_cache: &mut crate::status::StatusListInflateCache,
 ) -> Result<(DisclosedByNamespace, (Vec<u8>, i64)), VerifyFailure> {
     let doc_type = get_text(document, "docType").ok_or_else(VerifyFailure::malformed)?;
     let issuer_signed =
         get_map_entry(document, "issuerSigned").ok_or_else(VerifyFailure::malformed)?;
 
     // --- Issuer-side bar: IssuerAuth signature + DS trust + MSO validity + valueDigests integrity. --
-    let issuer_verified = verify_issuer_signed(
-        issuer_signed,
-        raw_items,
-        anchors,
-        &doc_type,
-        status,
-        params,
-        inflate_cache,
-    )?;
+    let issuer_verified =
+        verify_issuer_signed(issuer_signed, raw_items, anchors, &doc_type, status, params)?;
 
     // --- DeviceAuth holder binding: DeviceSignature over DeviceAuthentication w/ the MSO DeviceKey. --
     verify_device_binding(
@@ -792,7 +776,6 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
     doc_type: &str,
     status: StatusOutcome,
     params: &MdocVerifyParams<'_>,
-    inflate_cache: &mut crate::status::StatusListInflateCache,
 ) -> Result<IssuerVerified, VerifyFailure> {
     // --- Parse the IssuerAuth COSE_Sign1 and the MSO it carries. -----------------------------------
     let issuer_auth_value =
@@ -906,7 +889,6 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
             role: effective_role,
             format: crate::types::Format::Mdoc,
         },
-        inflate_cache,
     );
     match status_outcome {
         StatusOutcome::NoStatus | StatusOutcome::Good => {}
@@ -914,6 +896,7 @@ fn verify_issuer_signed<A: TrustAnchorSource + ?Sized>(
         StatusOutcome::Unavailable => {
             return Err(VerifyFailure::reason(ReasonCode::StatusUnavailable))
         }
+        StatusOutcome::Untrusted => return Err(VerifyFailure::reason(ReasonCode::StatusUntrusted)),
     }
 
     // The MSO docType MUST match the document's docType (a mismatch is a structural tamper).

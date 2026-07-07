@@ -171,6 +171,17 @@ pub enum ReasonCode {
     /// The revocation/status endpoint (or trust list) was unreachable or stale and the policy is
     /// fail-closed (never a silent VALID).
     StatusUnavailable,
+    /// A host-supplied **signed** status-list token failed IN-CORE AUTHENTICATION — a stronger,
+    /// likely-adversarial signal than [`Self::StatusUnavailable`]. Distinct from a benign unreachable
+    /// (no token supplied → [`Self::StatusUnavailable`]): here the host DID supply a Token Status List
+    /// token and the core could not authenticate it — its JWS/`COSE_Sign1` signature did not verify
+    /// under an authorized signer, its `sub` did not bind to the credential's list URI, it was
+    /// expired/stale, or its signer was untrusted / cross-issuer. Also carries a present-but-unusable
+    /// status *reference* (a declared `status_list` whose `idx`/`uri` the core cannot evaluate — it
+    /// named a mechanism that failed to resolve, closer to "untrusted" than "unreachable"). Identically
+    /// fail-closed INVALID (SC-002); this only refines the REASON so a SOC can tell a probable attack on
+    /// the revocation path from a transient outage, never the accept/reject.
+    StatusUntrusted,
     /// The holder binding did not verify (SD-JWT VC KB-JWT; mdoc DeviceAuth).
     HolderBinding,
     /// A disclosed attribute did not match an issuer-signed digest (SD-JWT disclosure digest; mdoc
@@ -320,6 +331,7 @@ mod tests {
             ReasonCode::Revoked,
             ReasonCode::UntrustedIssuer,
             ReasonCode::StatusUnavailable,
+            ReasonCode::StatusUntrusted,
             ReasonCode::HolderBinding,
             ReasonCode::DisclosureIntegrity,
             ReasonCode::Replay,

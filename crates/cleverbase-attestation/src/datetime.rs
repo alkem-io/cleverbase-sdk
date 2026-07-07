@@ -203,6 +203,28 @@ pub(crate) fn round_numeric_date_seconds(seconds: f64, rounding: DateRounding) -
     Some(rounded as i64)
 }
 
+/// Reduce a PRESENT JSON NumericDate value to whole `i64` seconds (RFC 7519 §2 / RFC 8392 permit a
+/// FRACTIONAL NumericDate): a canonical integer that already fits `i64` is taken verbatim (its
+/// `ceil`/`floor` are equal, so the direction is irrelevant for it); any other JSON number is rounded in
+/// `rounding`'s direction through [`round_numeric_date_seconds`]; a non-number — or one that rounds
+/// outside `i64`, a non-finite `NaN`/`±∞` included — yields `None`.
+///
+/// The single JSON-NumericDate **magnitude** reader (DRY — Principle III): the SD-JWT VC credential
+/// validity path (`crate::sdjwtvc`'s `numeric_date`) and the in-core Token Status List freshness path
+/// ([`crate::status`]) both delegate here. They differ ONLY in the surrounding policy kept at the call
+/// site — the absent→`None` distinction and the error carrier (a `ReasonCode` for the credential path;
+/// the status path's fail-closed `None`) — never in how a present number is reduced to whole seconds.
+pub(crate) fn json_numeric_date_seconds(
+    value: &serde_json::Value,
+    rounding: DateRounding,
+) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_f64()
+            .and_then(|s| round_numeric_date_seconds(s, rounding))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

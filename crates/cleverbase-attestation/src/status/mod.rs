@@ -74,12 +74,14 @@ pub static DEFAULT_STATUS_TOKENS: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 /// status seam (the single authoritative status type — DRY, Principle III).
 ///
 /// The per-format `verify` paths translate this into their reject reason: [`Self::Revoked`] →
-/// [`ReasonCode::Revoked`], [`Self::Unavailable`] → [`ReasonCode::StatusUnavailable`], and
-/// [`Self::NoStatus`]/[`Self::Good`] continue the bar. Carried across the C-ABI as CBOR (the host
-/// resolves it through [`check_status`] and passes the outcome in), hence the `serde` derives.
+/// [`ReasonCode::Revoked`], [`Self::Unavailable`] → [`ReasonCode::StatusUnavailable`], [`Self::Untrusted`]
+/// → [`ReasonCode::StatusUntrusted`], and [`Self::NoStatus`]/[`Self::Good`] continue the bar. Carried
+/// across the C-ABI as CBOR (the host resolves it through [`check_status`] and passes the outcome in),
+/// hence the `serde` derives.
 ///
 /// [`ReasonCode::Revoked`]: crate::types::ReasonCode::Revoked
 /// [`ReasonCode::StatusUnavailable`]: crate::types::ReasonCode::StatusUnavailable
+/// [`ReasonCode::StatusUntrusted`]: crate::types::ReasonCode::StatusUntrusted
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusOutcome {
@@ -89,9 +91,23 @@ pub enum StatusOutcome {
     Good,
     /// The status mechanism says the credential is revoked or suspended.
     Revoked,
-    /// The status document was unreachable (or unparseable) and the policy is fail-closed — never a
-    /// silent VALID.
+    /// The status document was genuinely absent / unreachable (no token supplied), or a SUPPLIED and
+    /// AUTHENTICATED token had a post-auth data problem the core could not read past (its `lst` would not
+    /// zlib-inflate, or the entry at this credential's `idx` is outside the list, or the status value is
+    /// not in the registry). Fail-closed — never a silent VALID. This is the *benign / transient* status
+    /// failure (distinct from [`Self::Untrusted`], the adversarial one).
     Unavailable,
+    /// A SUPPLIED signed status-list token FAILED IN-CORE AUTHENTICATION — a stronger, likely-adversarial
+    /// signal than [`Self::Unavailable`]. Returned by [`verify_status_list_token`] when a token that WAS
+    /// supplied fails any authentication check: its JWS/`COSE_Sign1` signature did not verify under the
+    /// authorized key, a header gate (`typ`/`alg`/`crit`/`COSE_Mac0`) or structural/claims parse failed,
+    /// its `sub` did not byte-bind to the credential's list URI, it was expired/stale, or the signer was
+    /// not authorized. Also the mapping for a present-but-unusable status *reference*
+    /// ([`StatusReference::Malformed`]): a declared mechanism the core cannot evaluate is closer to
+    /// "untrusted" than "unreachable". Identically fail-closed INVALID — this only refines the reason
+    /// (`ReasonCode::StatusUntrusted`) so a SOC can tell a probable revocation-path attack from a
+    /// transient outage; it never changes the accept/reject.
+    Untrusted,
 }
 
 /// What a credential declares about its status mechanism (parsed from the credential), or the
@@ -168,8 +184,9 @@ pub trait StatusSource {
 /// fail-closed reachability policy.
 ///
 /// - [`StatusReference::None`] → [`StatusOutcome::NoStatus`].
-/// - [`StatusReference::Malformed`] → [`StatusOutcome::Unavailable`] (a declared-but-uninterpretable
-///   status reference fails closed regardless of reachability — never a silent VALID).
+/// - [`StatusReference::Malformed`] → [`StatusOutcome::Untrusted`] (a declared-but-uninterpretable
+///   status reference fails closed regardless of reachability — never a silent VALID; it named a
+///   mechanism the core cannot evaluate, closer to "untrusted" than "unreachable").
 /// - A reachable status list / CRL → [`StatusOutcome::Revoked`] if the entry is revoked, else
 ///   [`StatusOutcome::Good`].
 /// - An **unreachable** status document → [`StatusOutcome::Unavailable`] under
@@ -187,7 +204,9 @@ pub fn check_status<S: StatusSource + ?Sized>(
         StatusReference::None => StatusOutcome::NoStatus,
         // A present-but-uninterpretable status reference fails closed (never reachability-dependent):
         // the credential declared a mechanism the core cannot evaluate, so it cannot be proven current.
-        StatusReference::Malformed => StatusOutcome::Unavailable,
+        // It named a mechanism that failed to resolve → the adversarial-leaning `Untrusted` (a stronger
+        // signal than a benign unreachable), still fail-closed INVALID.
+        StatusReference::Malformed => StatusOutcome::Untrusted,
         StatusReference::StatusList { index, uri } => source.fetch_status_list(uri).map_or_else(
             || unreachable_outcome(reachability),
             |list| evaluate_status_list(&list, *index),
@@ -333,17 +352,22 @@ pub struct SignerKeyMaterial {
 /// the tag-18 byte `0xD2`). The host fetched `token` by URI (sans-IO — the network is the host's); this
 /// verifies it in-core.
 ///
-/// Fail-closed contract: EVERY check must hold, else the result is [`StatusOutcome::Unavailable`],
-/// NEVER [`StatusOutcome::Good`]. In order:
+/// Fail-closed contract: EVERY check must hold, else the result is a fail-closed INVALID outcome, NEVER
+/// [`StatusOutcome::Good`]. The FAILING outcome distinguishes an AUTHENTICATION failure of the supplied
+/// token ([`StatusOutcome::Untrusted`] — the adversarial-leaning signal) from a post-auth DATA problem
+/// of an authenticated token ([`StatusOutcome::Unavailable`] — benign). In order:
 /// 1. **Signature** — JWS ES256 / `COSE_Sign1` ES256 under the key `resolve_key` authorizes; a bad
-///    signature, non-ES256 `alg`, wrong `typ`, present `crit`, or `COSE_Mac0` (tag 17) → `Unavailable`.
+///    signature, non-ES256 `alg`, wrong `typ`, present `crit`, `COSE_Mac0` (tag 17), or a malformed
+///    structure/claims → `Untrusted` (authentication failed).
 /// 2. **Subject binding** — the token's `sub` MUST byte-exactly equal `expected_uri` (the credential's
-///    `status_list.uri`); a validly-signed list for a *different* URI is rejected.
+///    `status_list.uri`); a validly-signed list for a *different* URI → `Untrusted`.
 /// 3. **Freshness** — a present `exp` MUST be `> now_unix`; a present `ttl` requires `iat + ttl >=
-///    now_unix` (else the cached token is stale). `iat` is REQUIRED.
+///    now_unix` (else the cached token is stale). `iat` is REQUIRED. Expired/stale → `Untrusted`.
 /// 4. **Bit** — the `lst` bitstring is zlib-inflated and the `bits`-wide, LSB-first entry at `idx` is
-///    read (an out-of-range `idx` → `Unavailable`, never `Good`) and mapped through the status
-///    registry (0=VALID→`Good`, 1=INVALID→`Revoked`, 2=SUSPENDED→`Revoked`, else→`Unavailable`).
+///    read and mapped through the status registry (0=VALID→`Good`, 1=INVALID→`Revoked`,
+///    2=SUSPENDED→`Revoked`). This step runs only AFTER authentication (1–3) holds, so its failures are
+///    post-auth DATA problems → `Unavailable`, never `Good`: a `lst` that will not inflate, an
+///    out-of-range `idx`, or an unknown/reserved status value.
 ///
 /// `resolve_key` receives the token's parsed [`SignerKeyMaterial`] and returns the [`VerifyingKey`] to
 /// verify under (or `Err(())` to reject). The signing-key TRUST/EKU decision is the closure's — layer 2
@@ -359,77 +383,29 @@ pub fn verify_status_list_token<F>(
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
 {
-    // The public entry authenticates + inflates afresh (no shared memo — a single-token caller). The
-    // multi-document mdoc path uses [`verify_status_list_token_cached`] to share the inflate per URI.
-    verify_status_list_token_cached(
-        token,
-        expected_uri,
-        idx,
-        now_unix,
-        resolve_key,
-        &mut StatusListInflateCache::new(),
-    )
-}
-
-/// A per-verify memo of the zlib-inflated Token Status List bytes, keyed by the credential's list URI.
-///
-/// Threaded through a multi-document mdoc verify so the (attacker-multipliable) up-to-
-/// [`MAX_STATUS_LIST_BYTES`] inflate runs ONCE per distinct list URI rather than once per document that
-/// references it: a `DeviceResponse` replaying one credential N times inflates the shared list ONCE,
-/// not N times (a decompression-DoS-amplification cap). The stored `Option` also caches a FAILED inflate
-/// (a cap-exceeding / corrupt `lst` → `None`) so a re-referenced bad list is not re-inflated per document.
-///
-/// **Soundness (no false-accept).** Memoizing by URI is safe because the inflate is a pure function of
-/// the single, host-fetched-by-URI token — trust-context-INDEPENDENT. Every document still independently
-/// runs the signer authorization, the ES256 signature verification, the `sub` binding, and the freshness
-/// check BEFORE this memo is consulted (it is reached only inside [`evaluate_status_claims`], after those
-/// pass), so a document whose token fails to authenticate returns `Unavailable` without ever reaching
-/// (or benefiting from) the cache. Each document then reads its OWN `idx` from the shared decompressed
-/// bytes (the bit read is per-`idx`; only the verify-preceding inflate is shared per URI).
-pub(crate) type StatusListInflateCache = BTreeMap<String, Option<Vec<u8>>>;
-
-/// [`verify_status_list_token`] threading a per-verify [`StatusListInflateCache`] so a status list that
-/// several documents of one `DeviceResponse` reference is zlib-inflated ONCE per URI (see the cache's
-/// soundness note). Identical semantics to the public entry for any single document; only the inflate is
-/// shared. The form detection + all fail-closed checks are unchanged.
-#[must_use]
-pub(crate) fn verify_status_list_token_cached<F>(
-    token: &[u8],
-    expected_uri: &str,
-    idx: u64,
-    now_unix: i64,
-    resolve_key: F,
-    inflate_cache: &mut StatusListInflateCache,
-) -> StatusOutcome
-where
-    F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
-{
     // Form detection: a compact JWS is entirely ASCII (the base64url alphabet + `.`), whereas a tagged
     // `COSE_Sign1` CWT is binary CBOR whose first byte is the tag-18 marker `0xD2` (non-ASCII). So an
     // all-ASCII token takes the JOSE path and everything else the COSE path; a blob that matches
     // neither form's structure fails its path and folds to `Unavailable` below (never re-tried as the
     // other form — a mis-shaped token is simply rejected, fail-closed).
+    //
+    // Each token is authenticated + zlib-inflated afresh (no cross-document memo): the inflate is
+    // [`MAX_STATUS_LIST_BYTES`]-capped and freed as soon as this call returns, so a multi-document
+    // `DeviceResponse` referencing N distinct lists holds only O(one cap) decompressed bytes live at a
+    // time — never N × 64 MiB — and the per-document ES256 verify (unavoidable) dominates any repeated
+    // same-URI inflate cost.
     let outcome = match core::str::from_utf8(token) {
-        Ok(text) if token.is_ascii() => verify_jwt_status_list(
-            text,
-            expected_uri,
-            idx,
-            now_unix,
-            resolve_key,
-            inflate_cache,
-        ),
-        _ => verify_cwt_status_list(
-            token,
-            expected_uri,
-            idx,
-            now_unix,
-            resolve_key,
-            inflate_cache,
-        ),
+        Ok(text) if token.is_ascii() => {
+            verify_jwt_status_list(text, expected_uri, idx, now_unix, resolve_key)
+        }
+        _ => verify_cwt_status_list(token, expected_uri, idx, now_unix, resolve_key),
     };
-    // Any hard failure (`None`) OR an unknown status value collapses to the fail-closed outcome; only a
-    // fully authenticated token with a known status value yields `Good`/`Revoked`.
-    outcome.unwrap_or(StatusOutcome::Unavailable)
+    // A `None` is an AUTHENTICATION failure of this SUPPLIED token (bad signature, header gate,
+    // structural/claims parse, `sub` mismatch, freshness, or an unauthorized signer) → the
+    // adversarial-leaning [`StatusOutcome::Untrusted`]. A `Some(outcome)` is a token that authenticated:
+    // `Good`/`Revoked`, or the benign [`StatusOutcome::Unavailable`] a post-auth data problem yields
+    // (see [`evaluate_status_claims`]). Either failure is fail-closed INVALID — only the reason differs.
+    outcome.unwrap_or(StatusOutcome::Untrusted)
 }
 
 /// The wire-independent Status List claims both forms parse into, so authentication finishes through
@@ -452,7 +428,6 @@ fn verify_jwt_status_list<F>(
     idx: u64,
     now_unix: i64,
     resolve_key: F,
-    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome>
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
@@ -461,8 +436,9 @@ where
     // check ([`crate::sdjwtvc::split_compact_jws`], DRY — the SD-JWT VC issuer path uses the same).
     let (header_b64, payload_b64, sig_b64) = crate::sdjwtvc::split_compact_jws(token)?;
 
-    // Protected header (base64url → JSON) + the mandated header gates.
-    let header: JsonValue = decode_json_b64url(header_b64)?;
+    // Protected header (base64url → JSON) + the mandated header gates. The segment→JSON decode is the
+    // shared [`crate::sdjwtvc::decode_json_b64url`] (DRY — the SD-JWT VC issuer header decoder uses the same).
+    let header: JsonValue = crate::sdjwtvc::decode_json_b64url(header_b64)?;
     if header.get("typ").and_then(JsonValue::as_str) != Some(JWT_TYP) {
         return None; // wrong/absent media type — not a Status List Token JWS
     }
@@ -484,15 +460,9 @@ where
     crate::sdjwtvc::verify_es256_signing_input(header_b64, payload_b64, sig_b64, &key).ok()?;
 
     // Only now (authenticated) parse the payload claims + evaluate.
-    let payload: JsonValue = decode_json_b64url(payload_b64)?;
+    let payload: JsonValue = crate::sdjwtvc::decode_json_b64url(payload_b64)?;
     let claims = jose_status_claims(&payload)?;
-    evaluate_status_claims(&claims, expected_uri, idx, now_unix, inflate_cache)
-}
-
-/// Base64url-unpadded-decode a compact-JWS segment and parse it as JSON.
-fn decode_json_b64url(segment: &str) -> Option<JsonValue> {
-    let raw = Base64UrlUnpadded::decode_vec(segment).ok()?;
-    serde_json::from_slice(&raw).ok()
+    evaluate_status_claims(&claims, expected_uri, idx, now_unix)
 }
 
 /// Parse the JOSE signer hint from a Status List Token header: the `x5c` chain (base64 *standard* DER,
@@ -519,15 +489,12 @@ fn jose_signer_material(header: &JsonValue) -> Option<SignerKeyMaterial> {
 /// keeps the freshness deadline `iat + ttl >= now` from prematurely marking a conformant token stale.
 fn jose_status_claims(payload: &JsonValue) -> Option<StatusListClaims> {
     let sub = payload.get("sub").and_then(JsonValue::as_str)?.to_owned();
-    let iat = json_numeric_seconds(payload.get("iat")?, DateRounding::Up)?;
+    let iat = crate::datetime::json_numeric_date_seconds(payload.get("iat")?, DateRounding::Up)?;
     let exp = optional_numeric_date(payload.get("exp"), |v| {
-        json_numeric_seconds(v, DateRounding::Up)
+        crate::datetime::json_numeric_date_seconds(v, DateRounding::Up)
     })
     .ok()?;
-    let ttl = optional_numeric_date(payload.get("ttl"), |v| {
-        json_numeric_seconds(v, DateRounding::Up)
-    })
-    .ok()?;
+    let ttl = optional_numeric_date(payload.get("ttl"), json_ttl_seconds).ok()?;
     let status_list = payload.get("status_list")?;
     let bits = status_list
         .get("bits")
@@ -549,8 +516,9 @@ fn jose_status_claims(payload: &JsonValue) -> Option<StatusListClaims> {
 /// `Ok(Some(v))` when `extract` yields a value, `Err(())` when present-but-`extract`-rejected (malformed
 /// → the call site's `.ok()?` turns that into the fail-closed reject). A `Result` (not `Option<Option>`)
 /// so the "absent vs malformed" distinction is explicit. Generic over the value type so the JOSE
-/// (`JsonValue`, via [`json_numeric_seconds`]) and CWT (`CborValue`, via [`cbor_numeric_seconds`]) paths
-/// share one shape (DRY — Principle III).
+/// (`JsonValue`, via [`crate::datetime::json_numeric_date_seconds`] / [`json_ttl_seconds`]) and CWT
+/// (`CborValue`, via [`cbor_numeric_seconds`] / [`cbor_ttl_seconds`]) paths share one shape (DRY —
+/// Principle III).
 fn optional_numeric_date<T>(
     value: Option<&T>,
     extract: impl FnOnce(&T) -> Option<i64>,
@@ -558,16 +526,18 @@ fn optional_numeric_date<T>(
     value.map_or(Ok(None), |v| extract(v).map(Some).ok_or(()))
 }
 
-/// Reduce a present JSON NumericDate value to whole `i64` seconds (RFC 7519 §2 permits a FRACTIONAL
-/// NumericDate): a canonical integer that fits `i64` is taken verbatim; any other JSON number is
-/// rounded in `rounding`'s direction through the shared [`round_numeric_date_seconds`] core; a
-/// non-number (or one that rounds outside `i64`) → `None` (the caller fails closed).
-fn json_numeric_seconds(value: &JsonValue, rounding: DateRounding) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        value
-            .as_f64()
-            .and_then(|s| round_numeric_date_seconds(s, rounding))
-    })
+/// Read a JSON `ttl` (a NON-NEGATIVE duration in seconds), rejecting a negative RAW value UP FRONT (3a):
+/// a fractional negative in `(-1, 0)` would otherwise `ceil` to `0` through [`DateRounding::Up`] and
+/// slip past the non-negative freshness guard (the round-4 fractional-rounding regression). `as_f64`
+/// covers BOTH an integer and a fractional JSON number, so a negative of either is rejected. A
+/// non-negative value is then reduced to whole seconds rounding UP — the direction the `iat + ttl >=
+/// now` deadline requires so a conformant fractional ttl is not prematurely marked stale — through the
+/// shared [`crate::datetime::json_numeric_date_seconds`] reader.
+fn json_ttl_seconds(value: &JsonValue) -> Option<i64> {
+    if value.as_f64().is_some_and(|s| s < 0.0) {
+        return None;
+    }
+    crate::datetime::json_numeric_date_seconds(value, DateRounding::Up)
 }
 
 /// Verify a tagged `COSE_Sign1` (CWT) Status List Token. Returns `None` on ANY deviation (the caller
@@ -578,7 +548,6 @@ fn verify_cwt_status_list<F>(
     idx: u64,
     now_unix: i64,
     resolve_key: F,
-    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome>
 where
     F: FnOnce(&SignerKeyMaterial) -> Result<VerifyingKey, ()>,
@@ -603,7 +572,7 @@ where
     let payload = sign1.payload.as_ref()?;
     let claims_cbor: CborValue = ciborium::from_reader(payload.as_slice()).ok()?;
     let claims = cwt_status_claims(&claims_cbor)?;
-    evaluate_status_claims(&claims, expected_uri, idx, now_unix, inflate_cache)
+    evaluate_status_claims(&claims, expected_uri, idx, now_unix)
 }
 
 /// Enforce the CWT Status List Token protected-header gates: `alg` MUST be ES256 (COSE −7); `crit` MUST
@@ -679,10 +648,7 @@ fn cwt_status_claims(value: &CborValue) -> Option<StatusListClaims> {
         cbor_numeric_seconds(v, DateRounding::Up)
     })
     .ok()?;
-    let ttl = optional_numeric_date(cbor_int_key(map, CWT_CLAIM_TTL), |v| {
-        cbor_numeric_seconds(v, DateRounding::Up)
-    })
-    .ok()?;
+    let ttl = optional_numeric_date(cbor_int_key(map, CWT_CLAIM_TTL), cbor_ttl_seconds).ok()?;
     let status_list = cbor_int_key(map, CWT_CLAIM_STATUS_LIST)?;
     // The `status_list` sub-map uses TEXT keys — read via the shared [`crate::mdoc::get_map_entry`] (3a).
     let bits = crate::mdoc::get_map_entry(status_list, "bits")
@@ -714,6 +680,19 @@ fn cbor_numeric_seconds(value: &CborValue, rounding: DateRounding) -> Option<i64
     }
 }
 
+/// Read a CBOR `ttl` (a NON-NEGATIVE duration in seconds), rejecting a negative RAW value UP FRONT (3a) —
+/// the CWT mirror of [`json_ttl_seconds`]. A CBOR float in `(-1, 0)` would otherwise `ceil` to `0` and
+/// slip past the non-negative freshness guard; a negative CBOR integer is likewise rejected here for a
+/// single non-negative contract. A non-negative value is then reduced to whole seconds rounding UP via
+/// the shared [`cbor_numeric_seconds`].
+fn cbor_ttl_seconds(value: &CborValue) -> Option<i64> {
+    match value {
+        CborValue::Integer(i) if i128::from(*i) < 0 => None,
+        CborValue::Float(f) if *f < 0.0 => None,
+        _ => cbor_numeric_seconds(value, DateRounding::Up),
+    }
+}
+
 /// Find an INTEGER-keyed entry in a CBOR association-list map (the CWT claim keys are integers — RFC
 /// 8392; distinct from the text-keyed [`crate::mdoc::get_map_entry`] used for the `status_list` sub-map).
 fn cbor_int_key(map: &[(CborValue, CborValue)], label: i128) -> Option<&CborValue> {
@@ -735,47 +714,43 @@ fn cbor_u64(value: &CborValue) -> Option<u64> {
 }
 
 /// The shared post-authentication evaluator (both forms): subject binding (D.2), freshness (D.3), then
-/// the bit read + status-registry mapping (B/C). Returns `None` for any hard failure (→ `Unavailable`)
-/// or `Some(outcome)` — where the outcome is itself `Unavailable` for an unknown status value (unknown
-/// is NEVER coerced to `Good`).
+/// the bit read + status-registry mapping (B/C).
+///
+/// The return distinguishes the two fail-closed reasons (Group 2 observability):
+/// - `None` — an AUTHENTICATION failure the caller folds to [`StatusOutcome::Untrusted`]: the `sub` did
+///   not bind (D.2), or the token was expired/stale (D.3). (The signature/header/parse authentication
+///   failures live in the per-form callers and likewise surface as `None` → `Untrusted`.)
+/// - `Some(StatusOutcome::Unavailable)` — a POST-AUTH data problem of an AUTHENTICATED token: its `lst`
+///   would not inflate, the entry at `idx` is outside the list, or the status value is not in the
+///   registry (unknown is NEVER coerced to `Good`). The token authenticated, so this is the benign
+///   "cannot read this credential's bit" — not an adversarial signal.
+/// - `Some(Good/Revoked)` — a fully authenticated token with a known status value.
 fn evaluate_status_claims(
     claims: &StatusListClaims,
     expected_uri: &str,
     idx: u64,
     now_unix: i64,
-    inflate_cache: &mut StatusListInflateCache,
 ) -> Option<StatusOutcome> {
     // D.2 — bind THIS signed list to THIS credential: `sub` MUST byte-exactly equal the credential's
-    // `status_list.uri`. A validly-signed list for a different URI is rejected (defeats a swap attack).
+    // `status_list.uri`. A validly-signed list for a different URI is rejected (defeats a swap attack) —
+    // an authentication failure (`None` → `Untrusted`).
     if claims.sub != expected_uri {
         return None;
     }
-    // D.3 — temporal validity of the token itself.
+    // D.3 — temporal validity of the token itself (expired/stale → `None` → `Untrusted`).
     check_status_token_time(claims.iat, claims.exp, claims.ttl, now_unix)?;
-    // B — inflate the zlib bitstring (memoized per URI within this verify — see the cache's soundness
-    // note; the sub-binding + freshness above are re-checked per document, so the memo is only consulted
-    // for a token THIS document already authenticated), then read the `bits`-wide LSB-first entry at `idx`.
-    let bytes = decompress_status_list_memoized(expected_uri, &claims.lst, inflate_cache)?;
-    let value = extract_status_value(bytes, idx, claims.bits)?;
-    // C — status registry → canonical outcome.
+    // The token is now AUTHENTICATED (signature + `sub` + freshness held). A data problem below — the
+    // `lst` will not zlib-inflate ([`MAX_STATUS_LIST_BYTES`]-capped, freed when this call returns), or
+    // the entry at `idx` is outside the list — is a POST-AUTH failure of an authenticated token: the
+    // benign [`StatusOutcome::Unavailable`], NOT `Untrusted`. Both are fail-closed INVALID.
+    let Some(bytes) = decompress_status_list(&claims.lst) else {
+        return Some(StatusOutcome::Unavailable);
+    };
+    let Some(value) = extract_status_value(&bytes, idx, claims.bits) else {
+        return Some(StatusOutcome::Unavailable);
+    };
+    // C — status registry → canonical outcome (an unknown/reserved value maps to `Unavailable` inside).
     Some(status_value_to_outcome(value))
-}
-
-/// Return the zlib-inflated status-list bytes for `uri`, inflating (through
-/// [`decompress_status_list`]) at most ONCE per URI within a single verify and caching the result — a
-/// success (`Some(bytes)`) or a fail-closed failure (`None`, e.g. cap-exceeding/corrupt `lst`) — in
-/// `inflate_cache`. The compressed `lst` is invariant for a given URI (the host supplies ONE token per
-/// URI), so the memo is keyed by URI alone. See [`StatusListInflateCache`] for why this preserves exact
-/// per-document semantics (each document re-runs signature/`sub`/freshness before reaching here).
-fn decompress_status_list_memoized<'a>(
-    uri: &str,
-    compressed: &[u8],
-    inflate_cache: &'a mut StatusListInflateCache,
-) -> Option<&'a [u8]> {
-    inflate_cache
-        .entry(uri.to_owned())
-        .or_insert_with(|| decompress_status_list(compressed))
-        .as_deref()
 }
 
 /// Enforce the Status List Token's own temporal validity (draft-ietf-oauth-status-list-21 §5): a present
@@ -797,7 +772,11 @@ fn check_status_token_time(iat: i64, exp: Option<i64>, ttl: Option<i64>, now: i6
     }
     if let Some(ttl) = ttl {
         if ttl < 0 {
-            return None; // a TTL is a non-negative number of seconds
+            // A TTL is a non-negative number of seconds. Negatives are already rejected at PARSE time by
+            // the raw-sign check in [`json_ttl_seconds`] / [`cbor_ttl_seconds`] (3a — before the UP
+            // rounding that would `ceil` a fractional `(-1, 0)` to `0`); this guard is defense-in-depth
+            // so a negative reaching here still fails closed rather than being treated as `ttl = 0`.
+            return None;
         }
         let freshness_deadline = iat.checked_add(ttl)?;
         if freshness_deadline < now {

@@ -56,9 +56,10 @@ fn no_status_reference_is_no_status() {
 
 #[test]
 fn malformed_status_reference_fails_closed_regardless_of_reachability() {
-    // A present-but-uninterpretable status reference is NEVER a silent VALID: it fails closed to
-    // `Unavailable` under BOTH reachability policies (the credential declared a mechanism the core
-    // cannot evaluate). This is what stops a malformed `status_list` falling through to a host `Good`.
+    // A present-but-uninterpretable status reference is NEVER a silent VALID: it fails closed under BOTH
+    // reachability policies (the credential declared a mechanism the core cannot evaluate). It named a
+    // mechanism that failed to resolve → `Untrusted` (the adversarial-leaning reason, Group 2), not the
+    // benign `Unavailable`. This is what stops a malformed `status_list` falling through to a host `Good`.
     let source = TestStatusSource::default();
     assert_eq!(
         check_status(
@@ -66,7 +67,7 @@ fn malformed_status_reference_fails_closed_regardless_of_reachability() {
             &source,
             StatusReachability::FailClosed
         ),
-        StatusOutcome::Unavailable
+        StatusOutcome::Untrusted
     );
     assert_eq!(
         check_status(
@@ -74,7 +75,7 @@ fn malformed_status_reference_fails_closed_regardless_of_reachability() {
             &source,
             StatusReachability::BestEffort
         ),
-        StatusOutcome::Unavailable
+        StatusOutcome::Untrusted
     );
 }
 
@@ -451,8 +452,9 @@ fn valid_cwt_reads_good_revoked_and_suspended() {
 // --- (3) Wrong `sub` (byte-exact URI binding) → Unavailable --------------------------------------
 
 #[test]
-fn jwt_sub_not_matching_expected_uri_is_unavailable() {
-    // A perfectly valid, correctly-signed list — but for a DIFFERENT URI than the credential's.
+fn jwt_sub_not_matching_expected_uri_is_untrusted() {
+    // A perfectly valid, correctly-signed list — but for a DIFFERENT URI than the credential's. A
+    // `sub` that does not bind is an AUTHENTICATION failure → `Untrusted` (Group 2), not `Unavailable`.
     let token = sign_jws(
         &signer(),
         &jwt_header(),
@@ -465,11 +467,11 @@ fn jwt_sub_not_matching_expected_uri_is_unavailable() {
             &zlib(&[0b0000_0010]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 1), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 1), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn cwt_sub_not_matching_expected_uri_is_unavailable() {
+fn cwt_sub_not_matching_expected_uri_is_untrusted() {
     let token = sign_cwt(
         &signer(),
         "application/statuslist+cwt",
@@ -482,14 +484,15 @@ fn cwt_sub_not_matching_expected_uri_is_unavailable() {
             &zlib(&[0b0000_0010]),
         ),
     );
-    assert_eq!(verify_cwt(&token, 1), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 1), StatusOutcome::Untrusted);
 }
 
-// --- (4) Bad signature → Unavailable -------------------------------------------------------------
+// --- (4) Bad signature → Untrusted (an authentication failure) -----------------------------------
 
 #[test]
-fn jwt_signature_not_verifying_under_resolved_key_is_unavailable() {
-    // Signed with `other_signer`, but the closure authorizes `signer`'s key → signature fails.
+fn jwt_signature_not_verifying_under_resolved_key_is_untrusted() {
+    // Signed with `other_signer`, but the closure authorizes `signer`'s key → signature fails → the
+    // token failed to authenticate → `Untrusted` (Group 2).
     let token = sign_jws(
         &other_signer(),
         &jwt_header(),
@@ -502,20 +505,20 @@ fn jwt_signature_not_verifying_under_resolved_key_is_unavailable() {
             &zlib(&[0b0000_0001]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn jwt_tampered_signature_bytes_are_unavailable() {
+fn jwt_tampered_signature_bytes_are_untrusted() {
     let mut token = valid_jwt(1, &[0b0000_0001]);
     // Flip the last base64url char of the signature segment.
     let last = token.pop().unwrap();
     token.push(if last == 'A' { 'B' } else { 'A' });
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn cwt_signature_not_verifying_under_resolved_key_is_unavailable() {
+fn cwt_signature_not_verifying_under_resolved_key_is_untrusted() {
     let token = sign_cwt(
         &other_signer(),
         "application/statuslist+cwt",
@@ -528,13 +531,13 @@ fn cwt_signature_not_verifying_under_resolved_key_is_unavailable() {
             &zlib(&[0b0000_0001]),
         ),
     );
-    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
 }
 
-// --- (5) Expired `exp` → Unavailable -------------------------------------------------------------
+// --- (5) Expired `exp` / stale `ttl` → Untrusted (a freshness authentication failure) ------------
 
 #[test]
-fn jwt_expired_exp_is_unavailable() {
+fn jwt_expired_exp_is_untrusted() {
     // exp strictly in the past (and exp == now is also expired: the bound is exclusive).
     let token = sign_jws(
         &signer(),
@@ -548,7 +551,7 @@ fn jwt_expired_exp_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 
     let at_boundary = sign_jws(
         &signer(),
@@ -562,11 +565,11 @@ fn jwt_expired_exp_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&at_boundary, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&at_boundary, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn cwt_expired_exp_is_unavailable() {
+fn cwt_expired_exp_is_untrusted() {
     let token = sign_cwt(
         &signer(),
         "application/statuslist+cwt",
@@ -579,12 +582,13 @@ fn cwt_expired_exp_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn jwt_stale_ttl_is_unavailable() {
-    // iat + ttl < now → the cached token is stale (exp absent / far future is irrelevant).
+fn jwt_stale_ttl_is_untrusted() {
+    // iat + ttl < now → the cached token is stale (exp absent / far future is irrelevant). A freshness
+    // failure is an authentication failure → `Untrusted` (Group 2).
     let token = sign_jws(
         &signer(),
         &jwt_header(),
@@ -597,7 +601,7 @@ fn jwt_stale_ttl_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 // --- (5b) Fractional NumericDate `exp`/`iat`/`ttl` verify (RFC 7519 §2 / RFC 8392) ---------------
@@ -647,71 +651,47 @@ fn cwt_fractional_exp_and_iat_verify_not_false_rejected() {
     assert_eq!(verify_cwt(&token, 0), StatusOutcome::Good);
 }
 
-// --- (5c) Per-URI inflate memoization (DoS-amplification cap) -------------------------------------
+// --- (5c) Per-call inflate: distinct large lists verify without retaining N × the cap ------------
 
 #[test]
-fn inflate_is_memoized_per_uri_and_each_read_uses_its_own_idx() {
-    // Within one verify sharing an inflate cache, a status list several documents reference is
-    // zlib-inflated ONCE per URI (the amplification cap), while each read applies its OWN idx.
-    // bits=1 byte 0b0000_0010: entry0 = VALID, entry1 = INVALID (revoked).
-    let token = valid_jwt(1, &[0b0000_0010]);
-    let mut cache = super::StatusListInflateCache::new();
-
-    // First document (idx 0) inflates + caches; returns Good, leaving exactly one cached URI.
-    let out0 = super::verify_status_list_token_cached(
-        token.as_bytes(),
-        LIST_URI,
-        0,
-        NOW,
-        accept(*signer().verifying_key()),
-        &mut cache,
+fn distinct_uri_large_lists_each_verify_from_their_own_token() {
+    // The round-4 per-URI inflate memo was dropped (its cross-document CPU dedup was a marginal win the
+    // review judged not worth the O(distinct-URIs × 64 MiB) retention it introduced). Each token is now
+    // authenticated + inflated afresh and the decompressed bytes are freed as the call returns, so a
+    // multi-document response referencing N DISTINCT large lists holds only one list's bytes live at a
+    // time. Assert two distinct-URI tokens over sizeable (~1 MiB decompressed) lists each read their OWN
+    // list correctly — no cross-URI contamination and no reliance on a shared cache.
+    let uri_a = "https://issuer.example/statuslists/A";
+    let uri_b = "https://issuer.example/statuslists/B";
+    // ~1 MiB each: list A marks entry 0 VALID, list B marks entry 0 INVALID (revoked); LSB-first bits=1.
+    let mut list_a = vec![0u8; 1 << 20];
+    let mut list_b = vec![0u8; 1 << 20];
+    list_a[0] = 0b0000_0000; // entry0 = VALID
+    list_b[0] = 0b0000_0001; // entry0 = INVALID
+    let token_a = sign_jws(
+        &signer(),
+        &jwt_header(),
+        &jwt_payload(uri_a, NOW - 100, Some(NOW + 1000), None, 1, &zlib(&list_a)),
     );
-    assert_eq!(out0, StatusOutcome::Good);
+    let token_b = sign_jws(
+        &signer(),
+        &jwt_header(),
+        &jwt_payload(uri_b, NOW - 100, Some(NOW + 1000), None, 1, &zlib(&list_b)),
+    );
+    let accept_signer = || accept(*signer().verifying_key());
     assert_eq!(
-        cache.len(),
-        1,
-        "the URI's inflated list is cached after the first document"
-    );
-
-    // Second document (idx 1, SAME uri) reuses the cached inflate; its OWN idx reads Revoked, and the
-    // cache still holds exactly one entry (the same URI was not re-inflated).
-    let out1 = super::verify_status_list_token_cached(
-        token.as_bytes(),
-        LIST_URI,
-        1,
-        NOW,
-        accept(*signer().verifying_key()),
-        &mut cache,
-    );
-    assert_eq!(out1, StatusOutcome::Revoked);
-    assert_eq!(cache.len(), 1, "the same URI is not re-inflated");
-}
-
-#[test]
-fn a_cache_hit_short_circuits_the_inflate() {
-    // Proof the memo genuinely REPLACES the inflate on a hit (not just tracks it): pre-seed the cache
-    // for the URI with a DIFFERENT decompressed list (entry0 = INVALID) and verify a token whose real
-    // `lst` has entry0 = VALID. A cache hit returns Revoked (the seeded bytes); a re-inflate would
-    // return Good. The token still passes signature/`sub`/freshness before the memo is consulted.
-    let token = valid_jwt(1, &[0b0000_0000]); // real list: entry0 = VALID
-    let mut seeded = super::StatusListInflateCache::new();
-    seeded.insert(LIST_URI.to_owned(), Some(vec![0b0000_0001])); // seeded: entry0 = INVALID
-    let out = super::verify_status_list_token_cached(
-        token.as_bytes(),
-        LIST_URI,
-        0,
-        NOW,
-        accept(*signer().verifying_key()),
-        &mut seeded,
+        verify_status_list_token(token_a.as_bytes(), uri_a, 0, NOW, accept_signer()),
+        StatusOutcome::Good
     );
     assert_eq!(
-        out,
-        StatusOutcome::Revoked,
-        "a cache hit short-circuits the inflate: the bit is read from the cached bytes"
+        verify_status_list_token(token_b.as_bytes(), uri_b, 0, NOW, accept_signer()),
+        StatusOutcome::Revoked
     );
 }
 
 // --- (6) Out-of-range `idx` → Unavailable (never Good) -------------------------------------------
+// An out-of-range `idx` is a POST-AUTH data problem of an AUTHENTICATED token (its signature/`sub`/
+// freshness all held) → the benign `Unavailable`, NOT `Untrusted` (Group 2 distinction).
 
 #[test]
 fn jwt_out_of_range_idx_is_unavailable() {
@@ -751,7 +731,7 @@ fn cwt_cose_mac0_is_rejected() {
         .build()
         .to_tagged_vec()
         .unwrap();
-    assert_eq!(verify_cwt(&mac0, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&mac0, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -778,10 +758,10 @@ fn cwt_untagged_cose_sign1_is_rejected() {
         .build()
         .to_vec()
         .unwrap();
-    assert_eq!(verify_cwt(&untagged, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&untagged, 0), StatusOutcome::Untrusted);
 }
 
-// --- (8) Wrong `typ` rejected --------------------------------------------------------------------
+// --- (8) Wrong `typ`/`alg`/`crit` rejected → Untrusted (a header authentication failure) ----------
 
 #[test]
 fn jwt_wrong_typ_is_rejected() {
@@ -797,7 +777,7 @@ fn jwt_wrong_typ_is_rejected() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -814,7 +794,7 @@ fn jwt_wrong_alg_is_rejected() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -831,7 +811,7 @@ fn jwt_present_crit_is_rejected() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -848,7 +828,7 @@ fn cwt_wrong_typ_is_rejected() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 // --- Unknown status value → Unavailable (never coerced to Good) ----------------------------------
@@ -860,14 +840,15 @@ fn unknown_status_value_is_unavailable() {
     assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
 }
 
-// --- Signer-authorization closure rejects → Unavailable ------------------------------------------
+// --- Signer-authorization closure rejects → Untrusted --------------------------------------------
 
 #[test]
-fn resolve_key_rejection_is_unavailable() {
-    // Even a perfectly-signed, in-window token is Unavailable if layer 2's closure declines the signer.
+fn resolve_key_rejection_is_untrusted() {
+    // Even a perfectly-signed, in-window token is `Untrusted` if layer 2's closure declines the signer
+    // (an unauthorized / cross-issuer signer is an authentication failure, not a benign unreachable).
     let token = valid_jwt(1, &[0b0000_0000]);
     let outcome = verify_status_list_token(token.as_bytes(), LIST_URI, 0, NOW, |_material| Err(()));
-    assert_eq!(outcome, StatusOutcome::Unavailable);
+    assert_eq!(outcome, StatusOutcome::Untrusted);
 }
 
 // --- The signer hint is parsed and handed to the closure -----------------------------------------
@@ -1012,7 +993,9 @@ fn status_registry_mapping() {
 
 #[test]
 fn corrupt_zlib_lst_fails_closed() {
-    // A valid signature over a payload whose `lst` is not valid zlib → decompression fails → Unavailable.
+    // A valid signature over a payload whose `lst` is not valid zlib → decompression fails. The token
+    // AUTHENTICATED (signature/`sub`/freshness held), so this post-auth data problem is the benign
+    // `Unavailable`, NOT `Untrusted` (Group 2 distinction).
     let token = sign_jws(
         &signer(),
         &jwt_header(),
@@ -1031,8 +1014,9 @@ fn corrupt_zlib_lst_fails_closed() {
 // --- (11) Fine-grained fail-closed branch coverage (coverage-review gaps) ------------------------
 
 #[test]
-fn negative_ttl_is_unavailable() {
-    // A `ttl` is a non-negative number of seconds; a negative one is malformed → fail closed.
+fn negative_ttl_is_untrusted() {
+    // A `ttl` is a non-negative number of seconds; a negative one is malformed → fail closed. A
+    // malformed freshness bound is an authentication failure → `Untrusted` (Group 2).
     let token = sign_jws(
         &signer(),
         &jwt_header(),
@@ -1045,11 +1029,58 @@ fn negative_ttl_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn iat_plus_ttl_overflow_is_unavailable() {
+fn fractional_negative_ttl_in_minus_one_to_zero_is_rejected() {
+    // 3a: a fractional negative `ttl` in (-1, 0) must NOT slip past the non-negative guard by `ceil`-ing
+    // to 0. `iat = NOW` here, so a wrongly-accepted ttl (rounded up to 0) would leave the freshness
+    // deadline `iat + 0 = now` NON-stale (`deadline < now` is false) and the token would be WRONGLY
+    // accepted as Good. A negative ttl is malformed → fail closed (Untrusted — a malformed freshness
+    // bound, Group 2). This is the round-4 fractional-rounding regression the raw-sign check fixes.
+    let payload = json!({
+        "sub": LIST_URI,
+        "iat": NOW,
+        "exp": NOW + 1000,
+        "ttl": -0.5f64,
+        "status_list": {
+            "bits": 1,
+            "lst": Base64UrlUnpadded::encode_string(&zlib(&[0b0000_0000])),
+        },
+    });
+    let token = sign_jws(&signer(), &jwt_header(), &payload);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
+}
+
+#[test]
+fn cwt_fractional_negative_ttl_in_minus_one_to_zero_is_rejected() {
+    // The CWT mirror of the 3a fix: a CBOR float `ttl` of -0.5 must be rejected before up-rounding.
+    let status_list = CborValue::Map(vec![
+        (
+            CborValue::Text("bits".to_owned()),
+            CborValue::Integer(1.into()),
+        ),
+        (
+            CborValue::Text("lst".to_owned()),
+            CborValue::Bytes(zlib(&[0b0000_0000])),
+        ),
+    ]);
+    let claims = CborValue::Map(vec![
+        (cbor_int(2), CborValue::Text(LIST_URI.to_owned())),
+        (cbor_int(6), cbor_int(NOW)),
+        (cbor_int(4), cbor_int(NOW + 1000)),
+        (cbor_int(65_534), CborValue::Float(-0.5)), // fractional negative ttl in (-1, 0)
+        (cbor_int(65_533), status_list),
+    ]);
+    let mut buf = Vec::new();
+    ciborium::into_writer(&claims, &mut buf).unwrap();
+    let token = sign_cwt(&signer(), "application/statuslist+cwt", buf);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
+}
+
+#[test]
+fn iat_plus_ttl_overflow_is_untrusted() {
     // `iat + ttl` overflowing `i64` is malformed (a `checked_add` failure) → fail closed, never a panic.
     // `exp` is checked before `ttl`, so a far-future `exp` lets the freshness (ttl) branch run.
     let token = sign_jws(
@@ -1064,14 +1095,15 @@ fn iat_plus_ttl_overflow_is_unavailable() {
             &zlib(&[0b0000_0000]),
         ),
     );
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
-fn genuinely_non_numeric_exp_is_unavailable() {
+fn genuinely_non_numeric_exp_is_untrusted() {
     // With fractional NumericDates now accepted (1b), a PRESENT `exp`/`ttl` that is not a number at all
     // (e.g. a JSON string) is still malformed → the bound is uninterpretable → fail closed (never
-    // silently ignored, which would read as unbounded validity — a false-accept).
+    // silently ignored, which would read as unbounded validity — a false-accept). A malformed claim is
+    // an authentication failure of the supplied token → `Untrusted` (Group 2).
     let payload = json!({
         "sub": LIST_URI,
         "iat": NOW - 100,
@@ -1082,7 +1114,7 @@ fn genuinely_non_numeric_exp_is_unavailable() {
         },
     });
     let token = sign_jws(&signer(), &jwt_header(), &payload);
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 
     // A non-numeric `ttl` likewise.
     let payload = json!({
@@ -1096,7 +1128,7 @@ fn genuinely_non_numeric_exp_is_unavailable() {
         },
     });
     let token = sign_jws(&signer(), &jwt_header(), &payload);
-    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_jwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -1124,7 +1156,7 @@ fn cwt_wrong_alg_is_rejected() {
         .build()
         .to_tagged_vec()
         .unwrap();
-    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]
@@ -1153,7 +1185,7 @@ fn cwt_present_crit_is_rejected() {
         .build()
         .to_tagged_vec()
         .unwrap();
-    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Unavailable);
+    assert_eq!(verify_cwt(&token, 0), StatusOutcome::Untrusted);
 }
 
 #[test]

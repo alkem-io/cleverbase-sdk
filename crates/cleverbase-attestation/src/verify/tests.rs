@@ -1204,8 +1204,9 @@ fn sd_jwt_malformed_status_list_fails_closed_over_a_positional_good() {
     // The issuer-signed `status.status_list` object IS present but malformed (a `uri`, no `idx`). A
     // present-but-uninterpretable status reference MUST NOT fall through to the host-supplied positional
     // `Good`: the credential declared a revocation mechanism the core cannot evaluate, so it fails closed
-    // to StatusUnavailable (SC-002). Contrast the well-formed-declared + positional-Good case above,
-    // which IS honored — this proves the malformed case is treated distinctly (not as "no status").
+    // to StatusUntrusted (it named a mechanism that failed to resolve — the adversarial-leaning reason,
+    // Group 2; SC-002). Contrast the well-formed-declared + positional-Good case above, which IS honored
+    // — this proves the malformed case is treated distinctly (not as "no status").
     let sd_jwt =
         mint_sd_jwt_with_malformed_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, STATUS_LIST_URI);
     let presentation = sd_jwt.presentation();
@@ -1228,7 +1229,7 @@ fn sd_jwt_malformed_status_list_fails_closed_over_a_positional_good() {
         !result.valid,
         "a present-but-malformed status_list must fail closed, not verify VALID off a positional Good"
     );
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }
 
 #[test]
@@ -1236,8 +1237,8 @@ fn sd_jwt_status_token_signed_by_untrusted_key_is_rejected() {
     // The token is signed by an UNTRUSTED key (wrong-issuer), carrying the wrong-issuer cert as its
     // `x5c` leaf. Same-issuer key reuse fails (leaf ≠ the credential's issuer leaf); the distinct
     // status-signer path fails too (the exact-pin test anchors authorize no distinct signer). So the
-    // signer is NOT authorized → the token is Unavailable → the credential is REJECTED with
-    // `StatusUnavailable`, NEVER accepted off an unauthenticated token.
+    // signer is NOT authorized → the token fails in-core authentication → the credential is REJECTED
+    // with `StatusUntrusted` (a supplied token that failed to authenticate — Group 2), NEVER accepted.
     let sd_jwt = mint_sd_jwt_with_status(ISSUER_KEY_PK8, ISSUER_CERT_DER, 0, STATUS_LIST_URI);
     let presentation = sd_jwt.presentation();
     let token = mint_status_jwt(
@@ -1262,7 +1263,7 @@ fn sd_jwt_status_token_signed_by_untrusted_key_is_rejected() {
         None,
     );
     assert!(!result.valid);
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }
 
 // --- Same-issuer authorization by KEY (B3): kid-only + rolled-over cert -----------------------------
@@ -1498,7 +1499,8 @@ fn sd_jwt_status_token_from_a_distinct_signer_chaining_to_the_issuer_root_verifi
 fn sd_jwt_status_token_from_a_distinct_signer_with_a_foreign_eku_is_rejected() {
     // B2 guard: a distinct signer that chains to the SAME root (ca-iaca) but bears the FOREIGN
     // `serverAuth` EKU (1.3.6.1.5.5.7.3.1) instead of the placeholder status-signing OID. The exact-OID
-    // EKU gate rejects it → StatusUnavailable. The previous `starts_with("1.3.6.1.5.5.7.3.")` prefix
+    // EKU gate rejects the signer → the supplied token fails authentication → StatusUntrusted (Group 2).
+    // The previous `starts_with("1.3.6.1.5.5.7.3.")` prefix
     // match (B2) would have ACCEPTED serverAuth once the root binding was fixed — this test proves that
     // hole is closed (never accepted off a TLS/other-purpose cert under a shared root).
     let sd_jwt = mint_windowed_status_sd_jwt(
@@ -1538,7 +1540,7 @@ fn sd_jwt_status_token_from_a_distinct_signer_with_a_foreign_eku_is_rejected() {
         !result.valid,
         "a distinct signer with a foreign (serverAuth) EKU must be rejected"
     );
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }
 
 #[test]
@@ -1546,7 +1548,8 @@ fn sd_jwt_status_token_from_a_distinct_signer_chaining_to_a_different_root_is_re
     // B1 (root-binding proof): a distinct signer WITH the placeholder EKU that chains to a DIFFERENT
     // root (attacker-ca) than the credential's issuer (ca-iaca). Both roots are trusted for (Pid,
     // SdJwtVc), so the signer DOES chain (to attacker-ca) and carries the correct EKU — yet its matched
-    // root ≠ the credential's root, so the same-root binding rejects it → StatusUnavailable. This is the
+    // root ≠ the credential's root, so the same-root binding rejects it → StatusUntrusted (a supplied
+    // token that failed signer authorization — Group 2). This is the
     // cross-issuer un-revocation the leaf/root confusion (B1) would have permitted once the branch was
     // reachable. The credential issuer still resolves to ca-iaca (its own issuing root).
     let sd_jwt = mint_windowed_status_sd_jwt(
@@ -1585,7 +1588,7 @@ fn sd_jwt_status_token_from_a_distinct_signer_chaining_to_a_different_root_is_re
         !result.valid,
         "a distinct signer chaining to a DIFFERENT root than the issuer must be rejected"
     );
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }
 
 // --- mdoc ----------------------------------------------------------------------------------------
@@ -1717,8 +1720,9 @@ fn mdoc_two_documents_referencing_the_same_status_uri_verify_with_a_shared_infla
 #[test]
 fn mdoc_malformed_status_list_fails_closed_over_a_positional_good() {
     // The issuer-signed MSO `status.status_list` object IS present but malformed (an `idx`, no `uri`). A
-    // present-but-uninterpretable reference MUST fail closed to StatusUnavailable, never falling through
-    // to the host-supplied positional `Good` (SC-002 — the mdoc mirror of the SD-JWT case).
+    // present-but-uninterpretable reference MUST fail closed to StatusUntrusted (a declared mechanism the
+    // core cannot evaluate — Group 2), never falling through to the host-supplied positional `Good`
+    // (SC-002 — the mdoc mirror of the SD-JWT case).
     let response = MdocBuilder::new().malformed_status_reference().build();
     let transcript = default_session_transcript();
     let ctx = VerifyContext {
@@ -1742,15 +1746,15 @@ fn mdoc_malformed_status_list_fails_closed_over_a_positional_good() {
         !result.valid,
         "a present-but-malformed mdoc status_list must fail closed, not verify off a positional Good"
     );
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }
 
 #[test]
 fn mdoc_status_token_signed_by_untrusted_key_is_rejected() {
     // The CWT is signed by the untrusted wrong-issuer key (its own cert as `x5chain` leaf), distinct
     // from the credential's DS leaf. Neither authorization path clears (same-issuer mismatch; the
-    // exact-pin anchors authorize no distinct signer) → Unavailable → `StatusUnavailable`, never
-    // accepted — even with a "valid" bit.
+    // exact-pin anchors authorize no distinct signer) → the supplied token fails authentication →
+    // `StatusUntrusted` (Group 2), never accepted — even with a "valid" bit.
     let response = MdocBuilder::new()
         .status_reference(0, STATUS_LIST_URI)
         .build();
@@ -1782,5 +1786,5 @@ fn mdoc_status_token_signed_by_untrusted_key_is_rejected() {
         None,
     );
     assert!(!result.valid);
-    assert_eq!(result.reasons, vec![ReasonCode::StatusUnavailable]);
+    assert_eq!(result.reasons, vec![ReasonCode::StatusUntrusted]);
 }

@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use base64ct::{Base64UrlUnpadded, Encoding as _};
 use serde_json::Value;
 
-use crate::datetime::{round_numeric_date_seconds, DateRounding};
+use crate::datetime::DateRounding;
 use crate::trust::TrustAnchorSource;
 use crate::types::{
     AttributeValue, IssuerRole, ReasonCode, TrustStatus, Validity, VerificationResult,
@@ -360,13 +360,12 @@ fn verify_inner<A: TrustAnchorSource + ?Sized>(
             role: effective_role,
             format: crate::types::Format::SdJwtVc,
         },
-        // A single credential — a throwaway inflate memo (there is no second document to share with).
-        &mut crate::status::StatusListInflateCache::new(),
     );
     match status_outcome {
         StatusInput::NoStatus | StatusInput::Good => {}
         StatusInput::Revoked => return Err(ReasonCode::Revoked),
         StatusInput::Unavailable => return Err(ReasonCode::StatusUnavailable),
+        StatusInput::Untrusted => return Err(ReasonCode::StatusUntrusted),
     }
 
     // 6. Holder binding (KB-JWT over `aud`/`nonce`/`sd_hash`, verified against the `cnf` key; a present
@@ -454,9 +453,18 @@ fn verify_issuer_signature(sd_jwt: &sd_jwt_payload::SdJwt) -> Result<Vec<Vec<u8>
 /// caller is responsible for any compact-JWS framing guard (e.g. the issuer path's exactly-3-segment
 /// check); this helper only reads the header segment, so a non-JWS string simply yields `None`.
 fn decode_jws_protected_header(jws: &str) -> Option<Value> {
-    let header_b64 = jws.split('.').next()?;
-    let header_json = Base64UrlUnpadded::decode_vec(header_b64).ok()?;
-    serde_json::from_slice(&header_json).ok()
+    decode_json_b64url(jws.split('.').next()?)
+}
+
+/// Base64url-unpadded-decode a compact-JWS **segment** and parse it as JSON. The shared
+/// segment→JSON body of the JWS decoders (DRY — Principle III): [`decode_jws_protected_header`] calls it
+/// after splitting off the header segment, and the in-core status-token JOSE verifier ([`crate::status`])
+/// uses it for both the header and payload segments (each already split from the compact JWS). This
+/// helper does NO framing check — a caller with the wrong number of segments simply passes a segment that
+/// is not valid base64url-JSON and gets `None`.
+pub(crate) fn decode_json_b64url(segment: &str) -> Option<Value> {
+    let raw = Base64UrlUnpadded::decode_vec(segment).ok()?;
+    serde_json::from_slice(&raw).ok()
 }
 
 /// Reject a JWS whose protected JOSE header carries a `crit` (Critical) Header Parameter this verifier
@@ -665,20 +673,17 @@ fn is_collision_resistant_name(name: &str) -> bool {
 ///   non-canonical `exp` would read as having unbounded validity). We reject anything we cannot
 ///   evaluate against `now` rather than ignore it.
 ///
-/// The fractional-seconds rounding + `i64` range bound is the shared
-/// [`crate::datetime::round_numeric_date_seconds`] core (DRY — the in-core status-token freshness path
-/// reduces its own fractional NumericDates through the same function).
+/// The absent→`None` distinction is this function's; the present-value magnitude read (verbatim `i64`,
+/// else the fractional round + `i64` range bound) is the shared [`crate::datetime::json_numeric_date_seconds`]
+/// reader (DRY — the in-core status-token JSON freshness path delegates to the same reader; only the
+/// error carrier differs — a `ReasonCode` here, a fail-closed `None` there).
 fn numeric_date(claim: Option<&Value>, rounding: DateRounding) -> Result<Option<i64>, ReasonCode> {
     let Some(value) = claim else { return Ok(None) };
-    // A canonical integer NumericDate that already fits `i64` is taken verbatim.
-    if let Some(int) = value.as_i64() {
-        return Ok(Some(int));
-    }
-    // RFC 7519 §2: "Non-integer values can be represented." Accept any JSON number and round it to
-    // whole seconds in the role-appropriate direction through the shared core; reject a non-number, or
-    // one that rounds outside `i64` (a non-finite value is out of range too, so it also rejects NaN/±∞).
-    let seconds = value.as_f64().ok_or(ReasonCode::MalformedCredential)?;
-    round_numeric_date_seconds(seconds, rounding)
+    // A present value MUST reduce to whole seconds: a canonical integer verbatim, else a fractional
+    // NumericDate (RFC 7519 §2) rounded in the role-appropriate direction. A non-number, or one that
+    // rounds outside `i64` (a non-finite `NaN`/`±∞` included), is uninterpretable → `MalformedCredential`
+    // (never silently skipped — that would read an expired credential as having unbounded validity).
+    crate::datetime::json_numeric_date_seconds(value, rounding)
         .map(Some)
         .ok_or(ReasonCode::MalformedCredential)
 }

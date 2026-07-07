@@ -412,11 +412,14 @@ impl SigAlg {
 ///
 /// ## Returns
 ///
-/// On success, `Ok(anchor_der)` is the DER of the **trust anchor the path terminated at** — for a
-/// chain-to-root path, the matched configured root; for a direct DER-equal pin, that pinned certificate
-/// (which IS the anchor). Callers that anchor a downstream trust decision to the credential's SAME
-/// specific root (`resolve_chain` storing it as [`crate::trust::TrustListEntry::anchor_cert_der`],
-/// consumed by the in-core status-signer authorization) rely on this being the ROOT, not the leaf.
+/// On success, `Ok(anchor_der)` is a **borrow** (with the input `anchor_certs_der` lifetime) of the DER
+/// of the **trust anchor the path terminated at** — for a chain-to-root path, the matched configured
+/// root; for a direct DER-equal pin, that pinned certificate (which IS the anchor). Returning a borrow
+/// keeps `verify_chain` allocation-free: a caller that must OWN the anchor DER clones at its own boundary
+/// (`resolve_chain` does, storing it as [`crate::trust::TrustListEntry::anchor_cert_der`], consumed by
+/// the in-core status-signer authorization), while the pass/fail-only callers clone nothing. Callers that
+/// anchor a downstream trust decision to the credential's SAME specific root rely on this being the ROOT,
+/// not the leaf.
 ///
 /// # Errors
 ///
@@ -426,13 +429,13 @@ impl SigAlg {
 /// algorithm is unsupported, an issuing certificate is not a CA or is outside its validity window, the
 /// leaf is outside its validity window at `leaf_validity_time`, a processed certificate carries an
 /// unrecognized critical extension or violates a name constraint, or the path exceeds [`MAX_PATH_LEN`].
-pub fn verify_chain(
+pub fn verify_chain<'a>(
     supplied_chain: &[&[u8]],
-    anchor_certs_der: &[Vec<u8>],
+    anchor_certs_der: &'a [Vec<u8>],
     now_unix: i64,
     leaf_validity_time: Option<i64>,
     leaf_purpose: LeafPurpose,
-) -> Result<Vec<u8>, ChainError> {
+) -> Result<&'a [u8], ChainError> {
     // The leaf is the head of the supplied chain; the tail are candidate path-building intermediates.
     let (leaf_der, intermediates_der) = supplied_chain
         .split_first()
@@ -457,7 +460,9 @@ pub fn verify_chain(
     // nothing more specific is known but skipped so it cannot mask a valid match (the documented
     // "only-unusable anchors ⇒ IssuerMismatch" contract).
     let mut last_err = ChainError::IssuerMismatch;
-    let mut anchors: Vec<(&[u8], Certificate)> = Vec::with_capacity(anchor_certs_der.len());
+    // The DER slices borrow `anchor_certs_der` with the input lifetime `'a`, so the anchor a path
+    // terminates at can be surfaced to the caller as a BORROW (not a fresh allocation) — see the return.
+    let mut anchors: Vec<(&'a [u8], Certificate)> = Vec::with_capacity(anchor_certs_der.len());
     for anchor_der in anchor_certs_der {
         match Certificate::from_der(anchor_der) {
             Ok(cert) => anchors.push((anchor_der.as_slice(), cert)),
@@ -513,7 +518,7 @@ pub fn verify_chain(
         WalkResult::Reached {
             processed,
             anchor,
-            anchor_der,
+            anchor_index,
         } => {
             let mut path_top_down: Vec<&Certificate> = Vec::with_capacity(processed.len() + 1);
             path_top_down.push(anchor);
@@ -522,7 +527,15 @@ pub fn verify_chain(
             // The path validated: surface the DER of the trust anchor it terminated at (the matched
             // root, or the pinned cert for a direct pin) so the caller can bind a downstream decision
             // to the credential's SAME specific root (fixes the leaf/root confusion — see the fn docs).
-            Ok(anchor_der.to_vec())
+            // Read it BY INDEX from the pre-parsed anchor set (whose slices borrow the input
+            // `anchor_certs_der` with lifetime `'a`), returning a BORROW — no allocation here; a caller
+            // that must OWN it clones at its boundary (`resolve_chain`), and the discarding callers
+            // (`trust::xml`, `qualified`) allocate nothing. `anchor_index` came from the walk over this
+            // same set so it is always in range; `.ok_or` is defensive fail-closed.
+            anchors
+                .get(anchor_index)
+                .map(|entry| entry.0)
+                .ok_or(ChainError::IssuerMismatch)
         }
         WalkResult::DeadEnd => Err(state.last_err),
         WalkResult::TooLong => Err(ChainError::PathTooLong),
@@ -577,13 +590,14 @@ impl WalkState<'_> {
 enum WalkResult<'c> {
     /// A configured anchor was reached on this branch — the path is trusted, pending the per-path
     /// extension checks. `processed` is the leaf-first list of processed certs; `anchor` is the trust
-    /// anchor the path terminated at (a direct pin or an issuing anchor), and `anchor_der` is that
-    /// anchor's DER slice (borrowed from the pre-parsed anchor set) so [`verify_chain`] can return the
-    /// matched ROOT to the caller.
+    /// anchor the path terminated at (a direct pin or an issuing anchor), and `anchor_index` is that
+    /// anchor's position in the pre-parsed anchor set — an INDEX (not a slice), so [`verify_chain`] can
+    /// read the matched ROOT's DER back out of that set with the INPUT anchor lifetime and return it as a
+    /// borrow (threading the input lifetime through this result directly would need a second lifetime).
     Reached {
         processed: Vec<&'c Certificate>,
         anchor: &'c Certificate,
-        anchor_der: &'c [u8],
+        anchor_index: usize,
     },
     /// This branch dead-ended (no anchor, every candidate issuer exhausted); `last_err` records why.
     DeadEnd,
@@ -641,11 +655,11 @@ fn walk<'c>(
     // is the trust anchor itself (not a processed path cert), so `processed` is empty. Surface the
     // matched anchor's own DER slice (lifetime `'c`, from the pre-parsed anchor set) as `anchor_der` —
     // for a direct pin the pinned cert IS the anchor.
-    if let Some(anchor_entry) = ctx.anchors.iter().find(|(a, _)| *a == current_der) {
+    if let Some(anchor_index) = ctx.anchors.iter().position(|(a, _)| *a == current_der) {
         return WalkResult::Reached {
             processed: Vec::new(),
             anchor: current,
-            anchor_der: anchor_entry.0,
+            anchor_index,
         };
     }
 
@@ -669,8 +683,7 @@ fn walk<'c>(
         );
         return WalkResult::DeadEnd;
     };
-    for anchor_entry in ctx.anchors {
-        let anchor_der = anchor_entry.0;
+    for (anchor_index, anchor_entry) in ctx.anchors.iter().enumerate() {
         let anchor = &anchor_entry.1;
         // Global work budget: charge one unit per issued-by ATTEMPT (the signature verify is the
         // dominant cost). Exhausting it means the supplied chain × anchors forced more path-building
@@ -683,7 +696,7 @@ fn walk<'c>(
                 return WalkResult::Reached {
                     processed: vec![current],
                     anchor,
-                    anchor_der,
+                    anchor_index,
                 }
             }
             Err(e) => record_more_specific(&mut state.last_err, e),
@@ -757,13 +770,13 @@ fn walk<'c>(
             WalkResult::Reached {
                 mut processed,
                 anchor,
-                anchor_der,
+                anchor_index,
             } => {
                 processed.insert(0, current);
                 return WalkResult::Reached {
                     processed,
                     anchor,
-                    anchor_der,
+                    anchor_index,
                 };
             }
             WalkResult::TooLong => saw_too_long = true,
@@ -1020,14 +1033,20 @@ pub(crate) fn leaf_has_status_signing_eku(leaf_der: &[u8]) -> bool {
     let Ok(leaf) = Certificate::from_der(leaf_der) else {
         return false; // a status signer whose cert cannot be parsed is not trusted (fail-closed)
     };
+    // Build the status-signing purpose OID ONCE from the single placeholder const and compare it typed
+    // (matching the [`leaf_has_purpose`] `eku.0.contains(&oid)` idiom — no `oid.to_string()` formatting
+    // anti-pattern). A malformed placeholder const → fail-closed `false` (unreachable for the compiled-in
+    // valid dotted OID, but never trusted on doubt).
+    let Ok(status_signing) =
+        crate::status::STATUS_SIGNING_EKU_OID_PLACEHOLDER.parse::<der::asn1::ObjectIdentifier>()
+    else {
+        return false;
+    };
     match leaf.tbs_certificate.get::<ExtendedKeyUsage>() {
         // EKU present and parsable: it MUST list EXACTLY the status-signing purpose OID — an exact
         // match against the single placeholder OID, never a prefix/arc match (which would accept
         // serverAuth/clientAuth/etc. — the B2 false-accept this replaces).
-        Ok(Some((_critical, eku))) => eku
-            .0
-            .iter()
-            .any(|oid| oid.to_string() == crate::status::STATUS_SIGNING_EKU_OID_PLACEHOLDER),
+        Ok(Some((_critical, eku))) => eku.0.contains(&status_signing),
         // Absent / unparsable (duplicate) EKU ⇒ not a conformant status signer (fail-closed).
         _ => false,
     }
