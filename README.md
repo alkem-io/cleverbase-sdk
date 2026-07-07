@@ -65,6 +65,23 @@ cargo build -p cleverbase-ffi
 ( cd frontend/helper-ts && npm install && npm run build && npm test )
 ```
 
+### Lint gate (match CI locally)
+
+CI runs a lint/format/type-check gate (`.github/workflows/lint.yml`) — `cargo fmt`+`clippy`,
+`ruff`+`mypy`, `eslint`+`prettier`+`tsc`, `gofmt`+`golangci-lint` — that the test commands above do
+**not** cover (`go test` passes code that `golangci-lint` rejects). Run the same gate locally:
+
+```bash
+./scripts/lint.sh            # runs every lint tool that is installed; warns on any that are missing
+CLEVERBASE_LINT_STRICT=1 ./scripts/lint.sh   # also fail on a missing tool (full CI parity)
+```
+
+To run it automatically before every push, enable the committed pre-push hook once per clone:
+
+```bash
+git config core.hooksPath .githooks   # then `git push` runs scripts/lint.sh first (bypass: --no-verify)
+```
+
 ## API documentation
 
 Generated API reference (Markdown, browseable on GitHub) lives under [`docs/api/`](docs/api/):
