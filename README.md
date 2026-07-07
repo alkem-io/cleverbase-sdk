@@ -1,28 +1,36 @@
 # Cleverbase SDK
 
-A production-grade, polyglot SDK for **remote Qualified Electronic Signing (QES)** of PDFs via
-[Cleverbase](https://cleverbase.com) (a Dutch Qualified Trust Service Provider), using the Cloud
-Signature Consortium (CSC) API + OpenID Connect. Built for the
-[Alkemio](https://github.com/alkem-io) platform, designed to stand alone.
+A production-grade, polyglot SDK for two capabilities built on
+[Cleverbase](https://cleverbase.com) (a Dutch Qualified Trust Service Provider):
 
-Cleverbase publishes no official SDK and signs only a *hash* — so this SDK owns the whole AdES
-stack (container assembly, timestamping, validation).
+- **Remote Qualified Electronic Signing (QES)** of PDFs — via the Cloud Signature Consortium (CSC)
+  API + OpenID Connect.
+- **EUDI attestation** — issuance (OpenID4VCI) and verification (OpenID4VP) of **SD-JWT VC** and
+  **ISO 18013-5 mdoc** credentials, with the EU trust model (trust lists, revocation/status, and the
+  opt-in eIDAS qualified gate).
+
+Built for the [Alkemio](https://github.com/alkem-io) platform, designed to stand alone. Cleverbase
+publishes no official SDK and signs only a *hash* — so this SDK owns the whole AdES stack (container
+assembly, timestamping, validation) and, for attestations, the full verification bar.
 
 ## Architecture
 
-A single **sans-IO Rust core** ([`crates/cleverbase-core`](crates/cleverbase-core)) holds all
-protocol + cryptography. It performs **no I/O**: it is a pure, serializable state machine that
-*emits effects* (HTTP requests to perform, browser redirects to issue) which the host executes,
-then feeds the results back. This keeps the core deterministic, auditable, and testable against
-recorded exchanges, and lets every language binding stay thin.
+**Sans-IO Rust cores** hold all protocol + cryptography and perform **no I/O**:
+[`crates/cleverbase-core`](crates/cleverbase-core) (signing) is a pure, serializable state machine
+that *emits effects* (HTTP requests to perform, browser redirects to issue) which the host executes
+and feeds back; [`crates/cleverbase-attestation`](crates/cleverbase-attestation) (EUDI attestation)
+takes host-supplied bytes — trust lists, status documents, presentations — and authenticates +
+evaluates them. This keeps the cores deterministic, auditable, and testable against recorded
+exchanges, and lets every language binding stay thin.
 
-```
-crates/cleverbase-core   sans-IO state machine, CSC/OIDC client, CAdES/PAdES CMS, RFC 3161
-crates/cleverbase-ffi     stable C ABI (CBOR in / result out) — consumed by Go
-bindings/python           PyO3 + maturin            → import cleverbase
-bindings/node             napi-rs                   → @cleverbase/sdk
-bindings/go               cgo over the C ABI        → typed Go API
-frontend/helper-ts        thin TS redirect/status helper (no crypto, no secrets)
+```text
+crates/cleverbase-core         sans-IO signing state machine, CSC/OIDC client, CAdES/PAdES CMS, RFC 3161
+crates/cleverbase-attestation  sans-IO EUDI verify (SD-JWT VC + mdoc), OpenID4VP/DCQL, status, OpenID4VCI issuance
+crates/cleverbase-ffi          stable C ABI (CBOR in / result out) — consumed by Go
+bindings/python                PyO3 + maturin            → import cleverbase
+bindings/node                  napi-rs                   → @cleverbase/sdk
+bindings/go                    cgo over the C ABI        → typed Go API
+frontend/helper-ts             thin TS redirect/status helper (no crypto, no secrets)
 ```
 
 ## Status (Phase 1: signing)
@@ -42,6 +50,27 @@ Implemented and tested (Rust unit + integration; independently validated with **
 
 See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
 and [`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work.
+
+## Status (EUDI attestation & verification)
+
+Implemented and tested (Rust unit + integration; offline and sans-IO — the host supplies trust
+lists, status documents, and presentations as bytes):
+
+- ✅ **Always-on verification bar** — issuer signature → issuer trust (RFC 5280 chain-to-anchor,
+  key-purpose, name constraints) → validity window → revocation/status → holder binding →
+  selective-disclosure integrity, for **SD-JWT VC** (RFC 9901) and **ISO 18013-5 mdoc** (CBOR/COSE).
+  Any failed check ⇒ INVALID with a specific reason (no false-accept).
+- ✅ **OpenID4VP 1.0** presentation verify (nonce/audience/replay, KB-JWT, mdoc handover transcript)
+  + in-core **DCQL** including set-level `credential_sets` / `multiple` cardinality.
+- ✅ **Token Status List** authentication (draft-ietf-oauth-status-list) — the core verifies the
+  signed JWT/CWT status token itself and reads the revocation bit.
+- ✅ Opt-in **eIDAS qualified-status gate** (ETSI TS 119 615) — off by default, fail-closed.
+- ✅ **Issuance** (OpenID4VCI) via a sans-IO obtain/present state machine + a holder signer-hook
+  (the SDK never holds the private key).
+- ✅ Python, Node, and Go bindings for the attestation surface.
+
+See [`specs/004-attestation-and-verification`](specs/004-attestation-and-verification) for the spec,
+plan, and standards-conformance record, and [`docs/attestation.md`](docs/attestation.md) for usage.
 
 ## Build & test
 
@@ -91,7 +120,7 @@ git config core.hooksPath .githooks   # then `git push` runs scripts/lint.sh fir
 
 Generated API reference (Markdown, browseable on GitHub) lives under [`docs/api/`](docs/api/):
 
-- Rust: [core (`cleverbase-core`)](docs/api/rust/cleverbase_core.md) · [C ABI (`cleverbase-ffi`)](docs/api/rust/cleverbase_ffi.md)
+- Rust: [core (`cleverbase-core`)](docs/api/rust/cleverbase_core.md) · [attestation (`cleverbase-attestation`)](docs/api/rust/cleverbase_attestation.md) · [C ABI (`cleverbase-ffi`)](docs/api/rust/cleverbase_ffi.md)
 - Backend bindings: [Go](docs/api/go.md) · [Python](docs/api/python.md) · [Node/TypeScript](docs/api/node/)
 - Frontend: [TypeScript helper (no-crypto)](docs/api/ts/)
 
