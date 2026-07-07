@@ -74,7 +74,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::openid4vp::{
-    verify_vp_token, MdocVpToken, PresentationRequest, VpToken, VpTokenVerification,
+    verify_vp_token_slots, MdocVpToken, PresentationRequest, VpToken, VpTokenSlot,
+    VpTokenVerification,
 };
 use crate::status::StatusOutcome;
 use crate::trust::ChainValidatingAnchors;
@@ -319,6 +320,22 @@ fn anchors_from_wire(entries: &[WireTrustAnchor], now_unix: i64) -> ChainValidat
     anchors
 }
 
+/// MOVE the wire `status_tokens` map (list URI → CBOR [`serde_bytes::ByteBuf`]) into the typed
+/// `uri → Vec<u8>` map the sans-IO verify context borrows, WITHOUT cloning the (attacker-sized) raw
+/// token buffers: `mem::take` empties the source map and each `ByteBuf` is `into_vec`'d in place.
+///
+/// One authoritative take-and-convert body shared by [`process_verify_bytes`]
+/// ([`WireContext::status_tokens`]) and [`process_vp_token_bytes`] ([`WireVpTokenRequest::status_tokens`])
+/// — DRY (Principle III), replacing the copy-pasted `mem::take + into_iter + into_vec + collect` block.
+fn take_status_tokens(
+    map: &mut BTreeMap<String, serde_bytes::ByteBuf>,
+) -> BTreeMap<String, Vec<u8>> {
+    std::mem::take(map)
+        .into_iter()
+        .map(|(uri, token)| (uri, token.into_vec()))
+        .collect()
+}
+
 /// Decode → verify → encode. Pure; shared by the C-ABI, language bindings, and tests (single source
 /// of truth — Principle III). A well-formed request runs the always-on [`verify`] entry point and
 /// returns the [`VerificationResult`]; a malformed one yields [`VerifyOutcome::Err`].
@@ -348,13 +365,8 @@ pub fn process_verify_bytes(input: &[u8]) -> Vec<u8> {
             // Convert the wire `BTreeMap<String, ByteBuf>` to the typed `BTreeMap<String, Vec<u8>>` the
             // sans-IO `VerifyContext` borrows (the raw signed Token Status List token bytes, keyed by
             // list URI). Empty (the `#[serde(default)]`) ⇒ the positional `statuses` seam alone. The
-            // owned request is consumed here — `mem::take` MOVES the map out (leaving an empty one) and
-            // each `ByteBuf` is `into_vec`'d, so the attacker-sized token buffers are never cloned.
-            let status_tokens: BTreeMap<String, Vec<u8>> =
-                std::mem::take(&mut req.context.status_tokens)
-                    .into_iter()
-                    .map(|(uri, token)| (uri, token.into_vec()))
-                    .collect();
+            // shared `take_status_tokens` MOVES the map out (never cloning the attacker-sized buffers).
+            let status_tokens = take_status_tokens(&mut req.context.status_tokens);
             let ctx = VerifyContext {
                 now_unix: req.context.now_unix,
                 role: req.context.role,
@@ -427,7 +439,7 @@ pub struct WireVpTokenRequest {
     /// The verification instant (Unix seconds), shared across every presentation.
     pub now_unix: i64,
     /// The default issuer role trust is anchored under (per-credential a query's expected PID type may
-    /// override it — see [`verify_vp_token`]).
+    /// override it — see [`crate::openid4vp::verify_vp_token`]).
     pub role: IssuerRole,
     /// The host-resolved revocation/status outcomes, keyed by credential id → per **token**
     /// (presentation) → per **document** (positional). A credential id / token / document with no
@@ -496,54 +508,78 @@ pub fn encode_vp_token_response(outcome: WireVpTokenOutcome) -> Vec<u8> {
     crate::cbor_to_vec(&resp)
 }
 
-/// Decode → [`verify_vp_token`] → encode for the set-level `vp_token` surface. Pure; shared by the
+/// Decode → [`crate::openid4vp::verify_vp_token`] → encode for the set-level `vp_token` surface (the
+/// wire delegates to the shared slot-level evaluator, which may carry a no-audience-mdoc slot). Pure; shared by the
 /// C-ABI, language bindings, and tests (single source of truth — Principle III). A well-formed request
 /// folds the complete OpenID4VP set-level DCQL semantics (`credential_sets` + `multiple`) AND
 /// authenticates any supplied signed Token Status List token in-core; a malformed one yields
 /// [`WireVpTokenOutcome::Err`] (fail-closed, same discipline as [`process_verify_bytes`]).
+///
+/// **The set-level surface does NOT run the opt-in eIDAS qualified-status gate** (it carries no national
+/// Trusted List / scheme anchors): a request with `policy.qualified_gate == true` is REJECTED with a
+/// clear [`WireVpTokenOutcome::Err`] rather than silently running no determination — the gate is
+/// available only on the single-presentation [`process_verify_bytes`] surface.
 #[must_use]
 pub fn process_vp_token_bytes(input: &[u8]) -> Vec<u8> {
     let outcome = match decode_vp_token_request(input) {
+        Ok(req) if req.policy.qualified_gate => {
+            // FAIL LOUD (no silent downgrade): the set-level surface carries no national Trusted List /
+            // scheme anchors, so the opt-in eIDAS qualified-status gate CANNOT run here — running it
+            // would be a silent no-op (`qualified_status` stays `None`) while still returning `satisfied`.
+            // Reject the request rather than let the flag be a silent no-op. The gate runs ONLY on the
+            // single-presentation `verify` surface, which carries those inputs.
+            WireVpTokenOutcome::Err {
+                message: "the opt-in qualified-status gate is not supported on the set-level vp_token \
+                          surface; verify each presentation via the single-presentation surface, or \
+                          unset qualified_gate"
+                    .to_owned(),
+            }
+        }
         Ok(mut req) => {
             // Chain-validate every credential's leaf against the host-supplied anchors at the
             // verification instant (reuses `anchors_from_wire` — DRY).
             let anchors = anchors_from_wire(&req.anchors, req.now_unix);
-            // MOVE the signed Token Status List tokens out (leaving an empty map) and `into_vec` each
-            // `ByteBuf`, so the attacker-sized token buffers are never cloned — exactly as
-            // `process_verify_bytes` does for `WireContext::status_tokens`.
-            let status_tokens: BTreeMap<String, Vec<u8>> = std::mem::take(&mut req.status_tokens)
-                .into_iter()
-                .map(|(uri, token)| (uri, token.into_vec()))
-                .collect();
-            // Build the BORROWED `{credential_id: [VpToken]}` map referencing the owned `req.vp_token`
-            // (VpToken borrows the presentation string / device-response bytes — held live in `req`
-            // through the `verify_vp_token` call). The `WirePresentation`→`VpToken` mapping mirrors the
-            // single-presentation `WirePresentation`→`Presentation` mapping in `process_verify_bytes`; an
-            // mdoc with no addressed audience defaults to `""`, which cannot match the request audience →
-            // `WrongAudience` (fail-closed — a set-level flow is always request-bound).
-            let vp_token: BTreeMap<String, Vec<VpToken<'_>>> = req
+            // MOVE the signed Token Status List tokens out (never cloning the attacker-sized buffers) via
+            // the shared `take_status_tokens` — exactly as `process_verify_bytes` does for
+            // `WireContext::status_tokens`.
+            let status_tokens = take_status_tokens(&mut req.status_tokens);
+            // Build the BORROWED `{credential_id: [VpTokenSlot]}` map referencing the owned `req.vp_token`
+            // (a slot borrows the presentation string / device-response bytes — held live in `req`
+            // through the `verify_vp_token_slots` call). The `WirePresentation`→slot mapping mirrors the
+            // single-presentation `WirePresentation`→`Presentation` mapping in `process_verify_bytes`,
+            // INCLUDING its treatment of an mdoc with NO addressed audience: the single-presentation
+            // `verify()` path hard-rejects that as `MissingRequestBinding`, so here it maps to
+            // [`VpTokenSlot::MissingAudienceMdoc`] (fail-closed to `MissingRequestBinding`, counted for
+            // cardinality but never bar-run) rather than a spoofable empty-string audience that would
+            // misreport `WrongAudience` and bypass an empty-`client_id` audience gate.
+            let vp_token: BTreeMap<String, Vec<VpTokenSlot<'_>>> = req
                 .vp_token
                 .iter()
                 .map(|(id, presentations)| {
-                    let tokens = presentations
+                    let slots = presentations
                         .iter()
                         .map(|presentation| match presentation {
                             WirePresentation::SdJwtVc { presentation } => {
-                                VpToken::SdJwtVc(presentation)
+                                VpTokenSlot::Present(VpToken::SdJwtVc(presentation))
                             }
                             WirePresentation::Mdoc {
                                 device_response,
                                 audience,
-                            } => VpToken::Mdoc(MdocVpToken {
-                                audience: audience.as_deref().unwrap_or_default(),
-                                device_response,
-                            }),
+                            } => audience.as_deref().map_or(
+                                VpTokenSlot::MissingAudienceMdoc,
+                                |audience| {
+                                    VpTokenSlot::Present(VpToken::Mdoc(MdocVpToken {
+                                        audience,
+                                        device_response,
+                                    }))
+                                },
+                            ),
                         })
                         .collect();
-                    (id.clone(), tokens)
+                    (id.clone(), slots)
                 })
                 .collect();
-            let result = verify_vp_token(
+            let result = verify_vp_token_slots(
                 &req.request,
                 &vp_token,
                 &req.policy,

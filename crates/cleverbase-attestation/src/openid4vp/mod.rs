@@ -199,6 +199,25 @@ impl VpToken<'_> {
     }
 }
 
+/// A single Presentation as supplied to the set-level evaluator [`verify_vp_token_slots`]: either a
+/// verifiable [`VpToken`], or an mdoc that arrived over the wire with NO addressed audience.
+///
+/// A `vp_token` mdoc with no addressed audience cannot be bound to an OpenID4VP request (the handover is
+/// reconstructed against the verifier `client_id` = the audience). So — exactly like the
+/// single-presentation [`crate::verify::verify()`] path, which hard-rejects a `None` mdoc audience as
+/// [`ReasonCode::MissingRequestBinding`] — it MUST fail closed as `MissingRequestBinding`, NEVER be
+/// coerced to a spoofable empty-string audience (that would misreport [`ReasonCode::WrongAudience`] and,
+/// against an empty verifier `client_id`, bypass the cleartext `token.audience != request.audience`
+/// gate). It still occupies a slot so the credential's `multiple` cardinality COUNTS it — dropping it
+/// could turn a cardinality-violating credential satisfiable, a false SATISFIED — but it is NEVER run
+/// through the crypto bar. Built only at the wire boundary ([`crate::wire::process_vp_token_bytes`]).
+pub(crate) enum VpTokenSlot<'a> {
+    /// A verifiable Presentation.
+    Present(VpToken<'a>),
+    /// An mdoc Presentation that arrived with NO addressed audience → INVALID `MissingRequestBinding`.
+    MissingAudienceMdoc,
+}
+
 /// The claim set a DCQL Claims Query resolves against for a VALID presentation — the FULL set of claims
 /// PRESENT in the presentation (OpenID4VP 1.0 §8.6 "VP Token Validation" step 2.2: the query is
 /// validated against the "Claims included in the presentation", which §6.4 notes legitimately includes
@@ -677,6 +696,51 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     statuses: &BTreeMap<String, Vec<Vec<StatusOutcome>>>,
     status_tokens: &BTreeMap<String, Vec<u8>>,
 ) -> VpTokenVerification {
+    // On the public (native) surface every Presentation is a present, verifiable token — the
+    // no-audience-mdoc slot arises ONLY at the wire boundary ([`crate::wire::process_vp_token_bytes`]),
+    // which builds the slot map directly. Wrap each token as `Present` and delegate to the shared
+    // slot-level evaluator (DRY — one authoritative set-fold body). Cloning a `VpToken` is shallow (it
+    // only holds borrows: a `&str` / a `Copy` [`MdocVpToken`]), so no attacker-sized buffer is copied.
+    let slots: BTreeMap<String, Vec<VpTokenSlot<'_>>> = vp_token
+        .iter()
+        .map(|(id, tokens)| {
+            (
+                id.clone(),
+                tokens
+                    .iter()
+                    .map(|token| VpTokenSlot::Present(token.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    verify_vp_token_slots(
+        request,
+        &slots,
+        policy,
+        anchors,
+        now_unix,
+        role,
+        statuses,
+        status_tokens,
+    )
+}
+
+/// The shared set-level evaluator over [`VpTokenSlot`]s — the single body both [`verify_vp_token`]
+/// (native callers, every token `Present`) and [`crate::wire::process_vp_token_bytes`] (the C-ABI wire,
+/// which may carry a [`VpTokenSlot::MissingAudienceMdoc`]) fold through (DRY — Principle III). See
+/// [`verify_vp_token`] for the full DCQL / status / role contract; this body adds only the wire-slot
+/// handling and the DoS skip guard.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_vp_token_slots<A: TrustAnchorSource + ?Sized>(
+    request: &PresentationRequest,
+    vp_token: &BTreeMap<String, Vec<VpTokenSlot<'_>>>,
+    policy: &VerificationPolicy,
+    anchors: &A,
+    now_unix: i64,
+    role: IssuerRole,
+    statuses: &BTreeMap<String, Vec<Vec<StatusOutcome>>>,
+    status_tokens: &BTreeMap<String, Vec<u8>>,
+) -> VpTokenVerification {
     // Parse the DCQL once. An unparseable query has no enforceable structure → nothing is satisfied
     // (the explicit multi-credential entry needs a real query; the single-presentation gate is the
     // lenient/backward-compatible path).
@@ -691,16 +755,35 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
     let mut satisfied_ids: BTreeSet<String> = BTreeSet::new();
     for (credential_id, tokens) in vp_token {
         let credential_query = by_id.get(credential_id.as_str()).copied();
-        // Per-credential anchoring role derived from the query's EXPECTED type (PID), else the caller's.
-        let credential_role = credential_query
-            .and_then(|candidate| crate::dcql::role_from_meta(&candidate.meta))
-            .unwrap_or(role);
         // `multiple:false` (default) ⇒ at most one Presentation per Credential Query (§"Response
         // Parameters": "When `multiple` is omitted, or set to `false`, the array MUST contain only one
         // Presentation.").
         let multiple_allowed = credential_query.is_some_and(|candidate| candidate.multiple);
         let cardinality_ok = multiple_allowed || tokens.len() <= 1;
 
+        // DoS hardening (the set-level C-ABI surface is attacker-reachable with N presentations): a
+        // credential that can NEVER enter `satisfied_ids` — either NOT named by the DCQL query
+        // (`credential_query.is_none()`) or already over its `multiple:false` cardinality
+        // (`!cardinality_ok`) — cannot change ANY verdict (`satisfied` below requires BOTH
+        // `credential_query.is_some()` AND `cardinality_ok`, and `credential_sets_satisfied` reads only
+        // the satisfied set). SKIP the O(tokens) always-on bar + ≤64 MiB per-token status inflate for it
+        // rather than let an attacker force full verifies (each a status inflate) with credential_ids the
+        // verifier never asked for; record a cheap empty (no-bar-run) unsatisfied marker for observability.
+        if credential_query.is_none() || !cardinality_ok {
+            credentials.insert(
+                credential_id.clone(),
+                CredentialVerification {
+                    presentations: Vec::new(),
+                    satisfied: false,
+                },
+            );
+            continue;
+        }
+
+        // Per-credential anchoring role derived from the query's EXPECTED type (PID), else the caller's.
+        let credential_role = credential_query
+            .and_then(|candidate| crate::dcql::role_from_meta(&candidate.meta))
+            .unwrap_or(role);
         // This credential's per-token status outcomes (each token is one Presentation, itself possibly a
         // multi-document mdoc `DeviceResponse` ⇒ a positional per-document slice). A credential_id / token
         // the host supplied no statuses for yields an empty slice ⇒ each document fails closed to
@@ -711,7 +794,19 @@ pub fn verify_vp_token<A: TrustAnchorSource + ?Sized>(
         // ≥1 fact is used (cardinality is enforced separately by `cardinality_ok`), so a `bool` suffices;
         // every token is still verified + pushed to `presentations` (no short-circuit).
         let mut matched = false;
-        for (token_index, token) in tokens.iter().enumerate() {
+        for (token_index, slot) in tokens.iter().enumerate() {
+            // A no-audience mdoc slot fails closed to `MissingRequestBinding` WITHOUT touching the crypto
+            // bar (mirroring the single-presentation `verify()` path); it still occupies its slot (already
+            // counted by `cardinality_ok` above) and, being INVALID, can never set `matched`.
+            let token = match slot {
+                VpTokenSlot::MissingAudienceMdoc => {
+                    presentations.push(VerificationResult::invalid(
+                        ReasonCode::MissingRequestBinding,
+                    ));
+                    continue;
+                }
+                VpTokenSlot::Present(token) => token,
+            };
             let token_statuses: &[StatusOutcome] = credential_statuses
                 .and_then(|per_token| per_token.get(token_index))
                 .map_or(&[], Vec::as_slice);

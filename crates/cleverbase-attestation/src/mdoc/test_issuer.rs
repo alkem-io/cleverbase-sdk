@@ -203,12 +203,13 @@ pub(crate) struct MdocBuilder {
     status_reference: Option<(u64, String)>,
     /// When set, add an MSO `status` element whose `status_list` object IS present but MALFORMED (only
     /// an `idx`, no `uri`) — the present-but-unusable status reference the bar MUST fail closed on
-    /// (`StatusUnavailable`), never falling through to a host-supplied positional `Good`.
+    /// (`StatusUntrusted` — a declared mechanism the core cannot evaluate), never falling through to a
+    /// host-supplied positional `Good`.
     malformed_status_reference: bool,
     /// When set, append a SECOND document that is a byte-identical CLONE of the first (the "replay one
     /// credential twice" shape). Combined with [`Self::status_reference`], BOTH documents reference the
-    /// same status-list URI — the per-URI inflate-memoization probe (the shared list is authenticated +
-    /// inflated ONCE, and the identical documents merge cleanly to an unchanged VALID verdict).
+    /// same status-list URI, so the same list is authenticated for each and the identical documents merge
+    /// cleanly to an unchanged VALID verdict.
     duplicate_first_document: bool,
 }
 
@@ -388,8 +389,7 @@ impl MdocBuilder {
 
     /// Append a SECOND document that is a byte-identical CLONE of the first (the "replay one credential
     /// twice" shape). With [`Self::status_reference`] set, BOTH documents reference the same status-list
-    /// URI — the per-URI inflate-memoization probe. The identical documents merge cleanly, so the verdict
-    /// is unchanged (VALID).
+    /// URI. The identical documents merge cleanly, so the verdict is unchanged (VALID).
     pub(crate) fn append_duplicate_document(mut self) -> Self {
         self.duplicate_first_document = true;
         self
@@ -1203,7 +1203,7 @@ impl MdocBuilder {
         };
         if self.duplicate_first_document {
             // A byte-identical clone (both documents reference the same status-list URI when
-            // `status_reference` is set) — the per-URI inflate-memoization probe.
+            // `status_reference` is set).
             documents.push(document.clone());
         }
         if self.append_forged_document {

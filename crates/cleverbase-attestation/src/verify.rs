@@ -605,7 +605,7 @@ pub(crate) struct StatusTrust<'a, A: TrustAnchorSource + ?Sized> {
 /// The trust-authorization closure for the in-core Token Status List verifier (security-critical): given
 /// the token's embedded [`crate::status::SignerKeyMaterial`], decide whether its signer is authorized to
 /// sign THIS credential's status list, and if so return the [`VerifyingKey`] to verify the token under.
-/// Fail-closed — any doubt is `Err(())`, which folds to [`StatusOutcome::Unavailable`].
+/// Fail-closed — any doubt is `Err(())`, which folds to [`StatusOutcome::Untrusted`].
 ///
 /// Two authorization paths (a key is NEVER authorized merely because it is embedded in the token —
 /// self-authorization would defeat the check):

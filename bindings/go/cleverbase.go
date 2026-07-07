@@ -198,6 +198,10 @@ func AttestationVerify(request []byte) ([]byte, error) {
 // overall `satisfied` verdict + per-credential results (and any decode error) ride inside the response
 // `outcome`; a non-nil error here means the FFI call itself failed (null/oversized/contained-panic),
 // never a mere unsatisfied verdict.
+//
+// The set-level surface does NOT run the opt-in eIDAS qualified-status gate: a request with
+// policy.qualified_gate = true is rejected with an `err` outcome (verify each presentation via
+// AttestationVerify if the qualified gate is required).
 func AttestationVerifyVpToken(request []byte) ([]byte, error) {
 	return callAbi("cleverbase_attestation_verify_vp_token", request, func(in *C.uint8_t, inLen C.size_t, out **C.uint8_t, outLen *C.size_t) C.int {
 		return C.cleverbase_attestation_verify_vp_token(in, inLen, out, outLen)

@@ -1192,6 +1192,94 @@ fn verify_vp_token_multiple_false_rejects_two_presentations() {
 }
 
 #[test]
+fn verify_vp_token_skips_unqueried_and_over_cardinality_without_changing_the_verdict() {
+    // GROUP 3a (DoS hardening — the set-level surface is attacker-reachable with N presentations): a
+    // credential_id NOT named by the DCQL query, and a queried `multiple:false` credential that returned
+    // >1 Presentation (already over its cardinality), can NEVER enter the satisfied set — so the
+    // evaluator must SKIP the always-on bar + status inflate for them (an attacker must not be able to
+    // force full verifies with credential_ids the verifier never asked for). Adding such noise must NOT
+    // change the overall `satisfied` verdict vs. a clean request, and neither noise credential is verified.
+    let dcql = format!(
+        r#"{{"credentials":[
+            {{"id":"good","format":"dc+sd-jwt","meta":{{"vct_values":["{VCT_A}"]}}}},
+            {{"id":"over","format":"dc+sd-jwt","meta":{{"vct_values":["{VCT_A}"]}}}}
+        ],"credential_sets":[{{"options":[["good"]],"required":true}}]}}"#
+    );
+    let request = request_with_dcql(AUDIENCE, &[9u8; 16], &dcql);
+    let good = sd_jwt_of_vct(VCT_A, &request);
+
+    // Baseline: just the satisfiable required credential → SATISFIED.
+    let mut baseline = BTreeMap::new();
+    baseline.insert("good".to_owned(), vec![VpToken::SdJwtVc(&good)]);
+    let baseline_out = verify_vp_token(
+        &request,
+        &baseline,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &all_no_status(&baseline),
+        &no_status_tokens(),
+    );
+    assert!(
+        baseline_out.satisfied,
+        "the required credential alone satisfies the request"
+    );
+
+    // Noisy: same, PLUS an UNQUERIED id "ghost" AND the queried `multiple:false` "over" with TWO
+    // Presentations (over its cardinality). Both noise credentials carry would-be-VALID Presentations —
+    // so if the bar HAD run, they would verify; their ABSENCE from the results proves the skip.
+    let ghost = sd_jwt_of_vct(VCT_A, &request);
+    let over1 = sd_jwt_of_vct(VCT_A, &request);
+    let over2 = sd_jwt_of_vct(VCT_A, &request);
+    let mut noisy = BTreeMap::new();
+    noisy.insert("good".to_owned(), vec![VpToken::SdJwtVc(&good)]);
+    noisy.insert("ghost".to_owned(), vec![VpToken::SdJwtVc(&ghost)]);
+    noisy.insert(
+        "over".to_owned(),
+        vec![VpToken::SdJwtVc(&over1), VpToken::SdJwtVc(&over2)],
+    );
+    let noisy_out = verify_vp_token(
+        &request,
+        &noisy,
+        &VerificationPolicy::default(),
+        &anchors_sd_jwt(),
+        NOW,
+        IssuerRole::Pid,
+        &all_no_status(&noisy),
+        &no_status_tokens(),
+    );
+
+    // The overall verdict is UNCHANGED by the noise.
+    assert_eq!(
+        noisy_out.satisfied, baseline_out.satisfied,
+        "unqueried / over-cardinality noise must not change the set-level verdict"
+    );
+    assert!(noisy_out.satisfied);
+
+    // The UNQUERIED id was not run through the bar (empty, unsatisfied result — no crypto/inflate).
+    let ghost = &noisy_out.credentials["ghost"];
+    assert!(
+        !ghost.satisfied,
+        "an unqueried credential is never satisfied"
+    );
+    assert!(
+        ghost.presentations.is_empty(),
+        "an unqueried credential must not be run through the always-on bar"
+    );
+    // The OVER-CARDINALITY credential is unsatisfied and likewise not verified.
+    let over = &noisy_out.credentials["over"];
+    assert!(
+        !over.satisfied,
+        "a multiple:false credential with >1 Presentation is unsatisfied (cardinality)"
+    );
+    assert!(
+        over.presentations.is_empty(),
+        "an over-cardinality credential must not be run through the always-on bar"
+    );
+}
+
+#[test]
 fn verify_vp_token_mdoc_credential_is_satisfied() {
     let dcql = r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}]}"#;
     let request = request_with_dcql(AUDIENCE, &[3u8; 16], dcql);

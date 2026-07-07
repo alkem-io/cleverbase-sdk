@@ -1672,11 +1672,10 @@ fn mdoc_status_list_revoked_bit_is_rejected_in_core() {
 }
 
 #[test]
-fn mdoc_two_documents_referencing_the_same_status_uri_verify_with_a_shared_inflate() {
+fn mdoc_two_documents_referencing_the_same_status_uri_verify() {
     // The "replay one credential twice" shape: two byte-identical valid documents BOTH referencing the
-    // same status-list URI. The per-URI inflate memo authenticates + inflates the shared list ONCE (not
-    // once per document — the DoS-amplification cap), and the identical documents merge cleanly, so the
-    // verdict is unchanged (VALID). Entry 0 is VALID (bit 0) in the same-issuer CWT.
+    // same status-list URI. The shared list authenticates for each document and the identical documents
+    // merge cleanly, so the verdict is unchanged (VALID). Entry 0 is VALID (bit 0) in the same-issuer CWT.
     let response = MdocBuilder::new()
         .status_reference(0, STATUS_LIST_URI)
         .append_duplicate_document()
@@ -1712,7 +1711,7 @@ fn mdoc_two_documents_referencing_the_same_status_uri_verify_with_a_shared_infla
     );
     assert!(
         result.valid,
-        "a two-document response referencing one status URI must verify (shared inflate, clean merge): {:?}",
+        "a two-document response referencing one status URI must verify (clean merge): {:?}",
         result.reasons
     );
 }

@@ -123,9 +123,10 @@ pub enum StatusReference {
     /// The credential declares a status mechanism (a `status_list` object IS present) but it is
     /// **unusable**: an empty/absent `uri`, a non-integer/absent `idx`, or the wrong CBOR/JSON types.
     /// This is DISTINCT from [`Self::None`] (no status claim at all): a present-but-malformed status
-    /// reference MUST fail closed ([`StatusOutcome::Unavailable`]) — never fall through to a
-    /// host-supplied positional `Good` — because the credential DID declare a revocation mechanism the
-    /// core cannot evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
+    /// reference MUST fail closed ([`StatusOutcome::Untrusted`] — a declared mechanism the core cannot
+    /// evaluate is closer to "untrusted" than "unreachable") — never fall through to a host-supplied
+    /// positional `Good` — because the credential DID declare a revocation mechanism the core cannot
+    /// evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
     Malformed,
     /// A Token Status List reference: the index of this credential's entry and the list URI the host
     /// fetches.

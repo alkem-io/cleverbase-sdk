@@ -57,6 +57,8 @@ func AttestationVerifyVpToken(request []byte) ([]byte, error)
 
 AttestationVerifyVpToken runs the EUDI attestation SET\-LEVEL OpenID4VP verifier over a CBOR WireVpTokenRequest envelope \(attestation schema version 5\) and returns the CBOR WireVpTokenResponse. Unlike AttestationVerify \(a single presentation\), this carries the whole multi\-credential vp\_token \(\`\{credential\_id: \[presentations\]\}\`\) so the core folds the OpenID4VP set\-level DCQL semantics \(\`credential\_sets\` required option\-sets \+ \`multiple\` cardinality\) AND authenticates supplied signed Token Status List tokens in\-core across the set. Like AttestationVerify it is CBOR\-in / CBOR\-out: the overall \`satisfied\` verdict \+ per\-credential results \(and any decode error\) ride inside the response \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere unsatisfied verdict.
 
+The set\-level surface does NOT run the opt\-in eIDAS qualified\-status gate: a request with policy.qualified\_gate = true is rejected with an \`err\` outcome \(verify each presentation via AttestationVerify if the qualified gate is required\).
+
 <a name="Appearance"></a>
 ## type Appearance
 

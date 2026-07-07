@@ -2573,9 +2573,10 @@ supplies it via the [`StatusSource`] seam; the core then evaluates `idx`/serial 
   - The credential declares a status mechanism (a `status_list` object IS present) but it is
 **unusable**: an empty/absent `uri`, a non-integer/absent `idx`, or the wrong CBOR/JSON types.
 This is DISTINCT from [`Self::None`] (no status claim at all): a present-but-malformed status
-reference MUST fail closed ([`StatusOutcome::Unavailable`]) — never fall through to a
-host-supplied positional `Good` — because the credential DID declare a revocation mechanism the
-core cannot evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
+reference MUST fail closed ([`StatusOutcome::Untrusted`] — a declared mechanism the core cannot
+evaluate is closer to "untrusted" than "unreachable") — never fall through to a host-supplied
+positional `Good` — because the credential DID declare a revocation mechanism the core cannot
+evaluate, so it cannot prove the credential is current (SC-002, fail-closed).
 - `StatusList { index: u64, uri: String }`
   - A Token Status List reference: the index of this credential's entry and the list URI the host
 fetches.
@@ -4591,7 +4592,7 @@ must be bound to — the SAME [`PresentationRequest`] carried by [`VerifyRequest
   - The verification instant (Unix seconds), shared across every presentation.
 - `role: IssuerRole`
   - The default issuer role trust is anchored under (per-credential a query's expected PID type may
-override it — see [`verify_vp_token`]).
+override it — see [`crate::openid4vp::verify_vp_token`]).
 - `statuses: BTreeMap<String, Vec<Vec<StatusOutcome>>>`
   - The host-resolved revocation/status outcomes, keyed by credential id → per **token**
 (presentation) → per **document** (positional). A credential id / token / document with no
@@ -4729,11 +4730,17 @@ returns the [`VerificationResult`]; a malformed one yields [`VerifyOutcome::Err`
 fn process_vp_token_bytes(input: &[u8]) -> Vec<u8>
 ```
 
-Decode → [`verify_vp_token`] → encode for the set-level `vp_token` surface. Pure; shared by the
+Decode → [`crate::openid4vp::verify_vp_token`] → encode for the set-level `vp_token` surface (the
+wire delegates to the shared slot-level evaluator, which may carry a no-audience-mdoc slot). Pure; shared by the
 C-ABI, language bindings, and tests (single source of truth — Principle III). A well-formed request
 folds the complete OpenID4VP set-level DCQL semantics (`credential_sets` + `multiple`) AND
 authenticates any supplied signed Token Status List token in-core; a malformed one yields
 [`WireVpTokenOutcome::Err`] (fail-closed, same discipline as [`process_verify_bytes`]).
+
+**The set-level surface does NOT run the opt-in eIDAS qualified-status gate** (it carries no national
+Trusted List / scheme anchors): a request with `policy.qualified_gate == true` is REJECTED with a
+clear [`WireVpTokenOutcome::Err`] rather than silently running no determination — the gate is
+available only on the single-presentation [`process_verify_bytes`] surface.
 
 ### Constants
 

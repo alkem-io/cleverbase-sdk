@@ -10,7 +10,7 @@ use super::{
     WireVpTokenResponse, ATTESTATION_SCHEMA_VERSION,
 };
 use crate::mdoc::test_issuer::{default_session_transcript, MdocBuilder};
-use crate::openid4vp::{Dcql, PresentationRequest};
+use crate::openid4vp::{oid4vp_handover_transcript, Dcql, PresentationRequest};
 use crate::qualified::EAA_EU_QUALIFIED_TYPE;
 use crate::sdjwtvc::test_issuer::{
     attach_kb_jwt_with_iat, block_on, holder_cnf, mint_sd_jwt_with_status_and_validity,
@@ -763,4 +763,195 @@ fn wire_vp_token_wrong_schema_version_is_rejected() {
     req.schema_version = ATTESTATION_SCHEMA_VERSION + 1;
     let err = decode_vp_token_request(&encode_vp(&req)).unwrap_err();
     assert!(err.contains("unsupported attestation schema_version"));
+}
+
+// =================================================================================================
+// GROUP 2 — the set-level surface does NOT run the opt-in qualified gate: `policy.qualified_gate = true`
+// must FAIL LOUD (a clear `Err`), never silently run no determination while still reporting satisfied.
+// =================================================================================================
+
+#[test]
+fn process_vp_token_bytes_rejects_qualified_gate_as_unsupported() {
+    // A set-level request with `policy.qualified_gate = true` carries no national Trusted List / scheme
+    // anchors, so the gate cannot run — the surface must reject it rather than let the flag be a silent
+    // no-op (`qualified_status` absent) while still folding a `satisfied` verdict.
+    let request = vp_request(&two_credential_vp_dcql());
+    let pres_a = bound_sd_jwt(&request);
+    let pres_b = bound_sd_jwt(&request);
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert(
+        "a".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_a,
+        }],
+    );
+    vp_token.insert(
+        "b".to_owned(),
+        vec![WirePresentation::SdJwtVc {
+            presentation: pres_b,
+        }],
+    );
+    let statuses = vp_no_status(&vp_token);
+    let mut req = vp_envelope(
+        request,
+        vp_token,
+        statuses,
+        std::collections::BTreeMap::new(),
+    );
+    req.policy.qualified_gate = true;
+
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        WireVpTokenOutcome::Err { message } => assert!(
+            message.contains("qualified"),
+            "the error must name the unsupported qualified gate: {message}"
+        ),
+        WireVpTokenOutcome::Ok { .. } => {
+            panic!("qualified_gate = true must FAIL LOUD on the set-level surface, not silently satisfy")
+        }
+    }
+
+    // Control: the SAME request with `qualified_gate = false` (the default) is unaffected — it runs the
+    // set-level verdict normally and is SATISFIED (proving the rejection above is the gate flag, not the
+    // request itself).
+    req.policy.qualified_gate = false;
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        WireVpTokenOutcome::Ok { result } => assert!(
+            result.satisfied,
+            "with the gate unset the set verifies normally: {:?}",
+            result.credentials
+        ),
+        WireVpTokenOutcome::Err { message } => panic!("gate-off request must not error: {message}"),
+    }
+}
+
+// =================================================================================================
+// GROUP 1 (+ GROUP 6 set-level-mdoc WIRE coverage) — an mdoc presentation with NO addressed audience on
+// the set-level wire path must fail closed as `MissingRequestBinding` (mirroring the single-presentation
+// `verify()` path), NOT be coerced to an empty-string audience → `WrongAudience`; a correctly-addressed
+// mdoc verifies VALID through the same wire mapping.
+// =================================================================================================
+
+/// A single-`mdl` mdoc DCQL whose one REQUIRED credential-set option demands `mdl`.
+fn mdl_vp_dcql() -> &'static str {
+    r#"{"credentials":[{"id":"mdl","format":"mso_mdoc","meta":{"doctype_value":"org.iso.18013.5.1.mDL"}}],"credential_sets":[{"options":[["mdl"]],"required":true}]}"#
+}
+
+/// Build an mdoc set-level envelope pinning the issuing IACA root under `(Pid, Mdoc)` (the DS leaf
+/// chains to it), with a single `mdl` presentation `presentation`, bound to `request`.
+fn mdoc_vp_envelope(
+    request: PresentationRequest,
+    presentation: WirePresentation,
+) -> WireVpTokenRequest {
+    let mut vp_token = std::collections::BTreeMap::new();
+    vp_token.insert("mdl".to_owned(), vec![presentation]);
+    let statuses = vp_no_status(&vp_token);
+    let mut req = vp_envelope(
+        request,
+        vp_token,
+        statuses,
+        std::collections::BTreeMap::new(),
+    );
+    // The mdoc DS leaf chains to the IACA root under (Pid, Mdoc) — replace the SD-JWT anchor.
+    req.anchors = vec![WireTrustAnchor {
+        role: IssuerRole::Pid,
+        format: Format::Mdoc,
+        cert_der: CA_IACA.to_vec(),
+    }];
+    req
+}
+
+/// Drive `process_vp_token_bytes` for a single-`mdl` mdoc presentation with NO addressed audience, bound
+/// to a request whose `client_id` is `request_audience`, and return the set-level result.
+fn no_audience_mdoc_result(request_audience: &str) -> crate::openid4vp::VpTokenVerification {
+    let mut request = vp_request(mdl_vp_dcql());
+    request.audience = request_audience.to_owned();
+    // The device_response is deliberately GARBAGE: a no-audience mdoc must NEVER reach the crypto bar, so
+    // these bytes are never decoded (a MalformedCredential/Tamper reason would prove the opposite).
+    let presentation = WirePresentation::Mdoc {
+        device_response: vec![0xff, 0x00, 0x13, 0x37],
+        audience: None,
+    };
+    let req = mdoc_vp_envelope(request, presentation);
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        WireVpTokenOutcome::Ok { result } => result,
+        WireVpTokenOutcome::Err { message } => panic!("unexpected error: {message}"),
+    }
+}
+
+#[test]
+fn process_vp_token_bytes_mdoc_without_audience_is_missing_request_binding_not_wrong_audience() {
+    let result = no_audience_mdoc_result(VP_AUDIENCE);
+    assert!(
+        !result.satisfied,
+        "a no-audience mdoc cannot satisfy the required set"
+    );
+    let mdl = &result.credentials["mdl"];
+    assert!(
+        !mdl.satisfied,
+        "the no-audience mdoc must not satisfy its query"
+    );
+    assert_eq!(
+        mdl.presentations[0].reasons,
+        vec![crate::types::ReasonCode::MissingRequestBinding],
+        "an mdoc with no addressed audience is MissingRequestBinding, NEVER WrongAudience"
+    );
+}
+
+#[test]
+fn process_vp_token_bytes_mdoc_without_audience_fails_closed_even_with_empty_client_id() {
+    // REGRESSION for the empty-`client_id` edge: even when the verifier's own `client_id` is "" (so an
+    // empty-string audience WOULD pass the `token.audience != request.audience` gate), a no-audience mdoc
+    // still fails closed as MissingRequestBinding — never coerced to "" and waved past the audience gate.
+    let result = no_audience_mdoc_result("");
+    assert!(!result.satisfied);
+    assert_eq!(
+        result.credentials["mdl"].presentations[0].reasons,
+        vec![crate::types::ReasonCode::MissingRequestBinding],
+        "an empty verifier client_id must not let a no-audience mdoc bypass the audience gate"
+    );
+}
+
+#[test]
+fn process_vp_token_bytes_mdoc_with_audience_verifies_valid() {
+    // Companion positive: a set-level mdoc WITH the correct addressed audience verifies VALID through the
+    // same wire mapping (so the no-audience rejection is the audience-absence gate, not a blanket
+    // set-level mdoc failure). In-window (the C-ABI trust path is chain-validating) + request-bound (the
+    // DeviceAuth signs the OpenID4VP handover the verifier reconstructs from the request).
+    let request = vp_request(mdl_vp_dcql());
+    let transcript = oid4vp_handover_transcript(VP_AUDIENCE, VP_NONCE, VP_RESPONSE_URI);
+    let device_response = MdocBuilder::new()
+        .signed("2026-08-01T00:00:00Z")
+        .validity("2026-08-01T00:00:00Z", "2027-02-01T00:00:00Z")
+        .session_transcript(transcript)
+        .build();
+    let presentation = WirePresentation::Mdoc {
+        device_response,
+        audience: Some(VP_AUDIENCE.to_owned()),
+    };
+    let req = mdoc_vp_envelope(request, presentation);
+
+    let out = process_vp_token_bytes(&encode_vp(&req));
+    let resp: WireVpTokenResponse = ciborium::from_reader(&out[..]).unwrap();
+    match resp.outcome {
+        WireVpTokenOutcome::Ok { result } => {
+            assert!(
+                result.satisfied,
+                "a correctly-addressed in-window mdoc satisfies the required set"
+            );
+            let mdl = &result.credentials["mdl"];
+            assert!(mdl.satisfied, "the mdoc must satisfy its query");
+            assert!(
+                mdl.presentations[0].valid,
+                "the mdoc presentation must be VALID: {:?}",
+                mdl.presentations[0].reasons
+            );
+        }
+        WireVpTokenOutcome::Err { message } => panic!("unexpected error: {message}"),
+    }
 }

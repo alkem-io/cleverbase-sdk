@@ -109,6 +109,10 @@ fn attestation_verify(request: Vec<u8>) -> PyResult<Vec<u8>> {
 /// verdict (`satisfied` + per-credential results) and any decode/usage error ride *inside* the
 /// response envelope — a malformed request yields a well-formed response carrying an `err` outcome
 /// rather than raising. The holder key never crosses this boundary.
+///
+/// The set-level surface does NOT run the opt-in eIDAS qualified-status gate: a request with
+/// `policy.qualified_gate = true` yields an `err` outcome (verify each presentation via
+/// `attestation_verify` if the qualified gate is required).
 #[pyfunction]
 // CBOR-through: every outcome rides inside the response envelope (see [`attestation_verify`]).
 #[allow(clippy::unnecessary_wraps)]
