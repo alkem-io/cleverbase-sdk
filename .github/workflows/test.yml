@@ -106,9 +106,19 @@ jobs:
       - name: Test + coverage
         working-directory: bindings/go
         env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
         run: |
           go test -coverprofile=cover.out ./...
+          go test -c -o "$RUNNER_TEMP/cleverbase-go.test" .
+          command -v readelf >/dev/null || { echo "::error::readelf is required for the RUNPATH check"; exit 1; }
+          dynamic_section="$(readelf -d "$RUNNER_TEMP/cleverbase-go.test")"
+          test -n "$dynamic_section" || { echo "::error::readelf returned no dynamic-section output"; exit 1; }
+          if printf '%s\n' "$dynamic_section" | grep -E '\((RPATH|RUNPATH)\)' \
+            | grep -F 'target/debug'; then
+            echo "::error::Go binding embeds a checkout-local target/debug RUNPATH"
+            exit 1
+          fi
           total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
           echo "Go binding statement coverage: ${total}%"
           # The thin cgo shim's remaining lines are unreachable defensive branches (the C-ABI

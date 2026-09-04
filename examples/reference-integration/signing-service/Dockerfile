@@ -23,8 +23,8 @@ COPY examples/reference-integration/signing-service ./examples/reference-integra
 COPY examples/reference-integration/mock-upstream ./examples/reference-integration/mock-upstream
 WORKDIR /src/examples/reference-integration/signing-service
 ENV CGO_ENABLED=1
-# Override the binding's default -L (which points at target/debug) to the staticlib we just built.
-# With only the .a present (no .so), the linker links cleverbase-ffi statically.
+# Point the binding at the staticlib built in the Rust stage. With only the .a present (no .so), the
+# linker links cleverbase-ffi statically.
 ENV CGO_LDFLAGS="-L/libs"
 RUN go build -trimpath -ldflags="-s -w" -o /refsvc ./cmd/refsvc
 
