@@ -27,6 +27,8 @@ jobs:
           persist-credentials: false
       - name: Set up Rust (version + components pinned via rust-toolchain.toml)
         run: rustup show
+      - name: Native release packaging contract
+        run: bash scripts/test-package-ffi-release.sh
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Test (includes OpenSSL independent validation)
