@@ -86,9 +86,8 @@ python3 -m venv .venv && .venv/bin/pip install maturin cbor2 pytest
 # Node binding
 ( cd bindings/node && npm install && npm run build && npm test )
 
-# Go binding (links the C ABI dylib)
-cargo build -p cleverbase-ffi
-( cd bindings/go && DYLD_LIBRARY_PATH=$PWD/../../target/debug go test )
+# Go binding (builds and links the debug C ABI library explicitly)
+make go-test
 
 # Frontend helper
 ( cd frontend/helper-ts && npm install && npm run build && npm test )

@@ -7,11 +7,10 @@
 package cleverbase
 
 /*
-// The default LDFLAGS point at this repo's debug build of cleverbase-ffi so the binding works
-// in-tree for development and CI. Consumers building against a packaged/release library override
-// these via the CGO_LDFLAGS environment variable, e.g.
-//   CGO_LDFLAGS="-L/opt/cleverbase/lib -lcleverbase_ffi -Wl,-rpath,/opt/cleverbase/lib"
-#cgo LDFLAGS: -L${SRCDIR}/../../target/debug -lcleverbase_ffi -Wl,-rpath,${SRCDIR}/../../target/debug
+// Build environments provide the library search directory through CGO_LDFLAGS. Keeping only the
+// library name here prevents checkout-local development paths from becoming consumer RUNPATHs.
+#cgo LDFLAGS: -lcleverbase_ffi
+#cgo darwin LDFLAGS: -framework CoreFoundation
 #include <stdint.h>
 #include <stdlib.h>
 int cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
