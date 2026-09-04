@@ -42,24 +42,28 @@ jobs:
             release_arch: amd64
             goos: linux
             goarch: amd64
+            system_ldflags: ""
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             release_os: linux
             release_arch: arm64
             goos: linux
             goarch: arm64
+            system_ldflags: ""
           - runner: macos-15
             rust_target: aarch64-apple-darwin
             release_os: darwin
             release_arch: arm64
             goos: darwin
             goarch: arm64
+            system_ldflags: -framework CoreFoundation
           - runner: macos-15
             rust_target: x86_64-apple-darwin
             release_os: darwin
             release_arch: amd64
             goos: darwin
             goarch: amd64
+            system_ldflags: -framework CoreFoundation
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -77,6 +81,10 @@ jobs:
             version="${RELEASE_TAG#bindings/go/v}"
             if [ "$version" = "$RELEASE_TAG" ] || [ "$version" != "$ffi_version" ]; then
               echo "::error::release tag $RELEASE_TAG must match cleverbase-ffi version $ffi_version"
+              exit 1
+            fi
+            if grep -Eq 'target/debug|-Wl,-rpath' bindings/go/cleverbase.go; then
+              echo "::error::release blocked: Go binding still embeds development linker paths"
               exit 1
             fi
           fi
@@ -115,11 +123,12 @@ jobs:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          SYSTEM_LDFLAGS: ${{ matrix.system_ldflags }}
         run: |
           extract_dir="$RUNNER_TEMP/cleverbase-ffi"
           mkdir -p "$extract_dir"
           tar -xzf "$ARCHIVE" -C "$extract_dir"
-          CGO_ENABLED=1 CGO_LDFLAGS="-L$extract_dir/lib" \
+          CGO_ENABLED=1 CGO_LDFLAGS="-L$extract_dir/lib $SYSTEM_LDFLAGS" \
             go test -c -o "$RUNNER_TEMP/cleverbase-go.test" .
         working-directory: bindings/go
 

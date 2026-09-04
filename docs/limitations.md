@@ -37,7 +37,7 @@ independent OpenSSL validation. The items below are deliberately deferred, block
 
 - CI matrix across Linux (glibc/musl) / macOS / Windows; packaging & publishing of Python wheels,
   Node prebuilds, and general-purpose cdylib releases. The Go binding release publishes the
-  `cleverbase-ffi` static library for Linux amd64/arm64 and Darwin arm64, but the wider
+  `cleverbase-ffi` static library for Linux and Darwin on amd64 and arm64, but the wider
   cross-platform matrix and other binding packages remain outstanding.
 - Per-binding full-signature tests + cross-language parity harness (bindings are tested at the
   begin/resume protocol level today); language demos; API reference docs.

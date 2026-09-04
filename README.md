@@ -109,6 +109,7 @@ example:
 
 ```bash
 gh release download bindings/go/v0.1.0 \
+  --repo alkem-io/cleverbase-sdk \
   --pattern 'cleverbase-ffi-v0.1.0-linux-amd64*' --dir .cleverbase
 ( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.1.0-linux-amd64.tar.gz.sha256 )
 tar -xzf .cleverbase/cleverbase-ffi-v0.1.0-linux-amd64.tar.gz -C .cleverbase
