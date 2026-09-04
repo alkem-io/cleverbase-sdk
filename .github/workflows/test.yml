@@ -18,15 +18,6 @@ permissions:
   contents: read
 
 jobs:
-  release-packaging:
-    name: Native release packaging contract
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-      - run: bash scripts/test-package-ffi-release.sh
-
   rust:
     name: Rust core + attestation + C ABI (test + coverage ≥95%)
     runs-on: ubuntu-latest
@@ -36,6 +27,8 @@ jobs:
           persist-credentials: false
       - name: Set up Rust (version + components pinned via rust-toolchain.toml)
         run: rustup show
+      - name: Native release packaging contract
+        run: bash scripts/test-package-ffi-release.sh
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Test (includes OpenSSL independent validation)
