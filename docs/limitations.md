@@ -35,9 +35,10 @@ independent OpenSSL validation. The items below are deliberately deferred, block
 
 ## Mechanical / not yet done
 
-- CI matrix across Linux (glibc/musl) / macOS / Windows; packaging & publishing of prebuilt
-  artifacts (wheels, napi prebuilds, cdylib releases). CI today runs `Lint` + `Tests` workflows on
-  ubuntu-latest (single platform); the cross-platform matrix and release packaging are outstanding.
+- CI matrix across Linux (glibc/musl) / macOS / Windows; packaging & publishing of Python wheels,
+  Node prebuilds, and general-purpose cdylib releases. The Go binding release publishes the
+  `cleverbase-ffi` static library for Linux amd64/arm64 and Darwin arm64, but the wider
+  cross-platform matrix and other binding packages remain outstanding.
 - Per-binding full-signature tests + cross-language parity harness (bindings are tested at the
   begin/resume protocol level today); language demos; API reference docs.
 - WASM surface (T020): **not required** — the frontend helper performs no crypto, so no in-browser
