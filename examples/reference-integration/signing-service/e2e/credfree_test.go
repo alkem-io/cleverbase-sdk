@@ -213,7 +213,10 @@ func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
 // the error (nil on accept) so a caller can assert a loud failure on an untrusted issuer.
 func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 	t.Helper()
-	parts := pdfByteRange(t, pdf)
+	parts, err := pdfByteRange(pdf)
+	if err != nil {
+		return err
+	}
 	a, b, c, d := parts[0], parts[1], parts[2], parts[3]
 	signed := append(append([]byte{}, pdf[a:a+b]...), pdf[c:c+d]...)
 
@@ -234,25 +237,42 @@ func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 	return nil
 }
 
-func pdfByteRange(t *testing.T, pdf []byte) [4]int {
-	t.Helper()
+func pdfByteRange(pdf []byte) ([4]int, error) {
 	m := byteRangeRE.FindSubmatch(pdf)
 	if m == nil {
-		t.Fatal("no /ByteRange in signed PDF")
+		return [4]int{}, fmt.Errorf("no /ByteRange in signed PDF")
 	}
 	var parts [4]int
 	for i := range parts {
 		value, err := strconv.Atoi(string(m[i+1]))
 		if err != nil {
-			t.Fatalf("invalid ByteRange component %q: %v", m[i+1], err)
+			return [4]int{}, fmt.Errorf("invalid ByteRange component %q: %w", m[i+1], err)
 		}
 		parts[i] = value
 	}
 	a, b, c, d := parts[0], parts[1], parts[2], parts[3]
-	if a != 0 || b < 0 || c < 0 || d < 0 || b > c || c > len(pdf) || d > len(pdf)-c {
-		t.Fatalf("ByteRange out of bounds: %v len=%d", parts, len(pdf))
+	if a != 0 || b < 0 || c < 0 || d < 0 || b > c || c > len(pdf) || d != len(pdf)-c {
+		return [4]int{}, fmt.Errorf("ByteRange does not cover the full PDF: %v len=%d", parts, len(pdf))
 	}
-	return parts
+	return parts, nil
+}
+
+func TestPDFByteRangeRejectsUnsignedSuffix(t *testing.T) {
+	declaredLength := 0
+	var pdf []byte
+	for {
+		pdf = fmt.Appendf(nil, "/ByteRange [0 0 0 %d]", declaredLength)
+		if len(pdf) == declaredLength {
+			break
+		}
+		declaredLength = len(pdf)
+	}
+	if _, err := pdfByteRange(pdf); err != nil {
+		t.Fatalf("valid full-document ByteRange rejected: %v", err)
+	}
+	if _, err := pdfByteRange(append(pdf, 'x')); err == nil {
+		t.Fatal("ByteRange with unsigned suffix accepted")
+	}
 }
 
 // assertTimestampToken checks that a B-T signature embeds an RFC 3161 signature-timestamp token as
@@ -274,7 +294,10 @@ func assertTimestampToken(t *testing.T, pdf []byte) {
 // declared length (dropping the zero padding).
 func extractContents(t *testing.T, pdf []byte) []byte {
 	t.Helper()
-	parts := pdfByteRange(t, pdf)
+	parts, err := pdfByteRange(pdf)
+	if err != nil {
+		t.Fatal(err)
+	}
 	gap := pdf[parts[0]+parts[1] : parts[2]]
 	hexStr := strings.Map(func(r rune) rune {
 		switch r {
