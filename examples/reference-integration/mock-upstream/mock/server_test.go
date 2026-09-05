@@ -97,9 +97,12 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
+		_ = resp.Body.Close()
 		t.Fatalf("token without client_id status = %d, want 400", resp.StatusCode)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close token response without client_id: %v", err)
 	}
 
 	// URL query parameters are not form fields in Cleverbase's token contract. ParseForm merges
@@ -111,9 +114,12 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
+		_ = resp.Body.Close()
 		t.Fatalf("token with query-only client_id status = %d, want 400", resp.StatusCode)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close token response with query-only client_id: %v", err)
 	}
 }
 
