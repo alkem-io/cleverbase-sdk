@@ -128,8 +128,8 @@ jobs:
           REFSVC_MODE: live
           REFSVC_ENV: acceptance
           REFSVC_CSC_API: ${{ matrix.csc_api }}
-          REFSVC_CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA }}
-          REFSVC_CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA }}
+          REFSVC_CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA || '' }}
+          REFSVC_CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA || '' }}
           REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
           REFSVC_LIVE_AUTHORIZER: headless

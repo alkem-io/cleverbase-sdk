@@ -49,7 +49,8 @@ Implemented and tested (Rust unit + integration; independently validated with **
 - ✅ Python, Node, and Go bindings + the TS frontend helper, all with passing tests.
 
 See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
-and [`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work.
+[`docs/proof-matrix.md`](docs/proof-matrix.md) for the current evidence, and
+[`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work.
 
 ## Status (EUDI attestation & verification)
 
