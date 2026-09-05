@@ -52,6 +52,15 @@ func TestBeginUsesUpstreamBaseURLForServiceRedirect(t *testing.T) {
 	}
 }
 
+func TestBeginRejectsInvalidUpstreamBaseURL(t *testing.T) {
+	cfg := testConfig()
+	cfg.UpstreamBaseURL = "https://trust-driver-stub-hash-signing.cleverbase.com:0"
+
+	if _, err := BeginSigning([]byte("%PDF-1.7\nminimal"), cfg, "B-B", nil, 1_700_000_000, testEntropy()); err == nil {
+		t.Fatal("BeginSigning accepted an upstream URL with port zero")
+	}
+}
+
 func TestResumeRedirectEmitsTokenExchange(t *testing.T) {
 	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), testConfig(), "B-B", nil, 1_700_000_000, testEntropy())
 	if err != nil {

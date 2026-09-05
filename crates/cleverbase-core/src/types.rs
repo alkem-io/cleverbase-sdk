@@ -1,7 +1,7 @@
 //! Input/output value types for the signing API (see contracts/sdk-api.md, data-model.md).
 
-use http::Uri;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// A secret string whose contents never appear in `Debug` output (Constitution Principle IV).
 /// It still (de)serializes its inner value so a session handle can round-trip authorization
@@ -220,6 +220,7 @@ pub struct TsaConfiguration {
 
 /// How to reach the Cleverbase trust service (data-model: TrustServiceConfiguration).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustServiceConfiguration {
     /// Which Cleverbase environment to target.
     pub environment: Environment,
@@ -273,37 +274,24 @@ impl TrustServiceConfiguration {
         let Some(value) = self.upstream_base_url.as_deref() else {
             return Ok(());
         };
-        let parsed: Uri = value
-            .parse()
+        let parsed = Url::parse(value)
             .map_err(|e| format!("upstream_base_url must be an absolute URL: {e}"))?;
-        let Some(authority) = parsed.authority() else {
+        let Some(host) = parsed.host_str() else {
             return Err("upstream_base_url must be an absolute URL with a host".into());
         };
-        if parsed.scheme_str().is_none() {
-            return Err("upstream_base_url must be an absolute URL with a scheme".into());
-        }
-        if authority.host().is_empty() {
-            return Err("upstream_base_url must be an absolute URL with a host".into());
-        }
-        if authority.as_str().contains('@') {
+        if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err("upstream_base_url must not contain credentials".into());
         }
-        // `http::Uri` keeps a literal fragment in the path because HTTP request targets normally
-        // never carry one, so reject it from the original absolute URL explicitly.
-        if parsed.query().is_some() || value.contains('#') {
+        if parsed.query().is_some() || parsed.fragment().is_some() {
             return Err("upstream_base_url must not contain a query or fragment".into());
         }
-        if parsed
-            .scheme_str()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-        {
+        if parsed.port() == Some(0) {
+            return Err("upstream_base_url must not use port zero".into());
+        }
+        if parsed.scheme() == "https" {
             return Ok(());
         }
-        if parsed
-            .scheme_str()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
-            && is_loopback_host(authority.host())
-        {
+        if parsed.scheme() == "http" && is_loopback_host(host) {
             return Ok(());
         }
         Err("upstream_base_url must use https, except http on a loopback host".into())
@@ -487,9 +475,25 @@ mod tests {
             "https://user:password@example.test",
             "https://example.test/path?query=value",
             "https://example.test/path#fragment",
+            "https://example.test:0",
         ] {
             assert!(config(Some(value.into())).validate().is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn trust_service_configuration_rejects_unknown_fields() {
+        let error = serde_json::from_value::<TrustServiceConfiguration>(serde_json::json!({
+            "environment": "acceptance",
+            "csc_api": "v1_rsa",
+            "client_id": "client",
+            "client_secret": "secret",
+            "redirect_uri": "https://app.example/callback",
+            "upstream_baseurl": "https://typo.example"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("upstream_baseurl"));
     }
 
     #[test]
