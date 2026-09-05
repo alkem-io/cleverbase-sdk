@@ -1,53 +1,46 @@
-name: Live contract path (opt-in)
+name: Cleverbase contract paths
 
-# Opt-in only: the live Cleverbase contract test (US2) signs against the REAL acceptance service and
-# verifies the result against the REAL issuer chain. It is never part of the default pipeline — it is
-# triggered manually and is gated on real-credential secrets that only exist in the protected
-# environment. Each algorithm leg SKIPS cleanly when that algorithm's credential is absent; the suite
-# passes when at least one leg verified (FR-007/008). Secrets are referenced only as env vars consumed
-# by the test process and are NEVER echoed (FR-010).
-
+# The public hash-signing stub runs without secrets every night and on manual dispatch. It exercises
+# the same reference-service binary as acceptance, but correctly terminates on the stub's fake
+# signature. A manually selected acceptance run keeps its protected environment and is visibly
+# skipped when the required secrets are absent.
 on:
-  # No inputs: B-B is always driven; B-T is additionally exercised when a TSA URL secret
-  # (LIVE_TSA_URL → REFSVC_TSA_URL) is provided to the protected environment. A missing TSA must not
-  # block B-B (FR-015), so conformance is driven by secret presence, not a manual input.
+  schedule:
+    - cron: "23 3 * * *"
   workflow_dispatch:
+    inputs:
+      target:
+        description: Contract target
+        required: true
+        default: stub
+        type: choice
+        options:
+          - stub
+          - acceptance
 
 permissions:
   contents: read
 
 concurrency:
-  group: live-${{ github.ref }}
+  group: cleverbase-contract-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  live:
-    name: Live signing (${{ matrix.leg }})
+  contract:
+    name: Cleverbase ${{ matrix.leg }} (${{ github.event_name == 'workflow_dispatch' && inputs.target || 'stub' }})
     runs-on: ubuntu-latest
-    # The real credentials live in a protected GitHub Environment; manual approval gates the run.
-    environment: live-acceptance
+    # Only acceptance receives the protected environment. The stub uses no secret and its public
+    # documented client values appear only in the test step below.
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && 'live-acceptance' || 'stub-contract' }}
     strategy:
       fail-fast: false
-      # Matrix over both algorithms (F6): v1_rsa and v2_ecdsa. Each leg is independently gated on its
-      # own credential secret and skips when that secret is absent — a single available credential is
-      # sufficient for the suite to pass.
       matrix:
         include:
           - leg: v1_rsa
             csc_api: v1_rsa
           - leg: v2_ecdsa
             csc_api: v2_ecdsa
-    # SINGLE SOURCE OF TRUTH for the per-leg credential selection, consumed by BOTH the gate step and
-    # the test-run step below (DRY — they previously duplicated this 4x). Per-leg gating uses ONLY this
-    # leg's own credential: two single-arm `&&` conditions OR'd together yield exactly this leg's secret
-    # and an empty string for the other leg — never cross-wired, so a leg with no credential is skipped
-    # rather than running with the wrong algorithm's credential.
-    # The trailing `|| ''` is REQUIRED: GHA `&&`/`||` return the operand JS-style, so when this leg's
-    # own secret is empty the expression collapses to the boolean `false`
-    # (`(true && '') || (false && Y)` → `'' || false` → `false`), which GHA renders as the literal
-    # string "false" — non-empty, so the `[ -n ... ]` gate would mis-detect an ABSENT credential as
-    # present and RUN the leg with CLIENT_ID="false". `|| ''` forces the all-falsy case back to a
-    # genuine empty string so the leg skips cleanly.
+    # One source for the acceptance matrix credentials. A public-stub job never evaluates them.
     env:
       LEG_CLIENT_ID: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA) || '' }}
       LEG_CLIENT_SECRET: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA) || '' }}
@@ -56,50 +49,63 @@ jobs:
         with:
           persist-credentials: false
 
-      # Per-leg skip gate: decide whether this algorithm's credential exists WITHOUT printing it. We
-      # only emit a boolean ("present"), never the secret value.
-      - name: Gate — is this algorithm's credential configured?
+      - name: Select and gate contract target
         id: gate
         env:
-          # Per-leg credential from the job-level `env` above (single source of truth). It is already
-          # this leg's own secret (or a genuine empty string when absent — never the literal "false"),
-          # so the `[ -n ... ]` gate below correctly detects present vs absent.
+          TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'stub' }}
           CLIENT_ID: ${{ env.LEG_CLIENT_ID }}
           CLIENT_SECRET: ${{ env.LEG_CLIENT_SECRET }}
           REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
         run: |
-          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ] && [ -n "$REDIRECT_URI" ] && [ -n "$CA_BUNDLE_B64" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping ${{ matrix.leg }}: its live credential / trust bundle is not configured."
-          fi
+          case "$TARGET" in
+            stub)
+              if [ "${{ matrix.csc_api }}" != "v1_rsa" ]; then
+                echo "run=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::Skipping v2_ecdsa: Cleverbase's public hash-signing stub exposes CSC v1 RSA only."
+              else
+                echo "run=true" >> "$GITHUB_OUTPUT"
+                echo "variant=stub" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            acceptance)
+              if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ] && [ -n "$REDIRECT_URI" ] && [ -n "$CA_BUNDLE_B64" ]; then
+                echo "run=true" >> "$GITHUB_OUTPUT"
+                echo "variant=acceptance" >> "$GITHUB_OUTPUT"
+              else
+                echo "run=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::Skipping acceptance ${{ matrix.leg }}: its client credential, redirect URI, or acceptance CA bundle is not configured."
+              fi
+              ;;
+            *)
+              echo "::error::unknown contract target: $TARGET"
+              exit 1
+              ;;
+          esac
 
       - name: Set up Rust (pinned via rust-toolchain.toml)
-        if: steps.gate.outputs.present == 'true'
+        if: steps.gate.outputs.run == 'true'
         run: rustup show
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        if: steps.gate.outputs.present == 'true'
+        if: steps.gate.outputs.run == 'true'
         with:
           go-version: "1.22"
 
       - name: Build the cleverbase-ffi library
-        if: steps.gate.outputs.present == 'true'
+        if: steps.gate.outputs.run == 'true'
         run: cargo build -p cleverbase-ffi
 
-      # Materialize the real issuer-chain PEM from a base64 secret into a workspace file the test reads
-      # via REFSVC_LIVE_CA_BUNDLE. The decoded bytes are written straight to a file, never printed.
-      - name: Materialize the live trust bundle
-        if: steps.gate.outputs.present == 'true'
+      # Acceptance requires an independently supplied issuer bundle. The public stub cannot produce
+      # a verifiable signature, so it deliberately has no trust-bundle bypass or materialization path.
+      - name: Materialize the acceptance trust bundle
+        if: steps.gate.outputs.variant == 'acceptance'
         env:
           CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
-        run: |
-          printf '%s' "$CA_BUNDLE_B64" | base64 -d > "$RUNNER_TEMP/live-ca-bundle.pem"
+        run: printf '%s' "$CA_BUNDLE_B64" | base64 -d > "$RUNNER_TEMP/live-ca-bundle.pem"
 
-      - name: Live contract test (${{ matrix.leg }} → start/complete×2/result/verify)
-        if: steps.gate.outputs.present == 'true'
+      - name: Run selected contract suite
+        if: steps.gate.outputs.run == 'true'
         working-directory: examples/reference-integration/signing-service
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
@@ -107,21 +113,16 @@ jobs:
           REFSVC_MODE: live
           REFSVC_ENV: acceptance
           REFSVC_CSC_API: ${{ matrix.csc_api }}
-          # Headless: unattended CI cannot do an interactive human approval. The headless approval
-          # mechanism is a PENDING external dependency (U1) — until it is wired, TestLive SKIPS this leg
-          # cleanly (green), and runs it for real the moment the mechanism exists. Defaults to
-          # interactive locally.
-          REFSVC_LIVE_AUTHORIZER: headless
-          # Per-leg credential from the job-level `env` above (single source of truth, same value the
-          # gate checked): ONLY this leg's own secret. This step only runs when the gate found the
-          # credential present, so the value here is always the real secret.
-          REFSVC_CLIENT_ID: ${{ env.LEG_CLIENT_ID }}
-          REFSVC_CLIENT_SECRET: ${{ env.LEG_CLIENT_SECRET }}
-          REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
-          # B-T is exercised only when a TSA URL secret is present (a missing TSA must NOT block B-B).
-          REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
+          REFSVC_CLIENT_ID: ${{ steps.gate.outputs.variant == 'stub' && '6dd5f48d-bcd9-4a98-8a4c-5c82182f5be4' || env.LEG_CLIENT_ID }}
+          REFSVC_CLIENT_SECRET: ${{ steps.gate.outputs.variant == 'stub' && '11628999-cb61-4c62-8e1f-09699dcb5521' || env.LEG_CLIENT_SECRET }}
+          REFSVC_REDIRECT_URI: ${{ steps.gate.outputs.variant == 'stub' && 'http://localhost:8080/oauth/cleverbase/callback' || secrets.LIVE_REDIRECT_URI }}
+          REFSVC_UPSTREAM_BASE_URL: ${{ steps.gate.outputs.variant == 'stub' && 'https://trust-driver-stub-hash-signing.cleverbase.com' || '' }}
+          REFSVC_TSA_URL: ${{ steps.gate.outputs.variant == 'stub' && '' || secrets.LIVE_TSA_URL }}
+          REFSVC_LIVE_AUTHORIZER: ${{ steps.gate.outputs.variant == 'acceptance' && 'headless' || '' }}
         run: |
-          export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
-          # -run Live covers exactly the configured REFSVC_CSC_API algorithm for this leg; "both" is
-          # this matrix. Keep -v so a skip (missing creds) is visible but no secret is printed.
-          go test -race -run 'Live' -v ./e2e/
+          if [ "${{ steps.gate.outputs.variant }}" = "stub" ]; then
+            go test -race -run '^TestCleverbaseHashSigningStub$' -v ./e2e/
+          else
+            export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
+            go test -race -run '^TestLive$' -v ./e2e/
+          fi
