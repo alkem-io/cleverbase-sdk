@@ -1,11 +1,13 @@
 //! CSC / OAuth response parsers and signer-identity derivation (FR-014).
 //!
 //! Cleverbase responses are JSON. These are pure parse functions over the response bytes the host
-//! feeds back via `ResumeInput::HttpResult`. Identity matching is derived from `credentials/info`,
-//! which returns the subject DN and serial number directly (no certificate parsing needed for the
-//! default match key).
+//! feeds back via `ResumeInput::HttpResult`. Identity matching uses the subject DN and serial
+//! number in `credentials/info` when both are present, otherwise the leaf certificate that CSC
+//! returns in the same response.
 
+use der::Decode;
 use serde::Deserialize;
+use x509_cert::Certificate;
 
 use super::CoreError;
 use crate::evidence::SignerIdentity;
@@ -233,17 +235,74 @@ fn extract_attr(dn: &str, attr: &str) -> Option<String> {
     None
 }
 
-/// Derive the signer's identity from `credentials/info` (subject DN + serial number).
-pub fn signer_identity(info: &CredentialInfo) -> SignerIdentity {
-    SignerIdentity {
-        serial_number: info.serial_number.clone(),
-        common_name: extract_attr(&info.subject_dn, "CN").unwrap_or_default(),
-        given_name: extract_attr(&info.subject_dn, "GN")
-            .or_else(|| extract_attr(&info.subject_dn, "givenName")),
-        surname: extract_attr(&info.subject_dn, "SN")
-            .or_else(|| extract_attr(&info.subject_dn, "surname")),
-        raw_subject: info.subject_dn.clone(),
+/// Canonical CSC representation of a certificate serial number.
+///
+/// CSC documents the field as uppercase hexadecimal without separators. The X.509 library exposes
+/// DER serials as bytes (with sign-padding zeroes removed); some CSC implementations and callers
+/// use colon-separated or lowercase spellings, so normalize each hexadecimal spelling here. Values
+/// outside that representation are preserved for compatibility with providers' non-standard fields.
+fn canonical_csc_serial_number(value: &str) -> String {
+    let compact: String = value
+        .chars()
+        .filter(|character| *character != ':')
+        .collect();
+    if compact.is_empty() || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return value.to_owned();
     }
+
+    // `00` is a DER INTEGER sign-padding octet, not part of the serial's unsigned value. Keep at
+    // least one byte so a malformed all-zero direct field is not silently converted to empty.
+    let significant = compact.trim_start_matches("00");
+    let significant = if significant.is_empty() {
+        "00"
+    } else {
+        significant
+    };
+    significant.to_ascii_uppercase()
+}
+
+fn certificate_serial_number(leaf: &Certificate) -> String {
+    // x509-cert preserves a DER INTEGER's leading sign-padding `00` for high-bit serials. Reuse
+    // the core's hex encoder, then let the shared CSC normalizer remove that padding once.
+    canonical_csc_serial_number(&crate::util::to_hex(
+        leaf.tbs_certificate.serial_number.as_bytes(),
+    ))
+}
+
+fn identity_from_subject(serial_number: String, subject_dn: String) -> SignerIdentity {
+    SignerIdentity {
+        serial_number: canonical_csc_serial_number(&serial_number),
+        common_name: extract_attr(&subject_dn, "CN").unwrap_or_default(),
+        given_name: extract_attr(&subject_dn, "GN")
+            .or_else(|| extract_attr(&subject_dn, "givenName")),
+        surname: extract_attr(&subject_dn, "SN").or_else(|| extract_attr(&subject_dn, "surname")),
+        raw_subject: subject_dn,
+    }
+}
+
+/// Derive the signer's identity from CSC `credentials/info`.
+///
+/// CSC providers may omit either non-standard `subjectDN` or `serialNumber` convenience field.
+/// Direct fields are authoritative only as a complete pair. If either is absent, the authoritative
+/// leaf certificate (first `certificates` entry) supplies both values, avoiding a mixed-source
+/// identity and preserving expected-signer matching.
+pub fn signer_identity(
+    info: &CredentialInfo,
+    leaf_certificate_der: &[u8],
+) -> Result<SignerIdentity, CoreError> {
+    if !info.subject_dn.is_empty() && !info.serial_number.is_empty() {
+        return Ok(identity_from_subject(
+            info.serial_number.clone(),
+            info.subject_dn.clone(),
+        ));
+    }
+
+    let leaf = Certificate::from_der(leaf_certificate_der)
+        .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
+    Ok(identity_from_subject(
+        certificate_serial_number(&leaf),
+        leaf.tbs_certificate.subject.to_string(),
+    ))
 }
 
 /// Check the authorizing signer against an expected identity (FR-014). The default match key is the
@@ -252,7 +311,10 @@ pub fn signer_identity(info: &CredentialInfo) -> SignerIdentity {
 /// `name_and_dob` is deferred (see data-model.md) and not a variant here.
 pub fn matches_expected(expected: &ExpectedSignerIdentity, identity: &SignerIdentity) -> bool {
     match expected.match_on {
-        MatchOn::CertificateSerialNumber => expected.value == identity.serial_number,
+        MatchOn::CertificateSerialNumber => {
+            canonical_csc_serial_number(&expected.value)
+                == canonical_csc_serial_number(&identity.serial_number)
+        }
         MatchOn::CleverbaseSubject => {
             extract_attr(&identity.raw_subject, "serialNumber").is_some_and(|s| s == expected.value)
         }
@@ -308,11 +370,118 @@ mod tests {
         assert_eq!(info.scal, "2");
         assert_eq!(info.certificates, vec!["QkFTRTY0REVS"]);
 
-        let id = signer_identity(&info);
+        let id = signer_identity(&info, b"unused when direct identity fields are present").unwrap();
         assert_eq!(id.common_name, "Jane Doe");
         assert_eq!(id.surname.as_deref(), Some("Doe"));
         assert_eq!(id.given_name.as_deref(), Some("Jane"));
         assert_eq!(id.serial_number, "PNONL-123");
+    }
+
+    #[test]
+    fn credentials_info_without_direct_identity_rejects_invalid_leaf_certificate() {
+        let info = CredentialInfo {
+            certificates: vec![],
+            subject_dn: "CN=partial direct identity".into(),
+            serial_number: String::new(),
+            scal: "2".into(),
+            key_algo: KeyAlgo::Rsa,
+        };
+
+        let err = signer_identity(&info, b"not a DER certificate").unwrap_err();
+        assert!(matches!(err, CoreError::ProtocolParse(_)));
+    }
+
+    #[test]
+    fn credentials_info_without_direct_identity_uses_leaf_certificate() {
+        // Exact public chain returned by Cleverbase's documented hash-signing service stub.
+        let certificate =
+            include_str!("../../tests/fixtures/cleverbase-hash-signing-stub-leaf.b64");
+        let body = serde_json::json!({
+            "key": {"algo": ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.11"]},
+            "cert": {"certificates": [certificate.trim()]},
+            "SCAL": "2"
+        });
+        let info = parse_credentials_info(body.to_string().as_bytes()).unwrap();
+        let leaf = crate::util::base64_decode(&info.certificates[0]).unwrap();
+        let identity = signer_identity(&info, &leaf).unwrap();
+
+        assert_eq!(identity.serial_number, "694FE11553653A72D0DB75D9F08A63B2");
+        assert_eq!(identity.common_name, "WILLEKE LISELOTTE DE BRUIJN");
+        assert_eq!(identity.given_name.as_deref(), Some("WILLEKE LISELOTTE"));
+        assert_eq!(identity.surname.as_deref(), Some("DE BRUIJN"));
+        assert!(identity
+            .raw_subject
+            .to_ascii_lowercase()
+            .contains("serialnumber=hb-5c699eab-1c61-41c5-9318-246a936c4ec6"));
+        assert!(matches_expected(
+            &ExpectedSignerIdentity {
+                match_on: MatchOn::CertificateSerialNumber,
+                value: "69:4f:e1:15:53:65:3a:72:d0:db:75:d9:f0:8a:63:b2".into(),
+            },
+            &identity
+        ));
+        assert!(matches_expected(
+            &ExpectedSignerIdentity {
+                match_on: MatchOn::CertificateSerialNumber,
+                value: "00:69:4F:E1:15:53:65:3A:72:D0:DB:75:D9:F0:8A:63:B2".into(),
+            },
+            &identity
+        ));
+        assert!(matches_expected(
+            &ExpectedSignerIdentity {
+                match_on: MatchOn::CleverbaseSubject,
+                value: "HB-5c699eab-1c61-41c5-9318-246a936c4ec6".into(),
+            },
+            &identity
+        ));
+
+        // A partial direct pair cannot safely be combined with certificate data: derive the
+        // complete identity from the leaf in either direction.
+        for (subject_dn, serial_number) in [("CN=untrusted partial identity", ""), ("", "DEADBEEF")]
+        {
+            let partial_body = serde_json::json!({
+                "key": {"algo": ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.11"]},
+                "cert": {
+                    "certificates": [certificate.trim()],
+                    "subjectDN": subject_dn,
+                    "serialNumber": serial_number
+                },
+                "SCAL": "2"
+            });
+            let partial_info = parse_credentials_info(partial_body.to_string().as_bytes()).unwrap();
+            assert_eq!(signer_identity(&partial_info, &leaf).unwrap(), identity);
+        }
+
+        let direct_body = serde_json::json!({
+            "key": {"algo": ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.11"]},
+            "cert": {
+                "certificates": [certificate.trim()],
+                "subjectDN": identity.raw_subject,
+                "serialNumber": "694FE11553653A72D0DB75D9F08A63B2"
+            },
+            "SCAL": "2"
+        });
+        let direct_info = parse_credentials_info(direct_body.to_string().as_bytes()).unwrap();
+        let direct_identity =
+            signer_identity(&direct_info, b"not used when direct fields are present").unwrap();
+        assert_eq!(direct_identity, identity);
+    }
+
+    #[test]
+    fn certificate_serial_number_removes_der_sign_padding() {
+        let certificate =
+            include_str!("../../tests/fixtures/cleverbase-hash-signing-stub-leaf.b64");
+        let leaf_der = crate::util::base64_decode(certificate.trim()).unwrap();
+        let mut leaf = Certificate::from_der(&leaf_der).unwrap();
+        leaf.tbs_certificate.serial_number =
+            x509_cert::serial_number::SerialNumber::new(&[0x80, 0x01]).unwrap();
+
+        // `x509-cert` preserves the DER sign pad; CSC serials exclude it.
+        assert_eq!(
+            leaf.tbs_certificate.serial_number.as_bytes(),
+            &[0x00, 0x80, 0x01]
+        );
+        assert_eq!(certificate_serial_number(&leaf), "8001");
     }
 
     #[test]
@@ -366,6 +535,22 @@ mod tests {
             value: "CN=Jane Doe,serialNumber=PNONL-123".into(),
         };
         assert!(!matches_expected(&by_full_dn, &id));
+    }
+
+    #[test]
+    fn csc_spec_serial_example_round_trips() {
+        // CSC API v1.0.4 `credentials/info` example serial number.
+        const CSC_SPEC_SERIAL: &str = "5AAC41CD8FA22B953640";
+        let identity = identity_from_subject(CSC_SPEC_SERIAL.into(), "CN=Example".into());
+
+        assert_eq!(identity.serial_number, CSC_SPEC_SERIAL);
+        assert!(matches_expected(
+            &ExpectedSignerIdentity {
+                match_on: MatchOn::CertificateSerialNumber,
+                value: CSC_SPEC_SERIAL.into(),
+            },
+            &identity
+        ));
     }
 
     #[test]

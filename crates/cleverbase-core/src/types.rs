@@ -105,8 +105,9 @@ impl CscApi {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchOn {
-    /// The credential certificate's serial number as reported by CSC `credentials/info`
-    /// (`cert.serialNumber`). Default.
+    /// The credential certificate's serial number from CSC `credentials/info` or its leaf
+    /// certificate when CSC omits `cert.serialNumber`, canonicalized as uppercase hexadecimal
+    /// without separators or DER `00` sign padding. Default.
     #[default]
     CertificateSerialNumber,
     /// The subject DN's `serialNumber` RDN — the stable natural-person identifier (e.g. `PNONL-…`).

@@ -524,7 +524,12 @@ pub fn resume(
                 ));
             }
 
-            let identity = csc::signer_identity(&info);
+            // The chain has at least one certificate (checked above), so it can provide signer
+            // identity for CSC providers that omit `subjectDN`/`serialNumber` convenience fields.
+            let leaf_cert = chain
+                .first()
+                .ok_or_else(|| CoreError::BadHandle("empty certificate chain".into()))?;
+            let identity = csc::signer_identity(&info, leaf_cert)?;
             handle.signer = Some(identity.clone());
 
             // Enforce expected-signer binding (FR-014).
@@ -588,11 +593,6 @@ pub fn resume(
             // conformance (see docs/limitations.md), so never assert unverified preservation.
             handle.pdf_a =
                 Some(container::is_pdf_a(&prepared.staged_pdf) && request.appearance.is_none());
-            // The empty-chain case failed above, so `first()` is Some; `.get`/`ok_or` avoids a
-            // panicking index while keeping the impossible case a clean error.
-            let leaf_cert = chain
-                .first()
-                .ok_or_else(|| CoreError::BadHandle("empty certificate chain".into()))?;
             let signed_attrs =
                 cms::build_signed_attrs(&prepared.content_hash, leaf_cert, ctx.now_unix)
                     .map_err(|e| CoreError::Internal(e.to_string()))?;

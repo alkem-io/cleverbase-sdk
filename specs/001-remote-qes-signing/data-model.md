@@ -22,9 +22,13 @@ What a request may be bound to (FR-014).
   `name_and_dob` is **deferred to a later phase** (not implemented in Phase 1 — we do not ship an
   untested match mode, per Constitution Principle I).
 - `value`: string — the expected identifier. For `certificate_serial_number` it is the credential
-  certificate's `serialNumber` as reported by CSC `credentials/info` (`cert.serialNumber`); for
-  `cleverbase_subject` it is the subject DN's `serialNumber` RDN (the stable natural-person
-  identifier, e.g. `PNONL-…`). Both are matched from the authorizing certificate.
+  certificate's serial number from CSC `credentials/info` (`cert.serialNumber`) or, when that
+  optional convenience field is absent, its leaf certificate. It is canonical uppercase hex with
+  no separators or DER `00` sign padding; for `cleverbase_subject` it is the
+  subject DN's `serialNumber` RDN (the stable natural-person identifier, e.g. `PNONL-…`). Both
+  are matched from the authorizing certificate.
+  When either direct identity field is missing, both identity values come from the leaf certificate
+  and the partial direct value is deliberately discarded.
   (OIDC `sub` matching is deferred — Phase 1 has no ID-token fetch, so it is not a match source yet.)
 - Rule: mismatch against the authorizing signer's certificate ⇒ terminal `IdentityMismatch`,
   no signature produced.
