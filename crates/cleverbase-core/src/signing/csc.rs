@@ -262,8 +262,8 @@ fn canonical_csc_serial_number(value: &str) -> String {
 }
 
 fn certificate_serial_number(leaf: &Certificate) -> String {
-    // x509-cert returns the positive INTEGER's raw bytes, with any leading DER sign-padding `00`
-    // already stripped. Reuse the core's hex encoder rather than duplicating byte-to-hex logic.
+    // x509-cert preserves a DER INTEGER's leading sign-padding `00` for high-bit serials. Reuse
+    // the core's hex encoder, then let the shared CSC normalizer remove that padding once.
     canonical_csc_serial_number(&crate::util::to_hex(
         leaf.tbs_certificate.serial_number.as_bytes(),
     ))
@@ -468,6 +468,23 @@ mod tests {
     }
 
     #[test]
+    fn certificate_serial_number_removes_der_sign_padding() {
+        let certificate =
+            include_str!("../../tests/fixtures/cleverbase-hash-signing-stub-leaf.b64");
+        let leaf_der = crate::util::base64_decode(certificate.trim()).unwrap();
+        let mut leaf = Certificate::from_der(&leaf_der).unwrap();
+        leaf.tbs_certificate.serial_number =
+            x509_cert::serial_number::SerialNumber::new(&[0x80, 0x01]).unwrap();
+
+        // `x509-cert` preserves the DER sign pad; CSC serials exclude it.
+        assert_eq!(
+            leaf.tbs_certificate.serial_number.as_bytes(),
+            &[0x00, 0x80, 0x01]
+        );
+        assert_eq!(certificate_serial_number(&leaf), "8001");
+    }
+
+    #[test]
     fn credentials_info_detects_ecdsa() {
         let body = br#"{"key":{"algo":["1.2.840.10045.2.1"]},
             "cert":{"certificates":[],"subjectDN":"CN=x","serialNumber":"s"}}"#;
@@ -518,6 +535,22 @@ mod tests {
             value: "CN=Jane Doe,serialNumber=PNONL-123".into(),
         };
         assert!(!matches_expected(&by_full_dn, &id));
+    }
+
+    #[test]
+    fn csc_spec_serial_example_round_trips() {
+        // CSC API v1.0.4 `credentials/info` example serial number.
+        const CSC_SPEC_SERIAL: &str = "5AAC41CD8FA22B953640";
+        let identity = identity_from_subject(CSC_SPEC_SERIAL.into(), "CN=Example".into());
+
+        assert_eq!(identity.serial_number, CSC_SPEC_SERIAL);
+        assert!(matches_expected(
+            &ExpectedSignerIdentity {
+                match_on: MatchOn::CertificateSerialNumber,
+                value: CSC_SPEC_SERIAL.into(),
+            },
+            &identity
+        ));
     }
 
     #[test]
