@@ -104,32 +104,43 @@ make go-test
 
 ### Consume the Go binding from a release
 
-The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.2.1`, while Go
+The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.0`, while Go
 consumers pin the module version normally:
 
 ```bash
-go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.2.1
+go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.0
 ```
 
-The same GitHub Release contains `cleverbase-ffi-v0.2.1-<os>-<arch>.tar.gz` and a matching
+The same GitHub Release contains `cleverbase-ffi-v0.3.0-<os>-<arch>.tar.gz` and a matching
 `.sha256` file for Linux and Darwin, on amd64 and arm64. Download the pair for the build host, verify
 the checksum before extraction, and point `CGO_LDFLAGS` at the extracted `lib` directory. For
 example:
 
 ```bash
-gh release download bindings/go/v0.2.1 \
+gh release download bindings/go/v0.3.0 \
   --repo alkem-io/cleverbase-sdk \
-  --pattern 'cleverbase-ffi-v0.2.1-linux-amd64*' --dir .cleverbase
-( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.2.1-linux-amd64.tar.gz.sha256 )
-tar -xzf .cleverbase/cleverbase-ffi-v0.2.1-linux-amd64.tar.gz -C .cleverbase
+  --pattern 'cleverbase-ffi-v0.3.0-linux-amd64*' --dir .cleverbase
+( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.0-linux-amd64.tar.gz.sha256 )
+tar -xzf .cleverbase/cleverbase-ffi-v0.3.0-linux-amd64.tar.gz -C .cleverbase
 CGO_LDFLAGS="-L$PWD/.cleverbase/lib" go build ./...
 ```
 
 To publish a release, update `cleverbase-ffi` to the intended SemVer and push the matching tag, for
-example `bindings/go/v0.2.1`. The tag workflow builds, link-tests, attests, and attaches all
+example `bindings/go/v0.3.0`. The tag workflow builds, link-tests, attests, and attaches all
 four native archives. The Go module and native ABI versions are deliberately welded: even a Go-only
 binding fix bumps `cleverbase-ffi` and receives a new matching tag.
 Running the packaging contract locally on macOS requires GNU tar (`brew install gnu-tar`).
+
+#### v0.3.0 release notes
+
+- Adds generic, stateless `verify_pdf` support to the Rust core and C ABI, exposed as `VerifyPDF`
+  by the Go binding. Invalid documents return typed verdicts rather than call errors.
+- Verifies strict single-signature PAdES B-B/B-T ByteRange and CMS integrity for RSA and P-256
+  ECDSA. B-T additionally verifies the timestamp token's internal content digest, binding to the
+  document signature value, and signature against the token's embedded signer certificate.
+- Successful verdicts expose the profile and embedded signer certificate's canonical serial and
+  common name. The verifier does not establish certificate-chain or TSA trust, revocation status,
+  TSA policy, signer authorization, or qualified status; multiple signatures remain unsupported.
 
 #### v0.2.1 release notes
 
