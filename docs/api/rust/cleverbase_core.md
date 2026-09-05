@@ -297,7 +297,7 @@ The signer's identity, derived from their qualified certificate subject.
 ##### Fields
 
 - `serial_number: String`
-  - Certificate serial number as reported by CSC `credentials/info`.
+  - Certificate serial number from CSC `credentials/info` or its leaf certificate.
 - `common_name: String`
   - Subject common name (`CN`), or empty if absent.
 - `given_name: Option<String>`
@@ -635,9 +635,9 @@ PAdES B-B and B-T are both implemented.
 CSC / OAuth response parsers and signer-identity derivation (FR-014).
 
 Cleverbase responses are JSON. These are pure parse functions over the response bytes the host
-feeds back via `ResumeInput::HttpResult`. Identity matching is derived from `credentials/info`,
-which returns the subject DN and serial number directly (no certificate parsing needed for the
-default match key).
+feeds back via `ResumeInput::HttpResult`. Identity matching uses the subject DN and serial
+number in `credentials/info` when both are present, otherwise the leaf certificate that CSC
+returns in the same response.
 
 #### Structs
 
@@ -780,10 +780,14 @@ Parse an OAuth2 token response body.
 ##### fn `signer_identity`
 
 ```rust
-fn signer_identity(info: &CredentialInfo) -> SignerIdentity
+fn signer_identity(info: &CredentialInfo, leaf_certificate_der: &[u8]) -> Result<SignerIdentity, CoreError>
 ```
 
-Derive the signer's identity from `credentials/info` (subject DN + serial number).
+Derive the signer's identity from CSC `credentials/info`.
+
+CSC providers may omit the non-standard `subjectDN` and `serialNumber` convenience fields.
+In that case the authoritative leaf certificate (first `certificates` entry) supplies both
+values, avoiding an empty identity and preserving expected-signer matching.
 
 ### Structs
 
@@ -1273,8 +1277,8 @@ How an expected signer identity is matched against the authorizing certificate.
 ##### Variants
 
 - `CertificateSerialNumber`
-  - The credential certificate's serial number as reported by CSC `credentials/info`
-(`cert.serialNumber`). Default.
+  - The credential certificate's serial number from CSC `credentials/info` or its leaf
+certificate when CSC omits `cert.serialNumber`. Default.
 - `CleverbaseSubject`
   - The subject DN's `serialNumber` RDN — the stable natural-person identifier (e.g. `PNONL-…`).
 

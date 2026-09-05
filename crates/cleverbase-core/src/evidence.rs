@@ -39,7 +39,7 @@ impl SigningOutcome {
 /// The signer's identity, derived from their qualified certificate subject.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignerIdentity {
-    /// Certificate serial number as reported by CSC `credentials/info`.
+    /// Certificate serial number from CSC `credentials/info` or its leaf certificate.
     pub serial_number: String,
     /// Subject common name (`CN`), or empty if absent.
     pub common_name: String,
