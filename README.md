@@ -95,32 +95,44 @@ make go-test
 
 ### Consume the Go binding from a release
 
-The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.1.0`, while Go
+The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.2.0`, while Go
 consumers pin the module version normally:
 
 ```bash
-go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.1.0
+go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.2.0
 ```
 
-The same GitHub Release contains `cleverbase-ffi-v0.1.0-<os>-<arch>.tar.gz` and a matching
+The same GitHub Release contains `cleverbase-ffi-v0.2.0-<os>-<arch>.tar.gz` and a matching
 `.sha256` file for Linux and Darwin, on amd64 and arm64. Download the pair for the build host, verify
 the checksum before extraction, and point `CGO_LDFLAGS` at the extracted `lib` directory. For
 example:
 
 ```bash
-gh release download bindings/go/v0.1.0 \
+gh release download bindings/go/v0.2.0 \
   --repo alkem-io/cleverbase-sdk \
-  --pattern 'cleverbase-ffi-v0.1.0-linux-amd64*' --dir .cleverbase
-( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.1.0-linux-amd64.tar.gz.sha256 )
-tar -xzf .cleverbase/cleverbase-ffi-v0.1.0-linux-amd64.tar.gz -C .cleverbase
+  --pattern 'cleverbase-ffi-v0.2.0-linux-amd64*' --dir .cleverbase
+( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.2.0-linux-amd64.tar.gz.sha256 )
+tar -xzf .cleverbase/cleverbase-ffi-v0.2.0-linux-amd64.tar.gz -C .cleverbase
 CGO_LDFLAGS="-L$PWD/.cleverbase/lib" go build ./...
 ```
 
 To publish a release, update `cleverbase-ffi` to the intended SemVer and push the matching tag, for
-example `bindings/go/v0.1.0`. The tag workflow builds, link-tests, attests, and attaches all
+example `bindings/go/v0.2.0`. The tag workflow builds, link-tests, attests, and attaches all
 four native archives. The Go module and native ABI versions are deliberately welded: even a Go-only
 binding fix bumps `cleverbase-ffi` and receives a new matching tag.
 Running the packaging contract locally on macOS requires GNU tar (`brew install gnu-tar`).
+
+#### v0.2.0 release notes
+
+- Adds an optional upstream base-URL override for documented developer services; `base_url()` now
+  returns `&str`, and `TrustServiceConfiguration` has the additive `upstream_base_url` field.
+- Rejects unknown fields in trust-service and TSA configuration rather than silently falling back
+  to a default endpoint.
+- Sends CSC RSA `signAlgo` as `rsaEncryption` (`1.2.840.113549.1.1.1`), with SHA-256 carried by
+  `hashAlgo`.
+- Derives signer identity from the signing leaf certificate when CSC does not supply a complete
+  direct identity pair, and canonicalizes certificate serials as uppercase hexadecimal without
+  separators or a DER sign pad.
 
 ### Lint gate (match CI locally)
 
