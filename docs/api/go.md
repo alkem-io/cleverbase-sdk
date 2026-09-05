@@ -31,7 +31,7 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 
 
 <a name="AttestationIssuance"></a>
-## func [AttestationIssuance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L221>)
+## func [AttestationIssuance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L222>)
 
 ```go
 func AttestationIssuance(request []byte) ([]byte, error)
@@ -40,7 +40,7 @@ func AttestationIssuance(request []byte) ([]byte, error)
 AttestationIssuance drives the EUDI attestation issuance / presentation sans\-IO state machine over a CBOR IssuanceRequest envelope \(issuance schema version 1\) and returns the CBOR IssuanceResponse. Like AttestationVerify it is CBOR\-in / CBOR\-out \(see the wire schema\). The holder's private key never crosses this boundary: a \`sign\` step surfaces a signing input the host signs out\-of\-process and feeds back via a follow\-up op \(finish\_present / resume\_obtain\).
 
 <a name="AttestationVerify"></a>
-## func [AttestationVerify](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L191>)
+## func [AttestationVerify](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L192>)
 
 ```go
 func AttestationVerify(request []byte) ([]byte, error)
@@ -49,7 +49,7 @@ func AttestationVerify(request []byte) ([]byte, error)
 AttestationVerify runs the EUDI attestation verifier over a CBOR VerifyRequest envelope \(attestation schema version 5\) and returns the CBOR VerifyResponse. Unlike the signing surface, the attestation surface is CBOR\-in / CBOR\-out: the caller builds the VerifyRequest and decodes the VerifyResponse per the documented wire schema \(see specs/004\-attestation\-and\-verification/standards\-conformance.md\). The VALID/INVALID verdict \(and any decode error\) rides inside the VerifyResponse \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere INVALID verdict.
 
 <a name="AttestationVerifyVpToken"></a>
-## func [AttestationVerifyVpToken](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L210>)
+## func [AttestationVerifyVpToken](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L211>)
 
 ```go
 func AttestationVerifyVpToken(request []byte) ([]byte, error)
@@ -60,7 +60,7 @@ AttestationVerifyVpToken runs the EUDI attestation SET\-LEVEL OpenID4VP verifier
 The set\-level surface does NOT run the opt\-in eIDAS qualified\-status gate: a request with policy.qualified\_gate = true is rejected with an \`err\` outcome \(verify each presentation via AttestationVerify if the qualified gate is required\).
 
 <a name="Appearance"></a>
-## type [Appearance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L106-L110>)
+## type [Appearance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L107-L111>)
 
 Appearance is an optional visible signature block \(FR\-016\). Page is 1\-based.
 
@@ -73,7 +73,7 @@ type Appearance struct {
 ```
 
 <a name="AppearanceShow"></a>
-## type [AppearanceShow](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L98-L103>)
+## type [AppearanceShow](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L99-L104>)
 
 AppearanceShow selects which lines a visible appearance renders.
 
@@ -87,7 +87,7 @@ type AppearanceShow struct {
 ```
 
 <a name="Config"></a>
-## type [Config](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L65-L79>)
+## type [Config](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L65-L80>)
 
 Config identifies the Cleverbase environment and OAuth client.
 
@@ -100,7 +100,8 @@ type Config struct {
     RedirectURI  string
     // UpstreamBaseURL optionally replaces the selected Cleverbase origin for a documented
     // developer/stub service. It must be an absolute URL with a host, use HTTPS except for an
-    // HTTP loopback endpoint, omit credentials, query, and fragment, and may include a base path.
+    // HTTP loopback endpoint, omit credentials, query, and fragment, reject port 0, and may include
+    // a base path.
     // It drives both OAuth redirects and CSC HTTP effects.
     UpstreamBaseURL string
     TsaURL          string // optional; "" means none (required for B-T)
@@ -110,7 +111,7 @@ type Config struct {
 ```
 
 <a name="ExpectedSigner"></a>
-## type [ExpectedSigner](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L83-L87>)
+## type [ExpectedSigner](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L84-L88>)
 
 ExpectedSigner binds the request to a signer identity \(FR\-014\). MatchOn is "certificate\_serial\_number" \(default, used when empty\) or "cleverbase\_subject".
 
@@ -123,7 +124,7 @@ type ExpectedSigner struct {
 ```
 
 <a name="Rect"></a>
-## type [Rect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L90-L95>)
+## type [Rect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L91-L96>)
 
 Rect is a signature\-appearance rectangle in PDF user\-space points.
 
@@ -137,7 +138,7 @@ type Rect struct {
 ```
 
 <a name="RequestOptions"></a>
-## type [RequestOptions](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L119-L123>)
+## type [RequestOptions](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L120-L124>)
 
 RequestOptions holds the optional parts of a signing request; pass nil for none.
 
@@ -150,7 +151,7 @@ type RequestOptions struct {
 ```
 
 <a name="Session"></a>
-## type [Session](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L129-L132>)
+## type [Session](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L130-L133>)
 
 Session is the opaque, serializable handle plus the latest Step.
 
@@ -162,7 +163,7 @@ type Session struct {
 ```
 
 <a name="BeginSigning"></a>
-### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L257>)
+### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L258>)
 
 ```go
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error)
@@ -171,7 +172,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request.
 
 <a name="ResumeHTTP"></a>
-### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L321>)
+### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L322>)
 
 ```go
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error)
@@ -180,7 +181,7 @@ func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, 
 ResumeHTTP advances the flow with the result of a performed HTTP effect.
 
 <a name="ResumeRedirect"></a>
-### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L299>)
+### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L300>)
 
 ```go
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error)
@@ -189,7 +190,7 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 ResumeRedirect advances the flow with the OAuth code\+state from a redirect return.
 
 <a name="ResumeRedirectError"></a>
-### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L311>)
+### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L312>)
 
 ```go
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error)
@@ -198,7 +199,7 @@ func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUn
 ResumeRedirectError advances the flow with an OAuth error returned to the redirect URI instead of a code \(e.g. "access\_denied" when the signer declines\), yielding a terminal Declined or AuthorizationExpired outcome.
 
 <a name="SignatureMeta"></a>
-## type [SignatureMeta](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L113-L116>)
+## type [SignatureMeta](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L114-L117>)
 
 SignatureMeta carries optional PAdES reason/location.
 
@@ -210,7 +211,7 @@ type SignatureMeta struct {
 ```
 
 <a name="Step"></a>
-## type [Step](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L126>)
+## type [Step](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L127>)
 
 Step is the next action the host must perform \(a decoded CBOR map: "kind" plus fields\).
 
