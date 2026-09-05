@@ -31,7 +31,10 @@ const ID_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47");
 use super::SHA256_OID as ID_SHA256;
 const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+const SHA256_WITH_RSA_ENCRYPTION: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 const ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 
 // 2050-01-01T00:00:00Z in Unix seconds — UTCTime covers up to (not incl.) this; later uses GeneralizedTime.
 const UTC_TIME_UPPER_BOUND_SECS: u64 = 2_524_608_000;
@@ -48,7 +51,7 @@ pub enum CmsError {
     /// The certificate chain was empty.
     #[error("empty certificate chain")]
     EmptyChain,
-    /// The CMS is parseable DER but is not the detached CAdES shape this SDK verifies.
+    /// The CMS is parseable DER but is not a supported CAdES or timestamp-token shape.
     #[error("invalid CMS structure: {0}")]
     Structure(&'static str),
     /// No embedded certificate matched the CMS SignerInfo identifier.
@@ -57,6 +60,12 @@ pub enum CmsError {
     /// Signature verification failed.
     #[error("verification failed: {0}")]
     Verify(String),
+    /// An RFC 3161 signature-time-stamp token is malformed, foreign, or invalidly signed.
+    #[error("invalid signature-time-stamp token")]
+    TimestampInvalid,
+    /// An RFC 3161 signature-time-stamp token uses an unsupported algorithm.
+    #[error("unsupported signature-time-stamp token algorithm")]
+    TimestampUnsupported,
 }
 
 /// Verified material extracted from a detached CMS signature.
@@ -67,8 +76,14 @@ pub(crate) struct VerifiedSignedData {
     pub signer_certificate: Certificate,
     /// Key family asserted by the CMS signature AlgorithmIdentifier.
     pub key_algo: KeyAlgo,
-    /// Whether an RFC 3161 signature-time-stamp unsigned attribute is present.
+    /// Whether a cryptographically valid RFC 3161 signature-time-stamp attribute is present.
     pub has_signature_timestamp: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SignedDataProfile {
+    PadesDetached,
+    TimestampToken,
 }
 
 /// Wrap any DER-encodable value as an `Any` (robust across der versions).
@@ -332,7 +347,7 @@ pub fn embed_timestamp(content_info_der: &[u8], token_der: &[u8]) -> Result<Vec<
     Ok(new_ci.to_der()?)
 }
 
-/// True if the CMS SignerInfo carries a `signature-time-stamp` unsigned attribute (B-T).
+/// True if the CMS SignerInfo carries a valid, signature-bound `signature-time-stamp` attribute.
 pub fn has_signature_timestamp(content_info_der: &[u8]) -> Result<bool, CmsError> {
     let ci = ContentInfo::from_der(content_info_der)?;
     let sd = SignedData::from_der(&ci.content.to_der()?)?;
@@ -353,14 +368,42 @@ fn signer_has_signature_timestamp(signer_info: &SignerInfo) -> Result<bool, CmsE
         .flat_map(SetOfVec::as_slice)
         .filter(|attribute| attribute.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN);
     let timestamp_attribute = timestamp_attributes.next();
-    if timestamp_attributes.next().is_some()
-        || timestamp_attribute.is_some_and(|attribute| attribute.values.as_slice().len() != 1)
-    {
-        return Err(CmsError::Structure(
-            "invalid signature-time-stamp attribute",
-        ));
+    if timestamp_attributes.next().is_some() {
+        return Err(CmsError::TimestampInvalid);
     }
-    Ok(timestamp_attribute.is_some())
+    let Some(timestamp_attribute) = timestamp_attribute else {
+        return Ok(false);
+    };
+    let [timestamp_value] = timestamp_attribute.values.as_slice() else {
+        return Err(CmsError::TimestampInvalid);
+    };
+    let token_der = timestamp_value
+        .to_der()
+        .map_err(|_| CmsError::TimestampInvalid)?;
+    verify_timestamp_token(&token_der, signer_info.signature.as_bytes())?;
+    Ok(true)
+}
+
+fn verify_timestamp_token(token_der: &[u8], signature_value: &[u8]) -> Result<(), CmsError> {
+    match verify_signed_data_profile(token_der, SignedDataProfile::TimestampToken) {
+        Ok(_) => {}
+        Err(CmsError::UnsupportedAlgo) => return Err(CmsError::TimestampUnsupported),
+        Err(_) => return Err(CmsError::TimestampInvalid),
+    }
+    if crate::timestamp::parse_gen_time(token_der).is_none() {
+        return Err(CmsError::TimestampInvalid);
+    }
+    let Some((imprint_algorithm, imprint)) =
+        crate::timestamp::parse_message_imprint_with_algorithm(token_der)
+    else {
+        return Err(CmsError::TimestampInvalid);
+    };
+    let expected = crate::timestamp::hash_message_imprint(imprint_algorithm, signature_value)
+        .ok_or(CmsError::TimestampUnsupported)?;
+    if imprint != expected {
+        return Err(CmsError::TimestampInvalid);
+    }
+    Ok(())
 }
 
 /// Verify the assembled CMS signature against the signer's leaf certificate (defense-in-depth: the
@@ -377,19 +420,45 @@ pub fn verify_signed_data(cms_der: &[u8], key_algo: KeyAlgo) -> Result<Vec<u8>, 
 /// Verify a detached CMS using the algorithm and certificate identified by its SignerInfo.
 ///
 /// Verification accepts the SHA-256 profile emitted by this SDK: `rsaEncryption` with PKCS #1
-/// v1.5 or `ecdsa-with-SHA256`, plus `ESSCertIDv2` with its default SHA-256 algorithm and without
-/// `issuerSerial`. Other digest/signature algorithms return [`CmsError::UnsupportedAlgo`]; other
-/// well-formed CMS profiles are outside this integrity verifier's contract.
+/// v1.5 or P-256 ECDSA with SHA-256 (`ecdsa-with-SHA256`), plus `ESSCertIDv2` with its default
+/// SHA-256 algorithm and without `issuerSerial`. Other digest/signature algorithms return
+/// [`CmsError::UnsupportedAlgo`]; other well-formed CMS profiles are outside this integrity
+/// verifier's contract.
 pub(crate) fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, CmsError> {
+    verify_signed_data_profile(cms_der, SignedDataProfile::PadesDetached)
+}
+
+fn verify_signed_data_profile(
+    cms_der: &[u8],
+    profile: SignedDataProfile,
+) -> Result<VerifiedSignedData, CmsError> {
     use x509_cert::spki::DecodePublicKey;
     let ci = ContentInfo::from_der(cms_der)?;
     if ci.content_type != ID_SIGNED_DATA {
         return Err(CmsError::Structure("ContentInfo is not signed-data"));
     }
     let sd = SignedData::from_der(&ci.content.to_der()?)?;
-    if sd.encap_content_info.econtent_type != ID_DATA || sd.encap_content_info.econtent.is_some() {
-        return Err(CmsError::Structure("signature is not detached data"));
+    let expected_content_type = match profile {
+        SignedDataProfile::PadesDetached => ID_DATA,
+        SignedDataProfile::TimestampToken => ID_CT_TST_INFO,
+    };
+    if sd.encap_content_info.econtent_type != expected_content_type {
+        return Err(CmsError::Structure("unexpected encapsulated content type"));
     }
+    let encapsulated_content = match (profile, sd.encap_content_info.econtent.as_ref()) {
+        (SignedDataProfile::PadesDetached, None) => None,
+        (SignedDataProfile::TimestampToken, Some(content)) => Some(
+            OctetString::from_der(&content.to_der()?)?
+                .as_bytes()
+                .to_vec(),
+        ),
+        (SignedDataProfile::PadesDetached, Some(_)) => {
+            return Err(CmsError::Structure("signature is not detached data"));
+        }
+        (SignedDataProfile::TimestampToken, None) => {
+            return Err(CmsError::Structure("timestamp token has no TSTInfo"));
+        }
+    };
     let digest_algorithms = sd.digest_algorithms.as_slice();
     if digest_algorithms.len() != 1
         || digest_algorithms
@@ -408,9 +477,12 @@ pub(crate) fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedDa
     if si.digest_alg.oid != ID_SHA256 {
         return Err(CmsError::UnsupportedAlgo);
     }
-    let key_algo = match si.signature_algorithm.oid {
-        RSA_ENCRYPTION => KeyAlgo::Rsa,
-        ECDSA_WITH_SHA256 => KeyAlgo::EcdsaP256,
+    let key_algo = match (profile, si.signature_algorithm.oid) {
+        (SignedDataProfile::PadesDetached, RSA_ENCRYPTION)
+        | (SignedDataProfile::TimestampToken, RSA_ENCRYPTION | SHA256_WITH_RSA_ENCRYPTION) => {
+            KeyAlgo::Rsa
+        }
+        (_, ECDSA_WITH_SHA256) => KeyAlgo::EcdsaP256,
         _ => return Err(CmsError::UnsupportedAlgo),
     };
     let attrs = si
@@ -420,7 +492,12 @@ pub(crate) fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedDa
     let signed_attrs_der = attrs.to_der()?;
     let signature = si.signature.as_bytes();
     let signer_certificate = signer_certificate_from(&sd, si)?;
-    let message_digest = validate_signed_attributes(attrs, &signer_certificate)?;
+    let message_digest = validate_signed_attributes(
+        attrs,
+        &signer_certificate,
+        expected_content_type,
+        matches!(profile, SignedDataProfile::PadesDetached),
+    )?;
     let spki_der = signer_certificate
         .tbs_certificate
         .subject_public_key_info
@@ -443,7 +520,18 @@ pub(crate) fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedDa
         vk.verify(&signed_attrs_der, &sig)
             .map_err(|e| CmsError::Verify(e.to_string()))?;
     }
-    let has_signature_timestamp = signer_has_signature_timestamp(si)?;
+    if encapsulated_content
+        .as_deref()
+        .is_some_and(|content| sha256(content).as_slice() != message_digest)
+    {
+        return Err(CmsError::Structure(
+            "encapsulated content message-digest mismatch",
+        ));
+    }
+    let has_signature_timestamp = match profile {
+        SignedDataProfile::PadesDetached => signer_has_signature_timestamp(si)?,
+        SignedDataProfile::TimestampToken => false,
+    };
     Ok(VerifiedSignedData {
         message_digest,
         signer_certificate,
@@ -494,6 +582,8 @@ fn single_attribute<'a>(
 fn validate_signed_attributes(
     attrs: &SetOfVec<Attribute>,
     signer_certificate: &Certificate,
+    expected_content_type: ObjectIdentifier,
+    require_pades_attributes: bool,
 ) -> Result<Vec<u8>, CmsError> {
     let content_type = single_attribute(attrs, ID_CONTENT_TYPE, "invalid content-type attribute")?;
     let content_type_value = content_type
@@ -501,8 +591,8 @@ fn validate_signed_attributes(
         .as_slice()
         .first()
         .ok_or(CmsError::Structure("invalid content-type attribute"))?;
-    if ObjectIdentifier::from_der(&content_type_value.to_der()?)? != ID_DATA {
-        return Err(CmsError::Structure("content-type is not data"));
+    if ObjectIdentifier::from_der(&content_type_value.to_der()?)? != expected_content_type {
+        return Err(CmsError::Structure("signed content-type does not match"));
     }
 
     let digest = single_attribute(attrs, ID_MESSAGE_DIGEST, "invalid message-digest attribute")?;
@@ -518,6 +608,16 @@ fn validate_signed_attributes(
         return Err(CmsError::Structure("message-digest is not SHA-256 length"));
     }
 
+    if require_pades_attributes {
+        validate_pades_attributes(attrs, signer_certificate)?;
+    }
+    Ok(message_digest)
+}
+
+fn validate_pades_attributes(
+    attrs: &SetOfVec<Attribute>,
+    signer_certificate: &Certificate,
+) -> Result<(), CmsError> {
     let signing_time = single_attribute(attrs, ID_SIGNING_TIME, "invalid signing-time attribute")?;
     let signing_time_der = signing_time
         .values
@@ -556,7 +656,7 @@ fn validate_signed_attributes(
             "signing-certificate-v2 does not identify the signer",
         ));
     }
-    Ok(message_digest)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -575,6 +675,8 @@ mod tests {
     const RSA_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-rsa.key.pk8");
     const EC_CERT: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-ec.cert.der");
     const EC_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-ec.key.pk8");
+    const RSA_TIMESTAMP_TOKEN: &[u8] =
+        include_bytes!("../../../../tests/fixtures/pades-bt/rsa-token.der");
 
     fn valid_rsa_cms() -> Vec<u8> {
         let content_hash = sha256(b"CMS verifier structural fixture");
@@ -747,6 +849,16 @@ mod tests {
             Err(CmsError::UnsupportedAlgo)
         ));
 
+        let pades_rsa_digest_algorithm = rewrite_signed_data(&cms, |_, signed_data| {
+            rewrite_signer_info(signed_data, |signer_info| {
+                signer_info.signature_algorithm.oid = SHA256_WITH_RSA_ENCRYPTION;
+            });
+        });
+        assert!(matches!(
+            verify_signed_data_auto(&pades_rsa_digest_algorithm),
+            Err(CmsError::UnsupportedAlgo)
+        ));
+
         let no_signed_attributes = rewrite_signed_data(&cms, |_, signed_data| {
             rewrite_signer_info(signed_data, |signer_info| signer_info.signed_attrs = None);
         });
@@ -797,7 +909,7 @@ mod tests {
         });
         assert!(matches!(
             verify_signed_data_auto(&wrong_content_type),
-            Err(CmsError::Structure("content-type is not data"))
+            Err(CmsError::Structure("signed content-type does not match"))
         ));
 
         let short_digest = rewrite_signed_data(&cms, |_, signed_data| {
@@ -884,9 +996,46 @@ mod tests {
         });
         assert!(matches!(
             verify_signed_data_auto(&ambiguous_timestamp),
-            Err(CmsError::Structure(
-                "invalid signature-time-stamp attribute"
-            ))
+            Err(CmsError::TimestampInvalid)
+        ));
+    }
+
+    #[test]
+    fn timestamp_attribute_must_contain_a_bound_rfc3161_token() {
+        let cms = valid_rsa_cms();
+        let timestamp_with_arbitrary_value = embed_timestamp(&cms, &[0x05, 0x00]).unwrap();
+
+        assert!(matches!(
+            verify_signed_data_auto(&timestamp_with_arbitrary_value),
+            Err(CmsError::TimestampInvalid)
+        ));
+    }
+
+    #[test]
+    fn timestamp_token_with_an_unsupported_cms_digest_is_distinguished() {
+        let unsupported_token = rewrite_signed_data(RSA_TIMESTAMP_TOKEN, |_, signed_data| {
+            let mut digest_algorithms = SetOfVec::new();
+            digest_algorithms
+                .insert(algorithm(ID_DATA, false).unwrap())
+                .unwrap();
+            signed_data.digest_algorithms = digest_algorithms;
+        });
+
+        assert!(matches!(
+            verify_timestamp_token(&unsupported_token, b"a signature value"),
+            Err(CmsError::TimestampUnsupported)
+        ));
+    }
+
+    #[test]
+    fn timestamp_token_signer_must_come_from_its_own_certificate_set() {
+        let token_without_its_signer =
+            rewrite_signed_data(RSA_TIMESTAMP_TOKEN, |_, signed_data| {
+                signed_data.certificates = None;
+            });
+        assert!(matches!(
+            verify_timestamp_token(&token_without_its_signer, b"a signature value"),
+            Err(CmsError::TimestampInvalid)
         ));
     }
 

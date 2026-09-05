@@ -50,14 +50,16 @@ unbounded concurrency). `Failed` always carries an evidence record (FR-015).
 
 `verify_pdf` is stateless and performs no I/O. Invalid or unsupported input is a normal
 `PdfVerification { integrity: false, ... }` verdict, not an exception. It accepts the SHA-256 CMS
-profile emitted by this SDK: `rsaEncryption` with PKCS #1 v1.5 or `ecdsa-with-SHA256`, plus
-`ESSCertIDv2` with its default SHA-256 algorithm and no `issuerSerial`. Other valid CMS profiles may
-return an unsupported or malformed verdict. Within that profile it validates one signature's
-strict `/ByteRange` and `/Contents` binding, detached CMS structure, signed attributes, embedded
-signer certificate selection, signature, and document message digest. It does not establish
-certificate trust, trusted-list or revocation status, signer authorization, or RFC 3161 token
-validity. `integrity=true` is therefore not qualified validation. A structurally present B-T
-timestamp identifies the profile but makes no claim about timestamp-token validity.
+profile emitted by this SDK: `rsaEncryption` with PKCS #1 v1.5 or P-256 ECDSA with SHA-256
+(`ecdsa-with-SHA256`), plus `ESSCertIDv2` with its default SHA-256 algorithm and no `issuerSerial`.
+Other valid CMS profiles may return an unsupported or malformed verdict. Within that profile it
+validates one signature's strict `/ByteRange` and `/Contents` binding, detached CMS structure,
+signed attributes, embedded signer certificate selection, signature, and document message digest.
+`profile=B_T` means the signature-time-stamp token binds the signature value through its declared
+SHA-2 `messageImprint`, and the token's CMS signature and content digest verify against the signer
+certificate selected from the token's own certificate set. It does not establish signer or TSA
+certificate trust, trusted-list or revocation status, signer authorization, or TSA policy.
+`integrity=true` is therefore not qualified validation.
 
 ## Idiomatic binding shapes (illustrative, same semantics)
 
@@ -114,8 +116,9 @@ major (Principle VII).
   `malformed_pdf`, `missing_signature`, `multiple_signatures_unsupported`,
   `malformed_byte_range`, `unsupported_subfilter`, `unsigned_suffix`, `invalid_contents`,
   `malformed_cms`, `missing_signer_certificate`, `unsupported_signature_algorithm`,
-  `invalid_signature`, or `message_digest_mismatch`. `integrity` is true if and only if `reasons`
-  is empty; `profile` and `signer` are present only in that case.
+  `invalid_signature`, `message_digest_mismatch`, `timestamp_invalid`, or
+  `timestamp_unsupported`. `integrity` is true if and only if `reasons` is empty; `profile` and
+  `signer` are present only in that case.
 - No secret material (client_secret, SAD, tokens) appears in any error message or evidence record
   (Principle IV).
 

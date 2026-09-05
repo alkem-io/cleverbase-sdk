@@ -2,10 +2,12 @@
 //!
 //! This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
 //! signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
-//! with PKCS #1 v1.5 or `ecdsa-with-SHA256`, and the SDK's minimal `ESSCertIDv2` form. Other valid
-//! CMS profiles may return an unsupported or malformed verdict rather than an integrity verdict.
-//! It does not establish certificate trust, trusted-list or revocation status, signer
-//! authorization, or RFC 3161 token validity; `integrity = true` is not qualified validation.
+//! with PKCS #1 v1.5 or P-256 ECDSA with SHA-256 (`ecdsa-with-SHA256`), and the SDK's minimal
+//! `ESSCertIDv2` form. Other valid CMS profiles may return an unsupported or malformed verdict.
+//! B-T classification also verifies that the timestamp token binds the signature value and is
+//! signed by a certificate embedded in that token. It does not establish certificate or TSA trust,
+//! trusted-list or revocation status, signer authorization, or TSA policy; `integrity = true` is
+//! not qualified validation.
 
 use core::mem::size_of;
 use lopdf::{Document, Object};
@@ -43,6 +45,10 @@ pub enum VerificationReason {
     InvalidSignature,
     /// The CMS message-digest differs from the PDF ByteRange digest.
     MessageDigestMismatch,
+    /// The RFC 3161 timestamp token is malformed, foreign, or has an invalid signature.
+    TimestampInvalid,
+    /// The RFC 3161 timestamp token uses an unsupported digest or signature algorithm.
+    TimestampUnsupported,
 }
 
 /// Identity fields read from the embedded signer certificate.
@@ -75,7 +81,7 @@ pub struct PdfVerification {
 /// Verify one unsigned-or-singly-signed PDF against the SHA-256 CMS profile emitted by this SDK.
 ///
 /// This operation establishes document/CMS integrity only. It does not establish certificate
-/// trust, trusted-list or revocation status, signer authorization, or RFC 3161 token validity.
+/// trust, trusted-list or revocation status, signer authorization, TSA trust, or TSA policy.
 pub fn verify_pdf(document: &[u8]) -> PdfVerification {
     if !document.starts_with(b"%PDF-") {
         return PdfVerification {
@@ -136,6 +142,10 @@ fn cms_failure_reason(error: &crate::crypto::cms::CmsError) -> VerificationReaso
             VerificationReason::MissingSignerCertificate
         }
         crate::crypto::cms::CmsError::Verify(_) => VerificationReason::InvalidSignature,
+        crate::crypto::cms::CmsError::TimestampInvalid => VerificationReason::TimestampInvalid,
+        crate::crypto::cms::CmsError::TimestampUnsupported => {
+            VerificationReason::TimestampUnsupported
+        }
     }
 }
 
@@ -365,17 +375,20 @@ mod tests {
     }
 
     #[test]
-    fn valid_b_b_and_b_t_results_cover_the_public_verdict() {
+    fn valid_b_b_and_invalid_timestamp_results_cover_the_public_verdict() {
         let b_b = verify_pdf(&signed_pdf(false));
         assert!(b_b.integrity);
         assert_eq!(b_b.profile, Some(ConformanceLevel::BB));
         assert!(b_b.reasons.is_empty());
         assert_eq!(b_b.signer.as_ref().unwrap().common_name, "Jane Doe");
 
-        let b_t = verify_pdf(&signed_pdf(true));
-        assert!(b_t.integrity);
-        assert_eq!(b_t.profile, Some(ConformanceLevel::BT));
-        assert!(b_t.reasons.is_empty());
+        let arbitrary_timestamp = verify_pdf(&signed_pdf(true));
+        assert!(!arbitrary_timestamp.integrity);
+        assert_eq!(arbitrary_timestamp.profile, None);
+        assert_eq!(
+            arbitrary_timestamp.reasons,
+            vec![VerificationReason::TimestampInvalid]
+        );
     }
 
     #[test]
@@ -515,6 +528,14 @@ mod tests {
                 CmsError::Verify("bad signature".into()),
                 VerificationReason::InvalidSignature,
             ),
+            (
+                CmsError::TimestampInvalid,
+                VerificationReason::TimestampInvalid,
+            ),
+            (
+                CmsError::TimestampUnsupported,
+                VerificationReason::TimestampUnsupported,
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(cms_failure_reason(&error), expected);
@@ -537,6 +558,8 @@ mod tests {
             VerificationReason::UnsupportedSignatureAlgorithm,
             VerificationReason::InvalidSignature,
             VerificationReason::MessageDigestMismatch,
+            VerificationReason::TimestampInvalid,
+            VerificationReason::TimestampUnsupported,
         ];
         let expected = PdfVerification {
             integrity: true,

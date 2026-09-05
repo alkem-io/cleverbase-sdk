@@ -32,6 +32,13 @@ const RSA_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.c
 const RSA_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.key.pk8");
 const EC_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-ec.cert.der");
 const EC_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-ec.key.pk8");
+const BT_RSA_RESPONSE: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/rsa.tsr");
+const BT_RSA_TOKEN: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/rsa-token.der");
+const BT_RSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/rsa.pdf");
+const BT_ECDSA_RESPONSE: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.tsr");
+const BT_ECDSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.pdf");
+const BT_WRONG_IMPRINT_RESPONSE: &[u8] =
+    include_bytes!("../../../tests/fixtures/pades-bt/wrong-imprint.tsr");
 
 /// Signature algorithm the harness drives end-to-end. ONE parametrized producer path covers both
 /// arms (FR-004) — no RSA/ECDSA copy-paste. Each arm pins the matching CSC API base, the
@@ -748,25 +755,19 @@ fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
 
 #[test]
 fn tsa_token_gen_time_is_parsed() {
-    // Drive a real openssl TSA and confirm we extract its genTime from the issued token (so the
-    // evidence reports the TSA's trusted time, not the host clock).
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping TSA genTime test");
-        return;
-    }
-    let imprint = cleverbase_core::crypto::sha256(b"some signature value");
-    let req = cleverbase_core::timestamp::build_request(&imprint, None).unwrap();
-    let tsr = openssl_timestamp(&req);
-    let token = cleverbase_core::timestamp::parse_response(&tsr).unwrap();
-    let gen_time = cleverbase_core::timestamp::parse_gen_time(&token)
+    // The checked-in token was issued by OpenSSL 3 from the synthetic TSA fixture; normal test
+    // runs never mint timestamps and therefore cannot silently vary by the platform TLS tool.
+    let gen_time = cleverbase_core::timestamp::parse_gen_time(BT_RSA_TOKEN)
         .expect("genTime should be parsed from a valid TSA token");
     // A real openssl-issued timestamp is a recent, plausible Unix time (well past 2023).
     assert!(gen_time > 1_700_000_000, "implausible genTime: {gen_time}");
     // The token's messageImprint must echo exactly the hash we submitted (binding check).
+    let signature = cleverbase_core::crypto::cms::signer_signature(&extract(BT_RSA_PDF).1).unwrap();
+    let imprint = cleverbase_core::crypto::sha256(&signature);
     assert_eq!(
-        cleverbase_core::timestamp::parse_message_imprint(&token).as_deref(),
+        cleverbase_core::timestamp::parse_message_imprint(BT_RSA_TOKEN).as_deref(),
         Some(imprint.as_slice()),
-        "token messageImprint must match the submitted hash"
+        "token messageImprint must bind the fixture PDF's signature value"
     );
 }
 
@@ -792,31 +793,70 @@ fn drive_bt_to_timestamp(algo: KeyAlgo) -> (cleverbase_core::SigningSessionHandl
 }
 
 fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
-    let (h, tsa_req) = drive_bt_to_timestamp(algo);
-    // Play the TSA with OpenSSL over the real request.
-    let resp = openssl_timestamp(&tsa_req);
-    match resume(h, http_ok_bytes(resp), ctx()).unwrap().1 {
+    let (h, _) = drive_bt_to_timestamp(algo);
+    let response = match algo {
+        KeyAlgo::Rsa => BT_RSA_RESPONSE,
+        KeyAlgo::EcdsaP256 => BT_ECDSA_RESPONSE,
+    };
+    match resume(h, http_ok_bytes(response.to_vec()), ctx())
+        .unwrap()
+        .1
+    {
         Step::Done { signed, .. } => signed,
         other => panic!("expected Done, got {other:?}"),
     }
 }
 
 #[test]
-fn b_t_rejects_timestamp_with_wrong_imprint() {
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping");
-        return;
+#[ignore = "human-run fixture generator; see tests/fixtures/pades-bt/gen.sh"]
+fn regenerate_pades_bt_fixtures() {
+    let fixture_dir = pki_dir().parent().unwrap().join("pades-bt");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
+        let (handle, request) = drive_bt_to_timestamp(algo);
+        let response = openssl_timestamp(&request);
+        let token = cleverbase_core::timestamp::parse_response(&response).unwrap();
+        let signed = match resume(handle, http_ok_bytes(response.clone()), ctx())
+            .unwrap()
+            .1
+        {
+            Step::Done { signed, .. } => signed,
+            other => panic!("expected Done, got {other:?}"),
+        };
+        let stem = match algo {
+            KeyAlgo::Rsa => "rsa",
+            KeyAlgo::EcdsaP256 => "ecdsa-p256",
+        };
+        std::fs::write(fixture_dir.join(format!("{stem}.tsr")), response).unwrap();
+        std::fs::write(fixture_dir.join(format!("{stem}-token.der")), token).unwrap();
+        std::fs::write(fixture_dir.join(format!("{stem}.pdf")), signed.pdf).unwrap();
     }
-    let (h, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
-    // Feed a token bound to an UNRELATED imprint (as a MITM'd/replayed TSA would) — it must be
-    // rejected, not embedded, because it does not cover our signature value.
-    let bogus_req = cleverbase_core::timestamp::build_request(
+    let wrong_request = cleverbase_core::timestamp::build_request(
         &cleverbase_core::crypto::sha256(b"some unrelated bytes"),
         None,
     )
     .unwrap();
-    let resp = openssl_timestamp(&bogus_req);
-    let (handle, step) = resume(h, http_ok_bytes(resp), ctx()).unwrap();
+    std::fs::write(
+        fixture_dir.join("wrong-imprint.tsr"),
+        openssl_timestamp(&wrong_request),
+    )
+    .unwrap();
+}
+
+/// Attach one token to the deterministic B-B CMS without changing any signed PDF bytes.
+fn with_timestamp_token(pdf: &[u8], token_der: &[u8]) -> Vec<u8> {
+    let (_, cms_der) = extract(pdf);
+    let timestamped = cleverbase_core::crypto::cms::embed_timestamp(&cms_der, token_der).unwrap();
+    replace_cms(pdf, &timestamped)
+}
+
+#[test]
+fn b_t_rejects_timestamp_with_wrong_imprint() {
+    let (h, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
+    // Feed a token bound to an UNRELATED imprint (as a MITM'd/replayed TSA would) — it must be
+    // rejected, not embedded, because it does not cover our signature value.
+    let (handle, step) =
+        resume(h, http_ok_bytes(BT_WRONG_IMPRINT_RESPONSE.to_vec()), ctx()).unwrap();
     assert_eq!(handle.phase, cleverbase_core::SigningPhase::Failed);
     match step {
         Step::Failed { evidence } => {
@@ -849,6 +889,16 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         assert_eq!(verification.profile, Some(ConformanceLevel::BT));
         assert!(verification.signer.is_some());
         assert!(verification.reasons.is_empty());
+        let expected_pdf = match algo {
+            KeyAlgo::Rsa => BT_RSA_PDF,
+            KeyAlgo::EcdsaP256 => BT_ECDSA_PDF,
+        };
+        assert_eq!(
+            signed.pdf,
+            expected_pdf,
+            "{} B-T output changed",
+            algo.name()
+        );
         Document::load_mem(&signed.pdf).unwrap();
 
         let (content, cms_der) = extract(&signed.pdf);
@@ -863,6 +913,37 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
             algo.name(),
         );
     }
+}
+
+#[test]
+fn verifier_rejects_a_timestamp_copied_from_another_signature() {
+    let ecdsa_bb = produce_signed_pdf(KeyAlgo::EcdsaP256);
+
+    let verification = verify_pdf(&with_timestamp_token(&ecdsa_bb.pdf, BT_RSA_TOKEN));
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.profile, None);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::TimestampInvalid]
+    );
+}
+
+#[test]
+fn verifier_rejects_a_bound_timestamp_with_a_tampered_token_signature() {
+    let tampered_token = flip_signature_byte(BT_RSA_TOKEN);
+    let rsa_bb = produce_signed_pdf(KeyAlgo::Rsa);
+
+    let verification = verify_pdf(&with_timestamp_token(&rsa_bb.pdf, &tampered_token));
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.profile, None);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::TimestampInvalid]
+    );
 }
 
 /// T007 (core arm) / F1: a tampered ECDSA B-T CMS is ALSO rejected by the always-on bar — the

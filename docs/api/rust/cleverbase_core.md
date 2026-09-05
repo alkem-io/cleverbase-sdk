@@ -53,11 +53,15 @@ Errors from CMS assembly/verification.
 - `EmptyChain`
   - The certificate chain was empty.
 - `Structure(&'static str)`
-  - The CMS is parseable DER but is not the detached CAdES shape this SDK verifies.
+  - The CMS is parseable DER but is not a supported CAdES or timestamp-token shape.
 - `SignerCertificateAbsent`
   - No embedded certificate matched the CMS SignerInfo identifier.
 - `Verify(String)`
   - Signature verification failed.
+- `TimestampInvalid`
+  - An RFC 3161 signature-time-stamp token is malformed, foreign, or invalidly signed.
+- `TimestampUnsupported`
+  - An RFC 3161 signature-time-stamp token uses an unsupported algorithm.
 
 #### Functions
 
@@ -93,7 +97,7 @@ Embed an RFC 3161 timestamp token as the `signature-time-stamp` unsigned attribu
 fn has_signature_timestamp(content_info_der: &[u8]) -> Result<bool, CmsError>
 ```
 
-True if the CMS SignerInfo carries a `signature-time-stamp` unsigned attribute (B-T).
+True if the CMS SignerInfo carries a valid, signature-bound `signature-time-stamp` attribute.
 
 ##### fn `reparse_for_verify`
 
@@ -1361,10 +1365,12 @@ Integrity-only verification of a single PAdES signature.
 
 This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
 signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
-with PKCS #1 v1.5 or `ecdsa-with-SHA256`, and the SDK's minimal `ESSCertIDv2` form. Other valid
-CMS profiles may return an unsupported or malformed verdict rather than an integrity verdict.
-It does not establish certificate trust, trusted-list or revocation status, signer
-authorization, or RFC 3161 token validity; `integrity = true` is not qualified validation.
+with PKCS #1 v1.5 or P-256 ECDSA with SHA-256 (`ecdsa-with-SHA256`), and the SDK's minimal
+`ESSCertIDv2` form. Other valid CMS profiles may return an unsupported or malformed verdict.
+B-T classification also verifies that the timestamp token binds the signature value and is
+signed by a certificate embedded in that token. It does not establish certificate or TSA trust,
+trusted-list or revocation status, signer authorization, or TSA policy; `integrity = true` is
+not qualified validation.
 
 ### Structs
 
@@ -1445,6 +1451,10 @@ A machine-readable limitation or failure observed while verifying a PDF.
   - The CMS signature does not verify against the embedded signer certificate.
 - `MessageDigestMismatch`
   - The CMS message-digest differs from the PDF ByteRange digest.
+- `TimestampInvalid`
+  - The RFC 3161 timestamp token is malformed, foreign, or has an invalid signature.
+- `TimestampUnsupported`
+  - The RFC 3161 timestamp token uses an unsupported digest or signature algorithm.
 
 ### Functions
 
@@ -1457,7 +1467,7 @@ fn verify_pdf(document: &[u8]) -> PdfVerification
 Verify one unsigned-or-singly-signed PDF against the SHA-256 CMS profile emitted by this SDK.
 
 This operation establishes document/CMS integrity only. It does not establish certificate
-trust, trusted-list or revocation status, signer authorization, or RFC 3161 token validity.
+trust, trusted-list or revocation status, signer authorization, TSA trust, or TSA policy.
 
 ## Module `wire`
 

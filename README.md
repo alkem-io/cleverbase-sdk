@@ -47,12 +47,13 @@ Implemented and tested (Rust unit + integration; independently validated with **
   optional **visible appearance** with rendered text (FR-016), stateless resumable session handle
   (FR-013), WYSIWYS hash-bound authorization.
 - ✅ Stateless integrity verification of a singly-signed PAdES B-B/B-T PDF using the SHA-256 CMS
-  profile emitted by this SDK (`rsaEncryption`/PKCS #1 v1.5 or `ecdsa-with-SHA256`, with the SDK's
-  minimal `ESSCertIDv2` form): strict ByteRange/CMS binding, embedded-leaf signature and digest
-  checks, profile and signer identity. Other valid CMS profiles may return an unsupported or
-  malformed verdict. This operation does not establish certificate trust, trusted-list or
-  revocation status, signer authorization, or timestamp-token validity, and is not qualified
-  validation.
+  profile emitted by this SDK (`rsaEncryption`/PKCS #1 v1.5 or P-256 ECDSA with SHA-256, with the
+  SDK's minimal `ESSCertIDv2` form): strict ByteRange/CMS binding, embedded-leaf signature and
+  digest checks, profile and signer identity. Other valid CMS profiles may return an unsupported
+  or malformed verdict. B-T additionally requires a timestamp token bound to the signature value
+  and signed by a certificate embedded in that token. This operation does not establish signer or
+  TSA certificate trust, trusted-list or revocation status, signer authorization, or TSA policy,
+  and is not qualified validation.
 - ✅ Python, Node, and Go bindings + the TS frontend helper, all with passing tests.
 
 See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
