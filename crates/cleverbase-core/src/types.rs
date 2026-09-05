@@ -207,6 +207,7 @@ fn default_level() -> ConformanceLevel {
 
 /// Configuration for reaching an external qualified Time-Stamping Authority (required for B-T).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TsaConfiguration {
     /// RFC 3161 TSA endpoint URL the host POSTs the timestamp query to.
     pub url: String,
@@ -245,17 +246,18 @@ impl TrustServiceConfiguration {
     /// Base URL for the configured upstream, with a trailing slash removed.
     ///
     /// Uses [`Self::upstream_base_url`] when present; otherwise selects the documented host from
-    /// [`Self::csc_api`] and [`Self::environment`].
-    pub fn base_url(&self) -> &str {
-        self.upstream_base_url
-            .as_deref()
-            .unwrap_or(match (self.csc_api, self.environment) {
-                (CscApi::V1Rsa, Environment::Production) => "https://connect.cleverbase.com",
-                (CscApi::V1Rsa, Environment::Acceptance) => "https://connect.acc.cleverbase.com",
-                // v2 beta is a single lab host regardless of environment.
-                (CscApi::V2Ecdsa, _) => "https://signing.lab.cleverbase.io",
-            })
-            .trim_end_matches('/')
+    /// [`Self::csc_api`] and [`Self::environment`]. A valid override is emitted in URL-normalized
+    /// form (canonical scheme/host, IDN, and path), never in the caller's raw spelling.
+    pub fn base_url(&self) -> String {
+        self.upstream_base_url.as_deref().map_or_else(
+            || default_base_url(self.csc_api, self.environment).to_owned(),
+            |value| {
+                normalize_upstream_base_url(value)
+                    // `validate` rejects this before a signing flow; preserve the caller's value
+                    // here instead of silently selecting the default production/acceptance host.
+                    .unwrap_or_else(|_| value.trim_end_matches('/').to_owned())
+            },
+        )
     }
 
     /// The OAuth2 authorization endpoint for the selected API generation and environment.
@@ -277,28 +279,41 @@ impl TrustServiceConfiguration {
         let Some(value) = self.upstream_base_url.as_deref() else {
             return Ok(());
         };
-        let parsed = Url::parse(value)
-            .map_err(|e| format!("upstream_base_url must be an absolute URL: {e}"))?;
-        let Some(host) = parsed.host_str() else {
-            return Err("upstream_base_url must be an absolute URL with a host".into());
-        };
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err("upstream_base_url must not contain credentials".into());
-        }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
-            return Err("upstream_base_url must not contain a query or fragment".into());
-        }
-        if parsed.port() == Some(0) {
-            return Err("upstream_base_url must not use port zero".into());
-        }
-        if parsed.scheme() == "https" {
-            return Ok(());
-        }
-        if parsed.scheme() == "http" && is_loopback_host(host) {
-            return Ok(());
-        }
-        Err("upstream_base_url must use https, except http on a loopback host".into())
+        normalize_upstream_base_url(value).map(|_| ())
     }
+}
+
+fn default_base_url(csc_api: CscApi, environment: Environment) -> &'static str {
+    match (csc_api, environment) {
+        (CscApi::V1Rsa, Environment::Production) => "https://connect.cleverbase.com",
+        (CscApi::V1Rsa, Environment::Acceptance) => "https://connect.acc.cleverbase.com",
+        // v2 beta is a single lab host regardless of environment.
+        (CscApi::V2Ecdsa, _) => "https://signing.lab.cleverbase.io",
+    }
+}
+
+fn normalize_upstream_base_url(value: &str) -> Result<String, String> {
+    let parsed =
+        Url::parse(value).map_err(|e| format!("upstream_base_url must be an absolute URL: {e}"))?;
+    let Some(host) = parsed.host_str() else {
+        return Err("upstream_base_url must be an absolute URL with a host".into());
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("upstream_base_url must not contain credentials".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("upstream_base_url must not contain a query or fragment".into());
+    }
+    if parsed.port() == Some(0) {
+        return Err("upstream_base_url must not use port zero".into());
+    }
+    if parsed.scheme() == "https" {
+        return Ok(parsed.as_str().trim_end_matches('/').to_owned());
+    }
+    if parsed.scheme() == "http" && is_loopback_host(host) {
+        return Ok(parsed.as_str().trim_end_matches('/').to_owned());
+    }
+    Err("upstream_base_url must use https, except http on a loopback host".into())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -448,6 +463,21 @@ mod tests {
     }
 
     #[test]
+    fn upstream_base_url_is_emitted_in_normalized_form() {
+        let config = TrustServiceConfiguration {
+            environment: Environment::Acceptance,
+            csc_api: CscApi::V1Rsa,
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url: Some("HTTPS://EXAMPLE.TEST/stub/../service/".into()),
+            tsa: None,
+        };
+
+        assert_eq!(config.base_url(), "https://example.test/service");
+    }
+
+    #[test]
     fn upstream_base_url_validation_allows_https_and_loopback_http_only() {
         let config = |upstream_base_url| TrustServiceConfiguration {
             environment: Environment::Acceptance,
@@ -497,6 +527,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("upstream_baseurl"));
+    }
+
+    #[test]
+    fn tsa_configuration_rejects_unknown_fields() {
+        let error = serde_json::from_value::<TsaConfiguration>(serde_json::json!({
+            "url": "https://tsa.example/rfc3161",
+            "policy": "0.4.0.2023.1.1"
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("policy"));
     }
 
     #[test]

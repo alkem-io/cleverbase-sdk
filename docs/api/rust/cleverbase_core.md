@@ -1148,13 +1148,14 @@ fn authorize_url(&self) -> String
 The OAuth2 authorization endpoint for the selected API generation and environment.
 
 ```rust
-fn base_url(&self) -> &str
+fn base_url(&self) -> String
 ```
 
 Base URL for the configured upstream, with a trailing slash removed.
 
 Uses [`Self::upstream_base_url`] when present; otherwise selects the documented host from
-[`Self::csc_api`] and [`Self::environment`].
+[`Self::csc_api`] and [`Self::environment`]. A valid override is emitted in URL-normalized
+form (canonical scheme/host, IDN, and path), never in the caller's raw spelling.
 
 ```rust
 fn token_url(&self) -> String
