@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"math/big"
 	"net/http"
@@ -211,6 +212,7 @@ type credentialsInfoKey struct {
 type credentialsInfoCert struct {
 	Certificates []string `json:"certificates"`
 	SerialNumber string   `json:"serialNumber"`
+	SubjectDN    string   `json:"subjectDN"`
 }
 
 type credentialsInfo struct {
@@ -231,12 +233,28 @@ func TestInfoCarriesRouteSignerCertAndAlgo(t *testing.T) {
 	defer ts.Close()
 
 	cases := []struct {
-		route, wantOID, wantSerial string
-		pubMatches                 func(*x509.Certificate) bool // the advertised cert's key type
-		pubName                    string
+		route, wantOID, wantSerial, wantSubject, wantCertificateSerial string
+		pubMatches                                                     func(*x509.Certificate) bool // the advertised cert's key type
+		pubName                                                        string
 	}{
-		{"/csc/v1", "1.2.840.113549.1.1.1", "PNONL-123", rsaPub, "RSA"},
-		{"/csc/v2", "1.2.840.10045.2.1", "PNONL-456", ecdsaPub, "ECDSA"},
+		{
+			route:                 "/csc/v1",
+			wantOID:               "1.2.840.113549.1.1.1",
+			wantSerial:            "PNONL-123",
+			wantSubject:           "CN=Jane Doe,serialNumber=PNONL-123",
+			wantCertificateSerial: "07FB0DA8384404C33517B852CFE79F04C5006AC1",
+			pubMatches:            rsaPub,
+			pubName:               "RSA",
+		},
+		{
+			route:                 "/csc/v2",
+			wantOID:               "1.2.840.10045.2.1",
+			wantSerial:            "PNONL-456",
+			wantSubject:           "CN=John Roe,serialNumber=PNONL-456",
+			wantCertificateSerial: "07FB0DA8384404C33517B852CFE79F04C5006AC2",
+			pubMatches:            ecdsaPub,
+			pubName:               "ECDSA",
+		},
 	}
 	for _, c := range cases {
 		resp, err := http.Get(ts.URL + c.route + "/credentials/info")
@@ -255,6 +273,9 @@ func TestInfoCarriesRouteSignerCertAndAlgo(t *testing.T) {
 		if m.Cert.SerialNumber != c.wantSerial {
 			t.Fatalf("%s serialNumber = %q, want %q", c.route, m.Cert.SerialNumber, c.wantSerial)
 		}
+		if m.Cert.SubjectDN != c.wantSubject {
+			t.Fatalf("%s subjectDN = %q, want %q", c.route, m.Cert.SubjectDN, c.wantSubject)
+		}
 		if len(m.Cert.Certificates) != 1 || strings.Contains(m.Cert.Certificates[0], "{{") {
 			t.Fatalf("%s cert placeholder not substituted: %v", c.route, m.Cert.Certificates)
 		}
@@ -270,6 +291,9 @@ func TestInfoCarriesRouteSignerCertAndAlgo(t *testing.T) {
 		// the cert and the OID/signature).
 		if !c.pubMatches(cert) {
 			t.Fatalf("%s cert is not %s", c.route, c.pubName)
+		}
+		if got := strings.ToUpper(hex.EncodeToString(cert.SerialNumber.Bytes())); got != c.wantCertificateSerial {
+			t.Fatalf("%s certificate serial = %s, want %s", c.route, got, c.wantCertificateSerial)
 		}
 	}
 }
