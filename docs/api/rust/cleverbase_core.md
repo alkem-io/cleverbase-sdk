@@ -297,7 +297,8 @@ The signer's identity, derived from their qualified certificate subject.
 ##### Fields
 
 - `serial_number: String`
-  - Certificate serial number from CSC `credentials/info` or its leaf certificate.
+  - Certificate serial number from CSC `credentials/info` or its leaf certificate, canonicalized
+as uppercase hexadecimal without separators or DER `00` sign padding.
 - `common_name: String`
   - Subject common name (`CN`), or empty if absent.
 - `given_name: Option<String>`
@@ -1278,7 +1279,8 @@ How an expected signer identity is matched against the authorizing certificate.
 
 - `CertificateSerialNumber`
   - The credential certificate's serial number from CSC `credentials/info` or its leaf
-certificate when CSC omits `cert.serialNumber`. Default.
+certificate when CSC omits `cert.serialNumber`, canonicalized as uppercase hexadecimal
+without separators or DER `00` sign padding. Default.
 - `CleverbaseSubject`
   - The subject DN's `serialNumber` RDN — the stable natural-person identifier (e.g. `PNONL-…`).
 
