@@ -4,7 +4,8 @@
 //! `signHash` with the synthetic fixture key), then verifies the embedded detached CMS with
 //! **OpenSSL** — an entirely independent implementation. OpenSSL checks: the CMS parses, the
 //! signature over the signed attributes is valid, the `message-digest` matches the ByteRange
-//! content, and the signer certificate chains to the test CA. Skipped if `openssl` is unavailable.
+//! content, and the signer certificate chains to the test CA. SDK assertions always run; only the
+//! additional independent OpenSSL assertion is skipped when the executable is unavailable.
 
 // This is a test binary: unwrap/expect/panic/indexing are the intended assertion mechanism,
 // matching the `cfg(test)` allow the library crates apply to their inline test modules.
@@ -36,6 +37,8 @@ const BT_RSA_RESPONSE: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/
 const BT_RSA_TOKEN: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/rsa-token.der");
 const BT_RSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/rsa.pdf");
 const BT_ECDSA_RESPONSE: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.tsr");
+const BT_ECDSA_TOKEN: &[u8] =
+    include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256-token.der");
 const BT_ECDSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.pdf");
 const BT_WRONG_IMPRINT_RESPONSE: &[u8] =
     include_bytes!("../../../tests/fixtures/pades-bt/wrong-imprint.tsr");
@@ -419,12 +422,27 @@ fn openssl_cms_verify(content: &[u8], cms_der: &[u8]) -> bool {
     out.status.success()
 }
 
-#[test]
-fn produced_b_b_signature_verifies_with_openssl() {
+/// Keep platform tool availability scoped to the independent reference assertion. The SDK
+/// verdicts surrounding each call are unconditional and therefore cannot pass by skipping.
+fn assert_openssl_cms_result_if_available(
+    content: &[u8],
+    cms_der: &[u8],
+    expected: bool,
+    context: &str,
+) {
     if !openssl_available() {
-        eprintln!("openssl not available; skipping independent validation");
+        eprintln!("openssl not available; skipping independent {context} assertion");
         return;
     }
+    assert_eq!(
+        openssl_cms_verify(content, cms_der),
+        expected,
+        "unexpected openssl cms -verify result for {context}"
+    );
+}
+
+#[test]
+fn produced_b_b_signature_verifies_with_openssl() {
     // One parametrized path, both algorithms (FR-004): each produced B-B CMS is accepted by the
     // independent OpenSSL validator.
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
@@ -441,10 +459,11 @@ fn produced_b_b_signature_verifies_with_openssl() {
         assert_eq!(signer.serial_number, algo.certificate_serial());
         assert_eq!(signer.common_name, algo.common_name());
         let (content, cms_der) = extract(&signed.pdf);
-        assert!(
-            openssl_cms_verify(&content, &cms_der),
-            "openssl cms -verify rejected a valid {} B-B signature",
-            algo.name(),
+        assert_openssl_cms_result_if_available(
+            &content,
+            &cms_der,
+            true,
+            &format!("valid {} B-B signature", algo.name()),
         );
     }
 }
@@ -551,23 +570,26 @@ fn verifier_rejects_tampered_pdf_byte_range_content() {
 /// the surrounding DER still parses but the signature no longer matches the signed attributes.
 #[test]
 fn tampered_ecdsa_signature_is_rejected_by_openssl() {
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping tamper test");
-        return;
-    }
     let signed = produce_signed_pdf(KeyAlgo::EcdsaP256);
     let (content, cms_der) = extract(&signed.pdf);
-    // Sanity: the untampered signature verifies, so a later rejection is due to the tamper.
-    assert!(
-        openssl_cms_verify(&content, &cms_der),
-        "baseline ECDSA signature should verify before tampering",
-    );
+    let baseline = verify_pdf(&signed.pdf);
+    assert!(baseline.integrity);
+    assert_eq!(baseline.profile, Some(ConformanceLevel::BB));
     let tampered = flip_signature_byte(&cms_der);
     assert_ne!(tampered, cms_der, "tamper must change the CMS bytes");
-    assert!(
-        !openssl_cms_verify(&content, &tampered),
-        "openssl cms -verify MUST reject a tampered ECDSA signature (no false-accept)",
+    let tampered_verification = verify_pdf(&replace_cms(&signed.pdf, &tampered));
+    assert!(!tampered_verification.integrity);
+    assert_eq!(
+        tampered_verification.reasons,
+        vec![VerificationReason::InvalidSignature]
     );
+    assert_openssl_cms_result_if_available(
+        &content,
+        &cms_der,
+        true,
+        "valid ECDSA signature before tampering",
+    );
+    assert_openssl_cms_result_if_available(&content, &tampered, false, "tampered ECDSA signature");
 }
 
 /// Locate the `SignerInfo.signature` OCTET STRING in a detached CMS `SignedData` and flip a bit in
@@ -757,18 +779,23 @@ fn openssl_timestamp(req_der: &[u8]) -> Vec<u8> {
 fn tsa_token_gen_time_is_parsed() {
     // The checked-in token was issued by OpenSSL 3 from the synthetic TSA fixture; normal test
     // runs never mint timestamps and therefore cannot silently vary by the platform TLS tool.
-    let gen_time = cleverbase_core::timestamp::parse_gen_time(BT_RSA_TOKEN)
-        .expect("genTime should be parsed from a valid TSA token");
-    // A real openssl-issued timestamp is a recent, plausible Unix time (well past 2023).
-    assert!(gen_time > 1_700_000_000, "implausible genTime: {gen_time}");
-    // The token's messageImprint must echo exactly the hash we submitted (binding check).
-    let signature = cleverbase_core::crypto::cms::signer_signature(&extract(BT_RSA_PDF).1).unwrap();
-    let imprint = cleverbase_core::crypto::sha256(&signature);
-    assert_eq!(
-        cleverbase_core::timestamp::parse_message_imprint(BT_RSA_TOKEN).as_deref(),
-        Some(imprint.as_slice()),
-        "token messageImprint must bind the fixture PDF's signature value"
-    );
+    for (token, pdf, algo) in [
+        (BT_RSA_TOKEN, BT_RSA_PDF, "RSA"),
+        (BT_ECDSA_TOKEN, BT_ECDSA_PDF, "ECDSA P-256"),
+    ] {
+        let gen_time = cleverbase_core::timestamp::parse_gen_time(token)
+            .expect("genTime should be parsed from a valid TSA token");
+        // A real openssl-issued timestamp is a recent, plausible Unix time (well past 2023).
+        assert!(gen_time > 1_700_000_000, "implausible genTime: {gen_time}");
+        // The token's messageImprint must echo exactly the hash we submitted (binding check).
+        let signature = cleverbase_core::crypto::cms::signer_signature(&extract(pdf).1).unwrap();
+        let imprint = cleverbase_core::crypto::sha256(&signature);
+        assert_eq!(
+            cleverbase_core::timestamp::parse_message_imprint(token).as_deref(),
+            Some(imprint.as_slice()),
+            "{algo} token messageImprint must bind the fixture PDF's signature value"
+        );
+    }
 }
 
 /// Drive a B-T flow up to the TSA request; return the handle (at TimestampPending) + the TSA query.
@@ -850,6 +877,42 @@ fn with_timestamp_token(pdf: &[u8], token_der: &[u8]) -> Vec<u8> {
     replace_cms(pdf, &timestamped)
 }
 
+/// Put the timestamp signer's certificate in the outer document CMS only while stripping the
+/// token's own certificate set. A verifier that incorrectly searches the outer set would accept
+/// this vector; the token verifier must remain self-contained.
+fn with_timestamp_signer_certificate_only_in_outer(pdf: &[u8], token_der: &[u8]) -> Vec<u8> {
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::{CertificateSet, SignedData};
+    use der::asn1::Any;
+    use der::{Decode, Encode};
+
+    let mut token_content_info = ContentInfo::from_der(token_der).unwrap();
+    let mut token_signed_data =
+        SignedData::from_der(&token_content_info.content.to_der().unwrap()).unwrap();
+    let token_certificates = token_signed_data.certificates.take().unwrap();
+    token_content_info.content = Any::from_der(&token_signed_data.to_der().unwrap()).unwrap();
+    let stripped_token = token_content_info.to_der().unwrap();
+
+    let (_, outer_der) = extract(pdf);
+    let mut outer_content_info = ContentInfo::from_der(&outer_der).unwrap();
+    let mut outer_signed_data =
+        SignedData::from_der(&outer_content_info.content.to_der().unwrap()).unwrap();
+    let mut outer_certificates = outer_signed_data.certificates.take().unwrap().0;
+    for certificate in token_certificates.0.as_slice() {
+        outer_certificates.insert(certificate.clone()).unwrap();
+    }
+    outer_signed_data.certificates = Some(CertificateSet(outer_certificates));
+    outer_content_info.content = Any::from_der(&outer_signed_data.to_der().unwrap()).unwrap();
+    let outer_with_timestamp_certificate = outer_content_info.to_der().unwrap();
+
+    let timestamped = cleverbase_core::crypto::cms::embed_timestamp(
+        &outer_with_timestamp_certificate,
+        &stripped_token,
+    )
+    .unwrap();
+    replace_cms(pdf, &timestamped)
+}
+
 #[test]
 fn b_t_rejects_timestamp_with_wrong_imprint() {
     let (h, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
@@ -871,10 +934,6 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
 
 #[test]
 fn produced_b_t_signature_has_timestamp_and_verifies() {
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping B-T validation");
-        return;
-    }
     // Both algorithms, one path (FR-004): each B-T signature carries a timestamp token AND the base
     // signature still verifies independently after timestamp embedding.
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
@@ -907,10 +966,11 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
             "{} B-T signature must carry a signature-time-stamp unsigned attribute",
             algo.name(),
         );
-        assert!(
-            openssl_cms_verify(&content, &cms_der),
-            "{} B-T base signature failed independent verification",
-            algo.name(),
+        assert_openssl_cms_result_if_available(
+            &content,
+            &cms_der,
+            true,
+            &format!("valid {} B-T signature", algo.name()),
         );
     }
 }
@@ -920,6 +980,23 @@ fn verifier_rejects_a_timestamp_copied_from_another_signature() {
     let ecdsa_bb = produce_signed_pdf(KeyAlgo::EcdsaP256);
 
     let verification = verify_pdf(&with_timestamp_token(&ecdsa_bb.pdf, BT_RSA_TOKEN));
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.profile, None);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::TimestampInvalid]
+    );
+}
+
+#[test]
+fn verifier_does_not_resolve_a_timestamp_signer_from_the_outer_cms() {
+    let rsa_bb = produce_signed_pdf(KeyAlgo::Rsa);
+    let timestamp_certificate_only_in_outer =
+        with_timestamp_signer_certificate_only_in_outer(&rsa_bb.pdf, BT_RSA_TOKEN);
+
+    let verification = verify_pdf(&timestamp_certificate_only_in_outer);
 
     assert!(!verification.integrity);
     assert_eq!(verification.profile, None);
@@ -950,21 +1027,31 @@ fn verifier_rejects_a_bound_timestamp_with_a_tampered_token_signature() {
 /// timestamp embedding must not create a false-accept window.
 #[test]
 fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
-    if !openssl_available() {
-        eprintln!("openssl not available; skipping B-T tamper test");
-        return;
-    }
     let signed = produce_signed_pdf_bt(KeyAlgo::EcdsaP256);
     let (content, cms_der) = extract(&signed.pdf);
-    assert!(
-        openssl_cms_verify(&content, &cms_der),
-        "baseline ECDSA B-T signature should verify before tampering",
-    );
+    let baseline = verify_pdf(&signed.pdf);
+    assert!(baseline.integrity);
+    assert_eq!(baseline.profile, Some(ConformanceLevel::BT));
+    assert!(baseline.reasons.is_empty());
     let tampered = flip_signature_byte(&cms_der);
     assert_ne!(tampered, cms_der, "tamper must change the CMS bytes");
-    assert!(
-        !openssl_cms_verify(&content, &tampered),
-        "openssl cms -verify MUST reject a tampered ECDSA B-T signature",
+    let tampered_verification = verify_pdf(&replace_cms(&signed.pdf, &tampered));
+    assert!(!tampered_verification.integrity);
+    assert_eq!(
+        tampered_verification.reasons,
+        vec![VerificationReason::InvalidSignature]
+    );
+    assert_openssl_cms_result_if_available(
+        &content,
+        &cms_der,
+        true,
+        "valid ECDSA B-T signature before tampering",
+    );
+    assert_openssl_cms_result_if_available(
+        &content,
+        &tampered,
+        false,
+        "tampered ECDSA B-T signature",
     );
 }
 

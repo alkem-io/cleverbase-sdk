@@ -15,6 +15,13 @@ pub const SHA256_OID_STR: &str = "2.16.840.1.101.3.4.2.1";
 pub const SHA256_OID: der::oid::ObjectIdentifier =
     der::oid::ObjectIdentifier::new_unwrap(SHA256_OID_STR);
 
+/// CMS `signedData` content type, shared by PAdES and RFC 3161 parsing.
+pub(crate) const CMS_SIGNED_DATA_OID: der::oid::ObjectIdentifier =
+    der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+/// RFC 3161 `id-ct-TSTInfo` content type, shared by timestamp and CMS validation.
+pub(crate) const RFC3161_TST_INFO_OID: der::oid::ObjectIdentifier =
+    der::oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+
 /// SHA-256 digest of `data`. (SHA-256 is the only hash Cleverbase's CSC service advertises.)
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();

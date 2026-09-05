@@ -12,10 +12,11 @@ use der::oid::ObjectIdentifier;
 use der::{Decode, Encode, Sequence};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
-use crate::crypto::SHA256_OID as ID_SHA256;
+use crate::crypto::{
+    CMS_SIGNED_DATA_OID as ID_SIGNED_DATA, RFC3161_TST_INFO_OID as ID_CT_TST_INFO,
+    SHA256_OID as ID_SHA256,
+};
 
-const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
-const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 const ID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
 const ID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 

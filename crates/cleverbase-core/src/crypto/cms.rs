@@ -19,11 +19,11 @@ use x509_cert::Certificate;
 
 use super::ess::{EssCertIdV2, SigningCertificateV2};
 use super::sha256;
+use super::{CMS_SIGNED_DATA_OID as ID_SIGNED_DATA, RFC3161_TST_INFO_OID as ID_CT_TST_INFO};
 use crate::signing::csc::KeyAlgo;
 
 // Object identifiers (avoid depending on const-oid db layout).
 const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 const ID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 const ID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 const ID_SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
@@ -34,7 +34,6 @@ const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 const SHA256_WITH_RSA_ENCRYPTION: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 const ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 
 // 2050-01-01T00:00:00Z in Unix seconds — UTCTime covers up to (not incl.) this; later uses GeneralizedTime.
 const UTC_TIME_UPPER_BOUND_SECS: u64 = 2_524_608_000;
@@ -1007,6 +1006,15 @@ mod tests {
 
         assert!(matches!(
             verify_signed_data_auto(&timestamp_with_arbitrary_value),
+            Err(CmsError::TimestampInvalid)
+        ));
+
+        let data_content_token = rewrite_signed_data(RSA_TIMESTAMP_TOKEN, |_, signed_data| {
+            signed_data.encap_content_info.econtent_type = ID_DATA;
+        });
+        let timestamp_with_data_content = embed_timestamp(&cms, &data_content_token).unwrap();
+        assert!(matches!(
+            verify_signed_data_auto(&timestamp_with_data_content),
             Err(CmsError::TimestampInvalid)
         ));
     }
