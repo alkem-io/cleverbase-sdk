@@ -32,11 +32,32 @@ need() {
 }
 
 section "Rust (cargo fmt + clippy)"
-if need cargo "install Rust via rustup"; then
-  run cargo cargo fmt --all --check
-  run clippy cargo clippy --workspace --all-targets --all-features -- -D warnings
-  run clippy-python cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
-  run clippy-node cargo clippy --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
+if need rustup "install Rust via rustup (the pinned rust-toolchain.toml channel is required)"; then
+  rust_channel="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+  if [ -z "$rust_channel" ]; then
+    FAILED+=("rust-toolchain.toml: missing toolchain channel")
+  else
+    rust_sysroot="$(rustup run "$rust_channel" rustc --print sysroot 2>/dev/null)"
+    if [ -z "$rust_sysroot" ] || [ ! -x "$rust_sysroot/bin/cargo-clippy" ]; then
+      FAILED+=("rustup toolchain $rust_channel: missing cargo-clippy")
+    else
+      # Do not call whichever `cargo`/`cargo-clippy` happens to be first on PATH: Homebrew's
+      # binaries ignore rust-toolchain.toml and can enforce a different lint set than CI.
+      # The edge is inherent to a mixed package-manager/rustup install, so one toolchain PATH
+      # removes it for every Rust command rather than guarding each invocation separately.
+      export PATH="$rust_sysroot/bin:$PATH"
+      clippy_expected="clippy 0.1.$(printf '%s' "$rust_channel" | awk -F. '{print $2}')"
+      clippy_version="$(rustup run "$rust_channel" cargo clippy --version)"
+      if [[ "$clippy_version" != "$clippy_expected"* ]]; then
+        FAILED+=("clippy: got $clippy_version, want $clippy_expected from $rust_channel")
+      else
+        run cargo rustup run "$rust_channel" cargo fmt --all --check
+        run clippy rustup run "$rust_channel" cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run clippy-python rustup run "$rust_channel" cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
+        run clippy-node rustup run "$rust_channel" cargo clippy --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
+      fi
+    fi
+  fi
 fi
 
 section "Python (ruff + mypy)"

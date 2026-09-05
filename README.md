@@ -157,6 +157,8 @@ CLEVERBASE_LINT_STRICT=1 ./scripts/lint.sh   # also fail on a missing tool
 `scripts/lint.sh` covers everything CI's lint job runs **except** the TypeScript `tsc --noEmit`
 type-check (it needs `npm install` in `frontend/helper-ts` + `examples/reference-integration/web`);
 run that in those dirs if you touch TypeScript. CI remains the authoritative gate.
+Local Rust linting requires [rustup](https://rustup.rs/): the script invokes the exact channel
+pinned in `rust-toolchain.toml` rather than an arbitrary package-manager Cargo.
 
 To run it automatically before every push, enable the committed pre-push hook once per clone:
 
