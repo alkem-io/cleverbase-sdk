@@ -142,8 +142,9 @@ type wireError struct {
 }
 
 type wireResult struct {
-	Ok  *okResult  `cbor:"ok"`
-	Err *wireError `cbor:"err"`
+	Ok           *okResult        `cbor:"ok"`
+	Err          *wireError       `cbor:"err"`
+	Verification *PDFVerification `cbor:"verification"`
 }
 
 type wireResponse struct {
@@ -225,32 +226,68 @@ func AttestationIssuance(request []byte) ([]byte, error) {
 	})
 }
 
-func dispatch(op map[string]any) (*Session, error) {
+func invoke(op map[string]any) (wireResult, error) {
 	req := map[string]any{keySchemaVersion: schemaVersion, keyOp: op}
 	in, err := cbor.Marshal(req)
 	if err != nil {
-		return nil, err
+		return wireResult{}, err
 	}
 	out, err := process(in)
 	if err != nil {
-		return nil, err
+		return wireResult{}, err
 	}
 	var resp wireResponse
 	if err := decMode().Unmarshal(out, &resp); err != nil {
-		return nil, err
+		return wireResult{}, err
 	}
 	// Refuse a response from an unexpected schema version rather than silently mis-decoding it
 	// after a wire-format bump (the binding and the core must agree on the envelope version).
 	if resp.SchemaVersion != schemaVersion {
-		return nil, fmt.Errorf("unexpected schema_version %d (expected %d)", resp.SchemaVersion, schemaVersion)
+		return wireResult{}, fmt.Errorf("unexpected schema_version %d (expected %d)", resp.SchemaVersion, schemaVersion)
 	}
 	if resp.Result.Err != nil {
-		return nil, errors.New(resp.Result.Err.Message)
+		return wireResult{}, errors.New(resp.Result.Err.Message)
 	}
-	if resp.Result.Ok == nil {
+	return resp.Result, nil
+}
+
+func dispatch(op map[string]any) (*Session, error) {
+	result, err := invoke(op)
+	if err != nil {
+		return nil, err
+	}
+	if result.Ok == nil {
 		return nil, errors.New("malformed response: neither ok nor err")
 	}
-	return &Session{Handle: resp.Result.Ok.Handle, Step: resp.Result.Ok.Step}, nil
+	return &Session{Handle: result.Ok.Handle, Step: result.Ok.Step}, nil
+}
+
+// PDFSigner is the identity read from the embedded signing certificate.
+type PDFSigner struct {
+	Serial string `cbor:"serial_number"`
+	CN     string `cbor:"common_name"`
+}
+
+// PDFVerification is the integrity-only verdict for one PDF signature. Profile and Signer are nil
+// unless Integrity is true. It intentionally makes no chain, revocation, or timestamp-token claim.
+type PDFVerification struct {
+	Integrity bool       `cbor:"integrity"`
+	Profile   *string    `cbor:"profile"`
+	Signer    *PDFSigner `cbor:"signer"`
+	Reasons   []string   `cbor:"reasons"`
+}
+
+// VerifyPDF verifies one PDF's ByteRange and embedded CMS signature. Invalid input returns a normal
+// verdict with Integrity=false; a non-nil error is reserved for ABI/CBOR contract failures.
+func VerifyPDF(document []byte) (*PDFVerification, error) {
+	result, err := invoke(map[string]any{keyOp: "verify_pdf", "document": document})
+	if err != nil {
+		return nil, err
+	}
+	if result.Verification == nil {
+		return nil, errors.New("malformed response: missing verification result")
+	}
+	return result.Verification, nil
 }
 
 // BeginSigning starts a signing flow and returns the first Step. Pass opts (or nil) for the

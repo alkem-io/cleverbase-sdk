@@ -1,8 +1,8 @@
 //! Stable C ABI over `cleverbase-core` + `cleverbase-attestation` (contracts/sdk-api.md,
 //! contracts/verifier.md).
 //!
-//! Signing mirrors Cleverbase's own `scal3` boundary: a coarse CBOR-in / CBOR-out
-//! `cleverbase_process`, and `cleverbase_free` to release the returned buffer. The EUDI attestation
+//! Signing and PDF verification share a coarse CBOR-in / CBOR-out `cleverbase_process`, plus
+//! `cleverbase_free` to release the returned buffer. The EUDI attestation
 //! domain adds `cleverbase_attestation_verify` over the same CBOR-in / CBOR-out + `cleverbase_free`
 //! pattern (the always-on verifier bar). Each CBOR envelope is versioned (`schema_version`), so the
 //! ABI stays stable within a SemVer major.
@@ -49,6 +49,9 @@ fn dispatch(req: WireRequest) -> WireResult {
                     message: e.to_string(),
                 },
             }
+        }
+        WireOp::VerifyPdf { document } => {
+            WireResult::Verification(cleverbase_core::verify_pdf(&document))
         }
     }
 }
@@ -317,6 +320,7 @@ mod tests {
                 assert_eq!(handle.schema_version, SCHEMA_VERSION);
             }
             WireResult::Err { message } => panic!("unexpected error: {message}"),
+            WireResult::Verification(_) => panic!("unexpected verification result"),
         }
     }
 
@@ -371,6 +375,7 @@ mod tests {
                 other => panic!("expected redirect, got {other:?}"),
             },
             WireResult::Err { message } => panic!("begin failed: {message}"),
+            WireResult::Verification(_) => panic!("unexpected verification result"),
         };
         let resume = encode(&WireRequest {
             schema_version: SCHEMA_VERSION,
@@ -394,6 +399,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn process_bytes_dispatches_pdf_verification() {
+        let request = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::VerifyPdf {
+                document: b"not a PDF".to_vec(),
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&request))[..]).unwrap();
+        let WireResult::Verification(verification) = response.result else {
+            panic!("expected verification result");
+        };
+        assert!(!verification.integrity);
     }
 
     #[test]
