@@ -12,6 +12,9 @@ begin(request: SigningRequest, config: TrustServiceConfiguration)
 
 resume(handle: SigningSessionHandle, input: ResumeInput)
     -> (handle: SigningSessionHandle, step: Step)
+
+verify_pdf(document: bytes)
+    -> PdfVerification
 ```
 
 `SigningRequest` carries `document`, `conformance_level`, and the optional `expected_signer`
@@ -45,6 +48,13 @@ deterministic (entropy MUST be ≥ 16 bytes).
 to persist. `begin`/`resume` never block on I/O and never mutate shared state (thread-safe;
 unbounded concurrency). `Failed` always carries an evidence record (FR-015).
 
+`verify_pdf` is stateless and performs no I/O. Invalid or unsupported input is a normal
+`PdfVerification { integrity: false, ... }` verdict, not an exception. It validates one signature's
+strict `/ByteRange` and `/Contents` binding, detached CMS structure, signed attributes, embedded
+signer certificate selection, signature, and document message digest. It does not build a trusted
+certificate chain, check revocation, or validate an RFC 3161 token. A structurally present B-T
+timestamp therefore returns `integrity: true` with reason `timestamp_unverified`.
+
 ## Idiomatic binding shapes (illustrative, same semantics)
 
 The native bindings return a CBOR `{ handle, step }`; the host loops on `step.kind`
@@ -71,6 +81,8 @@ Go (over the C-ABI; CBOR under the hood, typed wrapper on top):
 ```go
 sess, err := cleverbase.BeginSigning(document, cfg, conformance, opts, now, entropy)
 // loop: cleverbase.ResumeRedirect(...) | ResumeRedirectError(...) | ResumeHTTP(...)
+
+verification, err := cleverbase.VerifyPDF(document)
 ```
 
 Bindings MAY add a convenience driver that runs the loop given host-provided `doHttp` and
@@ -83,8 +95,9 @@ Coarse, stable, CBOR-in/result-out (mirrors `scal3`):
 int  cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 void cleverbase_free(uint8_t* out, size_t out_len);
 ```
-`in` = CBOR `{ op: "begin"|"resume", ... }`; `out` = CBOR `{ handle, step }` or `{ error }`. The
-CBOR schema is **versioned** (`schema_version`); compatible within a SemVer major (Principle VII).
+`in` = CBOR `{ op: "begin"|"resume"|"verify_pdf", ... }`; `out` carries `ok`, `err`, or
+`verification`. The CBOR schema is **versioned** (`schema_version`); compatible within a SemVer
+major (Principle VII).
 
 ## Error model
 
@@ -93,6 +106,12 @@ CBOR schema is **versioned** (`schema_version`); compatible within a SemVer majo
   `TimestampFailed`, `InvalidDocument`, `AppearancePlacementError`, `SignatureInvalid`).
 - **Programmer/usage errors** (malformed handle, schema mismatch, missing required config) surface
   as the binding's native error type / exception.
+- **PDF verification failures and limitations** are normal verdicts. `reasons` contains one of
+  `not_pdf`, `missing_signature`, `multiple_signatures_unsupported`, `malformed_byte_range`,
+  `unsigned_suffix`, `invalid_contents`, `malformed_cms`, `missing_signer_certificate`,
+  `unsupported_signature_algorithm`, `invalid_signature`, `message_digest_mismatch`, or the
+  non-failing B-T limitation `timestamp_unverified`. `profile` and `signer` are present only when
+  `integrity` is true.
 - No secret material (client_secret, SAD, tokens) appears in any error message or evidence record
   (Principle IV).
 

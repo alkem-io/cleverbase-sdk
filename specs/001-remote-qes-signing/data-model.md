@@ -88,6 +88,19 @@ next effect from `phase`; effects are not stored on the handle.
 - `pdf`: bytes (signed, incremental-update appended); `conformance_level`: enum;
   `pdf_a`: bool (preserved if input was PDF/A).
 
+### PdfVerification (output)
+- `integrity`: bool — true only when one signature dictionary is structurally bound to its raw-hex
+  `/Contents` gap, the embedded CMS signature verifies with the certificate selected by SignerInfo,
+  and the signed `message-digest` equals SHA-256 of the two `/ByteRange` segments.
+- `profile?`: enum `{ B_B, B_T }`, present only when `integrity=true`. B-T means the CMS contains a
+  signature-time-stamp attribute; its token is not validated by this integrity-only operation.
+- `signer?`: `{ serial_number, common_name }`, derived from the embedded signer certificate and
+  present only when `integrity=true`.
+- `reasons`: closed machine-readable list documented by the SDK API contract. Invalid input returns
+  a verdict rather than an exception. A valid B-T result includes `timestamp_unverified`.
+- Explicitly out of scope: certificate path building/trust, revocation, trusted-list status, and
+  RFC 3161 token validation. Phase 1 rejects multiple signatures; co-signing later lifts that limit.
+
 ### TimestampInfo (B-T evidence summary)
 - `tsa`: string (the TSA URL); `gen_time`: i64 (the TSA token's own genTime, Unix seconds);
   `policy_oid?`: string. The raw RFC 3161 `TimeStampToken` is embedded into the CMS as the

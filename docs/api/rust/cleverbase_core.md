@@ -15,8 +15,9 @@ See `specs/001-remote-qes-signing/` for the spec, plan, and contracts.
 Phase 1 (signing) is implemented and tested: the full CSC/OIDC flow (service auth → credential
 discovery → identity check → PDF prepare → hash-bound credential auth → `signHash` → CMS
 assembly → embed), PAdES **B-B** and **B-T** (RFC 3161), **RSA** and **ECDSA P-256**, optional
-visible appearance, and the stateless session handle. See `docs/limitations.md` for the
-later-phase roadmap (B-LT/B-LTA, full PDF/A, EUDI attestation).
+visible appearance, the stateless session handle, and integrity-only verification of a
+singly-signed PDF. See `docs/limitations.md` for the later-phase roadmap (B-LT/B-LTA, full
+PDF/A, EUDI attestation).
 
 ## Module `crypto`
 
@@ -32,6 +33,27 @@ This mirrors how Cleverbase signs: we build the signed attributes, the host obta
 over `sha256(DER(signedAttrs))` (Cleverbase `signHash`), and we assemble a detached
 `SignedData`. No private key ever lives in the core. Built only on vetted RustCrypto crates
 (Constitution Principle IV).
+
+#### Structs
+
+##### struct `VerifiedSignedData`
+
+```rust
+struct VerifiedSignedData
+```
+
+Verified material extracted from a detached CMS signature.
+
+###### Fields
+
+- `message_digest: Vec<u8>`
+  - The signed `message-digest` attribute.
+- `signer_certificate: Vec<u8>`
+  - DER of the certificate selected by SignerInfo issuer-and-serial.
+- `key_algo: KeyAlgo`
+  - Key family asserted by the CMS signature AlgorithmIdentifier.
+- `has_signature_timestamp: bool`
+  - Whether an RFC 3161 signature-time-stamp unsigned attribute is present.
 
 #### Enums
 
@@ -51,6 +73,10 @@ Errors from CMS assembly/verification.
   - The key algorithm is not supported for CMS assembly.
 - `EmptyChain`
   - The certificate chain was empty.
+- `Structure(&'static str)`
+  - The CMS is parseable DER but is not the detached CAdES shape this SDK verifies.
+- `SignerCertificateAbsent`
+  - No embedded certificate matched the CMS SignerInfo identifier.
 - `Verify(String)`
   - Signature verification failed.
 
@@ -124,6 +150,14 @@ fn verify_signed_data(cms_der: &[u8], key_algo: KeyAlgo) -> Result<Vec<u8>, CmsE
 Verify the assembled CMS signature against the signer's leaf certificate (defense-in-depth: the
 core must never report `Signed` for a signature it cannot itself verify). On success returns the
 `message-digest` signed attribute so the caller can bind it to the document without re-parsing.
+
+##### fn `verify_signed_data_auto`
+
+```rust
+fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, CmsError>
+```
+
+Verify a detached CMS using the algorithm and certificate identified by its SignerInfo.
 
 ### Module `ess`
 
@@ -1350,6 +1384,100 @@ fn to_hex(bytes: &[u8]) -> String
 
 Lowercase hex encoding.
 
+## Module `verification`
+
+Integrity-only verification of a single PAdES signature.
+
+This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
+signer certificate. Chain building, revocation, and RFC 3161 token validation belong to the
+later qualified-validation backend.
+
+### Structs
+
+#### struct `PdfSigner`
+
+```rust
+struct PdfSigner
+```
+
+Identity fields read from the embedded signer certificate.
+
+##### Fields
+
+- `serial_number: String`
+  - Canonical uppercase certificate serial without separators or DER sign padding.
+- `common_name: String`
+  - Subject common name (`CN`), or empty if the certificate has none.
+
+#### struct `PdfVerification`
+
+```rust
+struct PdfVerification
+```
+
+The integrity-only result for one PDF signature.
+
+A malformed or invalid document is represented as `integrity = false`, not as an API error,
+so callers can safely display a deterministic validation verdict.
+
+##### Fields
+
+- `integrity: bool`
+  - Whether the CMS signature and signed document bytes are internally consistent.
+- `profile: Option<ConformanceLevel>`
+  - The detected PAdES profile, only when integrity is true.
+- `signer: Option<PdfSigner>`
+  - The embedded signer's identity, only when integrity is true.
+- `reasons: Vec<VerificationReason>`
+  - Failure or limitation codes. A valid B-T result reports `timestamp_unverified` here.
+
+### Enums
+
+#### enum `VerificationReason`
+
+```rust
+enum VerificationReason
+```
+
+A machine-readable limitation or failure observed while verifying a PDF.
+
+##### Variants
+
+- `NotPdf`
+  - The input does not start with a PDF header.
+- `MissingSignature`
+  - No signature dictionary was found.
+- `MultipleSignaturesUnsupported`
+  - The PDF has more than one signature; co-signing validation is a later phase.
+- `MalformedByteRange`
+  - The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
+- `UnsignedSuffix`
+  - Bytes appear after the final signed range.
+- `InvalidContents`
+  - The signature `/Contents` value is not valid hex-encoded CMS data.
+- `MalformedCms`
+  - The embedded CMS cannot be parsed.
+- `MissingSignerCertificate`
+  - The CMS has no certificate matching its SignerInfo.
+- `UnsupportedSignatureAlgorithm`
+  - The CMS signature algorithm is not supported by this verifier.
+- `InvalidSignature`
+  - The CMS signature does not verify against the embedded signer certificate.
+- `MessageDigestMismatch`
+  - The CMS message-digest differs from the PDF ByteRange digest.
+- `TimestampUnverified`
+  - A B-T timestamp attribute exists but timestamp-token trust is not part of this verifier.
+
+### Functions
+
+#### fn `verify_pdf`
+
+```rust
+fn verify_pdf(document: &[u8]) -> PdfVerification
+```
+
+Verify the integrity of one unsigned-or-singly-signed PDF.
+
 ## Module `wire`
 
 Versioned CBOR wire envelope for the C-ABI (Go) and WASM boundaries (contracts/sdk-api.md).
@@ -1406,6 +1534,8 @@ A decoded operation request from a non-native binding.
   - Begin a new signing flow.
 - `Resume { handle: SigningSessionHandle, input: ResumeInput, ctx: HostContext }`
   - Resume an existing signing flow.
+- `VerifyPdf { document: Vec<u8> }`
+  - Verify one PDF using the core's integrity-only verifier.
 
 #### enum `WireResult`
 
@@ -1421,6 +1551,8 @@ The result of a wire operation: a `(handle, step)` pair on success, or an error 
   - Success: the updated session handle plus the next step.
 - `Err { message: String }`
   - A usage/protocol error, rendered as a message.
+- `Verification(PdfVerification)`
+  - A PDF integrity verdict. Invalid documents are successful operations with `integrity=false`.
 
 ### Functions
 
