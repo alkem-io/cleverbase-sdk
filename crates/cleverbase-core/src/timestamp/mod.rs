@@ -12,7 +12,13 @@ use der::oid::ObjectIdentifier;
 use der::{Decode, Encode, Sequence};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
-use crate::crypto::SHA256_OID as ID_SHA256;
+use crate::crypto::{
+    CMS_SIGNED_DATA_OID as ID_SIGNED_DATA, RFC3161_TST_INFO_OID as ID_CT_TST_INFO,
+    SHA256_OID as ID_SHA256,
+};
+
+const ID_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+const ID_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3");
 
 /// Errors from RFC 3161 handling.
 #[derive(Debug, thiserror::Error)]
@@ -106,13 +112,9 @@ pub fn parse_response(resp_der: &[u8]) -> Result<Vec<u8>, TimestampError> {
 /// Parse the TSA's `genTime` (Unix seconds) from a `TimeStampToken` (CMS `ContentInfo`, DER).
 /// Returns `None` if the token cannot be parsed.
 pub fn parse_gen_time(token_der: &[u8]) -> Option<i64> {
-    let ci = ContentInfo::from_der(token_der).ok()?;
-    let sd = SignedData::from_der(&ci.content.to_der().ok()?).ok()?;
-    // eContent is an OCTET STRING wrapping the TSTInfo DER.
-    let econtent = sd.encap_content_info.econtent?;
-    let tstinfo = OctetString::from_der(&econtent.to_der().ok()?).ok()?;
+    let tstinfo = token_tst_info(token_der)?;
     // Descend into the TSTInfo SEQUENCE and take its first GeneralizedTime field (= genTime).
-    let content = sequence_content(tstinfo.as_bytes())?;
+    let content = sequence_content(&tstinfo)?;
     let gt_tlv = first_tlv_with_tag(content, 0x18)?;
     parse_generalized_time_secs(gt_tlv)
 }
@@ -170,17 +172,54 @@ fn parse_generalized_time_secs(tlv: &[u8]) -> Option<i64> {
 /// `TimeStampToken`, so the caller can confirm the token is bound to the value it submitted.
 /// Returns `None` if the token cannot be parsed.
 pub fn parse_message_imprint(token_der: &[u8]) -> Option<Vec<u8>> {
+    parse_message_imprint_with_algorithm(token_der).map(|(_, imprint)| imprint)
+}
+
+/// Parse the algorithm and bytes of the RFC 3161 `messageImprint` from a timestamp token.
+pub(crate) fn parse_message_imprint_with_algorithm(
+    token_der: &[u8],
+) -> Option<(ObjectIdentifier, Vec<u8>)> {
+    let tstinfo = token_tst_info(token_der)?;
+    let content = sequence_content(&tstinfo)?;
+    // messageImprint is the first SEQUENCE field of TSTInfo.
+    let message_imprint = MessageImprint::from_der(first_tlv_with_tag(content, 0x30)?).ok()?;
+    Some((
+        message_imprint.hash_algorithm.oid,
+        message_imprint.hashed_message.as_bytes().to_vec(),
+    ))
+}
+
+/// Hash the timestamped signature value with the SHA-2 algorithm declared by `messageImprint`.
+/// Other algorithms are outside the integrity verifier's deliberately narrow profile.
+pub(crate) fn hash_message_imprint(
+    algorithm: ObjectIdentifier,
+    signature_value: &[u8],
+) -> Option<Vec<u8>> {
+    use sha2::Digest;
+
+    match algorithm {
+        ID_SHA256 => Some(sha2::Sha256::digest(signature_value).to_vec()),
+        ID_SHA384 => Some(sha2::Sha384::digest(signature_value).to_vec()),
+        ID_SHA512 => Some(sha2::Sha512::digest(signature_value).to_vec()),
+        _ => None,
+    }
+}
+
+/// Return the RFC 3161 `TSTInfo` bytes from a timestamp token, rejecting a generic CMS object that
+/// does not carry the required signed-data and TSTInfo content types.
+fn token_tst_info(token_der: &[u8]) -> Option<Vec<u8>> {
     let ci = ContentInfo::from_der(token_der).ok()?;
+    if ci.content_type != ID_SIGNED_DATA {
+        return None;
+    }
     let sd = SignedData::from_der(&ci.content.to_der().ok()?).ok()?;
+    if sd.encap_content_info.econtent_type != ID_CT_TST_INFO {
+        return None;
+    }
+    // eContent is an OCTET STRING wrapping the TSTInfo DER.
     let econtent = sd.encap_content_info.econtent?;
     let tstinfo = OctetString::from_der(&econtent.to_der().ok()?).ok()?;
-    let content = sequence_content(tstinfo.as_bytes())?;
-    // messageImprint is the first SEQUENCE field of TSTInfo; its hashedMessage is the OCTET STRING.
-    let mi = first_tlv_with_tag(content, 0x30)?;
-    let mi_content = sequence_content(mi)?;
-    let hashed = first_tlv_with_tag(mi_content, 0x04)?;
-    let (len, hdr) = read_der_len(hashed.get(1..)?)?;
-    Some(hashed.get(1 + hdr..1 + hdr + len)?.to_vec())
+    Some(tstinfo.as_bytes().to_vec())
 }
 
 /// Read a DER length at the start of `b`; returns `(content_length, length_field_byte_count)`.
@@ -308,5 +347,25 @@ mod tests {
         assert_eq!(parse_gen_time(b"not a token"), None);
         assert_eq!(parse_message_imprint(b"\x30\x03garbage"), None);
         assert_eq!(parse_gen_time(&[0x30, 0x80]), None); // indefinite-length form rejected
+    }
+
+    #[test]
+    fn message_imprint_hashes_follow_the_declared_sha2_algorithm() {
+        use sha2::Digest;
+
+        let value = b"the CMS signature value";
+        assert_eq!(
+            hash_message_imprint(ID_SHA256, value).unwrap(),
+            sha2::Sha256::digest(value).as_slice()
+        );
+        assert_eq!(
+            hash_message_imprint(ID_SHA384, value).unwrap(),
+            sha2::Sha384::digest(value).as_slice()
+        );
+        assert_eq!(
+            hash_message_imprint(ID_SHA512, value).unwrap(),
+            sha2::Sha512::digest(value).as_slice()
+        );
+        assert_eq!(hash_message_imprint(ID_SIGNED_DATA, value), None);
     }
 }

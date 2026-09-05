@@ -37,6 +37,12 @@ pub enum WireOp {
         /// Host-provided context (clock + entropy).
         ctx: HostContext,
     },
+    /// Verify one PDF using the core's integrity-only verifier.
+    VerifyPdf {
+        /// The PDF document bytes.
+        #[serde(with = "serde_bytes")]
+        document: Vec<u8>,
+    },
 }
 
 /// Versioned request envelope.
@@ -57,7 +63,7 @@ pub struct WireResponse {
     pub result: WireResult,
 }
 
-/// The result of a wire operation: a `(handle, step)` pair on success, or an error message.
+/// The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // Wire protocol enum: the ok variant (handle + step) is naturally larger than the err variant;
@@ -76,6 +82,11 @@ pub enum WireResult {
         /// Human-readable error message.
         message: String,
     },
+    /// A PDF integrity verdict. Invalid documents are successful operations with `integrity=false`.
+    Verification(
+        /// The typed verifier result.
+        crate::verification::PdfVerification,
+    ),
 }
 
 /// Decode a CBOR request envelope, rejecting unknown schema versions.
@@ -190,6 +201,19 @@ mod tests {
     }
 
     #[test]
+    fn verify_pdf_request_roundtrip() {
+        let req = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::VerifyPdf {
+                document: b"%PDF-1.7".to_vec(),
+            },
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&req, &mut buf).unwrap();
+        assert_eq!(decode_request(&buf).unwrap(), req);
+    }
+
+    #[test]
     fn decode_rejects_wrong_version() {
         let mut req = sample_begin();
         req.schema_version = 999;
@@ -212,6 +236,16 @@ mod tests {
                 message: "boom".into()
             }
         );
+    }
+
+    #[test]
+    fn verification_response_roundtrip() {
+        let bytes = encode_response(WireResult::Verification(crate::verify_pdf(b"not a PDF")));
+        let response: WireResponse = ciborium::from_reader(&bytes[..]).unwrap();
+        let WireResult::Verification(verification) = response.result else {
+            panic!("expected verification result");
+        };
+        assert!(!verification.integrity);
     }
 
     #[test]

@@ -19,6 +19,9 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 - [type AppearanceShow](<#AppearanceShow>)
 - [type Config](<#Config>)
 - [type ExpectedSigner](<#ExpectedSigner>)
+- [type PDFSigner](<#PDFSigner>)
+- [type PDFVerification](<#PDFVerification>)
+  - [func VerifyPDF\(document \[\]byte\) \(\*PDFVerification, error\)](<#VerifyPDF>)
 - [type Rect](<#Rect>)
 - [type RequestOptions](<#RequestOptions>)
 - [type Session](<#Session>)
@@ -31,7 +34,7 @@ It wraps the Rust core's stable C ABI \(CBOR request in / result out\) and expos
 
 
 <a name="AttestationIssuance"></a>
-## func [AttestationIssuance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L222>)
+## func [AttestationIssuance](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L223>)
 
 ```go
 func AttestationIssuance(request []byte) ([]byte, error)
@@ -40,7 +43,7 @@ func AttestationIssuance(request []byte) ([]byte, error)
 AttestationIssuance drives the EUDI attestation issuance / presentation sans\-IO state machine over a CBOR IssuanceRequest envelope \(issuance schema version 1\) and returns the CBOR IssuanceResponse. Like AttestationVerify it is CBOR\-in / CBOR\-out \(see the wire schema\). The holder's private key never crosses this boundary: a \`sign\` step surfaces a signing input the host signs out\-of\-process and feeds back via a follow\-up op \(finish\_present / resume\_obtain\).
 
 <a name="AttestationVerify"></a>
-## func [AttestationVerify](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L192>)
+## func [AttestationVerify](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L193>)
 
 ```go
 func AttestationVerify(request []byte) ([]byte, error)
@@ -49,7 +52,7 @@ func AttestationVerify(request []byte) ([]byte, error)
 AttestationVerify runs the EUDI attestation verifier over a CBOR VerifyRequest envelope \(attestation schema version 5\) and returns the CBOR VerifyResponse. Unlike the signing surface, the attestation surface is CBOR\-in / CBOR\-out: the caller builds the VerifyRequest and decodes the VerifyResponse per the documented wire schema \(see specs/004\-attestation\-and\-verification/standards\-conformance.md\). The VALID/INVALID verdict \(and any decode error\) rides inside the VerifyResponse \`outcome\`; a non\-nil error here means the FFI call itself failed \(null/oversized/contained\-panic\), never a mere INVALID verdict.
 
 <a name="AttestationVerifyVpToken"></a>
-## func [AttestationVerifyVpToken](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L211>)
+## func [AttestationVerifyVpToken](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L212>)
 
 ```go
 func AttestationVerifyVpToken(request []byte) ([]byte, error)
@@ -123,6 +126,41 @@ type ExpectedSigner struct {
 }
 ```
 
+<a name="PDFSigner"></a>
+## type [PDFSigner](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L266-L269>)
+
+PDFSigner is the identity read from the embedded signing certificate.
+
+```go
+type PDFSigner struct {
+    Serial string `cbor:"serial_number"`
+    CN     string `cbor:"common_name"`
+}
+```
+
+<a name="PDFVerification"></a>
+## type [PDFVerification](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L274-L279>)
+
+PDFVerification is the integrity\-only verdict for one PDF signature. Profile and Signer are nil unless Integrity is true. It intentionally makes no certificate\-chain trust, revocation, TSA trust, or TSA policy claim.
+
+```go
+type PDFVerification struct {
+    Integrity bool       `cbor:"integrity"`
+    Profile   *string    `cbor:"profile"`
+    Signer    *PDFSigner `cbor:"signer"`
+    Reasons   []string   `cbor:"reasons"`
+}
+```
+
+<a name="VerifyPDF"></a>
+### func [VerifyPDF](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L283>)
+
+```go
+func VerifyPDF(document []byte) (*PDFVerification, error)
+```
+
+VerifyPDF verifies one PDF's ByteRange and embedded CMS signature. Invalid input returns a normal verdict with Integrity=false; a non\-nil error is reserved for ABI/CBOR contract failures.
+
 <a name="Rect"></a>
 ## type [Rect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L91-L96>)
 
@@ -163,7 +201,7 @@ type Session struct {
 ```
 
 <a name="BeginSigning"></a>
-### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L258>)
+### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L296>)
 
 ```go
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error)
@@ -172,7 +210,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request.
 
 <a name="ResumeHTTP"></a>
-### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L322>)
+### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L360>)
 
 ```go
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error)
@@ -181,7 +219,7 @@ func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, 
 ResumeHTTP advances the flow with the result of a performed HTTP effect.
 
 <a name="ResumeRedirect"></a>
-### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L300>)
+### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L338>)
 
 ```go
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error)
@@ -190,7 +228,7 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 ResumeRedirect advances the flow with the OAuth code\+state from a redirect return.
 
 <a name="ResumeRedirectError"></a>
-### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L312>)
+### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L350>)
 
 ```go
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error)

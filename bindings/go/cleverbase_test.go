@@ -443,3 +443,16 @@ func TestAttestationIssuanceMalformedRequestIsErr(t *testing.T) {
 		t.Fatal("a malformed IssuanceRequest must yield an err outcome")
 	}
 }
+
+func TestVerifyPDFReturnsInvalidVerdictWithoutError(t *testing.T) {
+	verification, err := VerifyPDF([]byte("not a PDF"))
+	if err != nil {
+		t.Fatalf("VerifyPDF: %v", err)
+	}
+	if verification.Integrity {
+		t.Fatal("non-PDF input must not pass integrity verification")
+	}
+	if len(verification.Reasons) != 1 || verification.Reasons[0] != "not_pdf" {
+		t.Fatalf("reasons = %#v, want [not_pdf]", verification.Reasons)
+	}
+}

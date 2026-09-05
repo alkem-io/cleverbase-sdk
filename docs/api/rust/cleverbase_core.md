@@ -15,8 +15,9 @@ See `specs/001-remote-qes-signing/` for the spec, plan, and contracts.
 Phase 1 (signing) is implemented and tested: the full CSC/OIDC flow (service auth → credential
 discovery → identity check → PDF prepare → hash-bound credential auth → `signHash` → CMS
 assembly → embed), PAdES **B-B** and **B-T** (RFC 3161), **RSA** and **ECDSA P-256**, optional
-visible appearance, and the stateless session handle. See `docs/limitations.md` for the
-later-phase roadmap (B-LT/B-LTA, full PDF/A, EUDI attestation).
+visible appearance, the stateless session handle, and integrity-only verification of a
+singly-signed PDF. See `docs/limitations.md` for the later-phase roadmap (B-LT/B-LTA, full
+PDF/A, EUDI attestation).
 
 ## Module `crypto`
 
@@ -48,11 +49,19 @@ Errors from CMS assembly/verification.
 - `Der(Error)`
   - A DER encode/decode error.
 - `UnsupportedAlgo`
-  - The key algorithm is not supported for CMS assembly.
+  - A key, digest, or signature algorithm is not supported for CMS assembly or verification.
 - `EmptyChain`
   - The certificate chain was empty.
+- `Structure(&'static str)`
+  - The CMS is parseable DER but is not a supported CAdES or timestamp-token shape.
+- `SignerCertificateAbsent`
+  - No embedded certificate matched the CMS SignerInfo identifier.
 - `Verify(String)`
   - Signature verification failed.
+- `TimestampInvalid`
+  - An RFC 3161 signature-time-stamp token is malformed, foreign, or invalidly signed.
+- `TimestampUnsupported`
+  - An RFC 3161 signature-time-stamp token uses an unsupported algorithm.
 
 #### Functions
 
@@ -88,7 +97,7 @@ Embed an RFC 3161 timestamp token as the `signature-time-stamp` unsigned attribu
 fn has_signature_timestamp(content_info_der: &[u8]) -> Result<bool, CmsError>
 ```
 
-True if the CMS SignerInfo carries a `signature-time-stamp` unsigned attribute (B-T).
+True if the CMS SignerInfo carries a valid, signature-bound `signature-time-stamp` attribute.
 
 ##### fn `reparse_for_verify`
 
@@ -1350,6 +1359,116 @@ fn to_hex(bytes: &[u8]) -> String
 
 Lowercase hex encoding.
 
+## Module `verification`
+
+Integrity-only verification of a single PAdES signature.
+
+This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
+signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
+with PKCS #1 v1.5 or P-256 ECDSA with SHA-256 (`ecdsa-with-SHA256`), and the SDK's minimal
+`ESSCertIDv2` form. Other valid CMS profiles may return an unsupported or malformed verdict.
+B-T classification also verifies that the timestamp token binds the signature value, that its
+CMS content digest matches its TSTInfo content, and that it is signed by a certificate embedded
+in that token. It does not establish certificate or TSA trust, trusted-list or revocation status,
+signer authorization, or TSA policy; `integrity = true` is not qualified validation.
+
+### Structs
+
+#### struct `PdfSigner`
+
+```rust
+struct PdfSigner
+```
+
+Identity fields read from the embedded signer certificate.
+
+##### Fields
+
+- `serial_number: String`
+  - Canonical uppercase certificate serial without separators or DER sign padding.
+- `common_name: String`
+  - Subject common name (`CN`), or empty if the certificate has none.
+
+#### struct `PdfVerification`
+
+```rust
+struct PdfVerification
+```
+
+The integrity-only result for one PDF signature.
+
+A malformed, unsupported, or invalid document is represented as `integrity = false`, not as
+an API error, so callers can safely display a deterministic validation verdict. An integrity
+verdict establishes neither certificate trust nor signer authorization and MUST NOT be
+presented as qualified validation.
+
+##### Fields
+
+- `integrity: bool`
+  - Whether the CMS signature and signed document bytes are internally consistent.
+- `profile: Option<ConformanceLevel>`
+  - The detected PAdES profile, only when integrity is true.
+- `signer: Option<PdfSigner>`
+  - The embedded signer's identity, only when integrity is true.
+- `reasons: Vec<VerificationReason>`
+  - Failure codes. Empty if and only if `integrity` is true.
+
+### Enums
+
+#### enum `VerificationReason`
+
+```rust
+enum VerificationReason
+```
+
+A machine-readable limitation or failure observed while verifying a PDF.
+
+##### Variants
+
+- `NotPdf`
+  - The input does not start with a PDF header.
+- `MalformedPdf`
+  - The input starts with a PDF header but is not a parseable PDF.
+- `MissingSignature`
+  - No signature dictionary was found.
+- `MultipleSignaturesUnsupported`
+  - The PDF has more than one signature; co-signing validation is a later phase.
+- `MalformedByteRange`
+  - The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
+- `UnsupportedSubfilter`
+  - The signature uses a detached-signature subfilter this verifier does not support.
+- `UnsignedSuffix`
+  - Bytes appear after the final signed range.
+- `InvalidContents`
+  - The signature `/Contents` value is not valid hex-encoded CMS data.
+- `MalformedCms`
+  - The embedded CMS cannot be parsed.
+- `MissingSignerCertificate`
+  - The CMS has no certificate matching its SignerInfo.
+- `UnsupportedSignatureAlgorithm`
+  - The CMS digest or signature algorithm is not supported by this verifier.
+- `InvalidSignature`
+  - The CMS signature does not verify against the embedded signer certificate.
+- `MessageDigestMismatch`
+  - The CMS message-digest differs from the PDF ByteRange digest.
+- `TimestampInvalid`
+  - The RFC 3161 timestamp token is malformed, foreign, or has an invalid signature.
+- `TimestampUnsupported`
+  - The RFC 3161 timestamp token uses an unsupported digest or signature algorithm.
+
+### Functions
+
+#### fn `verify_pdf`
+
+```rust
+fn verify_pdf(document: &[u8]) -> PdfVerification
+```
+
+Verify one unsigned-or-singly-signed PDF against the SHA-256 CMS profile emitted by this SDK.
+
+This operation establishes document/CMS integrity only. It does not establish certificate
+trust, trusted-list or revocation status, signer authorization, TSA trust, or TSA policy.
+
 ## Module `wire`
 
 Versioned CBOR wire envelope for the C-ABI (Go) and WASM boundaries (contracts/sdk-api.md).
@@ -1406,6 +1525,8 @@ A decoded operation request from a non-native binding.
   - Begin a new signing flow.
 - `Resume { handle: SigningSessionHandle, input: ResumeInput, ctx: HostContext }`
   - Resume an existing signing flow.
+- `VerifyPdf { document: Vec<u8> }`
+  - Verify one PDF using the core's integrity-only verifier.
 
 #### enum `WireResult`
 
@@ -1413,7 +1534,7 @@ A decoded operation request from a non-native binding.
 enum WireResult
 ```
 
-The result of a wire operation: a `(handle, step)` pair on success, or an error message.
+The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
 
 ##### Variants
 
@@ -1421,6 +1542,8 @@ The result of a wire operation: a `(handle, step)` pair on success, or an error 
   - Success: the updated session handle plus the next step.
 - `Err { message: String }`
   - A usage/protocol error, rendered as a message.
+- `Verification(PdfVerification)`
+  - A PDF integrity verdict. Invalid documents are successful operations with `integrity=false`.
 
 ### Functions
 

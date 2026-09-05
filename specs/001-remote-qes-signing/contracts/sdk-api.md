@@ -12,6 +12,9 @@ begin(request: SigningRequest, config: TrustServiceConfiguration)
 
 resume(handle: SigningSessionHandle, input: ResumeInput)
     -> (handle: SigningSessionHandle, step: Step)
+
+verify_pdf(document: bytes)
+    -> PdfVerification
 ```
 
 `SigningRequest` carries `document`, `conformance_level`, and the optional `expected_signer`
@@ -45,6 +48,19 @@ deterministic (entropy MUST be ≥ 16 bytes).
 to persist. `begin`/`resume` never block on I/O and never mutate shared state (thread-safe;
 unbounded concurrency). `Failed` always carries an evidence record (FR-015).
 
+`verify_pdf` is stateless and performs no I/O. Invalid or unsupported input is a normal
+`PdfVerification { integrity: false, ... }` verdict, not an exception. It accepts the SHA-256 CMS
+profile emitted by this SDK: `rsaEncryption` with PKCS #1 v1.5 or P-256 ECDSA with SHA-256
+(`ecdsa-with-SHA256`), plus `ESSCertIDv2` with its default SHA-256 algorithm and no `issuerSerial`.
+Other valid CMS profiles may return an unsupported or malformed verdict. Within that profile it
+validates one signature's strict `/ByteRange` and `/Contents` binding, detached CMS structure,
+signed attributes, embedded signer certificate selection, signature, and document message digest.
+`profile=B_T` means the signature-time-stamp token binds the signature value through its declared
+SHA-2 `messageImprint`, and the token's CMS signature and content digest verify against the signer
+certificate selected from the token's own certificate set. It does not establish signer or TSA
+certificate trust, trusted-list or revocation status, signer authorization, or TSA policy.
+`integrity=true` is therefore not qualified validation.
+
 ## Idiomatic binding shapes (illustrative, same semantics)
 
 The native bindings return a CBOR `{ handle, step }`; the host loops on `step.kind`
@@ -71,6 +87,8 @@ Go (over the C-ABI; CBOR under the hood, typed wrapper on top):
 ```go
 sess, err := cleverbase.BeginSigning(document, cfg, conformance, opts, now, entropy)
 // loop: cleverbase.ResumeRedirect(...) | ResumeRedirectError(...) | ResumeHTTP(...)
+
+verification, err := cleverbase.VerifyPDF(document)
 ```
 
 Bindings MAY add a convenience driver that runs the loop given host-provided `doHttp` and
@@ -83,8 +101,9 @@ Coarse, stable, CBOR-in/result-out (mirrors `scal3`):
 int  cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 void cleverbase_free(uint8_t* out, size_t out_len);
 ```
-`in` = CBOR `{ op: "begin"|"resume", ... }`; `out` = CBOR `{ handle, step }` or `{ error }`. The
-CBOR schema is **versioned** (`schema_version`); compatible within a SemVer major (Principle VII).
+`in` = CBOR `{ op: "begin"|"resume"|"verify_pdf", ... }`; `out` carries `ok`, `err`, or
+`verification`. The CBOR schema is **versioned** (`schema_version`); compatible within a SemVer
+major (Principle VII).
 
 ## Error model
 
@@ -93,6 +112,13 @@ CBOR schema is **versioned** (`schema_version`); compatible within a SemVer majo
   `TimestampFailed`, `InvalidDocument`, `AppearancePlacementError`, `SignatureInvalid`).
 - **Programmer/usage errors** (malformed handle, schema mismatch, missing required config) surface
   as the binding's native error type / exception.
+- **PDF verification failures** are normal verdicts. `reasons` contains one of `not_pdf`,
+  `malformed_pdf`, `missing_signature`, `multiple_signatures_unsupported`,
+  `malformed_byte_range`, `unsupported_subfilter`, `unsigned_suffix`, `invalid_contents`,
+  `malformed_cms`, `missing_signer_certificate`, `unsupported_signature_algorithm`,
+  `invalid_signature`, `message_digest_mismatch`, `timestamp_invalid`, or
+  `timestamp_unsupported`. `integrity` is true if and only if `reasons` is empty; `profile` and
+  `signer` are present only in that case.
 - No secret material (client_secret, SAD, tokens) appears in any error message or evidence record
   (Principle IV).
 

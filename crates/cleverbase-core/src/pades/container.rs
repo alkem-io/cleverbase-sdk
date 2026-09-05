@@ -51,14 +51,21 @@ pub enum PadesError {
 /// scan, this works even when the signature dictionary lives inside a compressed object stream
 /// (PDF 1.5+), because lopdf decompresses object streams on load.
 fn document_is_signed(doc: &Document) -> bool {
-    doc.objects.values().any(|obj| {
-        obj.as_dict().is_ok_and(|d| {
-            d.get(b"ByteRange").is_ok()
-                || d.get(b"Type")
-                    .and_then(|t| t.as_name())
-                    .is_ok_and(|n| n == b"Sig")
-        })
-    })
+    doc.objects
+        .values()
+        .any(|obj| obj.as_dict().is_ok_and(is_signature_dictionary))
+}
+
+/// Whether a PDF dictionary is a signature dictionary or carries a signature ByteRange.
+///
+/// Shared by signing's already-signed check and offline verification so both operations identify
+/// candidate signature objects by the same structural rule.
+pub(crate) fn is_signature_dictionary(dictionary: &Dictionary) -> bool {
+    dictionary.get(b"ByteRange").is_ok()
+        || dictionary
+            .get(b"Type")
+            .and_then(Object::as_name)
+            .is_ok_and(|name| name == b"Sig")
 }
 
 /// A resolved visible signature appearance: where to draw and the text lines to render (FR-016).
