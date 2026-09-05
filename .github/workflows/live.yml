@@ -91,6 +91,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         with:
           go-version: "1.22"
+          cache-dependency-path: examples/reference-integration/signing-service/go.sum
 
       - name: Build the cleverbase-ffi library
         if: steps.gate.outputs.run == 'true'
