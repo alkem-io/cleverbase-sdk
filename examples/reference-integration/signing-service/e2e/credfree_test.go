@@ -135,16 +135,37 @@ func stateFromURL(rawURL string) string {
 	return u.Query().Get("state")
 }
 
+// flowRun is the result of driving one signing journey. CorrelationID is retained for contract tests
+// that inspect the session's server-side evidence after an intentionally failed upstream response.
+// The public HTTP result endpoint remains completion-only.
+type flowRun struct {
+	correlationID string
+	pdf           []byte
+	evidence      string
+	status        string
+	reason        string
+}
+
 // runFlow performs start → complete ×2 and returns the result PDF + evidence header (or the terminal
 // status/reason if it ends early). It drives each Cleverbase redirect through the pluggable Authorizer
 // (mockAutoApprove for credential-free runs, Interactive/Headless for live), calling Authorize exactly
 // once per redirect; the loop itself is authorizer-agnostic (contracts/authorizer.md, FR-013).
 func runFlow(t *testing.T, auth Authorizer, svc *httptest.Server, startBody string) (pdf []byte, evidence string, status, reason string) {
 	t.Helper()
+	run := driveFlow(t, auth, svc, startBody)
+	return run.pdf, run.evidence, run.status, run.reason
+}
+
+// driveFlow is the single flow driver used by all E2E backends. Keeping correlation id with the
+// terminal result lets a contract suite inspect failure evidence without duplicating start/complete
+// control flow or widening the completion-only public result endpoint.
+func driveFlow(t *testing.T, auth Authorizer, svc *httptest.Server, startBody string) flowRun {
+	t.Helper()
 	start := postJSON(t, svc.URL+"/v1/sign/start", startBody)
 	corr, _ := start["correlationId"].(string)
 	redirect, _ := start["redirectUrl"].(string)
 	expectState := stateFromURL(redirect)
+	status, reason := "", ""
 
 	for i := 0; i < 2 && redirect != ""; i++ {
 		code, state, err := auth.Authorize(context.Background(), redirect, expectState)
@@ -160,11 +181,11 @@ func runFlow(t *testing.T, auth Authorizer, svc *httptest.Server, startBody stri
 			break
 		}
 		if status != "authorizing" {
-			return nil, "", status, reason // failed / declined
+			return flowRun{correlationID: corr, status: status, reason: reason} // failed / declined
 		}
 	}
 	if status != "completed" {
-		return nil, "", status, reason
+		return flowRun{correlationID: corr, status: status, reason: reason}
 	}
 
 	req, _ := http.NewRequest(http.MethodGet, svc.URL+"/v1/sign/result?correlationId="+corr, nil)
@@ -177,8 +198,13 @@ func runFlow(t *testing.T, auth Authorizer, svc *httptest.Server, startBody stri
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("result fetch after completion returned %d", resp.StatusCode)
 	}
-	pdf, _ = io.ReadAll(resp.Body)
-	return pdf, resp.Header.Get("X-Signature-Evidence"), "completed", ""
+	pdf, _ := io.ReadAll(resp.Body)
+	return flowRun{
+		correlationID: corr,
+		pdf:           pdf,
+		evidence:      resp.Header.Get("X-Signature-Evidence"),
+		status:        "completed",
+	}
 }
 
 var byteRangeRE = regexp.MustCompile(`/ByteRange\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]`)

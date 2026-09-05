@@ -30,8 +30,8 @@ import (
 // real trust bundle (REFSVC_LIVE_CA_BUNDLE) to verify against. Optional: env, CSC api, TSA url (B-T),
 // authorizer mode.
 type liveEnv struct {
-	clientID, clientSecret, redirectURI, caBundle string
-	env, cscAPI, tsaURL, authorizer               string
+	clientID, clientSecret, redirectURI, caBundle, upstreamBaseURL string
+	env, cscAPI, tsaURL, authorizer                                string
 }
 
 // loadLiveEnv reads the live knobs and reports whether the required real-credential set is present.
@@ -39,14 +39,15 @@ type liveEnv struct {
 // BOTH RSA and ECDSA is a CI-matrix property (live.yml runs {v1_rsa, v2_ecdsa}), never a single run (I1/F6).
 func loadLiveEnv() (liveEnv, bool) {
 	e := liveEnv{
-		clientID:     os.Getenv("REFSVC_CLIENT_ID"),
-		clientSecret: os.Getenv("REFSVC_CLIENT_SECRET"),
-		redirectURI:  os.Getenv("REFSVC_REDIRECT_URI"),
-		caBundle:     os.Getenv("REFSVC_LIVE_CA_BUNDLE"),
-		env:          os.Getenv("REFSVC_ENV"),
-		cscAPI:       os.Getenv("REFSVC_CSC_API"),
-		tsaURL:       os.Getenv("REFSVC_TSA_URL"),
-		authorizer:   os.Getenv("REFSVC_LIVE_AUTHORIZER"),
+		clientID:        os.Getenv("REFSVC_CLIENT_ID"),
+		clientSecret:    os.Getenv("REFSVC_CLIENT_SECRET"),
+		redirectURI:     os.Getenv("REFSVC_REDIRECT_URI"),
+		caBundle:        os.Getenv("REFSVC_LIVE_CA_BUNDLE"),
+		env:             os.Getenv("REFSVC_ENV"),
+		cscAPI:          os.Getenv("REFSVC_CSC_API"),
+		tsaURL:          os.Getenv("REFSVC_TSA_URL"),
+		authorizer:      os.Getenv("REFSVC_LIVE_AUTHORIZER"),
+		upstreamBaseURL: os.Getenv("REFSVC_UPSTREAM_BASE_URL"),
 	}
 	if e.env == "" {
 		e.env = "acceptance"
@@ -60,6 +61,15 @@ func loadLiveEnv() (liveEnv, bool) {
 	// Gating (FR-009): the live path requires the real OIDC credentials AND a real trust bundle to
 	// verify the result against. Any missing → not present → t.Skip (never fail).
 	ok := e.clientID != "" && e.clientSecret != "" && e.redirectURI != "" && e.caBundle != ""
+	return e, ok
+}
+
+// loadStubEnv enables the public Cleverbase hash-signing stub contract suite only when every
+// connection input is explicit. This keeps ordinary local test runs hermetic while making CI's
+// external dependency visible in its environment rather than hidden behind test defaults.
+func loadStubEnv() (liveEnv, bool) {
+	e, _ := loadLiveEnv()
+	ok := e.clientID != "" && e.clientSecret != "" && e.redirectURI != "" && e.upstreamBaseURL != ""
 	return e, ok
 }
 
@@ -271,6 +281,15 @@ func liveAuthTimeout() time.Duration {
 // only configuration differs (SC-003).
 func buildLiveService(t *testing.T, e liveEnv, conformance string) *httptest.Server {
 	t.Helper()
+	svc, _ := buildLiveServiceWithEffector(t, e, conformance, nil)
+	return svc
+}
+
+// buildLiveServiceWithEffector wires the live profile to a supplied HTTP effector. The production
+// path passes nil and uses the real client; contract tests can observe the exact SDK-emitted
+// requests without reimplementing the signing flow or altering its host behavior.
+func buildLiveServiceWithEffector(t *testing.T, e liveEnv, conformance string, effector flow.Effector) (*httptest.Server, *session.Memory) {
+	t.Helper()
 	// Use the configured TSA only (REFSVC_TSA_URL → B-T covered); otherwise leave it empty and do B-B
 	// only. NEVER hardcode a real Cleverbase TSA host: that would be an undeclared external dependency
 	// and conflict with FR-015 (a missing TSA must not block B-B). This Profile is constructed directly
@@ -279,18 +298,22 @@ func buildLiveService(t *testing.T, e liveEnv, conformance string) *httptest.Ser
 	p := &config.Profile{
 		Mode: config.ModeLive, Environment: e.env, CscAPI: e.cscAPI,
 		ClientID: e.clientID, ClientSecret: e.clientSecret, RedirectURI: e.redirectURI,
-		TsaURL: e.tsaURL, LiveAuthorizer: e.authorizer, LiveCABundle: e.caBundle,
+		SDKUpstreamBaseURL: e.upstreamBaseURL,
+		TsaURL:             e.tsaURL, LiveAuthorizer: e.authorizer, LiveCABundle: e.caBundle,
 		APIKey: apiKey, AuthEnabled: true, DefaultConformance: conformance, SessionTTL: 5 * time.Minute,
 	}
 	store := session.NewMemory()
+	if effector == nil {
+		effector = upstream.New("")
+	}
 	eng := &flow.Engine{
-		SDK: sdk.New(p), Up: upstream.New(""), Store: store, // live: no host rewrite
+		SDK: sdk.New(p), Up: effector, Store: store, // live: no host rewrite
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), TTL: p.SessionTTL,
 	}
 	service := &httpapi.Service{Engine: eng, Store: store, Profile: p, Sample: samplePDF(t)}
 	svc := httptest.NewServer(service.Handler())
 	t.Cleanup(svc.Close)
-	return svc
+	return svc, store
 }
 
 // TestLive (T019/T023) drives the full real-surface contract path: start → Authorize → complete →
