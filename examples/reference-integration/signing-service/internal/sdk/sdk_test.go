@@ -105,3 +105,16 @@ func TestAdapterBeginAndResumeGlue(t *testing.T) {
 		t.Fatal("resume redirect error with garbage handle should error")
 	}
 }
+
+func TestNewForwardsSDKUpstreamBaseURL(t *testing.T) {
+	p := &config.Profile{
+		Environment: "acceptance", CscAPI: "v1_rsa", ClientID: "client", ClientSecret: "secret",
+		RedirectURI:        "http://localhost/callback",
+		SDKUpstreamBaseURL: "https://trust-driver-stub-hash-signing.cleverbase.com",
+	}
+
+	adapter := New(p)
+	if adapter.cfg.UpstreamBaseURL != p.SDKUpstreamBaseURL {
+		t.Fatalf("binding UpstreamBaseURL = %q, want %q", adapter.cfg.UpstreamBaseURL, p.SDKUpstreamBaseURL)
+	}
+}

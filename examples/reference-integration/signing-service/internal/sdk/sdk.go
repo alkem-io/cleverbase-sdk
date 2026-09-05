@@ -23,14 +23,15 @@ type Adapter struct {
 // New builds an adapter from the run profile.
 func New(p *config.Profile) *Adapter {
 	return &Adapter{cfg: bindings.Config{
-		Environment:  p.Environment,
-		CscAPI:       p.CscAPI,
-		ClientID:     p.ClientID,
-		ClientSecret: p.ClientSecret,
-		RedirectURI:  p.RedirectURI,
-		TsaURL:       p.TsaURL,
-		TsaAuth:      p.TsaAuth,
-		TsaPolicy:    p.TsaPolicy,
+		Environment:     p.Environment,
+		CscAPI:          p.CscAPI,
+		ClientID:        p.ClientID,
+		ClientSecret:    p.ClientSecret,
+		RedirectURI:     p.RedirectURI,
+		UpstreamBaseURL: p.SDKUpstreamBaseURL,
+		TsaURL:          p.TsaURL,
+		TsaAuth:         p.TsaAuth,
+		TsaPolicy:       p.TsaPolicy,
 	}}
 }
 
