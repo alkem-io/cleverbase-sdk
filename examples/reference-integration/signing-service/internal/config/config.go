@@ -48,6 +48,10 @@ const (
 	envPublicBaseURL = "REFSVC_PUBLIC_BASE_URL"
 	envRedirectURI   = "REFSVC_REDIRECT_URI"
 	envTsaURL        = "REFSVC_TSA_URL"
+	// envSDKUpstreamBaseURL is deliberately distinct from envBaseURL: the former is the SDK's
+	// authoritative Cleverbase endpoint selection, while the latter only rewrites HTTP effects to
+	// the in-process fixture mock.
+	envSDKUpstreamBaseURL = "REFSVC_UPSTREAM_BASE_URL"
 )
 
 // Live-only knob names (the gated e2e/live_test.go path), named once for DRY.
@@ -76,6 +80,10 @@ type Profile struct {
 	// URLs handed back to the frontend (an internal compose/k8s hostname is not resolvable from the
 	// user's browser). Defaults to UpstreamBaseURL. Empty in live (no rewrite).
 	PublicUpstreamBaseURL string
+	// SDKUpstreamBaseURL optionally replaces Cleverbase's acceptance/production origin inside the
+	// Rust SDK. The SDK validates its scheme/host/path rules once when a signing session begins;
+	// config deliberately does not duplicate that protocol validation.
+	SDKUpstreamBaseURL string
 
 	APIKey      string // bearer API key for the service's own REST API
 	AuthEnabled bool
@@ -113,6 +121,7 @@ func Load() (*Profile, error) {
 		TsaPolicy:             os.Getenv("REFSVC_TSA_POLICY"),
 		UpstreamBaseURL:       os.Getenv(envBaseURL),
 		PublicUpstreamBaseURL: os.Getenv(envPublicBaseURL),
+		SDKUpstreamBaseURL:    os.Getenv(envSDKUpstreamBaseURL),
 		APIKey:                os.Getenv("REFSVC_API_KEY"),
 		DefaultConformance:    env("REFSVC_DEFAULT_CONFORMANCE", ConformanceBB),
 		Listen:                env("REFSVC_LISTEN", ":8080"),

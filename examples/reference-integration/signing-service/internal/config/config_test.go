@@ -14,7 +14,7 @@ var knownEnvKeys = []string{
 	"REFSVC_CLIENT_SECRET", "REFSVC_CSC_API", "REFSVC_DEFAULT_CONFORMANCE", "REFSVC_ENV",
 	"REFSVC_LISTEN", "REFSVC_LIVE_AUTHORIZER", "REFSVC_LIVE_CA_BUNDLE", "REFSVC_MODE",
 	"REFSVC_PUBLIC_BASE_URL", "REFSVC_REDIRECT_URI", "REFSVC_SESSION_TTL", "REFSVC_TSA_AUTH",
-	"REFSVC_TSA_POLICY", "REFSVC_TSA_URL",
+	"REFSVC_TSA_POLICY", "REFSVC_TSA_URL", "REFSVC_UPSTREAM_BASE_URL",
 }
 
 // setEnv sets env vars for a test (restored afterward by t.Setenv), clearing every known REFSVC_* key
@@ -272,5 +272,24 @@ func TestLiveModeFailFast(t *testing.T) {
 	})
 	if _, err := Load(); err != nil {
 		t.Fatalf("valid live profile should load: %v", err)
+	}
+}
+
+func TestLiveUpstreamBaseURLIsRecordedSeparatelyFromFixtureRewrite(t *testing.T) {
+	// REFSVC_BASE_URL remains the fixture-only HTTP effect rewrite. The SDK endpoint override is a
+	// separate, explicit setting so a live stub run cannot accidentally change fixture routing.
+	e := validLiveEnv()
+	e["REFSVC_UPSTREAM_BASE_URL"] = "https://trust-driver-stub-hash-signing.cleverbase.com"
+	setEnv(t, e)
+
+	p, err := Load()
+	if err != nil {
+		t.Fatalf("load live upstream override: %v", err)
+	}
+	if p.SDKUpstreamBaseURL != e["REFSVC_UPSTREAM_BASE_URL"] {
+		t.Fatalf("SDKUpstreamBaseURL = %q, want %q", p.SDKUpstreamBaseURL, e["REFSVC_UPSTREAM_BASE_URL"])
+	}
+	if p.UpstreamBaseURL != "" {
+		t.Fatalf("fixture UpstreamBaseURL = %q, want empty in live mode", p.UpstreamBaseURL)
 	}
 }
