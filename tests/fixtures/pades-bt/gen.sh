@@ -15,5 +15,14 @@ case "${version}" in
 esac
 
 cd "${REPO_ROOT}"
+test_name="regenerate_pades_bt_fixtures"
+listed_tests="$(cargo test -p cleverbase-core --test independent_validation \
+  "${test_name}" -- --ignored --exact --list)"
+match_count="$(printf '%s\n' "${listed_tests}" | awk -v name="${test_name}: test" \
+  '$0 == name { count++ } END { print count + 0 }')"
+if [[ "${match_count}" != "1" ]]; then
+  echo "error: expected exactly one ${test_name} test; found ${match_count}" >&2
+  exit 1
+fi
 cargo test -p cleverbase-core --test independent_validation \
-  regenerate_pades_bt_fixtures -- --ignored --exact
+  "${test_name}" -- --ignored --exact

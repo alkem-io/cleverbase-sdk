@@ -4,10 +4,10 @@
 //! signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
 //! with PKCS #1 v1.5 or P-256 ECDSA with SHA-256 (`ecdsa-with-SHA256`), and the SDK's minimal
 //! `ESSCertIDv2` form. Other valid CMS profiles may return an unsupported or malformed verdict.
-//! B-T classification also verifies that the timestamp token binds the signature value and is
-//! signed by a certificate embedded in that token. It does not establish certificate or TSA trust,
-//! trusted-list or revocation status, signer authorization, or TSA policy; `integrity = true` is
-//! not qualified validation.
+//! B-T classification also verifies that the timestamp token binds the signature value, that its
+//! CMS content digest matches its TSTInfo content, and that it is signed by a certificate embedded
+//! in that token. It does not establish certificate or TSA trust, trusted-list or revocation status,
+//! signer authorization, or TSA policy; `integrity = true` is not qualified validation.
 
 use core::mem::size_of;
 use lopdf::{Document, Object};

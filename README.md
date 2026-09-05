@@ -50,10 +50,10 @@ Implemented and tested (Rust unit + integration; independently validated with **
   profile emitted by this SDK (`rsaEncryption`/PKCS #1 v1.5 or P-256 ECDSA with SHA-256, with the
   SDK's minimal `ESSCertIDv2` form): strict ByteRange/CMS binding, embedded-leaf signature and
   digest checks, profile and signer identity. Other valid CMS profiles may return an unsupported
-  or malformed verdict. B-T additionally requires a timestamp token bound to the signature value
-  and signed by a certificate embedded in that token. This operation does not establish signer or
-  TSA certificate trust, trusted-list or revocation status, signer authorization, or TSA policy,
-  and is not qualified validation.
+  or malformed verdict. B-T additionally requires a timestamp token bound to the signature value,
+  with a matching CMS content digest and a signature verified by a certificate embedded in that
+  token. This operation does not establish signer or TSA certificate trust, trusted-list or
+  revocation status, signer authorization, or TSA policy, and is not qualified validation.
 - ✅ Python, Node, and Go bindings + the TS frontend helper, all with passing tests.
 
 See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
