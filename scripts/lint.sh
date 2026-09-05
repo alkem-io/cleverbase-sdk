@@ -53,7 +53,7 @@ if need rustup "install Rust via rustup (the pinned rust-toolchain.toml channel 
       else
         run cargo rustup run "$rust_channel" cargo fmt --all --check
         run clippy rustup run "$rust_channel" cargo clippy --workspace --all-targets --all-features -- -D warnings
-        run clippy-python rustup run "$rust_channel" cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
+        run clippy-python env PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 rustup run "$rust_channel" cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
         run clippy-node rustup run "$rust_channel" cargo clippy --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
       fi
     fi
