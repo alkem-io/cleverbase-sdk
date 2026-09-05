@@ -287,7 +287,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Cleverbase's token contract requires client_id in the form as well as client authentication.
 	// Keep the mock strict here so its credential-free flows cannot mask the documented-stub
 	// integration defect this endpoint caught.
-	if r.Form.Get("client_id") == "" {
+	if r.PostForm.Get("client_id") == "" {
 		http.Error(w, "missing client_id", http.StatusBadRequest)
 		return
 	}

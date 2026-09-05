@@ -101,6 +101,20 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("token without client_id status = %d, want 400", resp.StatusCode)
 	}
+
+	// URL query parameters are not form fields in Cleverbase's token contract. ParseForm merges
+	// both sources, so this regression test ensures the mock reads PostForm and cannot accept an
+	// underspecified SDK request merely because an unrelated query string carries client_id.
+	resp, err = http.PostForm(ts.URL+"/oauth2/token?client_id=test-client", url.Values{
+		"grant_type": {"authorization_code"}, "code": {"svc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("token with query-only client_id status = %d, want 400", resp.StatusCode)
+	}
 }
 
 // signHash POSTs a SHA-256 digest to the given CSC route and returns the decoded signature bytes.
