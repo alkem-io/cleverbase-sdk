@@ -34,27 +34,6 @@ over `sha256(DER(signedAttrs))` (Cleverbase `signHash`), and we assemble a detac
 `SignedData`. No private key ever lives in the core. Built only on vetted RustCrypto crates
 (Constitution Principle IV).
 
-#### Structs
-
-##### struct `VerifiedSignedData`
-
-```rust
-struct VerifiedSignedData
-```
-
-Verified material extracted from a detached CMS signature.
-
-###### Fields
-
-- `message_digest: Vec<u8>`
-  - The signed `message-digest` attribute.
-- `signer_certificate: Vec<u8>`
-  - DER of the certificate selected by SignerInfo issuer-and-serial.
-- `key_algo: KeyAlgo`
-  - Key family asserted by the CMS signature AlgorithmIdentifier.
-- `has_signature_timestamp: bool`
-  - Whether an RFC 3161 signature-time-stamp unsigned attribute is present.
-
 #### Enums
 
 ##### enum `CmsError`
@@ -70,7 +49,7 @@ Errors from CMS assembly/verification.
 - `Der(Error)`
   - A DER encode/decode error.
 - `UnsupportedAlgo`
-  - The key algorithm is not supported for CMS assembly.
+  - A key, digest, or signature algorithm is not supported for CMS assembly or verification.
 - `EmptyChain`
   - The certificate chain was empty.
 - `Structure(&'static str)`
@@ -150,14 +129,6 @@ fn verify_signed_data(cms_der: &[u8], key_algo: KeyAlgo) -> Result<Vec<u8>, CmsE
 Verify the assembled CMS signature against the signer's leaf certificate (defense-in-depth: the
 core must never report `Signed` for a signature it cannot itself verify). On success returns the
 `message-digest` signed attribute so the caller can bind it to the document without re-parsing.
-
-##### fn `verify_signed_data_auto`
-
-```rust
-fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, CmsError>
-```
-
-Verify a detached CMS using the algorithm and certificate identified by its SignerInfo.
 
 ### Module `ess`
 
@@ -1389,8 +1360,11 @@ Lowercase hex encoding.
 Integrity-only verification of a single PAdES signature.
 
 This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
-signer certificate. Chain building, revocation, and RFC 3161 token validation belong to the
-later qualified-validation backend.
+signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
+with PKCS #1 v1.5 or `ecdsa-with-SHA256`, and the SDK's minimal `ESSCertIDv2` form. Other valid
+CMS profiles may return an unsupported or malformed verdict rather than an integrity verdict.
+It does not establish certificate trust, trusted-list or revocation status, signer
+authorization, or RFC 3161 token validity; `integrity = true` is not qualified validation.
 
 ### Structs
 
@@ -1417,8 +1391,10 @@ struct PdfVerification
 
 The integrity-only result for one PDF signature.
 
-A malformed or invalid document is represented as `integrity = false`, not as an API error,
-so callers can safely display a deterministic validation verdict.
+A malformed, unsupported, or invalid document is represented as `integrity = false`, not as
+an API error, so callers can safely display a deterministic validation verdict. An integrity
+verdict establishes neither certificate trust nor signer authorization and MUST NOT be
+presented as qualified validation.
 
 ##### Fields
 
@@ -1429,7 +1405,7 @@ so callers can safely display a deterministic validation verdict.
 - `signer: Option<PdfSigner>`
   - The embedded signer's identity, only when integrity is true.
 - `reasons: Vec<VerificationReason>`
-  - Failure or limitation codes. A valid B-T result reports `timestamp_unverified` here.
+  - Failure codes. Empty if and only if `integrity` is true.
 
 ### Enums
 
@@ -1445,12 +1421,16 @@ A machine-readable limitation or failure observed while verifying a PDF.
 
 - `NotPdf`
   - The input does not start with a PDF header.
+- `MalformedPdf`
+  - The input starts with a PDF header but is not a parseable PDF.
 - `MissingSignature`
   - No signature dictionary was found.
 - `MultipleSignaturesUnsupported`
   - The PDF has more than one signature; co-signing validation is a later phase.
 - `MalformedByteRange`
   - The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
+- `UnsupportedSubfilter`
+  - The signature uses a detached-signature subfilter this verifier does not support.
 - `UnsignedSuffix`
   - Bytes appear after the final signed range.
 - `InvalidContents`
@@ -1460,13 +1440,11 @@ A machine-readable limitation or failure observed while verifying a PDF.
 - `MissingSignerCertificate`
   - The CMS has no certificate matching its SignerInfo.
 - `UnsupportedSignatureAlgorithm`
-  - The CMS signature algorithm is not supported by this verifier.
+  - The CMS digest or signature algorithm is not supported by this verifier.
 - `InvalidSignature`
   - The CMS signature does not verify against the embedded signer certificate.
 - `MessageDigestMismatch`
   - The CMS message-digest differs from the PDF ByteRange digest.
-- `TimestampUnverified`
-  - A B-T timestamp attribute exists but timestamp-token trust is not part of this verifier.
 
 ### Functions
 
@@ -1476,7 +1454,10 @@ A machine-readable limitation or failure observed while verifying a PDF.
 fn verify_pdf(document: &[u8]) -> PdfVerification
 ```
 
-Verify the integrity of one unsigned-or-singly-signed PDF.
+Verify one unsigned-or-singly-signed PDF against the SHA-256 CMS profile emitted by this SDK.
+
+This operation establishes document/CMS integrity only. It does not establish certificate
+trust, trusted-list or revocation status, signer authorization, or RFC 3161 token validity.
 
 ## Module `wire`
 
@@ -1543,7 +1524,7 @@ A decoded operation request from a non-native binding.
 enum WireResult
 ```
 
-The result of a wire operation: a `(handle, step)` pair on success, or an error message.
+The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
 
 ##### Variants
 

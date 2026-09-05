@@ -211,11 +211,13 @@ the frontend transmitted no secrets and performed no cryptographic operations.
 - **FR-017**: When the input document is PDF/A-conformant, the signed output MUST remain PDF/A-valid
   (the signature and any visible appearance MUST NOT break PDF/A conformance, including embedding
   required fonts); for non-PDF/A inputs the SDK produces a standard signed PDF.
-- **FR-018**: The SDK MUST expose a stateless integrity-only verifier for an arbitrary singly-signed
-  PDF. It MUST strictly bind `/ByteRange` to `/Contents`, verify the detached CMS signature and
-  signed message digest with the embedded signer certificate, report B-B/B-T structure and signer
-  identity, and return invalid input as a typed verdict. It MUST NOT claim certificate-chain trust,
-  revocation status, or RFC 3161 token validity when those checks were not performed.
+- **FR-018**: The SDK MUST expose a stateless integrity-only verifier for an arbitrary input carrying
+  at most one signature in the SHA-256 CMS profile the SDK emits. It MUST strictly bind
+  `/ByteRange` to `/Contents`, verify the detached CMS signature and signed message digest with the
+  embedded signer certificate, report B-B/B-T structure and signer identity, and return invalid or
+  unsupported input as a typed verdict. It MUST NOT claim certificate-chain trust, trusted-list or
+  revocation status, signer authorization, or RFC 3161 token validity when those checks were not
+  performed.
 
 ### Key Entities
 

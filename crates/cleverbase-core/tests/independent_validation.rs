@@ -336,8 +336,10 @@ fn extract(pdf: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (content, bytes[..len].to_vec())
 }
 
-/// Replace only the unsigned raw-hex `/Contents` gap of an SDK-produced PDF. ByteRange and every
-/// signed byte stay unchanged, which isolates verifier vectors to their CMS input.
+/// Replace only the unsigned raw-hex `/Contents` gap of an SDK-produced PDF. This intentionally
+/// remains an independent raw scanner: using the production parser would make these external
+/// negative vectors repeat the implementation under test. ByteRange and every signed byte stay
+/// unchanged, which isolates verifier vectors to their CMS input.
 fn replace_cms(pdf: &[u8], cms_der: &[u8]) -> Vec<u8> {
     let br = find(pdf, b"/ByteRange").unwrap();
     let open = br + pdf[br..].iter().position(|&byte| byte == b'[').unwrap() + 1;
@@ -846,10 +848,7 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         );
         assert_eq!(verification.profile, Some(ConformanceLevel::BT));
         assert!(verification.signer.is_some());
-        assert_eq!(
-            verification.reasons,
-            vec![VerificationReason::TimestampUnverified]
-        );
+        assert!(verification.reasons.is_empty());
         Document::load_mem(&signed.pdf).unwrap();
 
         let (content, cms_der) = extract(&signed.pdf);

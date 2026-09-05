@@ -38,6 +38,18 @@ pub(crate) const fn hex_digit(nibble: u8) -> char {
     (if n < 10 { b'0' + n } else { b'a' + n - 10 }) as char
 }
 
+/// Decode one ASCII hex digit to its nibble value.
+///
+/// This is the inverse shared by RFC 4514 escape decoding and strict PDF `/Contents` decoding.
+pub(crate) const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Lowercase hex encoding.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -185,6 +197,10 @@ mod tests {
     #[test]
     fn hex_roundtrip_known() {
         assert_eq!(to_hex(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+        assert_eq!(hex_value(b'0'), Some(0));
+        assert_eq!(hex_value(b'a'), Some(10));
+        assert_eq!(hex_value(b'F'), Some(15));
+        assert_eq!(hex_value(b'g'), None);
     }
 
     #[test]

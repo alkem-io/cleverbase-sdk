@@ -177,16 +177,6 @@ fn split_rdns(dn: &str) -> Vec<String> {
 /// `Doe, Jane`) and `\HH` hex escapes (e.g. `\41` → `A`). Consecutive hex escapes can encode a
 /// multi-byte UTF-8 char (`\C3\A9` → `é`), so decode into a byte buffer and interpret as UTF-8.
 fn unescape_rdn_value(s: &str) -> String {
-    /// Hex-digit value (0–15) of an ASCII byte, or `None` if it is not a hex digit. Arithmetic so
-    /// there is no panicking `unwrap` on `to_digit`.
-    const fn hex_val(b: u8) -> Option<u8> {
-        match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        }
-    }
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -194,9 +184,17 @@ fn unescape_rdn_value(s: &str) -> String {
         if cur == b'\\' {
             // `\HH` hex escape (two hex digits) decodes to one byte; `\<char>` keeps the char.
             match (bytes.get(i + 1), bytes.get(i + 2)) {
-                (Some(&h), Some(&l)) if matches!((hex_val(h), hex_val(l)), (Some(_), Some(_))) => {
+                (Some(&h), Some(&l))
+                    if matches!(
+                        (crate::util::hex_value(h), crate::util::hex_value(l)),
+                        (Some(_), Some(_))
+                    ) =>
+                {
                     // Safe: the guard proved both are hex digits.
-                    let (hi, lo) = (hex_val(h).unwrap_or(0), hex_val(l).unwrap_or(0));
+                    let (hi, lo) = (
+                        crate::util::hex_value(h).unwrap_or(0),
+                        crate::util::hex_value(l).unwrap_or(0),
+                    );
                     out.push((hi << 4) | lo);
                     i += 3;
                 }
@@ -284,15 +282,11 @@ fn identity_from_subject(serial_number: String, subject_dn: String) -> SignerIde
 ///
 /// This is shared by CSC fallback parsing and offline CMS verification so both surfaces expose the
 /// same certificate serial and RFC 4514 subject representation.
-pub(crate) fn signer_identity_from_certificate(
-    leaf_certificate_der: &[u8],
-) -> Result<SignerIdentity, CoreError> {
-    let leaf = Certificate::from_der(leaf_certificate_der)
-        .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
-    Ok(identity_from_subject(
-        certificate_serial_number(&leaf),
+pub(crate) fn signer_identity_from_certificate(leaf: &Certificate) -> SignerIdentity {
+    identity_from_subject(
+        certificate_serial_number(leaf),
         leaf.tbs_certificate.subject.to_string(),
-    ))
+    )
 }
 
 /// Derive the signer's identity from CSC `credentials/info`.
@@ -312,7 +306,9 @@ pub fn signer_identity(
         ));
     }
 
-    signer_identity_from_certificate(leaf_certificate_der)
+    let leaf = Certificate::from_der(leaf_certificate_der)
+        .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
+    Ok(signer_identity_from_certificate(&leaf))
 }
 
 /// Check the authorizing signer against an expected identity (FR-014). The default match key is the

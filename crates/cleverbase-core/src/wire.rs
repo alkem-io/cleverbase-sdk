@@ -63,7 +63,7 @@ pub struct WireResponse {
     pub result: WireResult,
 }
 
-/// The result of a wire operation: a `(handle, step)` pair on success, or an error message.
+/// The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // Wire protocol enum: the ok variant (handle + step) is naturally larger than the err variant;

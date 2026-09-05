@@ -42,8 +42,8 @@ pub enum CmsError {
     /// A DER encode/decode error.
     #[error("DER error: {0}")]
     Der(#[from] der::Error),
-    /// The key algorithm is not supported for CMS assembly.
-    #[error("unsupported key algorithm for CMS assembly")]
+    /// A key, digest, or signature algorithm is not supported for CMS assembly or verification.
+    #[error("unsupported algorithm for CMS assembly or verification")]
     UnsupportedAlgo,
     /// The certificate chain was empty.
     #[error("empty certificate chain")]
@@ -60,12 +60,11 @@ pub enum CmsError {
 }
 
 /// Verified material extracted from a detached CMS signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedSignedData {
+pub(crate) struct VerifiedSignedData {
     /// The signed `message-digest` attribute.
     pub message_digest: Vec<u8>,
-    /// DER of the certificate selected by SignerInfo issuer-and-serial.
-    pub signer_certificate: Vec<u8>,
+    /// Certificate selected by SignerInfo issuer-and-serial.
+    pub signer_certificate: Certificate,
     /// Key family asserted by the CMS signature AlgorithmIdentifier.
     pub key_algo: KeyAlgo,
     /// Whether an RFC 3161 signature-time-stamp unsigned attribute is present.
@@ -343,11 +342,25 @@ pub fn has_signature_timestamp(content_info_der: &[u8]) -> Result<bool, CmsError
         .as_slice()
         .first()
         .ok_or_else(|| CmsError::Verify("no SignerInfo".into()))?;
-    Ok(si.unsigned_attrs.as_ref().is_some_and(|a| {
-        a.as_slice()
-            .iter()
-            .any(|attr| attr.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN)
-    }))
+    signer_has_signature_timestamp(si)
+}
+
+fn signer_has_signature_timestamp(signer_info: &SignerInfo) -> Result<bool, CmsError> {
+    let mut timestamp_attributes = signer_info
+        .unsigned_attrs
+        .as_ref()
+        .into_iter()
+        .flat_map(SetOfVec::as_slice)
+        .filter(|attribute| attribute.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN);
+    let timestamp_attribute = timestamp_attributes.next();
+    if timestamp_attributes.next().is_some()
+        || timestamp_attribute.is_some_and(|attribute| attribute.values.as_slice().len() != 1)
+    {
+        return Err(CmsError::Structure(
+            "invalid signature-time-stamp attribute",
+        ));
+    }
+    Ok(timestamp_attribute.is_some())
 }
 
 /// Verify the assembled CMS signature against the signer's leaf certificate (defense-in-depth: the
@@ -362,7 +375,12 @@ pub fn verify_signed_data(cms_der: &[u8], key_algo: KeyAlgo) -> Result<Vec<u8>, 
 }
 
 /// Verify a detached CMS using the algorithm and certificate identified by its SignerInfo.
-pub fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, CmsError> {
+///
+/// Verification accepts the SHA-256 profile emitted by this SDK: `rsaEncryption` with PKCS #1
+/// v1.5 or `ecdsa-with-SHA256`, plus `ESSCertIDv2` with its default SHA-256 algorithm and without
+/// `issuerSerial`. Other digest/signature algorithms return [`CmsError::UnsupportedAlgo`]; other
+/// well-formed CMS profiles are outside this integrity verifier's contract.
+pub(crate) fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, CmsError> {
     use x509_cert::spki::DecodePublicKey;
     let ci = ContentInfo::from_der(cms_der)?;
     if ci.content_type != ID_SIGNED_DATA {
@@ -401,10 +419,12 @@ pub fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, Cms
         .ok_or(CmsError::Structure("no signed attributes"))?;
     let signed_attrs_der = attrs.to_der()?;
     let signature = si.signature.as_bytes();
-    let leaf_der = signer_certificate_from(&sd, si)?;
-    let message_digest = validate_signed_attributes(attrs, &leaf_der)?;
-    let leaf = Certificate::from_der(&leaf_der)?;
-    let spki_der = leaf.tbs_certificate.subject_public_key_info.to_der()?;
+    let signer_certificate = signer_certificate_from(&sd, si)?;
+    let message_digest = validate_signed_attributes(attrs, &signer_certificate)?;
+    let spki_der = signer_certificate
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()?;
     if key_algo == KeyAlgo::Rsa {
         use rsa::signature::Verifier;
         let pk = rsa::RsaPublicKey::from_public_key_der(&spki_der)
@@ -423,30 +443,16 @@ pub fn verify_signed_data_auto(cms_der: &[u8]) -> Result<VerifiedSignedData, Cms
         vk.verify(&signed_attrs_der, &sig)
             .map_err(|e| CmsError::Verify(e.to_string()))?;
     }
-    let mut timestamp_attributes = si
-        .unsigned_attrs
-        .as_ref()
-        .into_iter()
-        .flat_map(SetOfVec::as_slice)
-        .filter(|attribute| attribute.oid == ID_AA_SIGNATURE_TIME_STAMP_TOKEN);
-    let timestamp_attribute = timestamp_attributes.next();
-    if timestamp_attributes.next().is_some()
-        || timestamp_attribute.is_some_and(|attribute| attribute.values.as_slice().len() != 1)
-    {
-        return Err(CmsError::Structure(
-            "invalid signature-time-stamp attribute",
-        ));
-    }
-    let has_signature_timestamp = timestamp_attribute.is_some();
+    let has_signature_timestamp = signer_has_signature_timestamp(si)?;
     Ok(VerifiedSignedData {
         message_digest,
-        signer_certificate: leaf_der,
+        signer_certificate,
         key_algo,
         has_signature_timestamp,
     })
 }
 
-fn signer_certificate_from(sd: &SignedData, si: &SignerInfo) -> Result<Vec<u8>, CmsError> {
+fn signer_certificate_from(sd: &SignedData, si: &SignerInfo) -> Result<Certificate, CmsError> {
     let SignerIdentifier::IssuerAndSerialNumber(sid) = &si.sid else {
         return Err(CmsError::Verify("unsupported SignerInfo identifier".into()));
     };
@@ -463,8 +469,7 @@ fn signer_certificate_from(sd: &SignedData, si: &SignerInfo) -> Result<Vec<u8>, 
             cert.tbs_certificate.issuer == sid.issuer
                 && cert.tbs_certificate.serial_number == sid.serial_number
         })
-        .map(Encode::to_der)
-        .transpose()?
+        .cloned()
         .ok_or(CmsError::SignerCertificateAbsent)
 }
 
@@ -488,7 +493,7 @@ fn single_attribute<'a>(
 
 fn validate_signed_attributes(
     attrs: &SetOfVec<Attribute>,
-    signer_certificate: &[u8],
+    signer_certificate: &Certificate,
 ) -> Result<Vec<u8>, CmsError> {
     let content_type = single_attribute(attrs, ID_CONTENT_TYPE, "invalid content-type attribute")?;
     let content_type_value = content_type
@@ -540,11 +545,12 @@ fn validate_signed_attributes(
                 "invalid signing-certificate-v2 attribute",
             ))?;
     let parsed = SigningCertificateV2::from_der(&signing_certificate_value.to_der()?)?;
+    let signer_certificate_der = signer_certificate.to_der()?;
     if parsed.certs.len() != 1
         || parsed
             .certs
             .first()
-            .is_none_or(|cert| cert.cert_hash.as_bytes() != sha256(signer_certificate))
+            .is_none_or(|cert| cert.cert_hash.as_bytes() != sha256(&signer_certificate_der))
     {
         return Err(CmsError::Structure(
             "signing-certificate-v2 does not identify the signer",
@@ -677,7 +683,7 @@ mod tests {
         assert_eq!(encoded_order.first().map(Vec::as_slice), Some(EC_CERT));
 
         let verified = verify_signed_data_auto(&cms).unwrap();
-        assert_eq!(verified.signer_certificate, RSA_CERT);
+        assert_eq!(verified.signer_certificate.to_der().unwrap(), RSA_CERT);
         assert_eq!(verified.key_algo, KeyAlgo::Rsa);
     }
 

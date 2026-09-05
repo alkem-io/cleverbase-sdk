@@ -1,8 +1,11 @@
 //! Integrity-only verification of a single PAdES signature.
 //!
 //! This intentionally verifies only the embedded CMS against the document's `/ByteRange` and
-//! signer certificate. Chain building, revocation, and RFC 3161 token validation belong to the
-//! later qualified-validation backend.
+//! signer certificate. It accepts the SHA-256 CMS profile emitted by this SDK: `rsaEncryption`
+//! with PKCS #1 v1.5 or `ecdsa-with-SHA256`, and the SDK's minimal `ESSCertIDv2` form. Other valid
+//! CMS profiles may return an unsupported or malformed verdict rather than an integrity verdict.
+//! It does not establish certificate trust, trusted-list or revocation status, signer
+//! authorization, or RFC 3161 token validity; `integrity = true` is not qualified validation.
 
 use core::mem::size_of;
 use lopdf::{Document, Object};
@@ -16,12 +19,16 @@ use crate::types::ConformanceLevel;
 pub enum VerificationReason {
     /// The input does not start with a PDF header.
     NotPdf,
+    /// The input starts with a PDF header but is not a parseable PDF.
+    MalformedPdf,
     /// No signature dictionary was found.
     MissingSignature,
     /// The PDF has more than one signature; co-signing validation is a later phase.
     MultipleSignaturesUnsupported,
     /// The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
     MalformedByteRange,
+    /// The signature uses a detached-signature subfilter this verifier does not support.
+    UnsupportedSubfilter,
     /// Bytes appear after the final signed range.
     UnsignedSuffix,
     /// The signature `/Contents` value is not valid hex-encoded CMS data.
@@ -30,14 +37,12 @@ pub enum VerificationReason {
     MalformedCms,
     /// The CMS has no certificate matching its SignerInfo.
     MissingSignerCertificate,
-    /// The CMS signature algorithm is not supported by this verifier.
+    /// The CMS digest or signature algorithm is not supported by this verifier.
     UnsupportedSignatureAlgorithm,
     /// The CMS signature does not verify against the embedded signer certificate.
     InvalidSignature,
     /// The CMS message-digest differs from the PDF ByteRange digest.
     MessageDigestMismatch,
-    /// A B-T timestamp attribute exists but timestamp-token trust is not part of this verifier.
-    TimestampUnverified,
 }
 
 /// Identity fields read from the embedded signer certificate.
@@ -51,8 +56,10 @@ pub struct PdfSigner {
 
 /// The integrity-only result for one PDF signature.
 ///
-/// A malformed or invalid document is represented as `integrity = false`, not as an API error,
-/// so callers can safely display a deterministic validation verdict.
+/// A malformed, unsupported, or invalid document is represented as `integrity = false`, not as
+/// an API error, so callers can safely display a deterministic validation verdict. An integrity
+/// verdict establishes neither certificate trust nor signer authorization and MUST NOT be
+/// presented as qualified validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PdfVerification {
     /// Whether the CMS signature and signed document bytes are internally consistent.
@@ -61,11 +68,14 @@ pub struct PdfVerification {
     pub profile: Option<ConformanceLevel>,
     /// The embedded signer's identity, only when integrity is true.
     pub signer: Option<PdfSigner>,
-    /// Failure or limitation codes. A valid B-T result reports `timestamp_unverified` here.
+    /// Failure codes. Empty if and only if `integrity` is true.
     pub reasons: Vec<VerificationReason>,
 }
 
-/// Verify the integrity of one unsigned-or-singly-signed PDF.
+/// Verify one unsigned-or-singly-signed PDF against the SHA-256 CMS profile emitted by this SDK.
+///
+/// This operation establishes document/CMS integrity only. It does not establish certificate
+/// trust, trusted-list or revocation status, signer authorization, or RFC 3161 token validity.
 pub fn verify_pdf(document: &[u8]) -> PdfVerification {
     if !document.starts_with(b"%PDF-") {
         return PdfVerification {
@@ -97,10 +107,7 @@ pub fn verify_pdf(document: &[u8]) -> PdfVerification {
         return invalid(VerificationReason::MessageDigestMismatch);
     }
     let signer =
-        match crate::signing::csc::signer_identity_from_certificate(&verified.signer_certificate) {
-            Ok(signer) => signer,
-            Err(_) => return invalid(VerificationReason::MissingSignerCertificate),
-        };
+        crate::signing::csc::signer_identity_from_certificate(&verified.signer_certificate);
     PdfVerification {
         integrity: true,
         profile: Some(if verified.has_signature_timestamp {
@@ -112,11 +119,7 @@ pub fn verify_pdf(document: &[u8]) -> PdfVerification {
             serial_number: signer.serial_number,
             common_name: signer.common_name,
         }),
-        reasons: verified
-            .has_signature_timestamp
-            .then_some(VerificationReason::TimestampUnverified)
-            .into_iter()
-            .collect(),
+        reasons: Vec::new(),
     }
 }
 
@@ -151,16 +154,10 @@ fn invalid(reason: VerificationReason) -> PdfVerification {
 /// keyword: a regular PDF page may contain unrelated content streams. The gap is raw hex; its
 /// `<` and `>` delimiters are part of the signed ranges immediately outside that gap.
 fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReason> {
-    let parsed =
-        Document::load_mem(document).map_err(|_| VerificationReason::MalformedByteRange)?;
+    let parsed = Document::load_mem(document).map_err(|_| VerificationReason::MalformedPdf)?;
     let mut signatures = parsed.objects.values().filter_map(|object| {
         let dictionary = object.as_dict().ok()?;
-        let is_signature = dictionary.get(b"ByteRange").is_ok()
-            || dictionary
-                .get(b"Type")
-                .and_then(Object::as_name)
-                .is_ok_and(|name| name == b"Sig");
-        is_signature.then_some(dictionary)
+        crate::pades::container::is_signature_dictionary(dictionary).then_some(dictionary)
     });
     let signature = signatures
         .next()
@@ -176,8 +173,11 @@ fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReaso
         .get_deref(b"SubFilter", &parsed)
         .and_then(Object::as_name)
         .map_err(|_| VerificationReason::MalformedCms)?;
-    if signature_type != b"Sig" || sub_filter != b"ETSI.CAdES.detached" {
+    if signature_type != b"Sig" {
         return Err(VerificationReason::MalformedCms);
+    }
+    if sub_filter != b"ETSI.CAdES.detached" {
+        return Err(VerificationReason::UnsupportedSubfilter);
     }
     let byte_range = signature
         .get_deref(b"ByteRange", &parsed)
@@ -234,10 +234,10 @@ fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReaso
         .get(..der_len)
         .map(ToOwned::to_owned)
         .ok_or(VerificationReason::InvalidContents)?;
-    let mut signed = Vec::with_capacity(first_range.len() + second_range.len());
-    signed.extend_from_slice(first_range);
-    signed.extend_from_slice(second_range);
-    Ok((cms_der, crate::crypto::sha256(&signed)))
+    let byte_range_digest =
+        crate::pades::container::byte_range_digest(document, (*first_len, *second_start))
+            .ok_or(VerificationReason::MalformedByteRange)?;
+    Ok((cms_der, byte_range_digest))
 }
 
 fn decode_hex(input: &[u8]) -> Result<Vec<u8>, VerificationReason> {
@@ -247,20 +247,19 @@ fn decode_hex(input: &[u8]) -> Result<Vec<u8>, VerificationReason> {
     input
         .chunks_exact(2)
         .map(|pair| {
-            let high = hex_nibble(pair.first().copied())?;
-            let low = hex_nibble(pair.get(1).copied())?;
+            let high = pair
+                .first()
+                .copied()
+                .and_then(crate::util::hex_value)
+                .ok_or(VerificationReason::InvalidContents)?;
+            let low = pair
+                .get(1)
+                .copied()
+                .and_then(crate::util::hex_value)
+                .ok_or(VerificationReason::InvalidContents)?;
             Ok((high << 4) | low)
         })
         .collect()
-}
-
-fn hex_nibble(byte: Option<u8>) -> Result<u8, VerificationReason> {
-    match byte {
-        Some(value @ b'0'..=b'9') => Ok(value - b'0'),
-        Some(value @ b'a'..=b'f') => Ok(value - b'a' + 10),
-        Some(value @ b'A'..=b'F') => Ok(value - b'A' + 10),
-        _ => Err(VerificationReason::InvalidContents),
-    }
 }
 
 fn der_length(der: &[u8]) -> Option<usize> {
@@ -291,7 +290,7 @@ mod tests {
     const RSA_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.cert.der");
     const RSA_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.key.pk8");
 
-    fn signed_pdf(with_timestamp: bool) -> Vec<u8> {
+    fn signed_pdf_parts(with_timestamp: bool) -> (Vec<u8>, Vec<u8>, (usize, usize)) {
         let mut document = Document::with_version("1.7");
         let pages_id = document.new_object_id();
         let mut page = Dictionary::new();
@@ -342,7 +341,11 @@ mod tests {
         }
         let mut signed = prepared.staged_pdf;
         crate::pades::container::embed_cms(&mut signed, prepared.contents_span, &cms).unwrap();
-        signed
+        (signed, signature.to_vec(), prepared.contents_span)
+    }
+
+    fn signed_pdf(with_timestamp: bool) -> Vec<u8> {
+        signed_pdf_parts(with_timestamp).0
     }
 
     fn rewrite_signature_dictionary(pdf: &[u8], mutate: impl FnOnce(&mut Dictionary)) -> Vec<u8> {
@@ -372,7 +375,7 @@ mod tests {
         let b_t = verify_pdf(&signed_pdf(true));
         assert!(b_t.integrity);
         assert_eq!(b_t.profile, Some(ConformanceLevel::BT));
-        assert_eq!(b_t.reasons, vec![VerificationReason::TimestampUnverified]);
+        assert!(b_t.reasons.is_empty());
     }
 
     #[test]
@@ -392,9 +395,6 @@ mod tests {
         let cases = [
             rewrite_signature_dictionary(&signed, |signature| {
                 signature.set("Type", Object::Name(b"NotSig".to_vec()));
-            }),
-            rewrite_signature_dictionary(&signed, |signature| {
-                signature.set("SubFilter", Object::Name(b"adbe.pkcs7.detached".to_vec()));
             }),
             rewrite_signature_dictionary(&signed, |signature| {
                 signature.set(
@@ -443,12 +443,45 @@ mod tests {
     }
 
     #[test]
+    fn a_well_formed_but_unsupported_subfilter_is_distinguished() {
+        let signed = rewrite_signature_dictionary(&signed_pdf(false), |signature| {
+            signature.set("SubFilter", Object::Name(b"adbe.pkcs7.detached".to_vec()));
+        });
+
+        assert_eq!(
+            verify_pdf(&signed).reasons,
+            vec![VerificationReason::UnsupportedSubfilter]
+        );
+    }
+
+    #[test]
+    fn one_valid_hex_byte_flip_inside_contents_invalidates_the_signature() {
+        let (mut signed, signature, contents_span) = signed_pdf_parts(false);
+        let (cms_der, _) = extract_cms(&signed).unwrap();
+        let signature_offset = cms_der
+            .windows(signature.len())
+            .position(|window| window == signature)
+            .unwrap();
+        let changed_byte = signature_offset + signature.len() / 2;
+        let high_nibble = contents_span.0 + changed_byte * 2;
+        signed[high_nibble] = if signed[high_nibble] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+
+        assert_eq!(
+            verify_pdf(&signed).reasons,
+            vec![VerificationReason::InvalidSignature]
+        );
+    }
+
+    #[test]
     fn hexadecimal_and_der_length_parsers_cover_their_strict_contract() {
         assert_eq!(decode_hex(b"00aAFF").unwrap(), vec![0x00, 0xaa, 0xff]);
         assert!(decode_hex(b"").is_err());
         assert!(decode_hex(b"0").is_err());
         assert!(decode_hex(b"GG").is_err());
-        assert!(hex_nibble(None).is_err());
 
         assert_eq!(der_length(&[0x30, 0x01, 0x00]), Some(3));
         assert_eq!(der_length(&[0x30, 0x81, 0x01, 0x00]), Some(4));
@@ -492,9 +525,11 @@ mod tests {
     fn verification_result_roundtrips_every_public_reason() {
         let reasons = vec![
             VerificationReason::NotPdf,
+            VerificationReason::MalformedPdf,
             VerificationReason::MissingSignature,
             VerificationReason::MultipleSignaturesUnsupported,
             VerificationReason::MalformedByteRange,
+            VerificationReason::UnsupportedSubfilter,
             VerificationReason::UnsignedSuffix,
             VerificationReason::InvalidContents,
             VerificationReason::MalformedCms,
@@ -502,7 +537,6 @@ mod tests {
             VerificationReason::UnsupportedSignatureAlgorithm,
             VerificationReason::InvalidSignature,
             VerificationReason::MessageDigestMismatch,
-            VerificationReason::TimestampUnverified,
         ];
         let expected = PdfVerification {
             integrity: true,
@@ -519,6 +553,6 @@ mod tests {
 
         assert_eq!(decoded, expected);
         let cloned = expected.clone();
-        assert!(format!("{cloned:?}").contains("TimestampUnverified"));
+        assert!(format!("{cloned:?}").contains("MalformedPdf"));
     }
 }

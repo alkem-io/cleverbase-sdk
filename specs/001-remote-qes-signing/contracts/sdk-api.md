@@ -49,11 +49,15 @@ to persist. `begin`/`resume` never block on I/O and never mutate shared state (t
 unbounded concurrency). `Failed` always carries an evidence record (FR-015).
 
 `verify_pdf` is stateless and performs no I/O. Invalid or unsupported input is a normal
-`PdfVerification { integrity: false, ... }` verdict, not an exception. It validates one signature's
+`PdfVerification { integrity: false, ... }` verdict, not an exception. It accepts the SHA-256 CMS
+profile emitted by this SDK: `rsaEncryption` with PKCS #1 v1.5 or `ecdsa-with-SHA256`, plus
+`ESSCertIDv2` with its default SHA-256 algorithm and no `issuerSerial`. Other valid CMS profiles may
+return an unsupported or malformed verdict. Within that profile it validates one signature's
 strict `/ByteRange` and `/Contents` binding, detached CMS structure, signed attributes, embedded
-signer certificate selection, signature, and document message digest. It does not build a trusted
-certificate chain, check revocation, or validate an RFC 3161 token. A structurally present B-T
-timestamp therefore returns `integrity: true` with reason `timestamp_unverified`.
+signer certificate selection, signature, and document message digest. It does not establish
+certificate trust, trusted-list or revocation status, signer authorization, or RFC 3161 token
+validity. `integrity=true` is therefore not qualified validation. A structurally present B-T
+timestamp identifies the profile but makes no claim about timestamp-token validity.
 
 ## Idiomatic binding shapes (illustrative, same semantics)
 
@@ -106,12 +110,12 @@ major (Principle VII).
   `TimestampFailed`, `InvalidDocument`, `AppearancePlacementError`, `SignatureInvalid`).
 - **Programmer/usage errors** (malformed handle, schema mismatch, missing required config) surface
   as the binding's native error type / exception.
-- **PDF verification failures and limitations** are normal verdicts. `reasons` contains one of
-  `not_pdf`, `missing_signature`, `multiple_signatures_unsupported`, `malformed_byte_range`,
-  `unsigned_suffix`, `invalid_contents`, `malformed_cms`, `missing_signer_certificate`,
-  `unsupported_signature_algorithm`, `invalid_signature`, `message_digest_mismatch`, or the
-  non-failing B-T limitation `timestamp_unverified`. `profile` and `signer` are present only when
-  `integrity` is true.
+- **PDF verification failures** are normal verdicts. `reasons` contains one of `not_pdf`,
+  `malformed_pdf`, `missing_signature`, `multiple_signatures_unsupported`,
+  `malformed_byte_range`, `unsupported_subfilter`, `unsigned_suffix`, `invalid_contents`,
+  `malformed_cms`, `missing_signer_certificate`, `unsupported_signature_algorithm`,
+  `invalid_signature`, or `message_digest_mismatch`. `integrity` is true if and only if `reasons`
+  is empty; `profile` and `signer` are present only in that case.
 - No secret material (client_secret, SAD, tokens) appears in any error message or evidence record
   (Principle IV).
 

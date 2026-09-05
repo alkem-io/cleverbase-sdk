@@ -47,6 +47,14 @@ fn non_pdf_is_an_invalid_verdict_not_an_api_error() {
 }
 
 #[test]
+fn truncated_pdf_is_distinguished_from_a_byte_range_failure() {
+    let verification = verify_pdf(b"%PDF-1.7\n1 0 obj\n");
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.reasons, vec![VerificationReason::MalformedPdf]);
+}
+
+#[test]
 fn unsigned_pdf_reports_a_missing_signature() {
     let verification = verify_pdf(&minimal_pdf());
 
