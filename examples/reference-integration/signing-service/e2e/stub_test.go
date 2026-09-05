@@ -29,31 +29,40 @@ const (
 )
 
 // stubContractChecklist is the sole list of claims made about the public Cleverbase hash-signing
-// stub. TestProofMatrixHashStubChecklistInSync pins the rendered proof-matrix rows to these IDs, so
-// the documentation cannot claim coverage that this suite does not name.
+// stub. TestProofMatrixHashStubChecklistInSync pins every rendered proof-matrix field to this
+// checklist, so the documentation cannot claim coverage that this suite does not name.
+const (
+	stubStatusVerified     = "[Verified in public-stub CI]("
+	stubStatusLimitation   = "Stub limitation;"
+	stubStatusNotExercised = "Not exercised."
+	stubStatusNotTestable  = "Not testable against this stub."
+)
+
 var stubContractChecklist = []struct {
-	id       string
-	endpoint string
+	id           string
+	endpoint     string
+	assertion    string
+	statusPrefix string
 }{
-	{"authorize-service", "/oauth2/authorize"},
-	{"authorize-credential", "/oauth2/authorize"},
-	{"token-service", "/oauth2/token"},
-	{"credentials-list", "/csc/v1/credentials/list"},
-	{"credentials-info", "/csc/v1/credentials/info"},
-	{"token-credential-sad", "/oauth2/token"},
-	{"sign-hash", "/csc/v1/signatures/signHash"},
-	{"token-wrong-client", "/oauth2/token"},
-	{"info-missing-credential", "/csc/v1/credentials/info"},
-	{"sign-hash-wrong-algorithm", "/csc/v1/signatures/signHash"},
-	{"sign-hash-invalid-sad", "/csc/v1/signatures/signHash"},
-	{"sign-hash-empty-credential-limitation", "/csc/v1/signatures/signHash"},
-	{"sign-hash-malformed-hash-limitation", "/csc/v1/signatures/signHash"},
-	{"sign-hash-short-hash-limitation", "/csc/v1/signatures/signHash"},
-	{"oauth-auth-not-used", "/oauth2/auth"},
-	{"oauth-revoke-not-used", "/oauth2/revoke"},
-	{"csc-info-not-used", "/csc/v1/info"},
-	{"csc-auth-revoke-not-used", "/csc/v1/auth/revoke"},
-	{"ecdsa-v2-not-exposed", "not exposed by hash-signing stub"},
+	{"authorize-service", "/oauth2/authorize", "Service-scope authorize request fields and immediate 302 with code/state.", stubStatusVerified},
+	{"authorize-credential", "/oauth2/authorize", "Credential-scope request includes credential ID, one signature, and SHA-256 consent hash; immediate 302.", stubStatusVerified},
+	{"token-service", "/oauth2/token", "Basic auth plus grant type, code, client ID, redirect URI; Bearer token response shape.", stubStatusVerified},
+	{"credentials-list", "/csc/v1/credentials/list", "Bearer JSON request and non-empty `credentialIDs` response.", stubStatusVerified},
+	{"credentials-info", "/csc/v1/credentials/info", "Selected ID, chain/certInfo request; SCAL 2, RSA-2048, auth mode, multisign and leaf identity response.", stubStatusVerified},
+	{"token-credential-sad", "/oauth2/token", "Credential authorization-code exchange has the same required form and returns SAD.", stubStatusVerified},
+	{"sign-hash", "/csc/v1/signatures/signHash", "Bearer request has ID, SAD, SHA-256 hash, `rsaEncryption` signAlgo, and one response signature.", stubStatusVerified},
+	{"token-wrong-client", "/oauth2/token", "Wrong HTTP Basic client credential is rejected (4xx).", stubStatusVerified},
+	{"info-missing-credential", "/csc/v1/credentials/info", "Missing credential ID is rejected (400).", stubStatusVerified},
+	{"sign-hash-wrong-algorithm", "/csc/v1/signatures/signHash", "`sha256WithRSAEncryption` is rejected (400); documented CSC `rsaEncryption` is the accepted value.", stubStatusVerified},
+	{"sign-hash-invalid-sad", "/csc/v1/signatures/signHash", "Invalid or expired SAD is rejected (400).", stubStatusVerified},
+	{"sign-hash-empty-credential-limitation", "/csc/v1/signatures/signHash", "Empty credential ID currently receives 200 despite the OpenAPI-required field.", stubStatusLimitation},
+	{"sign-hash-malformed-hash-limitation", "/csc/v1/signatures/signHash", "Non-base64 hash currently receives 200 despite the OpenAPI schema.", stubStatusLimitation},
+	{"sign-hash-short-hash-limitation", "/csc/v1/signatures/signHash", "31-byte hash currently receives 200 despite SHA-256 expectations.", stubStatusLimitation},
+	{"oauth-auth-not-used", "/oauth2/auth", "The SDK does not call this sibling authorize endpoint.", stubStatusNotExercised},
+	{"oauth-revoke-not-used", "/oauth2/revoke", "The SDK does not revoke OAuth tokens.", stubStatusNotExercised},
+	{"csc-info-not-used", "/csc/v1/info", "The SDK does not call general CSC info.", stubStatusNotExercised},
+	{"csc-auth-revoke-not-used", "/csc/v1/auth/revoke", "The SDK does not revoke CSC authorization.", stubStatusNotExercised},
+	{"ecdsa-v2-not-exposed", "not exposed by hash-signing stub", "The public hash-signing stub exposes CSC v1 RSA only.", stubStatusNotTestable},
 }
 
 // recordedEffect is a complete in-memory record of one SDK-emitted HTTP effect and the stub's
@@ -229,7 +238,7 @@ func TestProofMatrixHashStubChecklistInSync(t *testing.T) {
 	}
 	checklist := string(contents)[start+len(stubChecklistStart) : end]
 	for _, item := range stubContractChecklist {
-		row := "| `" + item.id + "` | `" + item.endpoint + "` |"
+		row := "| `" + item.id + "` | `" + item.endpoint + "` | " + item.assertion + " | " + item.statusPrefix
 		if !strings.Contains(checklist, row) {
 			t.Fatalf("proof matrix is missing stub checklist row %q", item.id)
 		}
