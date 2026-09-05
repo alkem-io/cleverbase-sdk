@@ -69,7 +69,9 @@ type Config struct {
 	ClientSecret string
 	RedirectURI  string
 	// UpstreamBaseURL optionally replaces the selected Cleverbase origin for a documented
-	// developer/stub service. It drives both OAuth redirects and CSC HTTP effects.
+	// developer/stub service. It must be an absolute URL with a host, use HTTPS except for an
+	// HTTP loopback endpoint, omit credentials, query, and fragment, and may include a base path.
+	// It drives both OAuth redirects and CSC HTTP effects.
 	UpstreamBaseURL string
 	TsaURL          string // optional; "" means none (required for B-T)
 	TsaAuth         string // optional TSA request Authorization header value

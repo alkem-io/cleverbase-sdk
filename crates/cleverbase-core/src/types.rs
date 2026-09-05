@@ -242,7 +242,10 @@ pub struct TrustServiceConfiguration {
 }
 
 impl TrustServiceConfiguration {
-    /// Base URL for the selected API generation and environment.
+    /// Base URL for the configured upstream, with a trailing slash removed.
+    ///
+    /// Uses [`Self::upstream_base_url`] when present; otherwise selects the documented host from
+    /// [`Self::csc_api`] and [`Self::environment`].
     pub fn base_url(&self) -> &str {
         self.upstream_base_url
             .as_deref()

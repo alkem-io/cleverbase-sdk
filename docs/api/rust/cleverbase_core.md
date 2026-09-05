@@ -1151,7 +1151,10 @@ The OAuth2 authorization endpoint for the selected API generation and environmen
 fn base_url(&self) -> &str
 ```
 
-Base URL for the selected API generation and environment.
+Base URL for the configured upstream, with a trailing slash removed.
+
+Uses [`Self::upstream_base_url`] when present; otherwise selects the documented host from
+[`Self::csc_api`] and [`Self::environment`].
 
 ```rust
 fn token_url(&self) -> String

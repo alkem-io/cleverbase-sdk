@@ -32,6 +32,11 @@ set -euo pipefail
 # pydoc-markdown install MUST stay in lockstep with PYDOC_MARKDOWN_VERSION.
 PYDOC_MARKDOWN_VERSION="4.8.2"
 GOMARKDOC_VERSION="v1.1.0"
+GOMARKDOC_REPOSITORY_URL="https://github.com/alkem-io/cleverbase-sdk"
+GOMARKDOC_DEFAULT_BRANCH="develop"
+# Gomarkdoc only emits source links when it can infer a branch from Git. Pin all repository facts
+# so generated Go API docs are identical in a local branch and CI's detached pull-request checkout.
+GOMARKDOC_REPOSITORY_PATH="/bindings/go"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -105,7 +110,11 @@ fi
   CGO_LDFLAGS="-L$LIB_DIR" \
   LD_LIBRARY_PATH="$LIB_DIR" \
   DYLD_LIBRARY_PATH="$LIB_DIR" \
-    "$GOMARKDOC" --output "$OUT/go.md" ./...
+    "$GOMARKDOC" \
+      --repository.url "$GOMARKDOC_REPOSITORY_URL" \
+      --repository.default-branch "$GOMARKDOC_DEFAULT_BRANCH" \
+      --repository.path "$GOMARKDOC_REPOSITORY_PATH" \
+      --output "$OUT/go.md" ./...
 )
 
 # ---------------------------------------------------------------------------
