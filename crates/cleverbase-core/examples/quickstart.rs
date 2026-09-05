@@ -31,6 +31,7 @@ fn main() {
         client_id: "your-client-id".into(),
         client_secret: Secret::new("your-client-secret"),
         redirect_uri: "https://your-app.example/callback".into(),
+        upstream_base_url: None,
         tsa: None,
     };
 

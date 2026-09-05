@@ -294,6 +294,7 @@ pub fn begin(
             "client_id and redirect_uri are required".into(),
         ));
     }
+    config.validate().map_err(CoreError::InvalidConfig)?;
     // The OAuth `state` CSRF token is derived from entropy; too little makes it guessable/empty.
     if ctx.entropy.len() < 16 {
         return Err(CoreError::InvalidConfig(
@@ -1023,6 +1024,50 @@ mod tests {
             begin(request(ConformanceLevel::BB, None), cfg(), short),
             Err(CoreError::InvalidConfig(_))
         ));
+        let mut c = cfg();
+        c.upstream_base_url = Some("http://not-loopback.example".into());
+        assert!(matches!(
+            begin(request(ConformanceLevel::BB, None), c, ctx()),
+            Err(CoreError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn upstream_base_url_drives_oauth_and_csc_effects() {
+        let origin = "https://trust-driver-stub-hash-signing.cleverbase.com";
+        let mut config = cfg();
+        config.upstream_base_url = Some(origin.into());
+
+        let (handle, step) = begin(request(ConformanceLevel::BB, None), config, ctx()).unwrap();
+        let redirect = expect_redirect(step);
+        assert!(redirect
+            .url
+            .starts_with(&format!("{origin}/oauth2/authorize?")));
+
+        let (handle, step) = resume(
+            handle,
+            ResumeInput::RedirectReturn {
+                code: "service-code".into(),
+                state: redirect.state,
+            },
+            ctx(),
+        )
+        .unwrap();
+        let Step::PerformHttp(token) = step else {
+            panic!("expected service token exchange");
+        };
+        assert_eq!(token.url, format!("{origin}/oauth2/token"));
+
+        let (_handle, step) = resume(
+            handle,
+            http_ok(serde_json::json!({"access_token":"bearer","token_type":"Bearer"})),
+            ctx(),
+        )
+        .unwrap();
+        let Step::PerformHttp(list) = step else {
+            panic!("expected credential discovery");
+        };
+        assert_eq!(list.url, format!("{origin}/csc/v1/credentials/list"));
     }
 
     /// Drive begin → redirect-return → the named HTTP-awaiting phase, returning the handle there.
@@ -1418,6 +1463,7 @@ mod tests {
             client_id: "client-123".into(),
             client_secret: Secret::new("shh"),
             redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url: None,
             tsa: None,
         }
     }

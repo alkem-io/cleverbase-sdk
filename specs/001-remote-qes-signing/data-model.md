@@ -40,6 +40,9 @@ Optional visible block (FR-016).
 - `environment`: enum `{ acceptance, production }`.
 - `csc_api`: enum `{ v1_rsa, v2_ecdsa }` (required — no default).
 - `client_id`: string; `client_secret`: secret; `redirect_uri`: string.
+- `upstream_base_url?`: alternate absolute Cleverbase origin for a documented developer service.
+  It replaces the selected environment host for both OAuth and CSC endpoints; it must use HTTPS,
+  except `http` on a loopback host, and may carry a base path but no credentials, query, or fragment.
 - `tsa`: TsaConfiguration? — required when `conformance_level=B_T`.
 - Rule: secrets are inputs the host supplies per call; the SDK never stores them.
 

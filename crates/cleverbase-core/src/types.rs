@@ -1,5 +1,6 @@
 //! Input/output value types for the signing API (see contracts/sdk-api.md, data-model.md).
 
+use http::Uri;
 use serde::{Deserialize, Serialize};
 
 /// A secret string whose contents never appear in `Debug` output (Constitution Principle IV).
@@ -230,6 +231,10 @@ pub struct TrustServiceConfiguration {
     pub client_secret: Secret,
     /// OAuth2 redirect URI registered for this client.
     pub redirect_uri: String,
+    /// Optional alternate Cleverbase origin for a documented developer/stub service. It replaces
+    /// the selected environment host for both OAuth and CSC endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
     /// TSA configuration; required when requesting B-T.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tsa: Option<TsaConfiguration>,
@@ -237,13 +242,16 @@ pub struct TrustServiceConfiguration {
 
 impl TrustServiceConfiguration {
     /// Base URL for the selected API generation and environment.
-    pub fn base_url(&self) -> &'static str {
-        match (self.csc_api, self.environment) {
-            (CscApi::V1Rsa, Environment::Production) => "https://connect.cleverbase.com",
-            (CscApi::V1Rsa, Environment::Acceptance) => "https://connect.acc.cleverbase.com",
-            // v2 beta is a single lab host regardless of environment.
-            (CscApi::V2Ecdsa, _) => "https://signing.lab.cleverbase.io",
-        }
+    pub fn base_url(&self) -> &str {
+        self.upstream_base_url
+            .as_deref()
+            .unwrap_or(match (self.csc_api, self.environment) {
+                (CscApi::V1Rsa, Environment::Production) => "https://connect.cleverbase.com",
+                (CscApi::V1Rsa, Environment::Acceptance) => "https://connect.acc.cleverbase.com",
+                // v2 beta is a single lab host regardless of environment.
+                (CscApi::V2Ecdsa, _) => "https://signing.lab.cleverbase.io",
+            })
+            .trim_end_matches('/')
     }
 
     /// The OAuth2 authorization endpoint for the selected API generation and environment.
@@ -255,6 +263,60 @@ impl TrustServiceConfiguration {
     pub fn token_url(&self) -> String {
         format!("{}/oauth2/token", self.base_url())
     }
+
+    /// Validate the optional alternate Cleverbase origin before a signing session starts.
+    ///
+    /// Alternate origins are for documented developer environments only. They must be absolute,
+    /// omit credentials, query, and fragment, and use HTTPS except for an explicitly loopback
+    /// HTTP endpoint used in local development. A path is permitted as a service base path.
+    pub fn validate(&self) -> Result<(), String> {
+        let Some(value) = self.upstream_base_url.as_deref() else {
+            return Ok(());
+        };
+        let parsed: Uri = value
+            .parse()
+            .map_err(|e| format!("upstream_base_url must be an absolute URL: {e}"))?;
+        let Some(authority) = parsed.authority() else {
+            return Err("upstream_base_url must be an absolute URL with a host".into());
+        };
+        if parsed.scheme_str().is_none() {
+            return Err("upstream_base_url must be an absolute URL with a scheme".into());
+        }
+        if authority.host().is_empty() {
+            return Err("upstream_base_url must be an absolute URL with a host".into());
+        }
+        if authority.as_str().contains('@') {
+            return Err("upstream_base_url must not contain credentials".into());
+        }
+        // `http::Uri` keeps a literal fragment in the path because HTTP request targets normally
+        // never carry one, so reject it from the original absolute URL explicitly.
+        if parsed.query().is_some() || value.contains('#') {
+            return Err("upstream_base_url must not contain a query or fragment".into());
+        }
+        if parsed
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+        {
+            return Ok(());
+        }
+        if parsed
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+            && is_loopback_host(authority.host())
+        {
+            return Ok(());
+        }
+        Err("upstream_base_url must use https, except http on a loopback host".into())
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// The optional parts of a [`SigningRequest`] that the language bindings accept as a single JSON
@@ -348,6 +410,7 @@ mod tests {
             client_id: "c".into(),
             client_secret: Secret::new("s"),
             redirect_uri: "https://app/cb".into(),
+            upstream_base_url: None,
             tsa: None,
         };
         assert_eq!(
@@ -362,6 +425,71 @@ mod tests {
             mk(CscApi::V2Ecdsa, Environment::Production).base_url(),
             "https://signing.lab.cleverbase.io"
         );
+    }
+
+    #[test]
+    fn upstream_base_url_override_drives_oauth_endpoints() {
+        // The developer stub has one origin for both OAuth and CSC. Deserializing the public wire
+        // shape here ensures bindings can carry the optional override without each reimplementing
+        // endpoint selection.
+        let config: TrustServiceConfiguration = serde_json::from_value(serde_json::json!({
+            "environment": "acceptance",
+            "csc_api": "v1_rsa",
+            "client_id": "client",
+            "client_secret": "secret",
+            "redirect_uri": "https://app.example/callback",
+            "upstream_base_url": "https://trust-driver-stub-hash-signing.cleverbase.com/api"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            config.base_url(),
+            "https://trust-driver-stub-hash-signing.cleverbase.com/api"
+        );
+        assert_eq!(
+            config.authorize_url(),
+            "https://trust-driver-stub-hash-signing.cleverbase.com/api/oauth2/authorize"
+        );
+        assert_eq!(
+            config.token_url(),
+            "https://trust-driver-stub-hash-signing.cleverbase.com/api/oauth2/token"
+        );
+    }
+
+    #[test]
+    fn upstream_base_url_validation_allows_https_and_loopback_http_only() {
+        let config = |upstream_base_url| TrustServiceConfiguration {
+            environment: Environment::Acceptance,
+            csc_api: CscApi::V1Rsa,
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url,
+            tsa: None,
+        };
+
+        for value in [
+            "https://trust-driver-stub-hash-signing.cleverbase.com",
+            "HTTPS://example.test",
+            "https://example.test/service-base",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/service-base",
+            "http://[::1]:8080",
+        ] {
+            assert!(config(Some(value.into())).validate().is_ok(), "{value}");
+        }
+        for value in [
+            "not a URL",
+            "/relative",
+            "https://:443",
+            "ftp://example.test",
+            "http://example.test",
+            "https://user:password@example.test",
+            "https://example.test/path?query=value",
+            "https://example.test/path#fragment",
+        ] {
+            assert!(config(Some(value.into())).validate().is_err(), "{value}");
+        }
     }
 
     #[test]

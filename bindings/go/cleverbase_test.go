@@ -39,6 +39,19 @@ func TestBeginReturnsServiceRedirect(t *testing.T) {
 	}
 }
 
+func TestBeginUsesUpstreamBaseURLForServiceRedirect(t *testing.T) {
+	cfg := testConfig()
+	cfg.UpstreamBaseURL = "https://trust-driver-stub-hash-signing.cleverbase.com"
+	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), cfg, "B-B", nil, 1_700_000_000, testEntropy())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	url, _ := sess.Step["url"].(string)
+	if !strings.HasPrefix(url, cfg.UpstreamBaseURL+"/oauth2/authorize?") {
+		t.Fatalf("service redirect = %s, want stub origin", url)
+	}
+}
+
 func TestResumeRedirectEmitsTokenExchange(t *testing.T) {
 	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), testConfig(), "B-B", nil, 1_700_000_000, testEntropy())
 	if err != nil {
