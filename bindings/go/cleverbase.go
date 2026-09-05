@@ -68,9 +68,15 @@ type Config struct {
 	ClientID     string
 	ClientSecret string
 	RedirectURI  string
-	TsaURL       string // optional; "" means none (required for B-T)
-	TsaAuth      string // optional TSA request Authorization header value
-	TsaPolicy    string // optional TSA policy OID
+	// UpstreamBaseURL optionally replaces the selected Cleverbase origin for a documented
+	// developer/stub service. It must be an absolute URL with a host, use HTTPS except for an
+	// HTTP loopback endpoint, omit credentials, query, and fragment, reject port 0, and may include
+	// a base path.
+	// It drives both OAuth redirects and CSC HTTP effects.
+	UpstreamBaseURL string
+	TsaURL          string // optional; "" means none (required for B-T)
+	TsaAuth         string // optional TSA request Authorization header value
+	TsaPolicy       string // optional TSA policy OID
 }
 
 // ExpectedSigner binds the request to a signer identity (FR-014). MatchOn is
@@ -256,6 +262,9 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 		"client_id":     cfg.ClientID,
 		"client_secret": cfg.ClientSecret,
 		"redirect_uri":  cfg.RedirectURI,
+	}
+	if cfg.UpstreamBaseURL != "" {
+		config["upstream_base_url"] = cfg.UpstreamBaseURL
 	}
 	if cfg.TsaURL != "" {
 		tsa := map[string]any{"url": cfg.TsaURL}

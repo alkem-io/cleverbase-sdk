@@ -1133,6 +1133,9 @@ How to reach the Cleverbase trust service (data-model: TrustServiceConfiguration
   - OAuth2 client secret (redacted in `Debug`).
 - `redirect_uri: String`
   - OAuth2 redirect URI registered for this client.
+- `upstream_base_url: Option<String>`
+  - Optional alternate Cleverbase origin for a documented developer/stub service. It replaces
+the selected environment host for both OAuth and CSC endpoints.
 - `tsa: Option<TsaConfiguration>`
   - TSA configuration; required when requesting B-T.
 
@@ -1145,16 +1148,30 @@ fn authorize_url(&self) -> String
 The OAuth2 authorization endpoint for the selected API generation and environment.
 
 ```rust
-fn base_url(&self) -> &'static str
+fn base_url(&self) -> String
 ```
 
-Base URL for the selected API generation and environment.
+Base URL for the configured upstream, with a trailing slash removed.
+
+Uses [`Self::upstream_base_url`] when present; otherwise selects the documented host from
+[`Self::csc_api`] and [`Self::environment`]. A valid override is emitted in URL-normalized
+form (canonical scheme/host, IDN, and path), never in the caller's raw spelling.
 
 ```rust
 fn token_url(&self) -> String
 ```
 
 The OAuth2 token endpoint for the selected API generation and environment.
+
+```rust
+fn validate(&self) -> Result<(), String>
+```
+
+Validate the optional alternate Cleverbase origin before a signing session starts.
+
+Alternate origins are for documented developer environments only. They must be absolute,
+omit credentials, query, and fragment, and use HTTPS except for an explicitly loopback
+HTTP endpoint used in local development. A path is permitted as a service base path.
 
 #### struct `TsaConfiguration`
 

@@ -51,6 +51,7 @@ pub fn begin_signing(
         client_id,
         client_secret: Secret::new(client_secret),
         redirect_uri,
+        upstream_base_url: None,
         tsa: tsa_url.map(|url| TsaConfiguration { url, auth: None, policy_oid: None }),
     };
     let ctx = HostContext { now_unix: now_unix as i64, entropy: entropy.to_vec() };

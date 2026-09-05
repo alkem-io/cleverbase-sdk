@@ -169,6 +169,7 @@ mod tests {
                     client_id: "c".into(),
                     client_secret: Secret::new("s"),
                     redirect_uri: "https://app/cb".into(),
+                    upstream_base_url: None,
                     tsa: None,
                 },
                 ctx: HostContext {

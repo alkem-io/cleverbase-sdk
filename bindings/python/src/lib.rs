@@ -52,6 +52,7 @@ fn begin_signing(
         client_id: client_id.to_string(),
         client_secret: Secret::new(client_secret),
         redirect_uri: redirect_uri.to_string(),
+        upstream_base_url: None,
         tsa: tsa_url.map(|url| TsaConfiguration { url, auth: None, policy_oid: None }),
     };
     let (handle, step) = begin(request, config, HostContext { now_unix, entropy }).map_err(err)?;

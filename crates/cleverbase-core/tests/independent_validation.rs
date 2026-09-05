@@ -180,6 +180,7 @@ fn trust_service_config(algo: KeyAlgo, conformance: ConformanceLevel) -> TrustSe
         client_id: "client-123".into(),
         client_secret: Secret::new("shh"),
         redirect_uri: "https://app.example/cb".into(),
+        upstream_base_url: None,
         tsa: match conformance {
             ConformanceLevel::BB => None,
             ConformanceLevel::BT => Some(TsaConfiguration {
