@@ -28,9 +28,11 @@ import (
 	"strings"
 )
 
-// codeCredential is the OAuth code the mock returns for the credential-scope authorization (and the
-// token endpoint switches on it to serve the credential SAD instead of the service token).
-const codeCredential = "cred"
+// OAuth codes the mock returns for the two authorization scopes and recognizes at /oauth2/token.
+const (
+	codeService    = "svc"
+	codeCredential = "cred"
+)
 
 // maxRequestBody caps POST request bodies (signHash, token form) so an unbounded body cannot
 // exhaust memory. These payloads are tiny (a base64 hash + metadata, or an OAuth form), so 1 MiB is
@@ -249,7 +251,7 @@ func (*Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	redirectURI := q.Get("redirect_uri")
 	state := q.Get("state")
-	code := "svc"
+	code := codeService
 	if q.Get("scope") == "credential" {
 		code = codeCredential
 	}
@@ -278,7 +280,17 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Cap the form body before ParseForm reads it so an unbounded request cannot exhaust memory;
 	// an OAuth token form is tiny, so the shared 1 MiB cap is generous.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid token form", bodyErrorStatus(err))
+		return
+	}
+	// Cleverbase's token contract requires client_id in the form as well as client authentication.
+	// Keep the mock strict here so its credential-free flows cannot mask the documented-stub
+	// integration defect this endpoint caught.
+	if r.PostForm.Get("client_id") == "" {
+		http.Error(w, "missing client_id", http.StatusBadRequest)
+		return
+	}
 	if r.Form.Get("code") == codeCredential {
 		writeRaw(w, s.credSAD)
 		return

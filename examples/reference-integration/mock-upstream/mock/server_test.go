@@ -72,7 +72,9 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	ts := newTestServer(t)
 	defer ts.Close()
 	get := func(code string) string {
-		resp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{"grant_type": {"authorization_code"}, "code": {code}})
+		resp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{
+			"grant_type": {"authorization_code"}, "code": {code}, "client_id": {"test-client"},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,6 +88,38 @@ func TestTokenServiceVsCredential(t *testing.T) {
 	}
 	if tok := get("cred"); tok != "SAD" {
 		t.Fatalf("credential token = %q, want SAD", tok)
+	}
+
+	// Cleverbase's documented token contract requires the public client identifier in the form even
+	// when the client authenticates separately. The mock must reject the old underspecified shape so
+	// the credential-free E2E cannot mask a regression that the public signing stub catches.
+	resp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{"grant_type": {"authorization_code"}, "code": {"svc"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		_ = resp.Body.Close()
+		t.Fatalf("token without client_id status = %d, want 400", resp.StatusCode)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close token response without client_id: %v", err)
+	}
+
+	// URL query parameters are not form fields in Cleverbase's token contract. ParseForm merges
+	// both sources, so this regression test ensures the mock reads PostForm and cannot accept an
+	// underspecified SDK request merely because an unrelated query string carries client_id.
+	resp, err = http.PostForm(ts.URL+"/oauth2/token?client_id=test-client", url.Values{
+		"grant_type": {"authorization_code"}, "code": {"svc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		_ = resp.Body.Close()
+		t.Fatalf("token with query-only client_id status = %d, want 400", resp.StatusCode)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close token response with query-only client_id: %v", err)
 	}
 }
 

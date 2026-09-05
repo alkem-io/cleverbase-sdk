@@ -182,8 +182,9 @@ fn token_exchange(config: &TrustServiceConfiguration, code: &str) -> HttpEffect 
         format!("{}:{}", config.client_id, config.client_secret.expose()).as_bytes(),
     );
     let body = format!(
-        "grant_type=authorization_code&code={}&redirect_uri={}",
+        "grant_type=authorization_code&code={}&client_id={}&redirect_uri={}",
         util::percent_encode(code),
+        util::percent_encode(&config.client_id),
         util::percent_encode(&config.redirect_uri),
     );
     HttpEffect {
@@ -1057,6 +1058,15 @@ mod tests {
             panic!("expected service token exchange");
         };
         assert_eq!(token.url, format!("{origin}/oauth2/token"));
+        let form = url::form_urlencoded::parse(token.body.as_deref().unwrap())
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(form.get("grant_type"), Some(&"authorization_code".into()));
+        assert_eq!(form.get("code"), Some(&"service-code".into()));
+        assert_eq!(form.get("client_id"), Some(&"client-123".into()));
+        assert_eq!(
+            form.get("redirect_uri"),
+            Some(&"https://app.example/callback".into())
+        );
 
         let (_handle, step) = resume(
             handle,
@@ -1930,7 +1940,7 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
-        let (h, _) = resume(
+        let (h, credential_token) = resume(
             h,
             ResumeInput::RedirectReturn {
                 code: "c2".into(),
@@ -1939,6 +1949,15 @@ mod tests {
             ctx(),
         )
         .unwrap();
+        let credential_form = match credential_token {
+            Step::PerformHttp(effect) => {
+                url::form_urlencoded::parse(effect.body.as_deref().unwrap())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            }
+            _ => panic!("expected credential token exchange"),
+        };
+        assert_eq!(credential_form.get("client_id"), Some(&"client-123".into()));
         let (_h, s) = resume(
             h,
             http_ok(serde_json::json!({"access_token": "SAD", "token_type": "SAD"})),
