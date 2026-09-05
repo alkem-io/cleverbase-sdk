@@ -269,7 +269,8 @@ type PDFSigner struct {
 }
 
 // PDFVerification is the integrity-only verdict for one PDF signature. Profile and Signer are nil
-// unless Integrity is true. It intentionally makes no chain, revocation, or timestamp-token claim.
+// unless Integrity is true. It intentionally makes no certificate-chain trust, revocation, TSA
+// trust, or TSA policy claim.
 type PDFVerification struct {
 	Integrity bool       `cbor:"integrity"`
 	Profile   *string    `cbor:"profile"`

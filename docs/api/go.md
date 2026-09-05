@@ -139,9 +139,9 @@ type PDFSigner struct {
 ```
 
 <a name="PDFVerification"></a>
-## type [PDFVerification](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L273-L278>)
+## type [PDFVerification](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L274-L279>)
 
-PDFVerification is the integrity\-only verdict for one PDF signature. Profile and Signer are nil unless Integrity is true. It intentionally makes no chain, revocation, or timestamp\-token claim.
+PDFVerification is the integrity\-only verdict for one PDF signature. Profile and Signer are nil unless Integrity is true. It intentionally makes no certificate\-chain trust, revocation, TSA trust, or TSA policy claim.
 
 ```go
 type PDFVerification struct {
@@ -153,7 +153,7 @@ type PDFVerification struct {
 ```
 
 <a name="VerifyPDF"></a>
-### func [VerifyPDF](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L282>)
+### func [VerifyPDF](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L283>)
 
 ```go
 func VerifyPDF(document []byte) (*PDFVerification, error)
@@ -201,7 +201,7 @@ type Session struct {
 ```
 
 <a name="BeginSigning"></a>
-### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L295>)
+### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L296>)
 
 ```go
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error)
@@ -210,7 +210,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request.
 
 <a name="ResumeHTTP"></a>
-### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L359>)
+### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L360>)
 
 ```go
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error)
@@ -219,7 +219,7 @@ func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, 
 ResumeHTTP advances the flow with the result of a performed HTTP effect.
 
 <a name="ResumeRedirect"></a>
-### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L337>)
+### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L338>)
 
 ```go
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error)
@@ -228,7 +228,7 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 ResumeRedirect advances the flow with the OAuth code\+state from a redirect return.
 
 <a name="ResumeRedirectError"></a>
-### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L349>)
+### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L350>)
 
 ```go
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error)
