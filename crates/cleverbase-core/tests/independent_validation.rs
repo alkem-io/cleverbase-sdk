@@ -21,8 +21,9 @@ use std::process::Command;
 
 use cleverbase_core::util::{base64_decode, base64_std};
 use cleverbase_core::{
-    begin, resume, ConformanceLevel, CscApi, Environment, HostContext, HttpEffect, ResumeInput,
-    Secret, SignedDocument, SigningRequest, Step, TrustServiceConfiguration, TsaConfiguration,
+    begin, resume, verify_pdf, ConformanceLevel, CscApi, Environment, HostContext, HttpEffect,
+    ResumeInput, Secret, SignedDocument, SigningRequest, Step, TrustServiceConfiguration,
+    TsaConfiguration, VerificationReason,
 };
 use lopdf::{Dictionary, Document, Object};
 use pkcs8::DecodePrivateKey;
@@ -79,6 +80,20 @@ impl KeyAlgo {
         match self {
             Self::Rsa => "PNONL-123",
             Self::EcdsaP256 => "PNONL-456",
+        }
+    }
+
+    fn certificate_serial(self) -> &'static str {
+        match self {
+            Self::Rsa => "07FB0DA8384404C33517B852CFE79F04C5006AC1",
+            Self::EcdsaP256 => "07FB0DA8384404C33517B852CFE79F04C5006AC2",
+        }
+    }
+
+    fn common_name(self) -> &'static str {
+        match self {
+            Self::Rsa => "Jane Doe",
+            Self::EcdsaP256 => "John Roe",
         }
     }
 
@@ -321,6 +336,30 @@ fn extract(pdf: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (content, bytes[..len].to_vec())
 }
 
+/// Replace only the unsigned raw-hex `/Contents` gap of an SDK-produced PDF. ByteRange and every
+/// signed byte stay unchanged, which isolates verifier vectors to their CMS input.
+fn replace_cms(pdf: &[u8], cms_der: &[u8]) -> Vec<u8> {
+    let br = find(pdf, b"/ByteRange").unwrap();
+    let open = br + pdf[br..].iter().position(|&byte| byte == b'[').unwrap() + 1;
+    let close = open + pdf[open..].iter().position(|&byte| byte == b']').unwrap();
+    let values = std::str::from_utf8(&pdf[open..close])
+        .unwrap()
+        .split_whitespace()
+        .map(|value| value.parse::<usize>().unwrap())
+        .collect::<Vec<_>>();
+    let first_len = values[1];
+    let second_start = values[2];
+    let mut replaced = pdf.to_vec();
+    let gap = &mut replaced[first_len..second_start];
+    assert!(cms_der.len() * 2 <= gap.len());
+    gap.fill(b'0');
+    for (encoded, byte) in gap.chunks_exact_mut(2).zip(cms_der) {
+        encoded[0] = b"0123456789ABCDEF"[(byte >> 4) as usize];
+        encoded[1] = b"0123456789ABCDEF"[(byte & 0x0f) as usize];
+    }
+    replaced
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
@@ -381,6 +420,17 @@ fn produced_b_b_signature_verifies_with_openssl() {
     // independent OpenSSL validator.
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
         let signed = produce_signed_pdf(algo);
+        let verification = verify_pdf(&signed.pdf);
+        assert!(
+            verification.integrity,
+            "core verifier rejected valid {} B-B",
+            algo.name()
+        );
+        assert_eq!(verification.profile, Some(ConformanceLevel::BB));
+        assert!(verification.reasons.is_empty());
+        let signer = verification.signer.as_ref().unwrap();
+        assert_eq!(signer.serial_number, algo.certificate_serial());
+        assert_eq!(signer.common_name, algo.common_name());
         let (content, cms_der) = extract(&signed.pdf);
         assert!(
             openssl_cms_verify(&content, &cms_der),
@@ -388,6 +438,102 @@ fn produced_b_b_signature_verifies_with_openssl() {
             algo.name(),
         );
     }
+}
+
+#[test]
+fn signing_output_is_byte_stable_after_shared_verifier_refactor() {
+    // Captured from develop at 4b06117 before the CMS self-check was refactored to share the
+    // offline verifier. The fixed clock, entropy, fixture key, and PKCS#1 v1.5 signature make this
+    // RSA B-B output deterministic; changing signer-certificate selection must not rewrite it.
+    assert_eq!(
+        cleverbase_core::crypto::sha256(&produce_signed_pdf(KeyAlgo::Rsa).pdf),
+        [
+            0x3c, 0xbf, 0x4e, 0x64, 0x4d, 0xbc, 0x68, 0xcb, 0x35, 0x26, 0xde, 0x0b, 0xb6, 0x70,
+            0x10, 0xc6, 0x60, 0x20, 0x1c, 0x17, 0xd6, 0x0b, 0xf1, 0x43, 0x4e, 0xe9, 0xcf, 0x0f,
+            0xa1, 0x6e, 0xbd, 0x49,
+        ]
+    );
+}
+
+#[test]
+fn verifier_rejects_cms_signed_by_a_key_other_than_its_embedded_certificate() {
+    use cleverbase_core::crypto::{cms, sha256};
+    use rsa::signature::{SignatureEncoding, Signer as _};
+
+    let signed = produce_signed_pdf(KeyAlgo::Rsa).pdf;
+    let (content, _) = extract(&signed);
+    let attributes = cms::build_signed_attrs(&sha256(&content), EC_CERT, ctx().now_unix).unwrap();
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
+    let signature = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key)
+        .sign(&attributes)
+        .to_bytes();
+    let wrong_certificate_cms = cms::assemble_signed_data(
+        &[EC_CERT.to_vec()],
+        &attributes,
+        &signature,
+        cleverbase_core::signing::csc::KeyAlgo::Rsa,
+    )
+    .unwrap();
+
+    let verification = verify_pdf(&replace_cms(&signed, &wrong_certificate_cms));
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::InvalidSignature]
+    );
+}
+
+#[test]
+fn verifier_rejects_the_public_cleverbase_stub_fake_signature() {
+    use cleverbase_core::crypto::{cms, sha256};
+
+    const STUB_LEAF_B64: &str = include_str!("fixtures/cleverbase-hash-signing-stub-leaf.b64");
+    // Captured from the public hash-signing stub's /csc/v1/signatures/signHash response on
+    // 2026-09-05. Its 40 bytes are deliberately not a real RSA-2048 signature.
+    const STUB_SIGNATURE_B64: &str = "KedJuTob5gtvYx9qM3k3gm7kbLBwVbEQRl26S2tmXjqNND7MRGtoew==";
+
+    let signed = produce_signed_pdf(KeyAlgo::Rsa).pdf;
+    let (content, _) = extract(&signed);
+    let leaf = base64_decode(STUB_LEAF_B64.trim()).unwrap();
+    let attributes = cms::build_signed_attrs(&sha256(&content), &leaf, ctx().now_unix).unwrap();
+    let fake_signature = base64_decode(STUB_SIGNATURE_B64).unwrap();
+    let fake_cms = cms::assemble_signed_data(
+        &[leaf],
+        &attributes,
+        &fake_signature,
+        cleverbase_core::signing::csc::KeyAlgo::Rsa,
+    )
+    .unwrap();
+
+    let verification = verify_pdf(&replace_cms(&signed, &fake_cms));
+
+    assert!(!verification.integrity);
+    assert_eq!(verification.profile, None);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::InvalidSignature]
+    );
+}
+
+#[test]
+fn verifier_rejects_tampered_pdf_byte_range_content() {
+    let mut signed = produce_signed_pdf(KeyAlgo::Rsa).pdf;
+    let changed = signed
+        .get_mut(7)
+        .expect("fixture has a PDF version minor digit");
+    *changed = b'6';
+
+    let verification = verify_pdf(&signed);
+    assert!(!verification.integrity);
+    assert_eq!(verification.profile, None);
+    assert_eq!(verification.signer, None);
+    assert_eq!(
+        verification.reasons,
+        vec![VerificationReason::MessageDigestMismatch]
+    );
 }
 
 /// A produced ECDSA B-B CMS whose embedded signature has been corrupted MUST be rejected by the
@@ -692,6 +838,18 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
         let signed = produce_signed_pdf_bt(algo);
         assert_eq!(signed.conformance_level, ConformanceLevel::BT);
+        let verification = verify_pdf(&signed.pdf);
+        assert!(
+            verification.integrity,
+            "core verifier rejected valid {} B-T",
+            algo.name()
+        );
+        assert_eq!(verification.profile, Some(ConformanceLevel::BT));
+        assert!(verification.signer.is_some());
+        assert_eq!(
+            verification.reasons,
+            vec![VerificationReason::TimestampUnverified]
+        );
         Document::load_mem(&signed.pdf).unwrap();
 
         let (content, cms_der) = extract(&signed.pdf);

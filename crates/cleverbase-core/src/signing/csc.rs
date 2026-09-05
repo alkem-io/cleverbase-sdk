@@ -280,6 +280,21 @@ fn identity_from_subject(serial_number: String, subject_dn: String) -> SignerIde
     }
 }
 
+/// Derive the canonical identity from an embedded leaf certificate.
+///
+/// This is shared by CSC fallback parsing and offline CMS verification so both surfaces expose the
+/// same certificate serial and RFC 4514 subject representation.
+pub(crate) fn signer_identity_from_certificate(
+    leaf_certificate_der: &[u8],
+) -> Result<SignerIdentity, CoreError> {
+    let leaf = Certificate::from_der(leaf_certificate_der)
+        .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
+    Ok(identity_from_subject(
+        certificate_serial_number(&leaf),
+        leaf.tbs_certificate.subject.to_string(),
+    ))
+}
+
 /// Derive the signer's identity from CSC `credentials/info`.
 ///
 /// CSC providers may omit either non-standard `subjectDN` or `serialNumber` convenience field.
@@ -297,12 +312,7 @@ pub fn signer_identity(
         ));
     }
 
-    let leaf = Certificate::from_der(leaf_certificate_der)
-        .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
-    Ok(identity_from_subject(
-        certificate_serial_number(&leaf),
-        leaf.tbs_certificate.subject.to_string(),
-    ))
+    signer_identity_from_certificate(leaf_certificate_der)
 }
 
 /// Check the authorizing signer against an expected identity (FR-014). The default match key is the
