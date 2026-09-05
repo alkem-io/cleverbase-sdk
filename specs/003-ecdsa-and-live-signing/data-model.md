@@ -30,7 +30,7 @@ The credential the flow signs with — unchanged in the core; listed for complet
 |-------|------|-------|
 | `keyAlgo` | `KeyAlgo` | derived from the cert key OID by the core (`key_algo_from_oids`) — `Rsa`/`EcdsaP256`/`Other` |
 | `certChain` | bytes[] | leaf + issuer chain; the trust anchor for independent verification |
-| `signAlgoOID` | string | `sha256WithRSAEncryption` / `ecdsa-with-SHA256` — set by the core from `keyAlgo` |
+| `signAlgoOID` | string | CSC `signHash` parameter: RSA is `rsaEncryption` (`1.2.840.113549.1.1.1`) while `hashAlgo` carries SHA-256; ECDSA is `ecdsa-with-SHA256`. CMS also uses RSA `rsaEncryption` with SHA-256 in its `digestAlgorithm` / `ecdsa-with-SHA256`. |
 
 **Rules**: an `Other`/unsupported key MUST be rejected with a specific error, never guessed (Edge Cases,
 FR acceptance US1#3).

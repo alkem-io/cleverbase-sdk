@@ -1908,6 +1908,10 @@ mod tests {
             util::base64_decode(&auth_hash.replace('-', "+").replace('_', "/")).unwrap();
         let signed = util::base64_decode(body["hash"][0].as_str().unwrap()).unwrap();
         assert_eq!(authorized, signed);
+        assert_eq!(body["hashAlgo"], "2.16.840.1.101.3.4.2.1");
+        // CSC receives a key algorithm here; CMS also carries rsaEncryption with SHA-256 in
+        // digestAlgorithm.
+        assert_eq!(body["signAlgo"], "1.2.840.113549.1.1.1");
     }
 
     #[test]
