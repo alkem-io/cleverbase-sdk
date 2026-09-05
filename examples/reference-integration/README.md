@@ -145,6 +145,7 @@ the seven SDK `SigningOutcome` failure codes — `authorization_expired` · `cre
 | `REFSVC_CLIENT_ID` | — | OAuth client id (**required in live**). |
 | `REFSVC_CLIENT_SECRET` | — | OAuth client secret (**required in live**). |
 | `REFSVC_REDIRECT_URI` | — | Registered redirect URI (**required in live**). |
+| `REFSVC_UPSTREAM_BASE_URL` | — | Optional SDK upstream-origin override in live mode (for the documented Cleverbase stub); distinct from fixture-only `REFSVC_BASE_URL`. |
 | `REFSVC_TSA_URL` | — | RFC 3161 TSA endpoint (**required in live** — conformance is per-request, so a live deployment must always be able to serve B-T). |
 | `REFSVC_TSA_AUTH` | — | Optional TSA authorization header value. |
 | `REFSVC_TSA_POLICY` | — | Optional TSA policy OID. |
@@ -165,6 +166,9 @@ additionally assert the ETSI EN 319 142 `PAdES-BASELINE-B/-T` level. A **live co
 (`e2e/live_test.go`, opt-in, gated on real Cleverbase credentials via `REFSVC_LIVE_*`; CI: `live.yml`) signs
 against the real service and verifies the result against the real issuer chain; it is skipped cleanly when
 credentials are absent.
+
+The maintained [SDK proof matrix](../../docs/proof-matrix.md) records exactly what the fixture, public-stub,
+and live paths do—and do not—prove.
 
 ### mock-upstream (`REFMOCK_*`)
 

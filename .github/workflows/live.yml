@@ -29,6 +29,7 @@ jobs:
   contract:
     name: Cleverbase ${{ matrix.leg }} (${{ github.event_name == 'workflow_dispatch' && inputs.target || 'stub' }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Only acceptance receives the protected environment. The stub uses no secret and its public
     # documented client values appear only in the test step below.
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && 'live-acceptance' || 'stub-contract' }}
@@ -40,10 +41,6 @@ jobs:
             csc_api: v1_rsa
           - leg: v2_ecdsa
             csc_api: v2_ecdsa
-    # One source for the acceptance matrix credentials. A public-stub job never evaluates them.
-    env:
-      LEG_CLIENT_ID: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA) || '' }}
-      LEG_CLIENT_SECRET: ${{ (matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA) || '' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -53,10 +50,10 @@ jobs:
         id: gate
         env:
           TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'stub' }}
-          CLIENT_ID: ${{ env.LEG_CLIENT_ID }}
-          CLIENT_SECRET: ${{ env.LEG_CLIENT_SECRET }}
-          REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
-          CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
+          CLIENT_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && ((matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_ID_ECDSA)) || '' }}
+          CLIENT_SECRET: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && ((matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA) || (matrix.leg == 'v2_ecdsa' && secrets.LIVE_CLIENT_SECRET_ECDSA)) || '' }}
+          REDIRECT_URI: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && secrets.LIVE_REDIRECT_URI || '' }}
+          CA_BUNDLE_B64: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'acceptance' && secrets.LIVE_CA_BUNDLE_B64 || '' }}
         run: |
           case "$TARGET" in
             stub)
@@ -105,8 +102,25 @@ jobs:
           CA_BUNDLE_B64: ${{ secrets.LIVE_CA_BUNDLE_B64 }}
         run: printf '%s' "$CA_BUNDLE_B64" | base64 -d > "$RUNNER_TEMP/live-ca-bundle.pem"
 
-      - name: Run selected contract suite
-        if: steps.gate.outputs.run == 'true'
+      - name: Run public stub contract suite
+        if: steps.gate.outputs.variant == 'stub'
+        working-directory: examples/reference-integration/signing-service
+        env:
+          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          REFSVC_MODE: live
+          REFSVC_ENV: acceptance
+          REFSVC_CSC_API: v1_rsa
+          REFSVC_CLIENT_ID: 6dd5f48d-bcd9-4a98-8a4c-5c82182f5be4
+          REFSVC_CLIENT_SECRET: 11628999-cb61-4c62-8e1f-09699dcb5521
+          REFSVC_REDIRECT_URI: http://localhost:8080/oauth/cleverbase/callback
+          REFSVC_UPSTREAM_BASE_URL: https://trust-driver-stub-hash-signing.cleverbase.com
+        run: go test -race -run '^TestCleverbaseHashSigningStub$' -v ./e2e/
+
+      # Stub and acceptance have different trust and secret boundaries. Separate steps make those
+      # boundaries explicit instead of relying on a falsy middle operand in a GitHub expression.
+      - name: Run acceptance contract suite
+        if: steps.gate.outputs.variant == 'acceptance'
         working-directory: examples/reference-integration/signing-service
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
@@ -114,16 +128,11 @@ jobs:
           REFSVC_MODE: live
           REFSVC_ENV: acceptance
           REFSVC_CSC_API: ${{ matrix.csc_api }}
-          REFSVC_CLIENT_ID: ${{ steps.gate.outputs.variant == 'stub' && '6dd5f48d-bcd9-4a98-8a4c-5c82182f5be4' || env.LEG_CLIENT_ID }}
-          REFSVC_CLIENT_SECRET: ${{ steps.gate.outputs.variant == 'stub' && '11628999-cb61-4c62-8e1f-09699dcb5521' || env.LEG_CLIENT_SECRET }}
-          REFSVC_REDIRECT_URI: ${{ steps.gate.outputs.variant == 'stub' && 'http://localhost:8080/oauth/cleverbase/callback' || secrets.LIVE_REDIRECT_URI }}
-          REFSVC_UPSTREAM_BASE_URL: ${{ steps.gate.outputs.variant == 'stub' && 'https://trust-driver-stub-hash-signing.cleverbase.com' || '' }}
-          REFSVC_TSA_URL: ${{ steps.gate.outputs.variant == 'stub' && '' || secrets.LIVE_TSA_URL }}
-          REFSVC_LIVE_AUTHORIZER: ${{ steps.gate.outputs.variant == 'acceptance' && 'headless' || '' }}
+          REFSVC_CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA }}
+          REFSVC_CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA }}
+          REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
+          REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
+          REFSVC_LIVE_AUTHORIZER: headless
         run: |
-          if [ "${{ steps.gate.outputs.variant }}" = "stub" ]; then
-            go test -race -run '^TestCleverbaseHashSigningStub$' -v ./e2e/
-          else
-            export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
-            go test -race -run '^TestLive$' -v ./e2e/
-          fi
+          export REFSVC_LIVE_CA_BUNDLE="$RUNNER_TEMP/live-ca-bundle.pem"
+          go test -race -run '^TestLive$' -v ./e2e/

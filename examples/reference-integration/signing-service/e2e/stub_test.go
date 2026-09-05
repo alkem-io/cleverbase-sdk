@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ const (
 // checklist, so the documentation cannot claim coverage that this suite does not name.
 const (
 	stubStatusVerified     = "[Verified in public-stub CI]("
-	stubStatusLimitation   = "Stub limitation;"
+	stubStatusObserved     = "Observed stub behavior;"
 	stubStatusNotExercised = "Not exercised."
 	stubStatusNotTestable  = "Not testable against this stub."
 )
@@ -55,14 +56,49 @@ var stubContractChecklist = []struct {
 	{"info-missing-credential", "/csc/v1/credentials/info", "Missing credential ID is rejected (400).", stubStatusVerified},
 	{"sign-hash-wrong-algorithm", "/csc/v1/signatures/signHash", "`sha256WithRSAEncryption` is rejected (400); documented CSC `rsaEncryption` is the accepted value.", stubStatusVerified},
 	{"sign-hash-invalid-sad", "/csc/v1/signatures/signHash", "Invalid or expired SAD is rejected (400).", stubStatusVerified},
-	{"sign-hash-empty-credential-limitation", "/csc/v1/signatures/signHash", "Empty credential ID currently receives 200 despite the OpenAPI-required field.", stubStatusLimitation},
-	{"sign-hash-malformed-hash-limitation", "/csc/v1/signatures/signHash", "Non-base64 hash currently receives 200 despite the OpenAPI schema.", stubStatusLimitation},
-	{"sign-hash-short-hash-limitation", "/csc/v1/signatures/signHash", "31-byte hash currently receives 200 despite SHA-256 expectations.", stubStatusLimitation},
+	{"sign-hash-empty-credential-limitation", "/csc/v1/signatures/signHash", "Logs either a current 200 acceptance or a spec-correct 400 for an empty credential ID.", stubStatusObserved},
+	{"sign-hash-malformed-hash-limitation", "/csc/v1/signatures/signHash", "Logs either a current 200 acceptance or a spec-correct 400 for a non-base64 hash.", stubStatusObserved},
+	{"sign-hash-short-hash-limitation", "/csc/v1/signatures/signHash", "Logs either a current 200 acceptance or a spec-correct 400 for a 31-byte hash.", stubStatusObserved},
 	{"oauth-auth-not-used", "/oauth2/auth", "The SDK does not call this sibling authorize endpoint.", stubStatusNotExercised},
 	{"oauth-revoke-not-used", "/oauth2/revoke", "The SDK does not revoke OAuth tokens.", stubStatusNotExercised},
 	{"csc-info-not-used", "/csc/v1/info", "The SDK does not call general CSC info.", stubStatusNotExercised},
 	{"csc-auth-revoke-not-used", "/csc/v1/auth/revoke", "The SDK does not revoke CSC authorization.", stubStatusNotExercised},
 	{"ecdsa-v2-not-exposed", "not exposed by hash-signing stub", "The public hash-signing stub exposes CSC v1 RSA only.", stubStatusNotTestable},
+}
+
+// stubProbes turns every documented checklist id into an executed subtest. The proof matrix is not
+// a second test plan: deleting a probe leaves a known id unseen and fails this suite.
+type stubProbes struct {
+	known map[string]struct{}
+	seen  map[string]bool
+}
+
+func newStubProbes() *stubProbes {
+	known := make(map[string]struct{}, len(stubContractChecklist))
+	for _, item := range stubContractChecklist {
+		known[item.id] = struct{}{}
+	}
+	return &stubProbes{known: known, seen: make(map[string]bool, len(known))}
+}
+
+func (p *stubProbes) run(t *testing.T, id string, check func(t *testing.T)) {
+	t.Helper()
+	if _, ok := p.known[id]; !ok {
+		t.Fatalf("stub probe %q is not in the proof checklist", id)
+	}
+	t.Run(id, func(t *testing.T) {
+		p.seen[id] = true
+		check(t)
+	})
+}
+
+func (p *stubProbes) requireAll(t *testing.T) {
+	t.Helper()
+	for _, item := range stubContractChecklist {
+		if !p.seen[item.id] {
+			t.Errorf("proof checklist probe %q was not executed", item.id)
+		}
+	}
 }
 
 // recordedEffect is a complete in-memory record of one SDK-emitted HTTP effect and the stub's
@@ -103,6 +139,7 @@ func (r *recordingEffector) snapshot() []recordedEffect {
 
 type recordedAuthorization struct {
 	query  url.Values
+	path   string
 	status int
 }
 
@@ -140,7 +177,7 @@ func (a *stubAuthorizer) Authorize(ctx context.Context, authorizeURL, expectStat
 		return "", "", errors.New("stub callback state did not match SDK state")
 	}
 	a.mu.Lock()
-	a.calls = append(a.calls, recordedAuthorization{query: u.Query(), status: resp.StatusCode})
+	a.calls = append(a.calls, recordedAuthorization{query: u.Query(), path: u.Path, status: resp.StatusCode})
 	a.mu.Unlock()
 	return code, state, nil
 }
@@ -186,10 +223,12 @@ type stubCertWire struct {
 }
 
 type stubFlowResult struct {
-	status   string
-	reason   string
-	evidence stubEvidence
-	access   stubAccess
+	status       string
+	reason       string
+	evidence     stubEvidence
+	access       stubAccess
+	resultPDFLen int
+	resultStatus int
 }
 
 // stubAccess is extracted only from the in-memory responses to the SDK's own successful effects.
@@ -266,33 +305,43 @@ func TestCleverbaseHashSigningStub(t *testing.T) {
 	if e.cscAPI != "v1_rsa" {
 		t.Fatalf("hash-signing stub exposes CSC v1 RSA only, got REFSVC_CSC_API=%q", e.cscAPI)
 	}
+	probes := newStubProbes()
 
 	for _, level := range []string{config.ConformanceBB, config.ConformanceBT} {
 		t.Run(level, func(t *testing.T) {
-			result := runStubContract(t, e, level)
+			result := runStubContract(t, e, level, probes)
 			if result.status != "failed" || result.reason != "signature_invalid" {
 				t.Fatalf("stub %s terminal status=%s reason=%s, want failed/signature_invalid", level, result.status, result.reason)
 			}
 			if result.evidence.outcome != "signature_invalid" {
 				t.Fatalf("stub %s evidence outcome=%q, want signature_invalid", level, result.evidence.outcome)
 			}
-			if result.evidence.signerPresent && (result.evidence.serialNumber != stubSignerSerial || result.evidence.rawSubject == "") {
+			if !result.evidence.signerPresent || result.evidence.serialNumber != stubSignerSerial || result.evidence.rawSubject == "" {
 				t.Fatalf("stub %s evidence identity=%+v, want canonical serial and raw subject", level, result.evidence)
 			}
-			if !result.evidence.signerPresent {
-				t.Log("stub failure evidence does not expose signer identity; recorded as a contract limitation")
+			if result.resultPDFLen != 0 {
+				t.Fatalf("stub %s retained %d result-PDF bytes after SignatureInvalid", level, result.resultPDFLen)
+			}
+			if result.resultStatus == http.StatusOK {
+				t.Fatalf("stub %s result endpoint returned 200 after SignatureInvalid", level)
 			}
 			if level == config.ConformanceBB {
-				assertStubModeledFailures(t, e, result.access)
+				assertStubModeledFailures(t, e, result.access, probes)
 			}
 		})
 	}
+	probes.run(t, "ecdsa-v2-not-exposed", func(t *testing.T) {
+		if e.cscAPI != "v1_rsa" {
+			t.Fatalf("stub test uses CSC API %q, want v1_rsa", e.cscAPI)
+		}
+	})
+	probes.requireAll(t)
 }
 
 // runStubContract drives the exact public service flow through Cleverbase's headless signing
 // stub. A stub response is deliberately not cryptographically valid, so the core must terminate at
 // SignatureInvalid after accepting signHash; it must never embed or return that fake signature.
-func runStubContract(t *testing.T, e liveEnv, level string) stubFlowResult {
+func runStubContract(t *testing.T, e liveEnv, level string, probes *stubProbes) stubFlowResult {
 	t.Helper()
 	// B-T needs a configured TSA to begin. The core rejects the fake signature before a timestamp
 	// request can exist, so this endpoint is intentionally never contacted; a real/stub TSA is not
@@ -310,10 +359,29 @@ func runStubContract(t *testing.T, e liveEnv, level string) stubFlowResult {
 	if err != nil {
 		t.Fatalf("read stub session evidence: %v", err)
 	}
+	if len(view.ResultPDF) != 0 {
+		t.Fatalf("stub session retained %d result-PDF bytes after SignatureInvalid", len(view.ResultPDF))
+	}
+	resultStatus := stubResultStatus(t, svc, run.correlationID)
 	evidence := parseStubEvidence(t, view.Evidence)
-	access := assertStubEffects(t, effector.snapshot(), e)
-	assertStubAuthorizations(t, authorizer.snapshot(), e)
-	return stubFlowResult{status: run.status, reason: run.reason, evidence: evidence, access: access}
+	access := assertStubEffects(t, effector.snapshot(), e, probes)
+	assertStubAuthorizations(t, authorizer.snapshot(), e, probes)
+	return stubFlowResult{status: run.status, reason: run.reason, evidence: evidence, access: access, resultPDFLen: len(view.ResultPDF), resultStatus: resultStatus}
+}
+
+func stubResultStatus(t *testing.T, svc *httptest.Server, correlationID string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, svc.URL+"/v1/sign/result?correlationId="+url.QueryEscape(correlationID), nil)
+	if err != nil {
+		t.Fatalf("build failed-session result request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fetch failed-session result: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
 }
 
 func parseStubEvidence(t *testing.T, raw []byte) stubEvidence {
@@ -333,52 +401,69 @@ func parseStubEvidence(t *testing.T, raw []byte) stubEvidence {
 	}
 }
 
-func assertStubAuthorizations(t *testing.T, calls []recordedAuthorization, e liveEnv) {
+func assertStubAuthorizations(t *testing.T, calls []recordedAuthorization, e liveEnv, probes *stubProbes) {
 	t.Helper()
 	if len(calls) != 2 {
 		t.Fatalf("stub authorize calls=%d, want service + credential", len(calls))
 	}
-	for index, call := range calls {
-		if call.status != http.StatusFound {
-			t.Fatalf("authorize %d status=%d, want 302", index, call.status)
+	probes.run(t, "authorize-service", func(t *testing.T) {
+		call := calls[0]
+		assertStubAuthorizationCommon(t, call, e, 0)
+		if got := call.query.Get("scope"); got != "service" {
+			t.Fatalf("service authorize scope=%q, want service", got)
 		}
-		for key, want := range map[string]string{
-			"response_type": "code",
-			"client_id":     e.clientID,
-			"redirect_uri":  e.redirectURI,
-		} {
-			if got := call.query.Get(key); got != want {
-				t.Fatalf("authorize %d %s=%q, want configured value", index, key, got)
+		for _, unexpected := range []string{"credentialID", "numSignatures", "hash"} {
+			if got := call.query.Get(unexpected); got != "" {
+				t.Fatalf("service authorize unexpectedly carried %s", unexpected)
 			}
 		}
-		if call.query.Get("state") == "" {
-			t.Fatalf("authorize %d omitted CSRF state", index)
+	})
+	probes.run(t, "authorize-credential", func(t *testing.T) {
+		call := calls[1]
+		assertStubAuthorizationCommon(t, call, e, 1)
+		if got := call.query.Get("scope"); got != "credential" {
+			t.Fatalf("credential authorize scope=%q, want credential", got)
+		}
+		if calls[1].query.Get("credentialID") == "" {
+			t.Fatal("credential authorize omitted credentialID")
+		}
+		if got := calls[1].query.Get("numSignatures"); got != "1" {
+			t.Fatalf("credential authorize numSignatures=%q, want 1", got)
+		}
+		hash, err := base64.RawURLEncoding.DecodeString(calls[1].query.Get("hash"))
+		if err != nil || len(hash) != 32 {
+			t.Fatalf("credential authorize hash is not a SHA-256 base64url value (len=%d err=%v)", len(hash), err)
+		}
+	})
+	probes.run(t, "oauth-auth-not-used", func(t *testing.T) {
+		for _, call := range calls {
+			if call.path == "/oauth2/auth" {
+				t.Fatal("SDK used the sibling /oauth2/auth endpoint")
+			}
+		}
+	})
+}
+
+func assertStubAuthorizationCommon(t *testing.T, call recordedAuthorization, e liveEnv, index int) {
+	t.Helper()
+	if call.status != http.StatusFound {
+		t.Fatalf("authorize %d status=%d, want 302", index, call.status)
+	}
+	for key, want := range map[string]string{
+		"response_type": "code",
+		"client_id":     e.clientID,
+		"redirect_uri":  e.redirectURI,
+	} {
+		if got := call.query.Get(key); got != want {
+			t.Fatalf("authorize %d %s=%q, want configured value", index, key, got)
 		}
 	}
-	if got := calls[0].query.Get("scope"); got != "service" {
-		t.Fatalf("service authorize scope=%q, want service", got)
-	}
-	for _, unexpected := range []string{"credentialID", "numSignatures", "hash"} {
-		if got := calls[0].query.Get(unexpected); got != "" {
-			t.Fatalf("service authorize unexpectedly carried %s", unexpected)
-		}
-	}
-	if got := calls[1].query.Get("scope"); got != "credential" {
-		t.Fatalf("credential authorize scope=%q, want credential", got)
-	}
-	if calls[1].query.Get("credentialID") == "" {
-		t.Fatal("credential authorize omitted credentialID")
-	}
-	if got := calls[1].query.Get("numSignatures"); got != "1" {
-		t.Fatalf("credential authorize numSignatures=%q, want 1", got)
-	}
-	hash, err := base64.RawURLEncoding.DecodeString(calls[1].query.Get("hash"))
-	if err != nil || len(hash) != 32 {
-		t.Fatalf("credential authorize hash is not a SHA-256 base64url value (len=%d err=%v)", len(hash), err)
+	if call.query.Get("state") == "" {
+		t.Fatalf("authorize %d omitted CSRF state", index)
 	}
 }
 
-func assertStubEffects(t *testing.T, calls []recordedEffect, e liveEnv) stubAccess {
+func assertStubEffects(t *testing.T, calls []recordedEffect, e liveEnv, probes *stubProbes) stubAccess {
 	t.Helper()
 	if len(calls) != 5 {
 		for index, call := range calls {
@@ -400,12 +485,45 @@ func assertStubEffects(t *testing.T, calls []recordedEffect, e liveEnv) stubAcce
 		}
 		t.Fatalf("stub HTTP effects=%d, want token/list/info/token/signHash", len(calls))
 	}
-	serviceToken := assertStubTokenEffect(t, calls[0], e, "Bearer")
-	credentialID := assertStubCredentialList(t, calls[1])
-	assertStubCredentialInfo(t, calls[2], credentialID)
-	sad := assertStubTokenEffect(t, calls[3], e, "SAD")
-	assertStubSignHash(t, calls[4], credentialID)
+	var serviceToken, credentialID, sad string
+	probes.run(t, "token-service", func(t *testing.T) {
+		serviceToken = assertStubTokenEffect(t, calls[0], e, "Bearer")
+	})
+	probes.run(t, "credentials-list", func(t *testing.T) {
+		credentialID = assertStubCredentialList(t, calls[1])
+	})
+	probes.run(t, "credentials-info", func(t *testing.T) {
+		assertStubCredentialInfo(t, calls[2], credentialID)
+	})
+	probes.run(t, "token-credential-sad", func(t *testing.T) {
+		sad = assertStubTokenEffect(t, calls[3], e, "SAD")
+	})
+	probes.run(t, "sign-hash", func(t *testing.T) {
+		assertStubSignHash(t, calls[4], credentialID)
+	})
+	for _, item := range []struct{ id, path string }{
+		{"oauth-revoke-not-used", "/oauth2/revoke"},
+		{"csc-info-not-used", "/csc/v1/info"},
+		{"csc-auth-revoke-not-used", "/csc/v1/auth/revoke"},
+	} {
+		probes.run(t, item.id, func(t *testing.T) {
+			assertNoStubEffect(t, calls, item.path)
+		})
+	}
 	return stubAccess{serviceToken: serviceToken, credentialID: credentialID, sad: sad}
+}
+
+func assertNoStubEffect(t *testing.T, calls []recordedEffect, path string) {
+	t.Helper()
+	for _, call := range calls {
+		u, err := url.Parse(call.url)
+		if err != nil {
+			t.Fatalf("parse recorded effect URL: %v", err)
+		}
+		if u.Path == path {
+			t.Fatalf("SDK emitted an unexpected request to %s", path)
+		}
+	}
 }
 
 func assertStubURL(t *testing.T, call recordedEffect, wantPath string) {
@@ -559,7 +677,7 @@ func assertStubSignHash(t *testing.T, call recordedEffect, credentialID string) 
 // never intentionally emits malformed requests, so these probes necessarily sit at the contract
 // boundary; they reuse the successful driver-issued bearer, credential ID, and SAD above rather than
 // grow a second happy-path OAuth/CSC client. No credential value is logged.
-func assertStubModeledFailures(t *testing.T, e liveEnv, access stubAccess) {
+func assertStubModeledFailures(t *testing.T, e liveEnv, access stubAccess, probes *stubProbes) {
 	t.Helper()
 	if access.serviceToken == "" || access.credentialID == "" || access.sad == "" {
 		t.Fatal("successful stub flow did not supply tokens and credential ID for error probes")
@@ -568,34 +686,38 @@ func assertStubModeledFailures(t *testing.T, e liveEnv, access stubAccess) {
 	// The token endpoint must reject bad HTTP Basic credentials. A fresh immediate-redirect code keeps
 	// this probe about client authentication rather than replaying an already-consumed authorization
 	// code.
-	authorizer := &stubAuthorizer{}
-	state := "stub-wrong-client-credentials"
-	code, _, err := authorizer.Authorize(context.Background(), stubAuthorizeURL(t, e, "service", state), state)
-	if err != nil {
-		t.Fatalf("obtain code for wrong-client-credentials probe: %v", err)
-	}
-	form := url.Values{
-		"grant_type":   {"authorization_code"},
-		"code":         {code},
-		"client_id":    {e.clientID},
-		"redirect_uri": {e.redirectURI},
-	}.Encode()
-	status, _, err := upstream.New("").Do(context.Background(), http.MethodPost, stubURL(t, e, "/oauth2/token"), [][2]string{
-		{"Content-Type", "application/x-www-form-urlencoded"},
-		{"Authorization", "Basic " + base64.StdEncoding.EncodeToString([]byte(e.clientID+":wrong-client-secret"))},
-	}, []byte(form))
-	if err != nil {
-		t.Fatalf("wrong-client-credentials token probe: %v", err)
-	}
-	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
-		t.Fatalf("wrong client credentials token status=%d, want 4xx", status)
-	}
+	probes.run(t, "token-wrong-client", func(t *testing.T) {
+		authorizer := &stubAuthorizer{}
+		state := "stub-wrong-client-credentials"
+		code, _, err := authorizer.Authorize(context.Background(), stubAuthorizeURL(t, e, "service", state), state)
+		if err != nil {
+			t.Fatalf("obtain code for wrong-client-credentials probe: %v", err)
+		}
+		form := url.Values{
+			"grant_type":   {"authorization_code"},
+			"code":         {code},
+			"client_id":    {e.clientID},
+			"redirect_uri": {e.redirectURI},
+		}.Encode()
+		status, _, err := upstream.New("").Do(context.Background(), http.MethodPost, stubURL(t, e, "/oauth2/token"), [][2]string{
+			{"Content-Type", "application/x-www-form-urlencoded"},
+			{"Authorization", "Basic " + base64.StdEncoding.EncodeToString([]byte(e.clientID+":wrong-client-secret"))},
+		}, []byte(form))
+		if err != nil {
+			t.Fatalf("wrong-client-credentials token probe: %v", err)
+		}
+		if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+			t.Fatalf("wrong client credentials token status=%d, want 4xx", status)
+		}
+	})
 
 	// Each remaining case is an explicit 400 in the stub's OpenAPI. These are protocol-inherent bad
 	// inputs, not SDK branches to add: the real flow above already proves the only valid request shape.
-	expectBadRequest(t, "credentials/info missing credentialID", stubPostJSON(t, e, "/csc/v1/credentials/info", access.serviceToken, map[string]any{
-		"certificates": "chain", "certInfo": true,
-	}))
+	probes.run(t, "info-missing-credential", func(t *testing.T) {
+		expectBadRequest(t, "credentials/info missing credentialID", stubPostJSON(t, e, "/csc/v1/credentials/info", access.serviceToken, map[string]any{
+			"certificates": "chain", "certInfo": true,
+		}))
+	})
 
 	validHash := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	baseSignHash := map[string]any{
@@ -613,16 +735,26 @@ func assertStubModeledFailures(t *testing.T, e liveEnv, access stubAccess) {
 		request[key] = value
 		return request
 	}
-	expectBadRequest(t, "signHash rejected signAlgo", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("signAlgo", "1.2.840.113549.1.1.11")))
-	expectBadRequest(t, "signHash invalid SAD", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("SAD", "invalid-or-expired-sad")))
+	probes.run(t, "sign-hash-wrong-algorithm", func(t *testing.T) {
+		expectBadRequest(t, "signHash rejected signAlgo", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("signAlgo", "1.2.840.113549.1.1.11")))
+	})
+	probes.run(t, "sign-hash-invalid-sad", func(t *testing.T) {
+		expectBadRequest(t, "signHash invalid SAD", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("SAD", "invalid-or-expired-sad")))
+	})
 	// The published schema requires credentialID, but the beta stub currently accepts an empty value.
 	// Pin that observed limitation so the proof matrix distinguishes a reachable endpoint from a
 	// validated server-side constraint; this is not a shape the SDK is allowed to emit.
-	expectStubLimitation(t, "signHash missing credentialID", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("credentialID", "")))
+	probes.run(t, "sign-hash-empty-credential-limitation", func(t *testing.T) {
+		expectStubLimitation(t, "signHash missing credentialID", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("credentialID", "")))
+	})
 	// The current beta stub also accepts malformed hashes. Keep these separate from the valid-flow
 	// assertion above: it proves request shape acceptance, not cryptographic input validation.
-	expectStubLimitation(t, "signHash malformed hash", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("hash", []string{"not-base64"})))
-	expectStubLimitation(t, "signHash wrong hash length", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("hash", []string{base64.StdEncoding.EncodeToString(make([]byte, 31))})))
+	probes.run(t, "sign-hash-malformed-hash-limitation", func(t *testing.T) {
+		expectStubLimitation(t, "signHash malformed hash", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("hash", []string{"not-base64"})))
+	})
+	probes.run(t, "sign-hash-short-hash-limitation", func(t *testing.T) {
+		expectStubLimitation(t, "signHash wrong hash length", stubPostJSON(t, e, "/csc/v1/signatures/signHash", access.serviceToken, with("hash", []string{base64.StdEncoding.EncodeToString(make([]byte, 31))})))
+	})
 }
 
 func expectBadRequest(t *testing.T, name string, status int) {
@@ -634,8 +766,13 @@ func expectBadRequest(t *testing.T, name string, status int) {
 
 func expectStubLimitation(t *testing.T, name string, status int) {
 	t.Helper()
-	if status != http.StatusOK {
-		t.Fatalf("%s status=%d, want current beta-stub limitation 200", name, status)
+	switch status {
+	case http.StatusOK:
+		t.Logf("%s: observed current beta-stub limitation (200)", name)
+	case http.StatusBadRequest:
+		t.Logf("%s: observed spec-correct stub validation (400)", name)
+	default:
+		t.Fatalf("%s status=%d, want observed limitation 200 or spec-correct 400", name, status)
 	}
 }
 
