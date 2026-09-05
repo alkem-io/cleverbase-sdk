@@ -11,7 +11,8 @@
 ## Context
 
 The SDK already *implements* both signature algorithms the Cleverbase remote-QES surface offers —
-RSA (CSC `v1_rsa`, sha256WithRSAEncryption) and ECDSA P-256 (CSC `v2_ecdsa`, ecdsa-with-SHA256) — and
+RSA (CSC `v1_rsa`, `rsaEncryption` with SHA-256 carried separately) and ECDSA P-256 (CSC `v2_ecdsa`,
+ecdsa-with-SHA256) — and
 both have unit coverage (credential-algorithm detection, signature-algorithm OIDs, ECDSA r‖s→DER
 encoding). However only **RSA** is proven correct end-to-end: the credential-free reference stack signs
 with an RSA key, the B-B/B-T end-to-end test runs `v1_rsa`, and the independent OpenSSL validation

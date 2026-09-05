@@ -48,7 +48,7 @@ impl KeyAlgo {
     pub fn sign_algo_oid(&self) -> &'static str {
         match self {
             // CSC v1 `signAlgo` selects the RSA key family; `hashAlgo` separately selects SHA-256.
-            // This is intentionally distinct from the CMS `SignerInfo` sha256WithRSAEncryption.
+            // CMS likewise carries rsaEncryption and records SHA-256 in its digestAlgorithm.
             Self::Rsa => "1.2.840.113549.1.1.1", // rsaEncryption
             Self::EcdsaP256 => "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
             Self::Other => "",
