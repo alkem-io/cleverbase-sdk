@@ -278,7 +278,17 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	// Cap the form body before ParseForm reads it so an unbounded request cannot exhaust memory;
 	// an OAuth token form is tiny, so the shared 1 MiB cap is generous.
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid token form", bodyErrorStatus(err))
+		return
+	}
+	// Cleverbase's token contract requires client_id in the form as well as client authentication.
+	// Keep the mock strict here so its credential-free flows cannot mask the documented-stub
+	// integration defect this endpoint caught.
+	if r.Form.Get("client_id") == "" {
+		http.Error(w, "missing client_id", http.StatusBadRequest)
+		return
+	}
 	if r.Form.Get("code") == codeCredential {
 		writeRaw(w, s.credSAD)
 		return
