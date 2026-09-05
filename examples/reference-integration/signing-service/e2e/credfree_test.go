@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -240,7 +241,7 @@ func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 func pdfByteRange(pdf []byte) ([4]int, error) {
 	m := byteRangeRE.FindSubmatch(pdf)
 	if m == nil {
-		return [4]int{}, fmt.Errorf("no /ByteRange in signed PDF")
+		return [4]int{}, errors.New("no /ByteRange in signed PDF")
 	}
 	var parts [4]int
 	for i := range parts {
