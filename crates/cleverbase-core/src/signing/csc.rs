@@ -282,9 +282,10 @@ fn identity_from_subject(serial_number: String, subject_dn: String) -> SignerIde
 
 /// Derive the signer's identity from CSC `credentials/info`.
 ///
-/// CSC providers may omit the non-standard `subjectDN` and `serialNumber` convenience fields.
-/// In that case the authoritative leaf certificate (first `certificates` entry) supplies both
-/// values, avoiding an empty identity and preserving expected-signer matching.
+/// CSC providers may omit either non-standard `subjectDN` or `serialNumber` convenience field.
+/// Direct fields are authoritative only as a complete pair. If either is absent, the authoritative
+/// leaf certificate (first `certificates` entry) supplies both values, avoiding a mixed-source
+/// identity and preserving expected-signer matching.
 pub fn signer_identity(
     info: &CredentialInfo,
     leaf_certificate_der: &[u8],
@@ -433,6 +434,23 @@ mod tests {
             },
             &identity
         ));
+
+        // A partial direct pair cannot safely be combined with certificate data: derive the
+        // complete identity from the leaf in either direction.
+        for (subject_dn, serial_number) in [("CN=untrusted partial identity", ""), ("", "DEADBEEF")]
+        {
+            let partial_body = serde_json::json!({
+                "key": {"algo": ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.11"]},
+                "cert": {
+                    "certificates": [certificate.trim()],
+                    "subjectDN": subject_dn,
+                    "serialNumber": serial_number
+                },
+                "SCAL": "2"
+            });
+            let partial_info = parse_credentials_info(partial_body.to_string().as_bytes()).unwrap();
+            assert_eq!(signer_identity(&partial_info, &leaf).unwrap(), identity);
+        }
 
         let direct_body = serde_json::json!({
             "key": {"algo": ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.11"]},

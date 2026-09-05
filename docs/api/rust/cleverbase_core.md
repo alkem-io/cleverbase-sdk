@@ -786,9 +786,10 @@ fn signer_identity(info: &CredentialInfo, leaf_certificate_der: &[u8]) -> Result
 
 Derive the signer's identity from CSC `credentials/info`.
 
-CSC providers may omit the non-standard `subjectDN` and `serialNumber` convenience fields.
-In that case the authoritative leaf certificate (first `certificates` entry) supplies both
-values, avoiding an empty identity and preserving expected-signer matching.
+CSC providers may omit either non-standard `subjectDN` or `serialNumber` convenience field.
+Direct fields are authoritative only as a complete pair. If either is absent, the authoritative
+leaf certificate (first `certificates` entry) supplies both values, avoiding a mixed-source
+identity and preserving expected-signer matching.
 
 ### Structs
 
