@@ -53,7 +53,7 @@ func repoFixtures(t *testing.T) string {
 
 func samplePDF(t *testing.T) []byte {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("..", "cmd", "refsvc", "sample.pdf"))
+	b, err := os.ReadFile(filepath.Join("testdata", "sample.pdf"))
 	if err != nil {
 		t.Fatalf("read sample pdf: %v", err)
 	}
@@ -213,15 +213,8 @@ func verifyCMS(t *testing.T, pdf, cmsDER []byte) error {
 // the error (nil on accept) so a caller can assert a loud failure on an untrusted issuer.
 func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 	t.Helper()
-	m := byteRangeRE.FindSubmatch(pdf)
-	if m == nil {
-		t.Fatal("no /ByteRange in signed PDF")
-	}
-	n := func(b []byte) int { v, _ := strconv.Atoi(string(b)); return v }
-	a, b, c, d := n(m[1]), n(m[2]), n(m[3]), n(m[4])
-	if a+b > len(pdf) || c+d > len(pdf) || a+b > c {
-		t.Fatalf("ByteRange out of bounds: [%d %d %d %d] len=%d", a, b, c, d, len(pdf))
-	}
+	parts := pdfByteRange(t, pdf)
+	a, b, c, d := parts[0], parts[1], parts[2], parts[3]
 	signed := append(append([]byte{}, pdf[a:a+b]...), pdf[c:c+d]...)
 
 	work := t.TempDir()
@@ -241,6 +234,27 @@ func verifyCMSWithCA(t *testing.T, pdf, cmsDER []byte, caPEMPath string) error {
 	return nil
 }
 
+func pdfByteRange(t *testing.T, pdf []byte) [4]int {
+	t.Helper()
+	m := byteRangeRE.FindSubmatch(pdf)
+	if m == nil {
+		t.Fatal("no /ByteRange in signed PDF")
+	}
+	var parts [4]int
+	for i := range parts {
+		value, err := strconv.Atoi(string(m[i+1]))
+		if err != nil {
+			t.Fatalf("invalid ByteRange component %q: %v", m[i+1], err)
+		}
+		parts[i] = value
+	}
+	a, b, c, d := parts[0], parts[1], parts[2], parts[3]
+	if a != 0 || b < 0 || c < 0 || d < 0 || b > c || c > len(pdf) || d > len(pdf)-c {
+		t.Fatalf("ByteRange out of bounds: %v len=%d", parts, len(pdf))
+	}
+	return parts
+}
+
 // assertTimestampToken checks that a B-T signature embeds an RFC 3161 signature-timestamp token as
 // an unsigned attribute (OID 1.2.840.113549.1.9.16.2.14).
 func assertTimestampToken(t *testing.T, pdf []byte) {
@@ -256,30 +270,19 @@ func assertTimestampToken(t *testing.T, pdf []byte) {
 	}
 }
 
-// extractContents finds the /Contents <hex> blob and returns the embedded CMS DER, trimmed to the
-// DER object's declared length (dropping the zero padding).
+// extractContents decodes the ByteRange gap containing the CMS hex and trims it to the DER object's
+// declared length (dropping the zero padding).
 func extractContents(t *testing.T, pdf []byte) []byte {
 	t.Helper()
-	k := strings.Index(string(pdf), "/Contents")
-	if k < 0 {
-		t.Fatal("no /Contents in signed PDF")
-	}
-	lt := bytes.IndexByte(pdf[k:], '<')
-	if lt < 0 {
-		t.Fatal("no '<' after /Contents")
-	}
-	lt += k + 1
-	gt := bytes.IndexByte(pdf[lt:], '>')
-	if gt < 0 {
-		t.Fatal("no '>' closing /Contents")
-	}
+	parts := pdfByteRange(t, pdf)
+	gap := pdf[parts[0]+parts[1] : parts[2]]
 	hexStr := strings.Map(func(r rune) rune {
 		switch r {
 		case ' ', '\n', '\r', '\t':
 			return -1
 		}
 		return r
-	}, string(pdf[lt:lt+gt]))
+	}, string(gap))
 	raw := decodeHex(t, hexStr)
 	return raw[:derTotalLen(raw)]
 }
