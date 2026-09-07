@@ -290,11 +290,6 @@ pub fn begin(
     config: TrustServiceConfiguration,
     ctx: HostContext,
 ) -> Result<(SigningSessionHandle, Step), CoreError> {
-    if config.client_id.is_empty() || config.redirect_uri.is_empty() {
-        return Err(CoreError::InvalidConfig(
-            "client_id and redirect_uri are required".into(),
-        ));
-    }
     config.validate().map_err(CoreError::InvalidConfig)?;
     // The OAuth `state` CSRF token is derived from entropy; too little makes it guessable/empty.
     if ctx.entropy.len() < 16 {

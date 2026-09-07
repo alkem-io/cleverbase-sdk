@@ -271,12 +271,16 @@ impl TrustServiceConfiguration {
         format!("{}/oauth2/token", self.base_url())
     }
 
-    /// Validate the optional alternate Cleverbase origin before a signing session starts.
+    /// Validate this trust-service configuration before it is used by a signing session.
     ///
-    /// Alternate origins are for documented developer environments only. They must be absolute,
-    /// omit credentials, query, and fragment, and use HTTPS except for an explicitly loopback
-    /// HTTP endpoint used in local development. A path is permitted as a service base path.
+    /// The OAuth client id and redirect URI are required. Alternate origins are for documented
+    /// developer environments only. They must be absolute, omit credentials, query, and fragment,
+    /// and use HTTPS except for an explicitly loopback HTTP endpoint used in local development. A
+    /// path is permitted as a service base path.
     pub fn validate(&self) -> Result<(), String> {
+        if self.client_id.is_empty() || self.redirect_uri.is_empty() {
+            return Err("client_id and redirect_uri are required".into());
+        }
         let Some(value) = self.upstream_base_url.as_deref() else {
             return Ok(());
         };
@@ -513,6 +517,32 @@ mod tests {
         ] {
             assert!(config(Some(value.into())).validate().is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn trust_service_configuration_validation_requires_begin_fields() {
+        let mut config = TrustServiceConfiguration {
+            environment: Environment::Acceptance,
+            csc_api: CscApi::V1Rsa,
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url: None,
+            tsa: None,
+        };
+        assert!(config.validate().is_ok());
+
+        config.client_id.clear();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "client_id and redirect_uri are required"
+        );
+        config.client_id = "client".into();
+        config.redirect_uri.clear();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "client_id and redirect_uri are required"
+        );
     }
 
     #[test]

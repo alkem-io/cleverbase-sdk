@@ -141,10 +141,13 @@ type wireError struct {
 	Message string `cbor:"message"`
 }
 
+type configValidatedResult struct{}
+
 type wireResult struct {
-	Ok           *okResult        `cbor:"ok"`
-	Err          *wireError       `cbor:"err"`
-	Verification *PDFVerification `cbor:"verification"`
+	Ok              *okResult              `cbor:"ok"`
+	Err             *wireError             `cbor:"err"`
+	Verification    *PDFVerification       `cbor:"verification"`
+	ConfigValidated *configValidatedResult `cbor:"config_validated"`
 }
 
 type wireResponse struct {
@@ -291,9 +294,22 @@ func VerifyPDF(document []byte) (*PDFVerification, error) {
 	return result.Verification, nil
 }
 
-// BeginSigning starts a signing flow and returns the first Step. Pass opts (or nil) for the
-// optional expected-signer / appearance / signature-metadata parts of the request.
-func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error) {
+// Validate checks this configuration using the Rust core's authoritative validation without
+// creating a signing session. It does not validate the TSA URL, and it cannot enforce that B-T
+// requires a TSA because conformance is part of the later signing request. BeginSigning validates
+// again as defense in depth.
+func (cfg Config) Validate() error {
+	result, err := invoke(map[string]any{keyOp: "validate_config", "config": cfg.toWire()})
+	if err != nil {
+		return err
+	}
+	if result.ConfigValidated == nil {
+		return errors.New("malformed response: missing config-validation result")
+	}
+	return nil
+}
+
+func (cfg Config) toWire() map[string]any {
 	config := map[string]any{
 		"environment":   cfg.Environment,
 		"csc_api":       cfg.CscAPI,
@@ -314,6 +330,12 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 		}
 		config["tsa"] = tsa
 	}
+	return config
+}
+
+// BeginSigning starts a signing flow and returns the first Step. Pass opts (or nil) for the
+// optional expected-signer / appearance / signature-metadata parts of the request.
+func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error) {
 	request := map[string]any{"document": document, "conformance_level": conformance}
 	if opts != nil {
 		if opts.ExpectedSigner != nil {
@@ -329,7 +351,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 	return dispatch(map[string]any{
 		keyOp:     "begin",
 		"request": request,
-		"config":  config,
+		"config":  cfg.toWire(),
 		keyCtx:    map[string]any{keyNowUnix: nowUnix, keyEntropy: entropy},
 	})
 }

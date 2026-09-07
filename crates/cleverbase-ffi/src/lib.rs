@@ -32,6 +32,10 @@ use cleverbase_core::wire::{decode_request, encode_response, WireOp, WireRequest
 /// core (Constitution Principle III: no protocol logic duplicated in bindings).
 fn dispatch(req: WireRequest) -> WireResult {
     match req.op {
+        WireOp::ValidateConfig { config } => match config.validate() {
+            Ok(()) => WireResult::ConfigValidated {},
+            Err(message) => WireResult::Err { message },
+        },
         WireOp::Begin {
             request,
             config,
@@ -321,6 +325,7 @@ mod tests {
             }
             WireResult::Err { message } => panic!("unexpected error: {message}"),
             WireResult::Verification(_) => panic!("unexpected verification result"),
+            WireResult::ConfigValidated {} => panic!("unexpected config-validation result"),
         }
     }
 
@@ -376,6 +381,7 @@ mod tests {
             },
             WireResult::Err { message } => panic!("begin failed: {message}"),
             WireResult::Verification(_) => panic!("unexpected verification result"),
+            WireResult::ConfigValidated {} => panic!("unexpected config-validation result"),
         };
         let resume = encode(&WireRequest {
             schema_version: SCHEMA_VERSION,
@@ -415,6 +421,45 @@ mod tests {
             panic!("expected verification result");
         };
         assert!(!verification.integrity);
+    }
+
+    #[test]
+    fn process_bytes_dispatches_config_validation() {
+        let valid = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Acceptance,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: None,
+                    tsa: None,
+                },
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&valid))[..]).unwrap();
+        assert!(matches!(response.result, WireResult::ConfigValidated {}));
+
+        let invalid = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Acceptance,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: Some("http://example.com".into()),
+                    tsa: None,
+                },
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&invalid))[..]).unwrap();
+        assert!(matches!(response.result, WireResult::Err { .. }));
     }
 
     #[test]

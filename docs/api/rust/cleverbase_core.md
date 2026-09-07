@@ -1182,11 +1182,12 @@ The OAuth2 token endpoint for the selected API generation and environment.
 fn validate(&self) -> Result<(), String>
 ```
 
-Validate the optional alternate Cleverbase origin before a signing session starts.
+Validate this trust-service configuration before it is used by a signing session.
 
-Alternate origins are for documented developer environments only. They must be absolute,
-omit credentials, query, and fragment, and use HTTPS except for an explicitly loopback
-HTTP endpoint used in local development. A path is permitted as a service base path.
+The OAuth client id and redirect URI are required. Alternate origins are for documented
+developer environments only. They must be absolute, omit credentials, query, and fragment,
+and use HTTPS except for an explicitly loopback HTTP endpoint used in local development. A
+path is permitted as a service base path.
 
 #### struct `TsaConfiguration`
 
@@ -1521,6 +1522,8 @@ A decoded operation request from a non-native binding.
 
 ##### Variants
 
+- `ValidateConfig { config: TrustServiceConfiguration }`
+  - Validate trust-service configuration without creating a signing session.
 - `Begin { request: SigningRequest, config: TrustServiceConfiguration, ctx: HostContext }`
   - Begin a new signing flow.
 - `Resume { handle: SigningSessionHandle, input: ResumeInput, ctx: HostContext }`
@@ -1534,10 +1537,13 @@ A decoded operation request from a non-native binding.
 enum WireResult
 ```
 
-The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
+The result of a wire operation: config validation, a `(handle, step)` pair, a PDF integrity
+verdict, or an error.
 
 ##### Variants
 
+- `ConfigValidated {  }`
+  - Trust-service configuration was valid.
 - `Ok { handle: SigningSessionHandle, step: Step }`
   - Success: the updated session handle plus the next step.
 - `Err { message: String }`

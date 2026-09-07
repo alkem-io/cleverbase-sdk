@@ -19,6 +19,11 @@ use crate::SCHEMA_VERSION;
 // variant would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireOp {
+    /// Validate trust-service configuration without creating a signing session.
+    ValidateConfig {
+        /// The trust-service configuration to validate.
+        config: TrustServiceConfiguration,
+    },
     /// Begin a new signing flow.
     Begin {
         /// The signing request.
@@ -63,13 +68,18 @@ pub struct WireResponse {
     pub result: WireResult,
 }
 
-/// The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
+/// The result of a wire operation: config validation, a `(handle, step)` pair, a PDF integrity
+/// verdict, or an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // Wire protocol enum: the ok variant (handle + step) is naturally larger than the err variant;
 // boxing would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireResult {
+    /// Trust-service configuration was valid.
+    // Deliberately an empty struct variant: a unit variant serializes as a bare string, which typed
+    // host bindings cannot decode as the `config_validated` result object.
+    ConfigValidated {},
     /// Success: the updated session handle plus the next step.
     Ok {
         /// The updated session handle.
@@ -211,6 +221,31 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(&req, &mut buf).unwrap();
         assert_eq!(decode_request(&buf).unwrap(), req);
+    }
+
+    #[test]
+    fn validate_config_request_and_response_roundtrip() {
+        let req = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Production,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: None,
+                    tsa: None,
+                },
+            },
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&req, &mut buf).unwrap();
+        assert_eq!(decode_request(&buf).unwrap(), req);
+
+        let response = encode_response(WireResult::ConfigValidated {});
+        let decoded: WireResponse = ciborium::from_reader(&response[..]).unwrap();
+        assert!(matches!(decoded.result, WireResult::ConfigValidated {}));
     }
 
     #[test]

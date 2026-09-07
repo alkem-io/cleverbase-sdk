@@ -61,6 +61,51 @@ func TestBeginRejectsInvalidUpstreamBaseURL(t *testing.T) {
 	}
 }
 
+func TestConfigValidate(t *testing.T) {
+	tests := map[string]struct {
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		"acceptance": {},
+		"production": {mutate: func(cfg *Config) { cfg.Environment = "production" }},
+		"missing client id": {
+			mutate:  func(cfg *Config) { cfg.ClientID = "" },
+			wantErr: true,
+		},
+		"missing redirect URI": {
+			mutate:  func(cfg *Config) { cfg.RedirectURI = "" },
+			wantErr: true,
+		},
+		"unknown environment": {
+			mutate:  func(cfg *Config) { cfg.Environment = "sandbox" },
+			wantErr: true,
+		},
+		"unknown CSC API": {
+			mutate:  func(cfg *Config) { cfg.CscAPI = "v3" },
+			wantErr: true,
+		},
+		"invalid upstream override": {
+			mutate:  func(cfg *Config) { cfg.UpstreamBaseURL = "http://example.com" },
+			wantErr: true,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			if test.mutate != nil {
+				test.mutate(&cfg)
+			}
+			err := cfg.Validate()
+			if test.wantErr && err == nil {
+				t.Fatal("Config.Validate() accepted invalid configuration")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("Config.Validate() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestResumeRedirectEmitsTokenExchange(t *testing.T) {
 	sess, err := BeginSigning([]byte("%PDF-1.7\nminimal"), testConfig(), "B-B", nil, 1_700_000_000, testEntropy())
 	if err != nil {
