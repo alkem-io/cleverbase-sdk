@@ -546,6 +546,42 @@ mod tests {
     }
 
     #[test]
+    fn tsa_url_validation_accepts_http_endpoints_and_rejects_malformed_urls() {
+        let config = |url: &str| TrustServiceConfiguration {
+            environment: Environment::Acceptance,
+            csc_api: CscApi::V1Rsa,
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url: None,
+            tsa: Some(TsaConfiguration {
+                url: url.into(),
+                auth: None,
+                policy_oid: None,
+            }),
+        };
+
+        for value in [
+            "https://tsa.example/rfc3161",
+            "http://cleverbase-refmock:9000/tsr",
+            "https://tsa.example/rfc3161?tenant=acceptance",
+        ] {
+            assert!(config(value).validate().is_ok(), "{value}");
+        }
+        for value in [
+            "not a URL",
+            "/relative",
+            "https://:443",
+            "ftp://tsa.example/tsr",
+            "https://user:password@tsa.example/tsr",
+            "https://tsa.example/tsr#response",
+            "https://tsa.example:0/tsr",
+        ] {
+            assert!(config(value).validate().is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn trust_service_configuration_rejects_unknown_fields() {
         let error = serde_json::from_value::<TrustServiceConfiguration>(serde_json::json!({
             "environment": "acceptance",

@@ -273,7 +273,7 @@ mod tests {
     use cleverbase_core::wire::{WireRequest, WireResponse, WireResult};
     use cleverbase_core::{
         ConformanceLevel, CscApi, Environment, HostContext, ResumeInput, Secret, SigningRequest,
-        Step, TrustServiceConfiguration, SCHEMA_VERSION,
+        Step, TrustServiceConfiguration, TsaConfiguration, SCHEMA_VERSION,
     };
 
     fn encode(req: &WireRequest) -> Vec<u8> {
@@ -459,6 +459,28 @@ mod tests {
         };
         let response: WireResponse =
             ciborium::from_reader(&process_bytes(&encode(&invalid))[..]).unwrap();
+        assert!(matches!(response.result, WireResult::Err { .. }));
+
+        let invalid_tsa = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Acceptance,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: None,
+                    tsa: Some(TsaConfiguration {
+                        url: "not a URL".into(),
+                        auth: None,
+                        policy_oid: None,
+                    }),
+                },
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&invalid_tsa))[..]).unwrap();
         assert!(matches!(response.result, WireResult::Err { .. }));
     }
 

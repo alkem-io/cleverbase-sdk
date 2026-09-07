@@ -88,6 +88,13 @@ func TestConfigValidate(t *testing.T) {
 			mutate:  func(cfg *Config) { cfg.UpstreamBaseURL = "http://example.com" },
 			wantErr: true,
 		},
+		"fixture TSA over HTTP": {
+			mutate: func(cfg *Config) { cfg.TsaURL = "http://cleverbase-refmock:9000/tsr" },
+		},
+		"invalid TSA URL": {
+			mutate:  func(cfg *Config) { cfg.TsaURL = "not a URL" },
+			wantErr: true,
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
