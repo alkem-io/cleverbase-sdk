@@ -17,6 +17,10 @@ def validate_config(
     client_secret: str,
     redirect_uri: str,
     tsa_url: str | None = ...,
+    *,
+    upstream_base_url: str | None = ...,
+    tsa_auth: str | None = ...,
+    tsa_policy_oid: str | None = ...,
 ) -> None: ...
 def begin_signing(
     document: bytes,
@@ -30,6 +34,10 @@ def begin_signing(
     entropy: bytes,
     tsa_url: str | None = ...,
     options_json: str | None = ...,
+    *,
+    upstream_base_url: str | None = ...,
+    tsa_auth: str | None = ...,
+    tsa_policy_oid: str | None = ...,
 ) -> bytes: ...
 def resume_redirect(
     handle: bytes,

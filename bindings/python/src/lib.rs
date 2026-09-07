@@ -17,6 +17,8 @@ fn err(e: impl ToString) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+// The scalar list is the binding contract; a private options struct would duplicate the core model.
+#[allow(clippy::too_many_arguments)]
 fn build_config(
     environment: &str,
     csc_api: &str,
@@ -24,6 +26,9 @@ fn build_config(
     client_secret: &str,
     redirect_uri: &str,
     tsa_url: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> PyResult<TrustServiceConfiguration> {
     Ok(TrustServiceConfiguration {
         environment: Environment::from_wire(environment)
@@ -33,11 +38,11 @@ fn build_config(
         client_id: client_id.to_string(),
         client_secret: Secret::new(client_secret),
         redirect_uri: redirect_uri.to_string(),
-        upstream_base_url: None,
+        upstream_base_url,
         tsa: tsa_url.map(|url| TsaConfiguration {
             url,
-            auth: None,
-            policy_oid: None,
+            auth: tsa_auth.map(Secret::new),
+            policy_oid: tsa_policy_oid,
         }),
     })
 }
@@ -45,7 +50,8 @@ fn build_config(
 /// Validate signing configuration without creating a signing session. Request-dependent rules are
 /// checked later by `begin_signing`, which validates the configuration again.
 #[pyfunction]
-#[pyo3(signature = (environment, csc_api, client_id, client_secret, redirect_uri, tsa_url=None))]
+#[pyo3(signature = (environment, csc_api, client_id, client_secret, redirect_uri, tsa_url=None, *, upstream_base_url=None, tsa_auth=None, tsa_policy_oid=None))]
+#[allow(clippy::too_many_arguments)]
 fn validate_config(
     environment: &str,
     csc_api: &str,
@@ -53,6 +59,9 @@ fn validate_config(
     client_secret: &str,
     redirect_uri: &str,
     tsa_url: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> PyResult<()> {
     build_config(
         environment,
@@ -61,13 +70,16 @@ fn validate_config(
         client_secret,
         redirect_uri,
         tsa_url,
+        upstream_base_url,
+        tsa_auth,
+        tsa_policy_oid,
     )?
     .validate()
     .map_err(err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (document, environment, csc_api, client_id, client_secret, redirect_uri, conformance, now_unix, entropy, tsa_url=None, options_json=None))]
+#[pyo3(signature = (document, environment, csc_api, client_id, client_secret, redirect_uri, conformance, now_unix, entropy, tsa_url=None, options_json=None, *, upstream_base_url=None, tsa_auth=None, tsa_policy_oid=None))]
 // FFI entry point: the individual scalar args cross the pyo3 boundary cleanly, where a params
 // struct would not; the signature mirrors the SDK's begin inputs.
 #[allow(clippy::too_many_arguments)]
@@ -83,6 +95,9 @@ fn begin_signing(
     entropy: Vec<u8>,
     tsa_url: Option<String>,
     options_json: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> PyResult<Vec<u8>> {
     // Optional expected_signer / appearance / signature_meta as a single JSON object (FR-014/FR-016).
     let options = RequestOptions::from_json(options_json.as_deref().unwrap_or("")).map_err(err)?;
@@ -101,6 +116,9 @@ fn begin_signing(
         client_secret,
         redirect_uri,
         tsa_url,
+        upstream_base_url,
+        tsa_auth,
+        tsa_policy_oid,
     )?;
     let (handle, step) = begin(request, config, HostContext { now_unix, entropy }).map_err(err)?;
     Ok(encode_handle_step(&handle, &step))

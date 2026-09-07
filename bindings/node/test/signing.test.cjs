@@ -35,6 +35,73 @@ test("config validation accepts valid inputs and rejects a missing client ID", (
   );
 });
 
+test("config options match the Go binding surface", () => {
+  assert.doesNotThrow(() =>
+    validateConfig(
+      "acceptance",
+      "v1_rsa",
+      "client-123",
+      "secret",
+      "https://app.example/cb",
+      "https://tsa.example/rfc3161",
+      "http://localhost:9000/stub",
+      "Basic public-test-credentials",
+      "1.2.3.4",
+    ),
+  );
+  assert.throws(() =>
+    validateConfig(
+      "acceptance",
+      "v1_rsa",
+      "client-123",
+      "secret",
+      "https://app.example/cb",
+      null,
+      "http://not-loopback.example/stub",
+    ),
+  );
+
+  const out = beginSigning(
+    PDF,
+    "acceptance",
+    "v1_rsa",
+    "client-123",
+    "secret",
+    "https://app.example/cb",
+    "B-T",
+    NOW,
+    ENTROPY,
+    "https://tsa.example/rfc3161",
+    null,
+    "http://localhost:9000/stub",
+    "Basic public-test-credentials",
+    "1.2.3.4",
+  );
+  const resp = cbor.decodeFirstSync(out);
+  assert.ok(resp.step.url.startsWith("http://localhost:9000/stub/oauth2/authorize?"));
+});
+
+test("config validation rejects invalid TSA URLs", () => {
+  for (const tsaUrl of [
+    "not a URL",
+    "ftp://tsa.example/tsr",
+    "https://user:password@tsa.example/tsr",
+    "https://tsa.example/tsr#response",
+    "https://tsa.example:0/tsr",
+  ]) {
+    assert.throws(() =>
+      validateConfig(
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        tsaUrl,
+      ),
+    );
+  }
+});
+
 test("begin returns a service-scope redirect", () => {
   const out = beginSigning(
     PDF,
