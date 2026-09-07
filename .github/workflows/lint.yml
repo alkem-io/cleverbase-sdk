@@ -39,11 +39,11 @@ jobs:
       - name: Clippy (core + C ABI — pedantic + nursery, warnings are errors)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Clippy (Python binding crate)
-        run: cargo clippy --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path bindings/python/Cargo.toml --all-targets -- -D warnings
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
       - name: Clippy (Node binding crate)
-        run: cargo clippy --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path bindings/node/Cargo.toml --all-targets -- -D warnings
 
   python:
     name: Python (ruff + mypy)
