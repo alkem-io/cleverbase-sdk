@@ -72,6 +72,7 @@ openssl verify -CAfile cleverbase-acceptance-ca.pem content-commitment-x509-test
 install -d -m 0700 "$HOME/.config/trust-gateway"
 install -m 0600 cleverbase-acceptance-ca.pem \
   "$HOME/.config/trust-gateway/cleverbase-acceptance-ca.pem"
+export TRUST_GATEWAY_E2E_CA_BUNDLE="$HOME/.config/trust-gateway/cleverbase-acceptance-ca.pem"
 ```
 
 Before a real acceptance run, compare the signing certificate chain embedded in the resulting PDF
