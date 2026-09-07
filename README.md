@@ -58,7 +58,9 @@ Implemented and tested (Rust unit + integration; independently validated with **
 
 See [`specs/001-remote-qes-signing`](specs/001-remote-qes-signing) for the spec, plan, and tasks,
 [`docs/proof-matrix.md`](docs/proof-matrix.md) for the current evidence, and
-[`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work.
+[`docs/limitations.md`](docs/limitations.md) for known limitations and remaining work. The
+[acceptance certificate provenance record](docs/acceptance-ca-provenance.md) documents the
+published test chain without treating it as an operator trust decision.
 
 ## Status (EUDI attestation & verification)
 
