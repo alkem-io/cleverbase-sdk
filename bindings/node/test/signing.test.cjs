@@ -1,11 +1,39 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const cbor = require("cbor");
-const { beginSigning, resumeRedirect, resumeRedirectError } = require("../index.js");
+const {
+  beginSigning,
+  resumeRedirect,
+  resumeRedirectError,
+  validateConfig,
+} = require("../index.js");
 
 const NOW = 1_700_000_000;
 const ENTROPY = Buffer.from(Array.from({ length: 16 }, (_, i) => i));
 const PDF = Buffer.from("%PDF-1.7\nminimal");
+
+test("config validation accepts valid inputs and rejects a missing client ID", () => {
+  assert.doesNotThrow(() =>
+    validateConfig(
+      "acceptance",
+      "v1_rsa",
+      "client-123",
+      "secret",
+      "https://app.example/cb",
+      "https://tsa.example/rfc3161",
+    ),
+  );
+  assert.throws(() =>
+    validateConfig(
+      "acceptance",
+      "v1_rsa",
+      "",
+      "secret",
+      "https://app.example/cb",
+      "https://tsa.example/rfc3161",
+    ),
+  );
+});
 
 test("begin returns a service-scope redirect", () => {
   const out = beginSigning(
