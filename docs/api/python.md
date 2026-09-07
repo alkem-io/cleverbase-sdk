@@ -5,13 +5,13 @@
 ## `validate_config`
 
 ```python
-def validate_config(environment: str, csc_api: str, client_id: str, client_secret: str, redirect_uri: str, tsa_url: str | None = ...) -> None
+def validate_config(environment: str, csc_api: str, client_id: str, client_secret: str, redirect_uri: str, tsa_url: str | None = ..., *, upstream_base_url: str | None = ..., tsa_auth: str | None = ..., tsa_policy_oid: str | None = ...) -> None
 ```
 
 ## `begin_signing`
 
 ```python
-def begin_signing(document: bytes, environment: str, csc_api: str, client_id: str, client_secret: str, redirect_uri: str, conformance: str, now_unix: int, entropy: bytes, tsa_url: str | None = ..., options_json: str | None = ...) -> bytes
+def begin_signing(document: bytes, environment: str, csc_api: str, client_id: str, client_secret: str, redirect_uri: str, conformance: str, now_unix: int, entropy: bytes, tsa_url: str | None = ..., options_json: str | None = ..., *, upstream_base_url: str | None = ..., tsa_auth: str | None = ..., tsa_policy_oid: str | None = ...) -> bytes
 ```
 
 ## `resume_redirect`

@@ -7,9 +7,9 @@
  * Validate signing configuration without creating a signing session. Request-dependent rules are
  * checked later by `beginSigning`, which validates the configuration again.
  */
-export declare function validateConfig(environment: string, cscApi: string, clientId: string, clientSecret: string, redirectUri: string, tsaUrl?: string | undefined | null): void
+export declare function validateConfig(environment: string, cscApi: string, clientId: string, clientSecret: string, redirectUri: string, tsaUrl?: string | undefined | null, upstreamBaseUrl?: string | undefined | null, tsaAuth?: string | undefined | null, tsaPolicyOid?: string | undefined | null): void
 /** Begin a signing flow. Returns a CBOR `{handle, step}` Buffer (decode-only for the caller). */
-export declare function beginSigning(document: Buffer, environment: string, cscApi: string, clientId: string, clientSecret: string, redirectUri: string, conformance: string, nowUnix: number, entropy: Buffer, tsaUrl?: string | undefined | null, optionsJson?: string | undefined | null): Buffer
+export declare function beginSigning(document: Buffer, environment: string, cscApi: string, clientId: string, clientSecret: string, redirectUri: string, conformance: string, nowUnix: number, entropy: Buffer, tsaUrl?: string | undefined | null, optionsJson?: string | undefined | null, upstreamBaseUrl?: string | undefined | null, tsaAuth?: string | undefined | null, tsaPolicyOid?: string | undefined | null): Buffer
 /** Resume after a redirect return (OAuth `code` + `state`). Returns a CBOR `{handle, step}` Buffer. */
 export declare function resumeRedirect(handle: Buffer, code: string, state: string, nowUnix: number, entropy: Buffer): Buffer
 /** Resume after a redirect OAuth error (`error` + `state`). Returns a CBOR `{handle, step}` Buffer. */

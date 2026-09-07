@@ -16,6 +16,8 @@ fn e(msg: impl ToString) -> Error {
     Error::from_reason(msg.to_string())
 }
 
+// The scalar list is the binding contract; a private options struct would duplicate the core model.
+#[allow(clippy::too_many_arguments)]
 fn build_config(
     environment: String,
     csc_api: String,
@@ -23,6 +25,9 @@ fn build_config(
     client_secret: String,
     redirect_uri: String,
     tsa_url: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> Result<TrustServiceConfiguration> {
     Ok(TrustServiceConfiguration {
         environment: Environment::from_wire(&environment)
@@ -32,11 +37,11 @@ fn build_config(
         client_id,
         client_secret: Secret::new(client_secret),
         redirect_uri,
-        upstream_base_url: None,
+        upstream_base_url,
         tsa: tsa_url.map(|url| TsaConfiguration {
             url,
-            auth: None,
-            policy_oid: None,
+            auth: tsa_auth.map(Secret::new),
+            policy_oid: tsa_policy_oid,
         }),
     })
 }
@@ -44,6 +49,7 @@ fn build_config(
 /// Validate signing configuration without creating a signing session. Request-dependent rules are
 /// checked later by `beginSigning`, which validates the configuration again.
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub fn validate_config(
     environment: String,
     csc_api: String,
@@ -51,6 +57,9 @@ pub fn validate_config(
     client_secret: String,
     redirect_uri: String,
     tsa_url: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> Result<()> {
     build_config(
         environment,
@@ -59,6 +68,9 @@ pub fn validate_config(
         client_secret,
         redirect_uri,
         tsa_url,
+        upstream_base_url,
+        tsa_auth,
+        tsa_policy_oid,
     )?
     .validate()
     .map_err(e)
@@ -81,6 +93,9 @@ pub fn begin_signing(
     entropy: Buffer,
     tsa_url: Option<String>,
     options_json: Option<String>,
+    upstream_base_url: Option<String>,
+    tsa_auth: Option<String>,
+    tsa_policy_oid: Option<String>,
 ) -> Result<Buffer> {
     // Optional expected_signer / appearance / signature_meta as a single JSON object (FR-014/FR-016).
     let options = RequestOptions::from_json(options_json.as_deref().unwrap_or("")).map_err(e)?;
@@ -99,6 +114,9 @@ pub fn begin_signing(
         client_secret,
         redirect_uri,
         tsa_url,
+        upstream_base_url,
+        tsa_auth,
+        tsa_policy_oid,
     )?;
     let ctx = HostContext { now_unix: now_unix as i64, entropy: entropy.to_vec() };
     let (handle, step) = begin(request, config, ctx).map_err(e)?;
