@@ -104,32 +104,42 @@ make go-test
 
 ### Consume the Go binding from a release
 
-The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.0`, while Go
+The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.1`, while Go
 consumers pin the module version normally:
 
 ```bash
-go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.0
+go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.1
 ```
 
-The same GitHub Release contains `cleverbase-ffi-v0.3.0-<os>-<arch>.tar.gz` and a matching
+The same GitHub Release contains `cleverbase-ffi-v0.3.1-<os>-<arch>.tar.gz` and a matching
 `.sha256` file for Linux and Darwin, on amd64 and arm64. Download the pair for the build host, verify
 the checksum before extraction, and point `CGO_LDFLAGS` at the extracted `lib` directory. For
 example:
 
 ```bash
-gh release download bindings/go/v0.3.0 \
+gh release download bindings/go/v0.3.1 \
   --repo alkem-io/cleverbase-sdk \
-  --pattern 'cleverbase-ffi-v0.3.0-linux-amd64*' --dir .cleverbase
-( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.0-linux-amd64.tar.gz.sha256 )
-tar -xzf .cleverbase/cleverbase-ffi-v0.3.0-linux-amd64.tar.gz -C .cleverbase
+  --pattern 'cleverbase-ffi-v0.3.1-linux-amd64*' --dir .cleverbase
+( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.1-linux-amd64.tar.gz.sha256 )
+tar -xzf .cleverbase/cleverbase-ffi-v0.3.1-linux-amd64.tar.gz -C .cleverbase
 CGO_LDFLAGS="-L$PWD/.cleverbase/lib" go build ./...
 ```
 
 To publish a release, update `cleverbase-ffi` to the intended SemVer and push the matching tag, for
-example `bindings/go/v0.3.0`. The tag workflow builds, link-tests, attests, and attaches all
+example `bindings/go/v0.3.1`. The tag workflow builds, link-tests, attests, and attaches all
 four native archives. The Go module and native ABI versions are deliberately welded: even a Go-only
 binding fix bumps `cleverbase-ffi` and receives a new matching tag.
 Running the packaging contract locally on macOS requires GNU tar (`brew install gnu-tar`).
+
+#### v0.3.1 release notes
+
+- Adds `Config.Validate()` to the Go binding so long-running hosts can reject invalid SDK
+  configuration before listening or creating a signing session.
+- Uses the Rust core's existing configuration validator through the versioned CBOR ABI; `Begin`
+  retains the same validation as defense in depth, and Go shares one configuration encoder across
+  both calls.
+- The config-only operation cannot enforce the request-dependent B-T-requires-TSA rule and does not
+  yet validate TSA URL syntax; that validation boundary is tracked in [#36](https://github.com/alkem-io/cleverbase-sdk/issues/36).
 
 #### v0.3.0 release notes
 
