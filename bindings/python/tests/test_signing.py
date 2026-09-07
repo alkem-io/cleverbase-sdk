@@ -20,6 +20,27 @@ def test_schema_version_exposed() -> None:
     assert cleverbase.SCHEMA_VERSION >= 1
 
 
+def test_validate_config_accepts_valid_inputs_and_rejects_missing_client_id() -> None:
+    cleverbase.validate_config(
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "https://tsa.example/rfc3161",
+    )
+
+    with pytest.raises(ValueError):
+        cleverbase.validate_config(
+            "acceptance",
+            "v1_rsa",
+            "",
+            "secret",
+            "https://app.example/cb",
+            "https://tsa.example/rfc3161",
+        )
+
+
 def test_begin_returns_service_redirect() -> None:
     out = cleverbase.begin_signing(
         PDF,

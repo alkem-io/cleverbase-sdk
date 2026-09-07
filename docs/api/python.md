@@ -2,6 +2,12 @@
 
 ## `SCHEMA_VERSION: int`
 
+## `validate_config`
+
+```python
+def validate_config(environment: str, csc_api: str, client_id: str, client_secret: str, redirect_uri: str, tsa_url: str | None = ...) -> None
+```
+
 ## `begin_signing`
 
 ```python

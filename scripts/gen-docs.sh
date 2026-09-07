@@ -121,7 +121,7 @@ fi
 # 3. PYTHON — pydoc-markdown renders the public surface to Markdown. The runtime
 #    module is a compiled PyO3 extension whose functions carry no __doc__, and
 #    PEP 484 stubs (ruff PYI021) carry no docstrings either — but cleverbase.pyi
-#    carries the full, mypy-strict-enforced TYPE SIGNATURES for the 4 public
+#    carries the full, mypy-strict-enforced TYPE SIGNATURES for the public
 #    functions + SCHEMA_VERSION, the durable documented contract. pydoc-markdown's
 #    bundled loader resolves modules by import name and only finds `.py`, so we
 #    drive it through scripts/pyi_to_markdown.py, which parses the `.pyi` with the

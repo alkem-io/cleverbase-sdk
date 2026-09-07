@@ -16,6 +16,54 @@ fn e(msg: impl ToString) -> Error {
     Error::from_reason(msg.to_string())
 }
 
+fn build_config(
+    environment: String,
+    csc_api: String,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    tsa_url: Option<String>,
+) -> Result<TrustServiceConfiguration> {
+    Ok(TrustServiceConfiguration {
+        environment: Environment::from_wire(&environment)
+            .ok_or_else(|| e("environment must be 'acceptance' or 'production'"))?,
+        csc_api: CscApi::from_wire(&csc_api)
+            .ok_or_else(|| e("csc_api must be 'v1_rsa' or 'v2_ecdsa'"))?,
+        client_id,
+        client_secret: Secret::new(client_secret),
+        redirect_uri,
+        upstream_base_url: None,
+        tsa: tsa_url.map(|url| TsaConfiguration {
+            url,
+            auth: None,
+            policy_oid: None,
+        }),
+    })
+}
+
+/// Validate signing configuration without creating a signing session. Request-dependent rules are
+/// checked later by `beginSigning`, which validates the configuration again.
+#[napi]
+pub fn validate_config(
+    environment: String,
+    csc_api: String,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    tsa_url: Option<String>,
+) -> Result<()> {
+    build_config(
+        environment,
+        csc_api,
+        client_id,
+        client_secret,
+        redirect_uri,
+        tsa_url,
+    )?
+    .validate()
+    .map_err(e)
+}
+
 /// Begin a signing flow. Returns a CBOR `{handle, step}` Buffer (decode-only for the caller).
 #[napi]
 // FFI entry point: the individual scalar args cross the napi boundary cleanly, where a params
@@ -44,16 +92,14 @@ pub fn begin_signing(
         appearance: options.appearance,
         signature_meta: options.signature_meta,
     };
-    let config = TrustServiceConfiguration {
-        environment: Environment::from_wire(&environment)
-            .ok_or_else(|| e("environment must be 'acceptance' or 'production'"))?,
-        csc_api: CscApi::from_wire(&csc_api).ok_or_else(|| e("csc_api must be 'v1_rsa' or 'v2_ecdsa'"))?,
+    let config = build_config(
+        environment,
+        csc_api,
         client_id,
-        client_secret: Secret::new(client_secret),
+        client_secret,
         redirect_uri,
-        upstream_base_url: None,
-        tsa: tsa_url.map(|url| TsaConfiguration { url, auth: None, policy_oid: None }),
-    };
+        tsa_url,
+    )?;
     let ctx = HostContext { now_unix: now_unix as i64, entropy: entropy.to_vec() };
     let (handle, step) = begin(request, config, ctx).map_err(e)?;
     Ok(encode_handle_step(&handle, &step).into())

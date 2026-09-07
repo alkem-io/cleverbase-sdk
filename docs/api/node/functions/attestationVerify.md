@@ -2,7 +2,7 @@
 
 > **attestationVerify**(`request`): `Buffer`
 
-Defined in: [index.d.ts:27](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L27)
+Defined in: [index.d.ts:32](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L32)
 
 Verify an EUDI attestation presentation.
 

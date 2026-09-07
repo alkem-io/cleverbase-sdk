@@ -17,6 +17,55 @@ fn err(e: impl ToString) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+fn build_config(
+    environment: &str,
+    csc_api: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+    tsa_url: Option<String>,
+) -> PyResult<TrustServiceConfiguration> {
+    Ok(TrustServiceConfiguration {
+        environment: Environment::from_wire(environment)
+            .ok_or_else(|| err("environment must be 'acceptance' or 'production'"))?,
+        csc_api: CscApi::from_wire(csc_api)
+            .ok_or_else(|| err("csc_api must be 'v1_rsa' or 'v2_ecdsa'"))?,
+        client_id: client_id.to_string(),
+        client_secret: Secret::new(client_secret),
+        redirect_uri: redirect_uri.to_string(),
+        upstream_base_url: None,
+        tsa: tsa_url.map(|url| TsaConfiguration {
+            url,
+            auth: None,
+            policy_oid: None,
+        }),
+    })
+}
+
+/// Validate signing configuration without creating a signing session. Request-dependent rules are
+/// checked later by `begin_signing`, which validates the configuration again.
+#[pyfunction]
+#[pyo3(signature = (environment, csc_api, client_id, client_secret, redirect_uri, tsa_url=None))]
+fn validate_config(
+    environment: &str,
+    csc_api: &str,
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+    tsa_url: Option<String>,
+) -> PyResult<()> {
+    build_config(
+        environment,
+        csc_api,
+        client_id,
+        client_secret,
+        redirect_uri,
+        tsa_url,
+    )?
+    .validate()
+    .map_err(err)
+}
+
 #[pyfunction]
 #[pyo3(signature = (document, environment, csc_api, client_id, client_secret, redirect_uri, conformance, now_unix, entropy, tsa_url=None, options_json=None))]
 // FFI entry point: the individual scalar args cross the pyo3 boundary cleanly, where a params
@@ -45,16 +94,14 @@ fn begin_signing(
         appearance: options.appearance,
         signature_meta: options.signature_meta,
     };
-    let config = TrustServiceConfiguration {
-        environment: Environment::from_wire(environment)
-            .ok_or_else(|| err("environment must be 'acceptance' or 'production'"))?,
-        csc_api: CscApi::from_wire(csc_api).ok_or_else(|| err("csc_api must be 'v1_rsa' or 'v2_ecdsa'"))?,
-        client_id: client_id.to_string(),
-        client_secret: Secret::new(client_secret),
-        redirect_uri: redirect_uri.to_string(),
-        upstream_base_url: None,
-        tsa: tsa_url.map(|url| TsaConfiguration { url, auth: None, policy_oid: None }),
-    };
+    let config = build_config(
+        environment,
+        csc_api,
+        client_id,
+        client_secret,
+        redirect_uri,
+        tsa_url,
+    )?;
     let (handle, step) = begin(request, config, HostContext { now_unix, entropy }).map_err(err)?;
     Ok(encode_handle_step(&handle, &step))
 }
@@ -138,6 +185,7 @@ fn attestation_issuance(request: Vec<u8>) -> PyResult<Vec<u8>> {
 #[pymodule]
 fn cleverbase(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SCHEMA_VERSION", cleverbase_core::SCHEMA_VERSION)?;
+    m.add_function(wrap_pyfunction!(validate_config, m)?)?;
     m.add_function(wrap_pyfunction!(begin_signing, m)?)?;
     m.add_function(wrap_pyfunction!(resume_redirect, m)?)?;
     m.add_function(wrap_pyfunction!(resume_redirect_error, m)?)?;

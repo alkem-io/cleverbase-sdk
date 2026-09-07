@@ -10,6 +10,14 @@
 
 SCHEMA_VERSION: int
 
+def validate_config(
+    environment: str,
+    csc_api: str,
+    client_id: str,
+    client_secret: str,
+    redirect_uri: str,
+    tsa_url: str | None = ...,
+) -> None: ...
 def begin_signing(
     document: bytes,
     environment: str,
