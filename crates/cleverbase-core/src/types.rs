@@ -220,6 +220,16 @@ pub struct TsaConfiguration {
     pub policy_oid: Option<String>,
 }
 
+impl TsaConfiguration {
+    fn validate(&self) -> Result<(), String> {
+        let parsed = parse_absolute_http_url(&self.url, "tsa.url")?;
+        if parsed.fragment().is_some() {
+            return Err("tsa.url must not contain a fragment".into());
+        }
+        Ok(())
+    }
+}
+
 /// How to reach the Cleverbase trust service (data-model: TrustServiceConfiguration).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,15 +286,19 @@ impl TrustServiceConfiguration {
     /// The OAuth client id and redirect URI are required. Alternate origins are for documented
     /// developer environments only. They must be absolute, omit credentials, query, and fragment,
     /// and use HTTPS except for an explicitly loopback HTTP endpoint used in local development. A
-    /// path is permitted as a service base path.
+    /// path is permitted as a service base path. A configured TSA endpoint must be an absolute HTTP
+    /// or HTTPS URL without embedded credentials or a fragment.
     pub fn validate(&self) -> Result<(), String> {
         if self.client_id.is_empty() || self.redirect_uri.is_empty() {
             return Err("client_id and redirect_uri are required".into());
         }
-        let Some(value) = self.upstream_base_url.as_deref() else {
-            return Ok(());
-        };
-        normalize_upstream_base_url(value).map(|_| ())
+        if let Some(value) = self.upstream_base_url.as_deref() {
+            normalize_upstream_base_url(value)?;
+        }
+        if let Some(tsa) = &self.tsa {
+            tsa.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -298,27 +312,35 @@ fn default_base_url(csc_api: CscApi, environment: Environment) -> &'static str {
 }
 
 fn normalize_upstream_base_url(value: &str) -> Result<String, String> {
-    let parsed =
-        Url::parse(value).map_err(|e| format!("upstream_base_url must be an absolute URL: {e}"))?;
-    let Some(host) = parsed.host_str() else {
-        return Err("upstream_base_url must be an absolute URL with a host".into());
-    };
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("upstream_base_url must not contain credentials".into());
-    }
+    let parsed = parse_absolute_http_url(value, "upstream_base_url")?;
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err("upstream_base_url must not contain a query or fragment".into());
-    }
-    if parsed.port() == Some(0) {
-        return Err("upstream_base_url must not use port zero".into());
     }
     if parsed.scheme() == "https" {
         return Ok(parsed.as_str().trim_end_matches('/').to_owned());
     }
-    if parsed.scheme() == "http" && is_loopback_host(host) {
+    if parsed.scheme() == "http" && parsed.host_str().is_some_and(is_loopback_host) {
         return Ok(parsed.as_str().trim_end_matches('/').to_owned());
     }
     Err("upstream_base_url must use https, except http on a loopback host".into())
+}
+
+fn parse_absolute_http_url(value: &str, field: &str) -> Result<Url, String> {
+    let parsed =
+        Url::parse(value).map_err(|e| format!("{field} must be an absolute HTTP URL: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{field} must use http or https"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(format!("{field} must be an absolute HTTP URL with a host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!("{field} must not contain credentials"));
+    }
+    if parsed.port() == Some(0) {
+        return Err(format!("{field} must not use port zero"));
+    }
+    Ok(parsed)
 }
 
 fn is_loopback_host(host: &str) -> bool {
