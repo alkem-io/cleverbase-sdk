@@ -418,6 +418,45 @@ mod tests {
     }
 
     #[test]
+    fn process_bytes_dispatches_config_validation() {
+        let valid = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Acceptance,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: None,
+                    tsa: None,
+                },
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&valid))[..]).unwrap();
+        assert!(matches!(response.result, WireResult::ConfigValidated {}));
+
+        let invalid = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Acceptance,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: Some("http://example.com".into()),
+                    tsa: None,
+                },
+            },
+        };
+        let response: WireResponse =
+            ciborium::from_reader(&process_bytes(&encode(&invalid))[..]).unwrap();
+        assert!(matches!(response.result, WireResult::Err { .. }));
+    }
+
+    #[test]
     fn process_bytes_begin_error_is_err_result() {
         // Empty client_id → core InvalidConfig → WireResult::Err (the dispatch Begin-error arm).
         let req = WireRequest {

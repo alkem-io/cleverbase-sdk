@@ -214,6 +214,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_request_and_response_roundtrip() {
+        let req = WireRequest {
+            schema_version: SCHEMA_VERSION,
+            op: WireOp::ValidateConfig {
+                config: TrustServiceConfiguration {
+                    environment: Environment::Production,
+                    csc_api: CscApi::V1Rsa,
+                    client_id: "client".into(),
+                    client_secret: Secret::new("secret"),
+                    redirect_uri: "https://app.example/callback".into(),
+                    upstream_base_url: None,
+                    tsa: None,
+                },
+            },
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&req, &mut buf).unwrap();
+        assert_eq!(decode_request(&buf).unwrap(), req);
+
+        let response = encode_response(WireResult::ConfigValidated {});
+        let decoded: WireResponse = ciborium::from_reader(&response[..]).unwrap();
+        assert!(matches!(decoded.result, WireResult::ConfigValidated {}));
+    }
+
+    #[test]
     fn decode_rejects_wrong_version() {
         let mut req = sample_begin();
         req.schema_version = 999;

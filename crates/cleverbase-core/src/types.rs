@@ -516,6 +516,32 @@ mod tests {
     }
 
     #[test]
+    fn trust_service_configuration_validation_requires_begin_fields() {
+        let mut config = TrustServiceConfiguration {
+            environment: Environment::Acceptance,
+            csc_api: CscApi::V1Rsa,
+            client_id: "client".into(),
+            client_secret: Secret::new("secret"),
+            redirect_uri: "https://app.example/callback".into(),
+            upstream_base_url: None,
+            tsa: None,
+        };
+        assert!(config.validate().is_ok());
+
+        config.client_id.clear();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "client_id and redirect_uri are required"
+        );
+        config.client_id = "client".into();
+        config.redirect_uri.clear();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "client_id and redirect_uri are required"
+        );
+    }
+
+    #[test]
     fn trust_service_configuration_rejects_unknown_fields() {
         let error = serde_json::from_value::<TrustServiceConfiguration>(serde_json::json!({
             "environment": "acceptance",
