@@ -128,7 +128,7 @@ func TestTokenServiceVsCredential(t *testing.T) {
 func signHash(t *testing.T, baseURL, route string, digest []byte) []byte {
 	t.Helper()
 	req := map[string]any{"hash": []string{base64.StdEncoding.EncodeToString(digest)}}
-	if route == "/csc/v1" {
+	if route == cscV1Route {
 		// Pin Cleverbase's documented CSC v1 request contract independently of production constants.
 		req["hashAlgo"] = "2.16.840.1.101.3.4.2.1"
 		req["signAlgo"] = "1.2.840.113549.1.1.1"
@@ -184,7 +184,7 @@ func TestSignHashV1RequiresDocumentedAlgorithms(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp, err := http.Post(ts.URL+"/csc/v1/signatures/signHash", "application/json", strings.NewReader(string(body)))
+			resp, err := http.Post(ts.URL+cscV1Route+"/signatures/signHash", "application/json", strings.NewReader(string(body)))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -219,7 +219,7 @@ func TestSignHashV1ProducesVerifiableRSASignature(t *testing.T) {
 	defer ts.Close()
 
 	digest := sha256.Sum256([]byte("to-be-signed attributes"))
-	sig := signHash(t, ts.URL, "/csc/v1", digest[:])
+	sig := signHash(t, ts.URL, cscV1Route, digest[:])
 
 	pub, ok := parseCert(t, "signer-rsa.cert.der").PublicKey.(*rsa.PublicKey)
 	if !ok {
