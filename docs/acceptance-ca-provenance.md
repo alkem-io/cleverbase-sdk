@@ -39,6 +39,7 @@ Run this in a temporary directory. The AIA transport is HTTP, so the pinned dige
 do not update it by trust-on-first-use.
 
 ```bash
+set -euo pipefail
 work_dir="$(mktemp -d)"
 cd "$work_dir"
 
