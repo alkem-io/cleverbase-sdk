@@ -83,6 +83,28 @@ def test_config_options_match_the_go_binding_surface() -> None:
     assert resp["step"]["url"].startswith("http://localhost:9000/stub/oauth2/authorize?")
 
 
+@pytest.mark.parametrize(
+    "tsa_url",
+    [
+        "not a URL",
+        "ftp://tsa.example/tsr",
+        "https://user:password@tsa.example/tsr",
+        "https://tsa.example/tsr#response",
+        "https://tsa.example:0/tsr",
+    ],
+)
+def test_validate_config_rejects_invalid_tsa_urls(tsa_url: str) -> None:
+    with pytest.raises(ValueError):
+        cleverbase.validate_config(
+            "acceptance",
+            "v1_rsa",
+            "client-123",
+            "secret",
+            "https://app.example/cb",
+            tsa_url=tsa_url,
+        )
+
+
 def test_begin_returns_service_redirect() -> None:
     out = cleverbase.begin_signing(
         PDF,

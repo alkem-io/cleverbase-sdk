@@ -81,6 +81,27 @@ test("config options match the Go binding surface", () => {
   assert.ok(resp.step.url.startsWith("http://localhost:9000/stub/oauth2/authorize?"));
 });
 
+test("config validation rejects invalid TSA URLs", () => {
+  for (const tsaUrl of [
+    "not a URL",
+    "ftp://tsa.example/tsr",
+    "https://user:password@tsa.example/tsr",
+    "https://tsa.example/tsr#response",
+    "https://tsa.example:0/tsr",
+  ]) {
+    assert.throws(() =>
+      validateConfig(
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        tsaUrl,
+      ),
+    );
+  }
+});
+
 test("begin returns a service-scope redirect", () => {
   const out = beginSigning(
     PDF,
