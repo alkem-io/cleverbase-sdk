@@ -1,8 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const path = require("node:path");
 const cbor = require("cbor");
 const {
   beginSigning,
+  resumeHttp,
   resumeRedirect,
   resumeRedirectError,
   validateConfig,
@@ -11,6 +14,59 @@ const {
 const NOW = 1_700_000_000;
 const ENTROPY = Buffer.from(Array.from({ length: 16 }, (_, i) => i));
 const PDF = Buffer.from("%PDF-1.7\nminimal");
+const REPO_ROOT = path.resolve(__dirname, "../../..");
+
+function driveToTsaEffect() {
+  const document = fs.readFileSync(
+    path.join(REPO_ROOT, "tests/fixtures/signing/binding-input.pdf"),
+  );
+  const certificate = fs
+    .readFileSync(path.join(REPO_ROOT, "tests/fixtures/pki/signer-rsa.cert.der"))
+    .toString("base64");
+  const signHashResponse = fs.readFileSync(
+    path.join(REPO_ROOT, "tests/fixtures/signing/rsa_sign_hash_response.json"),
+  );
+  const decode = (value) => cbor.decodeFirstSync(value);
+  const resumeJson = (result, response) =>
+    decode(resumeHttp(result.handle, 200, Buffer.from(JSON.stringify(response)), NOW, ENTROPY));
+
+  let result = decode(
+    beginSigning(
+      document,
+      "acceptance",
+      "v1_rsa",
+      "client-123",
+      "secret",
+      "https://app.example/cb",
+      "B-T",
+      NOW,
+      ENTROPY,
+      "https://tsa.example/rfc3161",
+      null,
+      null,
+      "Basic public-test-credentials",
+      "1.2.3.4",
+    ),
+  );
+  result = decode(resumeRedirect(result.handle, "service-code", result.step.state, NOW, ENTROPY));
+  result = resumeJson(result, { access_token: "bearer", token_type: "Bearer" });
+  result = resumeJson(result, { credentialIDs: ["cred-1"] });
+  result = resumeJson(result, {
+    key: { status: "enabled", algo: ["1.2.840.113549.1.1.1"], len: 2048 },
+    cert: {
+      status: "valid",
+      certificates: [certificate],
+      subjectDN: "CN=Jane Doe,serialNumber=PNONL-123",
+      serialNumber: "PNONL-123",
+    },
+    SCAL: "2",
+  });
+  result = decode(
+    resumeRedirect(result.handle, "credential-code", result.step.state, NOW, ENTROPY),
+  );
+  result = resumeJson(result, { access_token: "SAD", token_type: "SAD" });
+  return decode(resumeHttp(result.handle, 200, signHashResponse, NOW, ENTROPY)).step;
+}
 
 test("config validation accepts valid inputs and rejects a missing client ID", () => {
   assert.doesNotThrow(() =>
@@ -79,6 +135,18 @@ test("config options match the Go binding surface", () => {
   );
   const resp = cbor.decodeFirstSync(out);
   assert.ok(resp.step.url.startsWith("http://localhost:9000/stub/oauth2/authorize?"));
+});
+
+test("TSA auth and policy reach the timestamp request", () => {
+  const step = driveToTsaEffect();
+
+  assert.strictEqual(step.kind, "perform_http");
+  assert.strictEqual(step.url, "https://tsa.example/rfc3161");
+  assert.strictEqual(
+    Object.fromEntries(step.headers).Authorization,
+    "Basic public-test-credentials",
+  );
+  assert.ok(step.body.includes(Buffer.from("06032a0304", "hex"))); // DER OBJECT IDENTIFIER 1.2.3.4
 });
 
 test("config validation rejects invalid TSA URLs", () => {
