@@ -161,6 +161,10 @@ pub fn attestation_verify(request: Buffer) -> Result<Buffer> {
 /// the response body, not through this call's error channel; a malformed request fails closed to an
 /// `err` outcome rather than throwing. All protocol/crypto logic lives in `cleverbase-attestation`
 /// (Constitution Principle III/VIII); this wrapper is bytes-in / bytes-out only.
+///
+/// The set-level surface does NOT run the opt-in eIDAS qualified-status gate: a request with
+/// `policy.qualified_gate = true` yields an `err` outcome (verify each presentation via
+/// `attestation_verify` if the qualified gate is required).
 #[napi]
 pub fn attestation_verify_vp_token(request: Buffer) -> Result<Buffer> {
     Ok(cleverbase_attestation::wire::process_vp_token_bytes(&request).into())
