@@ -295,7 +295,9 @@ func VerifyPDF(document []byte) (*PDFVerification, error) {
 }
 
 // Validate checks this configuration using the Rust core's authoritative validation without
-// creating a signing session. BeginSigning validates again as defense in depth.
+// creating a signing session. It does not validate the TSA URL, and it cannot enforce that B-T
+// requires a TSA because conformance is part of the later signing request. BeginSigning validates
+// again as defense in depth.
 func (cfg Config) Validate() error {
 	result, err := invoke(map[string]any{keyOp: "validate_config", "config": cfg.toWire()})
 	if err != nil {

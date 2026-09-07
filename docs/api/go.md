@@ -115,13 +115,13 @@ type Config struct {
 ```
 
 <a name="Config.Validate"></a>
-### func \(Config\) [Validate](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L299>)
+### func \(Config\) [Validate](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L301>)
 
 ```go
 func (cfg Config) Validate() error
 ```
 
-Validate checks this configuration using the Rust core's authoritative validation without creating a signing session. BeginSigning validates again as defense in depth.
+Validate checks this configuration using the Rust core's authoritative validation without creating a signing session. It does not validate the TSA URL, and it cannot enforce that B\-T requires a TSA because conformance is part of the later signing request. BeginSigning validates again as defense in depth.
 
 <a name="ExpectedSigner"></a>
 ## type [ExpectedSigner](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L84-L88>)
@@ -211,7 +211,7 @@ type Session struct {
 ```
 
 <a name="BeginSigning"></a>
-### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L336>)
+### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L338>)
 
 ```go
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error)
@@ -220,7 +220,7 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request.
 
 <a name="ResumeHTTP"></a>
-### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L380>)
+### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L382>)
 
 ```go
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error)
@@ -229,7 +229,7 @@ func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, 
 ResumeHTTP advances the flow with the result of a performed HTTP effect.
 
 <a name="ResumeRedirect"></a>
-### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L358>)
+### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L360>)
 
 ```go
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error)
@@ -238,7 +238,7 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 ResumeRedirect advances the flow with the OAuth code\+state from a redirect return.
 
 <a name="ResumeRedirectError"></a>
-### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L370>)
+### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L372>)
 
 ```go
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error)

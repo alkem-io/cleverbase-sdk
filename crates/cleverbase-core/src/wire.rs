@@ -77,6 +77,8 @@ pub struct WireResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum WireResult {
     /// Trust-service configuration was valid.
+    // Deliberately an empty struct variant: a unit variant serializes as a bare string, which typed
+    // host bindings cannot decode as the `config_validated` result object.
     ConfigValidated {},
     /// Success: the updated session handle plus the next step.
     Ok {

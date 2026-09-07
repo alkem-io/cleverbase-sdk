@@ -25,6 +25,9 @@ func main() {
 		ClientSecret: "your-client-secret",
 		RedirectURI:  "https://your-app.example/callback",
 	}
+	if err := cfg.Validate(); err != nil {
+		panic(err)
+	}
 	// Optional: bind to an expected signer (FR-014) and/or a visible appearance (FR-016); pass nil
 	// for neither.
 	opts := &cleverbase.RequestOptions{
