@@ -67,8 +67,12 @@ jobs:
               ;;
             acceptance)
               if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ] && [ -n "$REDIRECT_URI" ] && [ -n "$CA_BUNDLE_B64" ]; then
-                echo "run=true" >> "$GITHUB_OUTPUT"
-                echo "variant=acceptance" >> "$GITHUB_OUTPUT"
+                {
+                  echo "run=true"
+                  echo "variant=acceptance"
+                  printf 'client_id=%s\n' "$CLIENT_ID"
+                  printf 'client_secret=%s\n' "$CLIENT_SECRET"
+                } >> "$GITHUB_OUTPUT"
               else
                 echo "run=false" >> "$GITHUB_OUTPUT"
                 echo "::notice::Skipping acceptance ${{ matrix.leg }}: its client credential, redirect URI, or acceptance CA bundle is not configured."
@@ -128,8 +132,8 @@ jobs:
           REFSVC_MODE: live
           REFSVC_ENV: acceptance
           REFSVC_CSC_API: ${{ matrix.csc_api }}
-          REFSVC_CLIENT_ID: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_ID_RSA || secrets.LIVE_CLIENT_ID_ECDSA || '' }}
-          REFSVC_CLIENT_SECRET: ${{ matrix.leg == 'v1_rsa' && secrets.LIVE_CLIENT_SECRET_RSA || secrets.LIVE_CLIENT_SECRET_ECDSA || '' }}
+          REFSVC_CLIENT_ID: ${{ steps.gate.outputs.client_id }}
+          REFSVC_CLIENT_SECRET: ${{ steps.gate.outputs.client_secret }}
           REFSVC_REDIRECT_URI: ${{ secrets.LIVE_REDIRECT_URI }}
           REFSVC_TSA_URL: ${{ secrets.LIVE_TSA_URL }}
           REFSVC_LIVE_AUTHORIZER: headless
