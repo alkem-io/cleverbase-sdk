@@ -271,12 +271,16 @@ impl TrustServiceConfiguration {
         format!("{}/oauth2/token", self.base_url())
     }
 
-    /// Validate the optional alternate Cleverbase origin before a signing session starts.
+    /// Validate this trust-service configuration before it is used by a signing session.
     ///
-    /// Alternate origins are for documented developer environments only. They must be absolute,
-    /// omit credentials, query, and fragment, and use HTTPS except for an explicitly loopback
-    /// HTTP endpoint used in local development. A path is permitted as a service base path.
+    /// The OAuth client id and redirect URI are required. Alternate origins are for documented
+    /// developer environments only. They must be absolute, omit credentials, query, and fragment,
+    /// and use HTTPS except for an explicitly loopback HTTP endpoint used in local development. A
+    /// path is permitted as a service base path.
     pub fn validate(&self) -> Result<(), String> {
+        if self.client_id.is_empty() || self.redirect_uri.is_empty() {
+            return Err("client_id and redirect_uri are required".into());
+        }
         let Some(value) = self.upstream_base_url.as_deref() else {
             return Ok(());
         };

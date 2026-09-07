@@ -32,6 +32,10 @@ use cleverbase_core::wire::{decode_request, encode_response, WireOp, WireRequest
 /// core (Constitution Principle III: no protocol logic duplicated in bindings).
 fn dispatch(req: WireRequest) -> WireResult {
     match req.op {
+        WireOp::ValidateConfig { config } => match config.validate() {
+            Ok(()) => WireResult::ConfigValidated {},
+            Err(message) => WireResult::Err { message },
+        },
         WireOp::Begin {
             request,
             config,
@@ -321,6 +325,7 @@ mod tests {
             }
             WireResult::Err { message } => panic!("unexpected error: {message}"),
             WireResult::Verification(_) => panic!("unexpected verification result"),
+            WireResult::ConfigValidated {} => panic!("unexpected config-validation result"),
         }
     }
 
@@ -376,6 +381,7 @@ mod tests {
             },
             WireResult::Err { message } => panic!("begin failed: {message}"),
             WireResult::Verification(_) => panic!("unexpected verification result"),
+            WireResult::ConfigValidated {} => panic!("unexpected config-validation result"),
         };
         let resume = encode(&WireRequest {
             schema_version: SCHEMA_VERSION,

@@ -7,6 +7,9 @@ Types reference [data-model.md](../data-model.md).
 ## Core operations (logical)
 
 ```text
+validate_config(config: TrustServiceConfiguration)
+    -> ConfigValidated | error
+
 begin(request: SigningRequest, config: TrustServiceConfiguration)
     -> (handle: SigningSessionHandle, step: Step)
 
@@ -85,6 +88,7 @@ out = cleverbase.begin_signing(
 
 Go (over the C-ABI; CBOR under the hood, typed wrapper on top):
 ```go
+err := cfg.Validate() // fail fast without creating a session
 sess, err := cleverbase.BeginSigning(document, cfg, conformance, opts, now, entropy)
 // loop: cleverbase.ResumeRedirect(...) | ResumeRedirectError(...) | ResumeHTTP(...)
 
@@ -101,9 +105,9 @@ Coarse, stable, CBOR-in/result-out (mirrors `scal3`):
 int  cleverbase_process(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len);
 void cleverbase_free(uint8_t* out, size_t out_len);
 ```
-`in` = CBOR `{ op: "begin"|"resume"|"verify_pdf", ... }`; `out` carries `ok`, `err`, or
-`verification`. The CBOR schema is **versioned** (`schema_version`); compatible within a SemVer
-major (Principle VII).
+`in` = CBOR `{ op: "validate_config"|"begin"|"resume"|"verify_pdf", ... }`; `out` carries
+`config_validated`, `ok`, `err`, or `verification`. The CBOR schema is **versioned**
+(`schema_version`); compatible within a SemVer major (Principle VII).
 
 ## Error model
 

@@ -19,6 +19,11 @@ use crate::SCHEMA_VERSION;
 // variant would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireOp {
+    /// Validate trust-service configuration without creating a signing session.
+    ValidateConfig {
+        /// The trust-service configuration to validate.
+        config: TrustServiceConfiguration,
+    },
     /// Begin a new signing flow.
     Begin {
         /// The signing request.
@@ -63,13 +68,16 @@ pub struct WireResponse {
     pub result: WireResult,
 }
 
-/// The result of a wire operation: a `(handle, step)` pair, a PDF integrity verdict, or an error.
+/// The result of a wire operation: config validation, a `(handle, step)` pair, a PDF integrity
+/// verdict, or an error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 // Wire protocol enum: the ok variant (handle + step) is naturally larger than the err variant;
 // boxing would distort the CBOR shape for no runtime benefit (decoded once per call).
 #[allow(clippy::large_enum_variant)]
 pub enum WireResult {
+    /// Trust-service configuration was valid.
+    ConfigValidated {},
     /// Success: the updated session handle plus the next step.
     Ok {
         /// The updated session handle.
