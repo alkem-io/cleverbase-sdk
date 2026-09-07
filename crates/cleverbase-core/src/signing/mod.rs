@@ -1026,6 +1026,16 @@ mod tests {
             begin(request(ConformanceLevel::BB, None), c, ctx()),
             Err(CoreError::InvalidConfig(_))
         ));
+        let mut c = cfg();
+        c.tsa = Some(TsaConfiguration {
+            url: "not a URL".into(),
+            auth: None,
+            policy_oid: None,
+        });
+        assert!(matches!(
+            begin(request(ConformanceLevel::BB, None), c, ctx()),
+            Err(CoreError::InvalidConfig(_))
+        ));
     }
 
     #[test]

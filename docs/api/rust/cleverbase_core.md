@@ -1187,7 +1187,8 @@ Validate this trust-service configuration before it is used by a signing session
 The OAuth client id and redirect URI are required. Alternate origins are for documented
 developer environments only. They must be absolute, omit credentials, query, and fragment,
 and use HTTPS except for an explicitly loopback HTTP endpoint used in local development. A
-path is permitted as a service base path.
+path is permitted as a service base path. A configured TSA endpoint must be an absolute HTTP
+or HTTPS URL without embedded credentials or a fragment.
 
 #### struct `TsaConfiguration`
 

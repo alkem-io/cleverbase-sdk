@@ -140,8 +140,8 @@ Running the packaging contract locally on macOS requires GNU tar (`brew install 
 - Uses the Rust core's existing configuration validator through the versioned CBOR ABI; `Begin`
   retains the same validation as defense in depth, and Go shares one configuration encoder across
   both calls.
-- The config-only operation cannot enforce the request-dependent B-T-requires-TSA rule and does not
-  yet validate TSA URL syntax; that validation boundary is tracked in [#36](https://github.com/alkem-io/cleverbase-sdk/issues/36).
+- The config-only operation validates a configured TSA URL but cannot enforce the request-dependent
+  B-T-requires-TSA rule; `Begin` remains the single place that combines request and configuration.
 
 #### v0.3.0 release notes
 

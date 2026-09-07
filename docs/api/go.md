@@ -121,7 +121,7 @@ type Config struct {
 func (cfg Config) Validate() error
 ```
 
-Validate checks this configuration using the Rust core's authoritative validation without creating a signing session. It does not validate the TSA URL, and it cannot enforce that B\-T requires a TSA because conformance is part of the later signing request. BeginSigning validates again as defense in depth.
+Validate checks this configuration using the Rust core's authoritative validation without creating a signing session. It validates a configured TSA URL, but cannot enforce that B\-T requires a TSA because conformance is part of the later signing request. BeginSigning validates again and enforces that request\-dependent rule as defense in depth.
 
 <a name="ExpectedSigner"></a>
 ## type [ExpectedSigner](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L84-L88>)
