@@ -141,11 +141,13 @@ type wireError struct {
 	Message string `cbor:"message"`
 }
 
+type configValidatedResult struct{}
+
 type wireResult struct {
-	Ok              *okResult        `cbor:"ok"`
-	Err             *wireError       `cbor:"err"`
-	Verification    *PDFVerification `cbor:"verification"`
-	ConfigValidated *struct{}        `cbor:"config_validated"`
+	Ok              *okResult              `cbor:"ok"`
+	Err             *wireError             `cbor:"err"`
+	Verification    *PDFVerification       `cbor:"verification"`
+	ConfigValidated *configValidatedResult `cbor:"config_validated"`
 }
 
 type wireResponse struct {
