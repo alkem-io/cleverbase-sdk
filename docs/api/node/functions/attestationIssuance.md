@@ -2,7 +2,7 @@
 
 > **attestationIssuance**(`request`): `Buffer`
 
-Defined in: [index.d.ts:59](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L59)
+Defined in: [index.d.ts:64](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L64)
 
 Drive an EUDI attestation issuance / holder-presentation step.
 

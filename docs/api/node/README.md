@@ -9,3 +9,4 @@
 - [resumeHttp](functions/resumeHttp.md)
 - [resumeRedirect](functions/resumeRedirect.md)
 - [resumeRedirectError](functions/resumeRedirectError.md)
+- [validateConfig](functions/validateConfig.md)
