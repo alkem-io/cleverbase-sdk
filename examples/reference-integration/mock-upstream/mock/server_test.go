@@ -127,7 +127,13 @@ func TestTokenServiceVsCredential(t *testing.T) {
 // signHash POSTs a SHA-256 digest to the given CSC route and returns the decoded signature bytes.
 func signHash(t *testing.T, baseURL, route string, digest []byte) []byte {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{"hash": []string{base64.StdEncoding.EncodeToString(digest)}})
+	req := map[string]any{"hash": []string{base64.StdEncoding.EncodeToString(digest)}}
+	if route == cscV1Route {
+		// Pin Cleverbase's documented CSC v1 request contract independently of production constants.
+		req["hashAlgo"] = "2.16.840.1.101.3.4.2.1"
+		req["signAlgo"] = "1.2.840.113549.1.1.1"
+	}
+	body, _ := json.Marshal(req)
 	resp, err := http.Post(baseURL+route+"/signatures/signHash", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +150,52 @@ func signHash(t *testing.T, baseURL, route string, digest []byte) []byte {
 		t.Fatalf("sig base64: %v", err)
 	}
 	return sig
+}
+
+func TestSignHashV1RequiresDocumentedAlgorithms(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+
+	digest := sha256.Sum256([]byte("contract request"))
+	valid := map[string]any{
+		"hash":     []string{base64.StdEncoding.EncodeToString(digest[:])},
+		"hashAlgo": "2.16.840.1.101.3.4.2.1",
+		"signAlgo": "1.2.840.113549.1.1.1",
+	}
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   int
+	}{
+		{name: "documented algorithms", mutate: func(map[string]any) {}, want: http.StatusOK},
+		{name: "missing hash algorithm", mutate: func(v map[string]any) { delete(v, "hashAlgo") }, want: http.StatusBadRequest},
+		{name: "wrong hash algorithm", mutate: func(v map[string]any) { v["hashAlgo"] = "1.3.14.3.2.26" }, want: http.StatusBadRequest},
+		{name: "missing signature algorithm", mutate: func(v map[string]any) { delete(v, "signAlgo") }, want: http.StatusBadRequest},
+		{name: "wrong signature algorithm", mutate: func(v map[string]any) { v["signAlgo"] = "1.2.840.113549.1.1.11" }, want: http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := make(map[string]any, len(valid))
+			for key, value := range valid {
+				req[key] = value
+			}
+			tc.mutate(req)
+			body, err := json.Marshal(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.Post(ts.URL+cscV1Route+"/signatures/signHash", "application/json", strings.NewReader(string(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatalf("close signHash response: %v", err)
+			}
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
 }
 
 // parseCert loads a signer cert (DER) from the PKI fixtures.
@@ -167,7 +219,7 @@ func TestSignHashV1ProducesVerifiableRSASignature(t *testing.T) {
 	defer ts.Close()
 
 	digest := sha256.Sum256([]byte("to-be-signed attributes"))
-	sig := signHash(t, ts.URL, "/csc/v1", digest[:])
+	sig := signHash(t, ts.URL, cscV1Route, digest[:])
 
 	pub, ok := parseCert(t, "signer-rsa.cert.der").PublicKey.(*rsa.PublicKey)
 	if !ok {

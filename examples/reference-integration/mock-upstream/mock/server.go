@@ -42,11 +42,14 @@ const maxRequestBody = 1 << 20 // 1 MiB
 // p256ScalarLen is the fixed width (bytes) of each of r and s in a P-256 raw r‖s signature.
 const p256ScalarLen = 32
 
-// Per-route signer algorithm labels — one authoritative string each (Constitution III), used as the
-// key-load error label.
+// Per-route signer algorithm labels and the documented CSC v1 request OIDs — one authoritative
+// string each (Constitution III).
 const (
-	algoRSA   = "RSA"
-	algoECDSA = "EcdsaP256"
+	algoRSA          = "RSA"
+	algoECDSA        = "EcdsaP256"
+	cscV1Route       = "/csc/v1"
+	v1HashAlgoSHA256 = "2.16.840.1.101.3.4.2.1"
+	v1SignAlgoRSA    = "1.2.840.113549.1.1.1"
 )
 
 // bodyErrorStatus maps a request-body read/decode error to an HTTP status: an over-limit body
@@ -83,7 +86,7 @@ func rsaSigner(pkiDir string) (*signer, error) {
 	}
 	return &signer{
 		certDER:   certDER,
-		algoOID:   "1.2.840.113549.1.1.1", // rsaEncryption
+		algoOID:   v1SignAlgoRSA, // rsaEncryption
 		subjectDN: "CN=Jane Doe,serialNumber=PNONL-123",
 		serial:    "PNONL-123",
 		sign: func(tbs []byte) ([]byte, error) {
@@ -218,13 +221,17 @@ func New(fixturesDir string) (*Server, error) {
 	mux.HandleFunc("/oauth2/authorize", s.handleAuthorize)
 	mux.HandleFunc("/oauth2/token", s.handleToken)
 	// CSC v1 → RSA signer (signer-rsa); CSC v2 → ECDSA P-256 signer (signer-ec). Each route binds
-	// its own signer + the credentials/info filled from that same signer (no drift).
-	routes := map[string]*signer{"/csc/v1": rsaSig, "/csc/v2": ecSig}
-	for base, sig := range routes {
-		info := infoFor(infoTemplate, sig)
+	// its own signer + the credentials/info filled from that same signer (no drift). Only v1 pins
+	// request algorithms: the published v2 contract remains unresolved under issue #15.
+	routes := map[string]signingRoute{
+		cscV1Route: {signer: rsaSig, expectedAlgorithms: &signHashAlgorithms{hash: v1HashAlgoSHA256, sign: v1SignAlgoRSA}},
+		"/csc/v2":  {signer: ecSig},
+	}
+	for base, route := range routes {
+		info := infoFor(infoTemplate, route.signer)
 		mux.HandleFunc(base+"/credentials/list", s.handleList)
 		mux.HandleFunc(base+"/credentials/info", serveInfo(info))
-		mux.HandleFunc(base+"/signatures/signHash", signHashHandler(sig))
+		mux.HandleFunc(base+"/signatures/signHash", signHashHandler(route.signer, route.expectedAlgorithms))
 	}
 	mux.HandleFunc("/tsr", s.handleTSA)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, map[string]string{"status": "ok"}) })
@@ -306,13 +313,25 @@ func serveInfo(info []byte) http.HandlerFunc {
 }
 
 type signHashRequest struct {
-	Hash []string `json:"hash"`
+	Hash     []string `json:"hash"`
+	HashAlgo string   `json:"hashAlgo"`
+	SignAlgo string   `json:"signAlgo"`
+}
+
+type signHashAlgorithms struct {
+	hash string
+	sign string
+}
+
+type signingRoute struct {
+	signer             *signer
+	expectedAlgorithms *signHashAlgorithms
 }
 
 // signHashHandler signs the submitted to-be-signed digest with the route's signer (RSA PKCS#1 v1.5
 // over a SHA-256 DigestInfo on /csc/v1; raw ECDSA P-256 r‖s on /csc/v2), mirroring the SDK's
 // independent-validation test. One handler, dispatched on the route's signer — no hardcoded key.
-func signHashHandler(sig *signer) http.HandlerFunc {
+func signHashHandler(sig *signer, expected *signHashAlgorithms) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Cap the body before decoding so an unbounded request cannot exhaust memory; a signHash
 		// request only carries a base64 hash plus small metadata, so 1 MiB is generous.
@@ -320,6 +339,10 @@ func signHashHandler(sig *signer) http.HandlerFunc {
 		var req signHashRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Hash) == 0 {
 			http.Error(w, "bad signHash request", bodyErrorStatus(err))
+			return
+		}
+		if expected != nil && (req.HashAlgo != expected.hash || req.SignAlgo != expected.sign) {
+			http.Error(w, "unsupported signHash algorithms", http.StatusBadRequest)
 			return
 		}
 		tbs, err := base64.StdEncoding.DecodeString(req.Hash[0])
