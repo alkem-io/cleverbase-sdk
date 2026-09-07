@@ -41,6 +41,48 @@ def test_validate_config_accepts_valid_inputs_and_rejects_missing_client_id() ->
         )
 
 
+def test_config_options_match_the_go_binding_surface() -> None:
+    cleverbase.validate_config(
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        tsa_url="https://tsa.example/rfc3161",
+        upstream_base_url="http://localhost:9000/stub",
+        tsa_auth="Basic public-test-credentials",
+        tsa_policy_oid="1.2.3.4",
+    )
+
+    with pytest.raises(ValueError):
+        cleverbase.validate_config(
+            "acceptance",
+            "v1_rsa",
+            "client-123",
+            "secret",
+            "https://app.example/cb",
+            upstream_base_url="http://not-loopback.example/stub",
+        )
+
+    out = cleverbase.begin_signing(
+        PDF,
+        "acceptance",
+        "v1_rsa",
+        "client-123",
+        "secret",
+        "https://app.example/cb",
+        "B-T",
+        NOW,
+        ENTROPY,
+        tsa_url="https://tsa.example/rfc3161",
+        upstream_base_url="http://localhost:9000/stub",
+        tsa_auth="Basic public-test-credentials",
+        tsa_policy_oid="1.2.3.4",
+    )
+    resp = cbor2.loads(out)
+    assert resp["step"]["url"].startswith("http://localhost:9000/stub/oauth2/authorize?")
+
+
 def test_begin_returns_service_redirect() -> None:
     out = cleverbase.begin_signing(
         PDF,
