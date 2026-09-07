@@ -1,0 +1,2 @@
+# The precomputed signHash response binds these bytes; never rewrite line endings on checkout.
+tests/fixtures/signing/*.pdf binary
