@@ -42,6 +42,8 @@ const BT_ECDSA_TOKEN: &[u8] =
 const BT_ECDSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.pdf");
 const BT_WRONG_IMPRINT_RESPONSE: &[u8] =
     include_bytes!("../../../tests/fixtures/pades-bt/wrong-imprint.tsr");
+const BT_MISSING_NONCE_RESPONSE: &[u8] =
+    include_bytes!("../../../tests/fixtures/pades-bt/missing-nonce.tsr");
 
 /// Signature algorithm the harness drives end-to-end. ONE parametrized producer path covers both
 /// arms (FR-004) — no RSA/ECDSA copy-paste. Each arm pins the matching CSC API base, the
@@ -816,6 +818,21 @@ fn drive_bt_to_timestamp(algo: KeyAlgo) -> (cleverbase_core::SigningSessionHandl
         }
         other => panic!("expected TSA request, got {other:?}"),
     };
+    let nonce = h.timestamp_nonce.as_ref().expect("pending timestamp nonce");
+    let mut encoded_nonce = vec![
+        0x02,
+        (nonce.len() + usize::from(nonce[0] & 0x80 != 0)) as u8,
+    ];
+    if nonce[0] & 0x80 != 0 {
+        encoded_nonce.push(0);
+    }
+    encoded_nonce.extend_from_slice(nonce);
+    assert!(
+        tsa_req
+            .windows(encoded_nonce.len())
+            .any(|window| window == encoded_nonce),
+        "the emitted TSA request must carry the pending nonce as a DER INTEGER"
+    );
     (h, tsa_req)
 }
 
@@ -825,10 +842,12 @@ fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
         KeyAlgo::Rsa => BT_RSA_RESPONSE,
         KeyAlgo::EcdsaP256 => BT_ECDSA_RESPONSE,
     };
-    match resume(h, http_ok_bytes(response.to_vec()), ctx())
-        .unwrap()
-        .1
-    {
+    let (completed, step) = resume(h, http_ok_bytes(response.to_vec()), ctx()).unwrap();
+    assert!(
+        completed.timestamp_nonce.is_none(),
+        "terminal handle must not retain its RFC 3161 nonce"
+    );
+    match step {
         Step::Done { signed, .. } => signed,
         other => panic!("expected Done, got {other:?}"),
     }
@@ -839,8 +858,12 @@ fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
 fn regenerate_pades_bt_fixtures() {
     let fixture_dir = pki_dir().parent().unwrap().join("pades-bt");
     std::fs::create_dir_all(&fixture_dir).unwrap();
+    let mut rsa_nonce = None;
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
         let (handle, request) = drive_bt_to_timestamp(algo);
+        if matches!(algo, KeyAlgo::Rsa) {
+            rsa_nonce = handle.timestamp_nonce.clone();
+        }
         let response = openssl_timestamp(&request);
         let token = cleverbase_core::timestamp::parse_response(&response).unwrap();
         let signed = match resume(handle, http_ok_bytes(response.clone()), ctx())
@@ -861,6 +884,7 @@ fn regenerate_pades_bt_fixtures() {
     let wrong_request = cleverbase_core::timestamp::build_request(
         &cleverbase_core::crypto::sha256(b"some unrelated bytes"),
         None,
+        rsa_nonce.as_deref().expect("RSA fixture nonce"),
     )
     .unwrap();
     std::fs::write(
@@ -927,9 +951,62 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
                 evidence.outcome,
                 cleverbase_core::SigningOutcome::TimestampFailed
             );
+            assert_eq!(
+                evidence.failure_reason.as_deref(),
+                Some("timestamp imprint does not match the signature")
+            );
         }
         other => panic!("expected TimestampFailed, got {other:?}"),
     }
+}
+
+#[test]
+fn b_t_requires_the_timestamp_response_to_echo_the_exact_nonce() {
+    let (handle, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
+    assert!(handle.timestamp_nonce.is_some());
+
+    let (missing_handle, missing_step) = resume(
+        handle.clone(),
+        http_ok_bytes(BT_MISSING_NONCE_RESPONSE.to_vec()),
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(missing_handle.phase, cleverbase_core::SigningPhase::Failed);
+    assert!(missing_handle.timestamp_nonce.is_none());
+    assert_eq!(
+        match missing_step {
+            Step::Failed { evidence } => evidence.outcome,
+            other => panic!("expected TimestampFailed, got {other:?}"),
+        },
+        cleverbase_core::SigningOutcome::TimestampFailed
+    );
+
+    let mut mismatched = handle;
+    mismatched.timestamp_nonce = Some(vec![0xff]);
+    let (mismatched_handle, mismatched_step) =
+        resume(mismatched, http_ok_bytes(BT_RSA_RESPONSE.to_vec()), ctx()).unwrap();
+    assert_eq!(
+        mismatched_handle.phase,
+        cleverbase_core::SigningPhase::Failed
+    );
+    assert!(mismatched_handle.timestamp_nonce.is_none());
+    assert_eq!(
+        match mismatched_step {
+            Step::Failed { evidence } => evidence.outcome,
+            other => panic!("expected TimestampFailed, got {other:?}"),
+        },
+        cleverbase_core::SigningOutcome::TimestampFailed
+    );
+
+    let (mut missing_expected, _) = drive_bt_to_timestamp(KeyAlgo::Rsa);
+    missing_expected.timestamp_nonce = None;
+    let error = resume(
+        missing_expected,
+        http_ok_bytes(BT_RSA_RESPONSE.to_vec()),
+        ctx(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, cleverbase_core::CoreError::BadHandle(_)));
 }
 
 #[test]
@@ -942,8 +1019,9 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         let verification = verify_pdf(&signed.pdf);
         assert!(
             verification.integrity,
-            "core verifier rejected valid {} B-T",
-            algo.name()
+            "core verifier rejected valid {} B-T: {:?}",
+            algo.name(),
+            verification.reasons
         );
         assert_eq!(verification.profile, Some(ConformanceLevel::BT));
         assert!(verification.signer.is_some());
@@ -1030,7 +1108,11 @@ fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
     let signed = produce_signed_pdf_bt(KeyAlgo::EcdsaP256);
     let (content, cms_der) = extract(&signed.pdf);
     let baseline = verify_pdf(&signed.pdf);
-    assert!(baseline.integrity);
+    assert!(
+        baseline.integrity,
+        "core verifier rejected valid ECDSA B-T: {:?}",
+        baseline.reasons
+    );
     assert_eq!(baseline.profile, Some(ConformanceLevel::BT));
     assert!(baseline.reasons.is_empty());
     let tampered = flip_signature_byte(&cms_der);

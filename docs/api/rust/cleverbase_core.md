@@ -578,6 +578,8 @@ Opaque-to-the-integrator, serializable session state.
   - Byte span (start, end) of the `/Contents` hex placeholder in `staged_pdf`.
 - `cms_der: Option<Vec<u8>>`
   - Assembled CMS (without timestamp), carried from signing to the B-T timestamp step.
+- `timestamp_nonce: Option<Vec<u8>>`
+  - RFC 3161 nonce expected from the TSA, carried only while awaiting its response.
 - `signing_time_unix: Option<i64>`
   - Signing time (Unix seconds) recorded at the prepare step.
 - `signer: Option<SignerIdentity>`
@@ -815,7 +817,7 @@ Host-provided context for a single call (keeps the core deterministic).
 - `now_unix: i64`
   - Current time, Unix seconds.
 - `entropy: Vec<u8>`
-  - Fresh random bytes (OAuth `state`, correlation id). Provide ≥ 16 bytes.
+  - Fresh random bytes (OAuth `state`, correlation id, RFC 3161 nonce). Provide ≥ 16 bytes.
 
 ### Enums
 
@@ -885,7 +887,8 @@ Advance a signing flow given the result of the last effect.
 RFC 3161 timestamping for PAdES B-T.
 
 Builds a `TimeStampReq` over `sha256(signature value)` and extracts the `TimeStampToken` from
-the TSA's `TimeStampResp`. The token is embedded into the CMS as the `signature-time-stamp`
+the TSA's `TimeStampResp`. Each request carries a fresh positive nonce and requires the response
+token to echo it exactly. The token is embedded into the CMS as the `signature-time-stamp`
 unsigned attribute (see [`crate::crypto::cms::embed_timestamp`]). Cleverbase's CSC signing API
 exposes no timestamp endpoint, so the host points this at a configured RFC 3161 TSA.
 
@@ -907,17 +910,19 @@ Errors from RFC 3161 handling.
   - The TSA did not grant a timestamp (non-granted status or no token in the response).
 - `InvalidPolicyOid(String)`
   - The configured TSA policy OID was not a valid object identifier.
+- `InvalidNonce`
+  - An RFC 3161 nonce must be a positive integer.
 
 ### Functions
 
 #### fn `build_request`
 
 ```rust
-fn build_request(signature_sha256: &[u8], policy_oid: Option<&str>) -> Result<Vec<u8>, TimestampError>
+fn build_request(signature_sha256: &[u8], policy_oid: Option<&str>, nonce: &[u8]) -> Result<Vec<u8>, TimestampError>
 ```
 
-Build an RFC 3161 `TimeStampReq` over `sha256(signature value)` with `certReq = true`, optionally
-constraining the TSA to a specific policy OID.
+Build an RFC 3161 `TimeStampReq` over `sha256(signature value)` with a positive nonce and
+`certReq = true`, optionally constraining the TSA to a specific policy OID.
 
 #### fn `parse_gen_time`
 

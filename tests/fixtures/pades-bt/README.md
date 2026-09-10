@@ -8,12 +8,15 @@ under `tests/fixtures/pki`:
 - `rsa-token.der` / `ecdsa-p256-token.der`: the corresponding CMS TimeStampTokens;
 - `rsa.pdf` / `ecdsa-p256.pdf`: complete SDK-produced PAdES B-T documents; and
 - `wrong-imprint.tsr`: a valid response timestamping unrelated bytes, used to prove the signing
-  flow rejects a foreign timestamp.
+  flow rejects a foreign timestamp; and
+- `missing-nonce.tsr`: the previous otherwise-valid RSA response without a nonce, retained to
+  prove that a new signing flow rejects a response which does not echo its request nonce.
 
-They were generated on 2026-09-05 with OpenSSL 3.6.3 and the committed synthetic test PKI. They
-are deliberately checked in: normal tests must not depend on a local timestamp issuer, wall clock,
-or platform-specific `openssl ts` defaults. `gen.sh` rejects LibreSSL because it silently ignores
-the configured SHA-256 signer digest and emits a SHA-1 CMS signer digest.
+The active RSA/ECDSA/wrong-imprint fixtures were generated on 2026-09-10 with OpenSSL 3.6.3 and
+the committed synthetic test PKI; each active response echoes the deterministic positive nonce in
+its request. They are deliberately checked in: normal tests must not depend on a local timestamp
+issuer, wall clock, or platform-specific `openssl ts` defaults. `gen.sh` rejects LibreSSL because
+it silently ignores the configured SHA-256 signer digest and emits a SHA-1 CMS signer digest.
 
 Regeneration changes the RFC 3161 `genTime` and therefore the token and PDF bytes. Review every
 binary diff and regenerate only when the signing or test-PKI contract intentionally changes.

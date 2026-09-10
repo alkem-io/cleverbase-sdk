@@ -73,8 +73,10 @@ rejected for B-B/B-T (reserved only for later formal *validation*).
 
 **Decision**: B-T embeds a **signature timestamp** (`signature-time-stamp` unsigned attribute) built
 via **RFC 3161**: the core produces a `TimeStampReq` over the signature value as an `HttpEffect` to a
-**configurable external qualified TSA**; the returned `TimeStampToken` is embedded into the CMS.
-A requested level is never silently downgraded (FR-005).
+**configurable external qualified TSA**. The request carries a fresh positive nonce and
+`certReq=true`; the returned token must echo the nonce exactly and its `messageImprint` must bind the
+signature value before it is embedded into the CMS. A requested level is never silently downgraded
+(FR-005).
 
 **Rationale**: Cleverbase provides **no timestamp service and no qualified TSA on the EU Trusted
 List** (verified) — so a third-party qualified TSA is a required, configurable dependency

@@ -78,6 +78,9 @@ pub struct SigningSessionHandle {
     /// Assembled CMS (without timestamp), carried from signing to the B-T timestamp step.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub cms_der: Option<Vec<u8>>,
+    /// RFC 3161 nonce expected from the TSA, carried only while awaiting its response.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub timestamp_nonce: Option<Vec<u8>>,
     /// Signing time (Unix seconds) recorded at the prepare step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_time_unix: Option<i64>,
@@ -119,6 +122,7 @@ impl SigningSessionHandle {
             staged_pdf: None,
             contents_span: None,
             cms_der: None,
+            timestamp_nonce: None,
             signing_time_unix: None,
             signer: None,
             pdf_a: None,
@@ -145,5 +149,23 @@ mod tests {
         ciborium::into_writer(&h, &mut buf).unwrap();
         let back: SigningSessionHandle = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn timestamp_pending_handle_roundtrips_its_nonce() {
+        let mut handle = SigningSessionHandle::terminal(
+            SigningPhase::TimestampPending,
+            "abcd".into(),
+            ConformanceLevel::BT,
+            "corr-1".into(),
+        );
+        handle.timestamp_nonce = Some(vec![0x80, 0x01]);
+
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&handle, &mut cbor).unwrap();
+        let restored: SigningSessionHandle = ciborium::from_reader(cbor.as_slice()).unwrap();
+
+        assert_eq!(restored.phase, SigningPhase::TimestampPending);
+        assert_eq!(restored.timestamp_nonce, Some(vec![0x80, 0x01]));
     }
 }
