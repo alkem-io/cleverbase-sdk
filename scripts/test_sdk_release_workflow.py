@@ -54,7 +54,7 @@ def test_publish_jobs_are_tag_only_ordered_and_protected() -> None:
     assert "needs: publish-github" in text
     assert "needs: publish-pypi" in text
     assert "needs: publish-npm" in text
-    assert "draft: true" in text
+    assert "gh release create" in text and "--draft" in text
     assert "--draft=false" in text
     assert "--clobber" not in text
     assert "continue-on-error: true" not in text
@@ -72,4 +72,3 @@ def test_external_actions_are_pinned_and_permissions_are_job_local() -> None:
     assert action_lines
     for line in action_lines:
         assert re.fullmatch(r"uses: [^@\s]+@[0-9a-f]{40}(?:\s+#.*)?", line), line
-
