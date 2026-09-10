@@ -1462,6 +1462,9 @@ A machine-readable limitation or failure observed while verifying a PDF.
   - The PDF has more than one signature; co-signing validation is a later phase.
 - `MalformedByteRange`
   - The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
+- `LegacyByteRangeConvention`
+  - The `/ByteRange` excludes only the raw `/Contents` hex, not its `<...>` delimiters.
+Re-sign the document with a conformant producer before relying on its integrity.
 - `UnsupportedSubfilter`
   - The signature uses a detached-signature subfilter this verifier does not support.
 - `UnsignedSuffix`

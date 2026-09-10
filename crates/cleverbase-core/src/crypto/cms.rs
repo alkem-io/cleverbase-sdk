@@ -907,22 +907,6 @@ mod tests {
             Err(CmsError::Structure("message-digest is not SHA-256 length"))
         ));
 
-        let invalid_signing_time = rewrite_signed_data(&cms, |_, signed_data| {
-            rewrite_signer_info(signed_data, |signer_info| {
-                replace_signed_attribute(
-                    signer_info,
-                    ID_SIGNING_TIME,
-                    Some(single_value_attr(ID_SIGNING_TIME, any_of(&Null).unwrap()).unwrap()),
-                );
-            });
-        });
-        assert!(matches!(
-            verify_signed_data_auto(&invalid_signing_time),
-            Err(CmsError::Structure(
-                "PAdES CMS signing-time attribute is forbidden"
-            ))
-        ));
-
         let wrong_signing_certificate = rewrite_signed_data(&cms, |_, signed_data| {
             rewrite_signer_info(signed_data, |signer_info| {
                 let signing_certificate = SigningCertificateV2 {

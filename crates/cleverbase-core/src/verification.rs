@@ -29,6 +29,9 @@ pub enum VerificationReason {
     MultipleSignaturesUnsupported,
     /// The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
     MalformedByteRange,
+    /// The `/ByteRange` excludes only the raw `/Contents` hex, not its `<...>` delimiters.
+    /// Re-sign the document with a conformant producer before relying on its integrity.
+    LegacyByteRangeConvention,
     /// The signature uses a detached-signature subfilter this verifier does not support.
     UnsupportedSubfilter,
     /// Bytes appear after the final signed range.
@@ -229,6 +232,22 @@ fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReaso
         || document.get(*first_len) != Some(&b'<')
         || document.get(contents_end) != Some(&b'>')
     {
+        let legacy_contents = signature
+            .get_deref(b"Contents", &parsed)
+            .and_then(Object::as_str)
+            .ok();
+        let legacy_gap_matches_contents = first_len
+            .checked_sub(1)
+            .is_some_and(|open| document.get(open) == Some(&b'<'))
+            && document.get(*second_start) == Some(&b'>')
+            && document
+                .get(*first_len..*second_start)
+                .and_then(|hex| decode_hex(hex).ok())
+                .zip(legacy_contents)
+                .is_some_and(|(decoded, contents)| decoded == contents);
+        if legacy_gap_matches_contents {
+            return Err(VerificationReason::LegacyByteRangeConvention);
+        }
         return Err(VerificationReason::MalformedByteRange);
     }
     let hex = document
@@ -568,6 +587,7 @@ mod tests {
             VerificationReason::MissingSignature,
             VerificationReason::MultipleSignaturesUnsupported,
             VerificationReason::MalformedByteRange,
+            VerificationReason::LegacyByteRangeConvention,
             VerificationReason::UnsupportedSubfilter,
             VerificationReason::UnsignedSuffix,
             VerificationReason::InvalidContents,

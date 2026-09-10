@@ -4,6 +4,12 @@ Honest status of the Cleverbase SDK Phase-1 signing slice. The core signing capa
 B-B/B-T, RSA + ECDSA, all three bindings, frontend helper) is implemented and tested, with
 independent OpenSSL validation. The items below are deliberately deferred, blocked, or partial.
 
+## Compatibility
+
+- The v0.3.2 verifier rejects the raw-hex-only `/Contents` ByteRange convention emitted by SDK
+  versions through v0.3.1. It reports `legacy_byte_range_convention` with `integrity = false`; the
+  document must be re-signed so the excluded range covers the complete `<...>` contents string.
+
 ## Blocked on external input
 
 - **Live acceptance / production signing** (tasks T061/T064/T065 and any real-signer flow) requires a

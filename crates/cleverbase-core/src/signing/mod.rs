@@ -6,7 +6,9 @@
 //! PDF preparation → hash-bound credential authorization → `signHash` → CMS assembly → embed.
 //! PAdES B-B and B-T are both implemented.
 
+use der::Decode;
 use serde::{Deserialize, Serialize};
+use x509_cert::Certificate;
 
 pub mod csc;
 
@@ -524,6 +526,9 @@ pub fn resume(
                 .first()
                 .ok_or_else(|| CoreError::BadHandle("empty certificate chain".into()))?;
             let identity = csc::signer_identity(&info, leaf_cert)?;
+            let leaf = Certificate::from_der(leaf_cert)
+                .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
+            let certificate_identity = csc::signer_identity_from_certificate(&leaf);
             handle.signer = Some(identity.clone());
 
             // Enforce expected-signer binding (FR-014).
@@ -555,8 +560,8 @@ pub fn resume(
             let visible = build_visible_appearance(&request, &identity, ctx.now_unix);
             let signature_metadata = container::SignatureMetadata {
                 claimed_signing_time_unix: ctx.now_unix,
-                signer_name: (!identity.common_name.is_empty())
-                    .then_some(identity.common_name.as_str()),
+                signer_name: (!certificate_identity.common_name.is_empty())
+                    .then_some(certificate_identity.common_name.as_str()),
                 reason: reason.as_deref(),
                 location: location.as_deref(),
             };
@@ -1460,8 +1465,7 @@ mod tests {
     fn pdf_signer_name_comes_from_the_embedded_leaf_certificate() {
         let h = advance_to(SigningPhase::InfoPending);
         let mut info = info_json();
-        info["cert"]["subjectDN"] =
-            serde_json::json!("CN=Provider Label,serialNumber=PNONL-123");
+        info["cert"]["subjectDN"] = serde_json::json!("CN=Provider Label,serialNumber=PNONL-123");
 
         let (h, step) = resume(h, http_ok(info), ctx()).unwrap();
         assert!(matches!(step, Step::Redirect(_)));
