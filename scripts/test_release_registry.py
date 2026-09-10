@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import time
 from typing import TYPE_CHECKING
 
 import pytest
 
+import release_registry
 from release_registry import RegistryError, npm_status, pypi_provenance_valid, pypi_status
 
 if TYPE_CHECKING:
@@ -90,3 +92,32 @@ def test_pypi_provenance_matches_the_integrity_api_shape() -> None:
     assert pypi_provenance_valid({"attestation_bundles": [{"attestations": [{}]}]})
     assert not pypi_provenance_valid({"attestation_bundles": []})
     assert not pypi_provenance_valid({"version": 1})
+
+
+def test_verify_retries_transient_registry_visibility_with_fixed_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "alkemio_cleverbase_sdk-0.3.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    sdist = tmp_path / "alkemio_cleverbase_sdk-0.3.3.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    payload = {
+        "info": {"name": "alkemio-cleverbase-sdk", "version": "0.3.3"},
+        "urls": [
+            {"filename": wheel.name, "digests": {"sha256": hashlib.sha256(b"wheel").hexdigest()}},
+            {"filename": sdist.name, "digests": {"sha256": hashlib.sha256(b"sdist").hexdigest()}},
+        ],
+    }
+    responses = iter([None, None, None, payload])
+    sleeps: list[int] = []
+    monkeypatch.setattr(release_registry, "_pypi_metadata", lambda _version: next(responses))
+    monkeypatch.setattr(release_registry, "_verify_pypi_provenance", lambda *_args: None)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    result = release_registry.main(
+        ["release_registry.py", "pypi", "verify", str(tmp_path), "0.3.3"],
+    )
+
+    assert result == 0
+    assert sleeps == [2, 5, 10]
