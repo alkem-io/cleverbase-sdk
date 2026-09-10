@@ -351,10 +351,20 @@ mod tests {
         assert_eq!(back.nonce.unwrap().as_bytes(), [1]);
         // An invalid policy OID is rejected, not silently dropped.
         assert!(build_request(&imprint, Some("not-an-oid"), &nonce).is_err());
-        assert!(matches!(
-            build_request(&imprint, None, &[]),
-            Err(TimestampError::InvalidNonce)
-        ));
+        for invalid_nonce in [&[][..], &[0][..], &[0, 0][..]] {
+            assert!(matches!(
+                build_request(&imprint, None, invalid_nonce),
+                Err(TimestampError::InvalidNonce)
+            ));
+        }
+
+        let high_bit_nonce = [0x80, 0x01];
+        let high_bit_request = build_request(&imprint, None, &high_bit_nonce).unwrap();
+        let high_bit_roundtrip = TimeStampReq::from_der(&high_bit_request).unwrap();
+        assert_eq!(
+            high_bit_roundtrip.nonce.unwrap().as_bytes(),
+            high_bit_nonce
+        );
     }
 
     #[test]
