@@ -79,8 +79,16 @@ def test_external_actions_are_pinned_and_permissions_are_job_local() -> None:
     assert re.search(r"^permissions:\n  contents: read$", text, re.MULTILINE)
     action_lines = [line.strip() for line in text.splitlines() if line.strip().startswith("uses:")]
     assert action_lines
+    assert len(action_lines) == text.count("uses:")
     for line in action_lines:
         assert re.fullmatch(r"uses: [^@\s]+@[0-9a-f]{40}(?:\s+#.*)?", line), line
+
+
+def test_python_artifact_tests_use_only_the_installed_distribution() -> None:
+    script = (ROOT / "scripts/test-python-release-artifact.sh").read_text(encoding="utf-8")
+
+    assert 'cd "$work_dir"' in script
+    assert '-m pytest -q -p no:cacheprovider "$repo_root/bindings/python/tests"' in script
 
 
 def test_tag_publication_jobs_keep_fail_closed_runtime_boundaries() -> None:
