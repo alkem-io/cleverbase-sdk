@@ -52,6 +52,7 @@ def test_release_workflow_has_one_build_test_publish_coordinator() -> None:
     assert "scripts/test-node-release-artifact.sh" in text
     assert "scripts/test-python-release-artifact.sh" in text
     assert "scripts/test-native-release-artifact.sh" in text
+    assert "python -m pytest -q scripts/" in text
 
 
 def test_publish_jobs_are_tag_only_ordered_and_protected() -> None:
