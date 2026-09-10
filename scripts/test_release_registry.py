@@ -293,6 +293,16 @@ def test_http_boundary_keeps_malformed_json_non_retryable(
     assert isinstance(caught.value.__cause__, json.JSONDecodeError)
 
 
+@pytest.mark.parametrize(
+    "url",
+    ["http://pypi.org/test", "https://example.com/test"],
+    ids=["plain-http", "unapproved-host"],
+)
+def test_registry_reads_require_an_approved_https_origin(url: str) -> None:
+    with pytest.raises(RegistryError, match="approved HTTPS origin"):
+        release_registry._http_json(url)  # noqa: SLF001
+
+
 def test_verify_does_not_retry_digest_or_provenance_mismatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

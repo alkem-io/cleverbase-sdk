@@ -15,6 +15,7 @@ from check_sdk_artifact import (
     check_node_tarball,
     check_python_sdist,
     check_python_wheel,
+    main,
 )
 
 VERSION = "0.3.3"
@@ -200,6 +201,17 @@ def test_python_wheel_rejects_unexpected_non_sbom_member(tmp_path: Path) -> None
         check_python_wheel(wheel, VERSION, tag)
 
 
+def test_python_wheel_validates_every_allowed_sbom(tmp_path: Path) -> None:
+    tag = "cp39-abi3-manylinux_2_28_x86_64"
+    wheel = tmp_path / f"alkemio_cleverbase_sdk-{VERSION}-{tag}.whl"
+    files = wheel_files(tag)
+    dist_info = f"alkemio_cleverbase_sdk-{VERSION}.dist-info"
+    files[f"{dist_info}/sboms/auditwheel.cyclonedx.json"] = b"not JSON"
+    write_zip(wheel, files)
+    with pytest.raises(ArtifactError, match="SBOM"):
+        check_python_wheel(wheel, VERSION, tag)
+
+
 def test_python_sdist_is_self_contained_and_clean(tmp_path: Path) -> None:
     sdist = tmp_path / f"alkemio_cleverbase_sdk-{VERSION}.tar.gz"
     files = sdist_files()
@@ -223,3 +235,8 @@ def test_python_sdist_is_self_contained_and_clean(tmp_path: Path) -> None:
     write_tgz(sdist, files)
     with pytest.raises(ArtifactError, match="license content mismatch"):
         check_python_sdist(sdist, VERSION)
+
+
+def test_unknown_artifact_kind_has_a_diagnostic(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check_sdk_artifact.py", "unknown", "artifact", VERSION]) == 2
+    assert "unsupported SDK artifact kind" in capsys.readouterr().err
