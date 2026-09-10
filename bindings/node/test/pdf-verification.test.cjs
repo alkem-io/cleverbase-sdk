@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
-const { beginSigning, verifyPdf } = require("../index.js");
+const { beginSigning, verifyPdf } = require("./load-sdk.cjs");
 
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 const VALID_BT_PDF = path.join(REPO_ROOT, "tests/fixtures/pades-bt/rsa.pdf");

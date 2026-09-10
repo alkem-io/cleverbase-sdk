@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const cbor = require("cbor");
-const { attestationVerify, attestationVerifyVpToken, attestationIssuance } = require("../index.js");
+const { attestationVerify, attestationVerifyVpToken, attestationIssuance } = require("./load-sdk.cjs");
 
 // The attestation surface is CBOR-through: a CBOR VerifyRequest / IssuanceRequest goes in and a
 // CBOR VerifyResponse / IssuanceResponse comes out. The verdict and any error ride *inside* the
