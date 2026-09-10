@@ -1,8 +1,8 @@
 # Data Model: ECDSA P-256 validation parity + live Cleverbase-account signing
 
-This feature introduces no persisted data and no new SDK API types. The "entities" below are the
-**test/fixture/harness** constructs the design revolves around — their fields, relationships, and the
-validation rules drawn from the functional requirements.
+This feature introduces no persisted data. Most entities below are test/fixture/harness constructs;
+the later PAdES conformance correction also adds the public Rust `SignatureMetadata` helper used by the
+core PDF assembler. No C-ABI or binding configuration type is added.
 
 ## SignerProfile (mock upstream)
 

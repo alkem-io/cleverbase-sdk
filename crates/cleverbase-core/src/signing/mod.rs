@@ -26,7 +26,7 @@ use crate::crypto::SHA256_OID_STR as SHA256_OID;
 /// Host-provided context for a single call (keeps the core deterministic).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostContext {
-    /// Current time, Unix seconds.
+    /// Current time, Unix seconds. Its UTC year must be representable as four digits (0000–9999).
     pub now_unix: i64,
     /// Fresh random bytes (OAuth `state`, correlation id, RFC 3161 nonce). Provide ≥ 16 bytes.
     #[serde(with = "serde_bytes")]

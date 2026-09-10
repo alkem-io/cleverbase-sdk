@@ -25,11 +25,10 @@ preceded by a test that MUST fail first.
 
 ## Key constraint (from plan.md / research.md)
 
-**Do NOT modify `crates/cleverbase-core/src/`** — the core already produces and self-verifies correct
-ECDSA P-256, and already rejects unsupported keys / normalizes raw `r‖s`. All work is in fixtures, the mock
-upstream, the E2E harness, the core's *test* crate (`crates/cleverbase-core/tests/`), and CI. The
-negative-path tasks (T007–T009) assert the core's **existing** reject behaviour end-to-end; they add no
-`src/` change. Every change is algorithm-parametrized (no RSA/ECDSA copy-paste — FR-004).
+Do not refactor the already-correct ECDSA algorithm path: the parity work belongs in fixtures, the mock
+upstream, the E2E harness, the core's test crate, and CI. Independently reproduced PAdES baseline defects
+are fixed at their single source in `crates/cleverbase-core/src/`; those common container/CMS changes are
+not ECDSA-specific. Every algorithm change remains parametrized (no RSA/ECDSA copy-paste — FR-004).
 
 ---
 
@@ -88,8 +87,9 @@ path (FR-004).
 
 ## Phase 4: PAdES/eIDAS profile-conformance gate (FR-014 — cross-cutting, opt-in)
 
-**Goal**: An opt-in gate that asserts produced B-B/B-T PDFs meet the ETSI EN 319 142 baseline profile, in
-addition to (never instead of) the always-on OpenSSL bar. Validates US1 outputs first; reused for US2.
+**Goal**: An opt-in gate that asserts produced B-B/B-T PDFs meet the ETSI EN 319 142-1 V1.2.1
+(2024-01) baseline profile, in addition to (never instead of) the always-on OpenSSL bar. Validates US1
+outputs first; reused for US2.
 
 ### Test (write first — MUST fail / self-skip if toolchain absent)
 
@@ -139,10 +139,10 @@ service/credential problem from an SDK defect (FR-011).
 ## Phase 6: Polish & cross-cutting concerns
 
 - [X] T026 [P] In `.github/workflows/test.yml`, add the ECDSA arm to the always-on credential-free E2E job (still zero external dependencies; keeps the pipeline green).
-- [X] T027 [P] **(F7 — coverage scope)** Verify unit-test coverage stays **≥95% per package** after the changes (Principle VI / SC-004), explicitly **including the new Go harness/config code** — `e2e/authorizer.go` (Interactive/mockAutoApprove non-gated branches), the `config.go` live-knob validation, and any new branch logic — not just the unchanged core. Add targeted tests for any new package/branch that dipped below the floor.
+- [X] T027 [P] **(F7 — coverage scope)** Verify unit-test coverage stays **≥95% per package** after the changes (Principle VI / SC-004), explicitly **including the Rust core and new Go harness/config code** — `e2e/authorizer.go` (Interactive/mockAutoApprove non-gated branches), the `config.go` live-knob validation, and any new branch logic. Add targeted tests for any new package/branch that dipped below the floor.
 - [X] T028 [P] DRY review (FR-004 / SC-003): confirm a single `signer` type, one `credentials/info` template, and one algorithm-parametrized producer per harness — no RSA/ECDSA twin code anywhere.
-- [X] T029 [P] Update docs: `examples/reference-integration/README.md` (+ any doc asserting RSA-only validation) to state ECDSA parity, the opt-in profile gate, and the live-path env vars (`REFSVC_LIVE_AUTHORIZER`, `REFSVC_LIVE_CA_BUNDLE`); regenerate API docs if any public surface text changed (none expected).
-- [X] T030 Run `quickstart.md` scenarios 1–4 (credential-free) end-to-end and confirm green; record the RCA-style note that the gap was validation-coverage-only (core unchanged).
+- [X] T029 [P] Update docs: `examples/reference-integration/README.md` (+ any doc asserting RSA-only validation) to state ECDSA parity, the opt-in profile gate, and the live-path env vars (`REFSVC_LIVE_AUTHORIZER`, `REFSVC_LIVE_CA_BUNDLE`); regenerate API docs for the public Rust PAdES/CMS helper changes.
+- [X] T030 Run `quickstart.md` scenarios 1–4 (credential-free) end-to-end and confirm green; record that the original ECDSA parity gap was validation coverage, and separately record any common PAdES defect exposed by the independent validators.
 
 ---
 
@@ -170,7 +170,8 @@ service/credential problem from an SDK defect (FR-011).
 - **Increment 2 = Profile gate (Phase 4)**: adds the opt-in eIDAS profile-conformance assurance.
 - **Increment 3 = User Story 2 (Phase 5)**: adds the real-surface live contract test (interactive now,
   headless drop-in later).
-- Test-first throughout; the core is never modified (RCA: the gap is coverage, not capability).
+- Test-first throughout; ECDSA parity does not alter algorithm dispatch, while common PAdES defects
+  demonstrated by independent validators are corrected in the core that emits those bytes.
 
 ## Analysis remediation
 

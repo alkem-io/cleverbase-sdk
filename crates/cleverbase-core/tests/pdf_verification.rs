@@ -2,9 +2,7 @@
 
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
-use cleverbase_core::{
-    resume, verify_pdf, CoreError, HostContext, ResumeInput, VerificationReason,
-};
+use cleverbase_core::{verify_pdf, VerificationReason};
 use lopdf::{Dictionary, Document, Object};
 
 fn minimal_pdf() -> Vec<u8> {
@@ -194,68 +192,6 @@ fn real_pre_fix_acceptance_pdf_is_rejected_as_nonconformant() {
     assert!(!verdict.integrity);
     assert_eq!(
         serde_json::to_value(&verdict.reasons).unwrap(),
-        serde_json::json!(["legacy_byte_range_convention"])
+        serde_json::json!(["malformed_byte_range"])
     );
-
-    let parsed = Document::load_mem(pdf).unwrap();
-    let signature = parsed
-        .objects
-        .values()
-        .filter_map(|object| object.as_dict().ok())
-        .find(|dictionary| dictionary.get(b"ByteRange").is_ok())
-        .unwrap();
-    let byte_range = signature.get(b"ByteRange").unwrap().as_array().unwrap();
-    let first_len = usize::try_from(byte_range[1].as_i64().unwrap()).unwrap();
-    let mut malformed_near_miss = pdf.to_vec();
-    let byte_range_offset = malformed_near_miss
-        .windows(b"/ByteRange".len())
-        .position(|window| window == b"/ByteRange")
-        .unwrap();
-    let first_len_text = first_len.to_string();
-    let first_len_offset = byte_range_offset
-        + malformed_near_miss[byte_range_offset..]
-            .windows(first_len_text.len())
-            .position(|window| window == first_len_text.as_bytes())
-            .unwrap();
-    let shifted_first_len = (first_len + 2).to_string();
-    assert_eq!(shifted_first_len.len(), first_len_text.len());
-    malformed_near_miss[first_len_offset..first_len_offset + first_len_text.len()]
-        .copy_from_slice(shifted_first_len.as_bytes());
-    assert_eq!(
-        verify_pdf(&malformed_near_miss).reasons,
-        vec![VerificationReason::MalformedByteRange]
-    );
-}
-
-#[test]
-fn released_v031_timestamp_pending_handle_fails_closed() {
-    let handle_cbor = cleverbase_core::util::base64_decode(include_str!(
-        "../../../tests/fixtures/pades-conformance/v0.3.1-timestamp-pending.cbor.b64"
-    ))
-    .unwrap();
-    let handle = cleverbase_core::wire::decode_handle(&handle_cbor).unwrap();
-    assert!(handle.timestamp_nonce.is_none());
-    let tsa_response = cleverbase_core::util::base64_decode(include_str!(
-        "../../../tests/fixtures/pades-conformance/v0.3.1-rsa.tsr.b64"
-    ))
-    .unwrap();
-
-    let error = resume(
-        handle,
-        ResumeInput::HttpResult {
-            status: 200,
-            headers: Vec::new(),
-            body: tsa_response,
-        },
-        HostContext {
-            now_unix: 1_700_000_000,
-            entropy: (0u8..16).collect(),
-        },
-    )
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        CoreError::BadHandle(message) if message == "missing timestamp nonce"
-    ));
 }

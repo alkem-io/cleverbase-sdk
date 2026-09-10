@@ -3,10 +3,12 @@
 Phase 0 output. Each decision is grounded in a read of the actual codebase (file:line cited) — there were
 no open `NEEDS CLARIFICATION` markers entering planning (the spec resolved all four via `/speckit-clarify`).
 
-## D1 — The core needs no changes; the gap is test/validation coverage
+## D1 — The ECDSA algorithm path needs no changes; its original gap is validation coverage
 
-**Decision**: Make **no change to `cleverbase-core`**. Close the ECDSA gap entirely in fixtures, the mock
-upstream, the E2E harness, and `independent_validation.rs`.
+**Decision**: Make no algorithm-dispatch change to `cleverbase-core`. Close the ECDSA parity gap in
+fixtures, the mock upstream, the E2E harness, and `independent_validation.rs`. This decision does not
+exclude later core corrections when independent validators demonstrate defects in common PAdES
+assembly or verification; those corrections were subsequently required for both RSA and ECDSA.
 
 **Rationale**: The core already produces and **self-verifies** a correct ECDSA P-256 signature end-to-end.
 `KeyAlgo` (`csc.rs:36-44`) is detected once from the credential cert OIDs (`key_algo_from_oids`,
@@ -16,7 +18,8 @@ ECDSA signature-algorithm (`cms.rs:155-179`); the core then cryptographically ve
 signature before reporting `Signed` (`cms.rs:337-366`, called at `signing/mod.rs:721`). ECDSA is asserted
 with real signatures at the `cms.rs` unit level (`ecdsa_signed_data_assembles_and_verifies`,
 `ecdsa_raw_signature_is_normalized_to_der`). The only thing missing is a **full-flow, independently
-validated** ECDSA run. Touching the core would violate Principle VIII (out-of-scope).
+validated** ECDSA run. Refactoring the already-correct algorithm path would violate Principle VIII;
+fixing independently reproduced common PAdES defects does not.
 
 **Alternatives considered**: Refactoring the core's `match key_algo` sites — **rejected**: there is no
 copy-paste there; the two branch points (signature-algorithm OID at `cms.rs:169-173`; raw→DER at
@@ -117,9 +120,10 @@ ECDSA P-256), and **EU DSS** specifically for the **structural baseline-level** 
 **Rationale**: pyHanko is MIT, pip-installable, CI-trivial, and the constitution's named "lighter
 alternative" (Principle V) — but its CLI **explicitly does not** assert structural PAdES-profile-level
 conformance. EU DSS **does** emit the `PAdES-BASELINE-B/-T` level in its validation report, which is exactly
-FR-014's literal wording ("meets the ETSI EN 319 142 PAdES B-B/B-T profile"). Using pyHanko for the AdES
-validation and DSS for the baseline-level check satisfies FR-014 fully while keeping the everyday gate
-lightweight. LGPL-2.1 (DSS) is fine for a separately-invoked, unmodified CI tool.
+FR-014's literal wording ("meets the ETSI EN 319 142-1 V1.2.1 (2024-01) PAdES B-B/B-T
+profile"). Using pyHanko for the AdES validation and DSS for the baseline-level check satisfies FR-014
+fully while keeping the everyday gate lightweight. LGPL-2.1 (DSS) is fine for a separately-invoked,
+unmodified CI tool.
 
 **Alternatives considered**: pyHanko only — **rejected** (cannot assert the baseline *level*, FR-014's
 literal requirement); EU DSS only — **rejected** as the everyday gate (JVM/Maven heavier; the constitution

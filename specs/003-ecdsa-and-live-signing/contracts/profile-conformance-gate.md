@@ -1,9 +1,9 @@
 # Contract: opt-in PAdES/eIDAS profile-conformance gate
 
 An **opt-in, additional** validation over produced signatures (credential-free + live) asserting ETSI
-EN 319 142 PAdES **B-B/B-T** profile conformance (FR-014). It runs **in addition to — never instead of** —
-the always-on OpenSSL cryptographic+structural bar (FR-003/FR-012), and is **never linked into the shipped
-SDK** (Principle V — pluggable, self-hosted validation backend).
+EN 319 142-1 V1.2.1 (2024-01) PAdES **B-B/B-T** profile conformance (FR-014). It runs **in addition to —
+never instead of** — the always-on OpenSSL cryptographic+structural bar (FR-003/FR-012), and is **never
+linked into the shipped SDK** (Principle V — pluggable, self-hosted validation backend).
 
 ## Entry point: `scripts/validate-pades.sh <pdf>... `
 

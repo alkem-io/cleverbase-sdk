@@ -4,8 +4,9 @@ name: PAdES profile conformance (opt-in)
 #
 # This job is OFF BY DEFAULT. It never runs on push or pull_request — only when manually dispatched
 # (`workflow_dispatch`) or when a PR carries the `profile-conformance` label. It is an ADDITIONAL gate
-# over the always-on credential-free E2E (test.yml), never a replacement: it asserts ETSI EN 319 142
-# PAdES BASELINE-B/-T conformance with pdfsig (PDF-native full-document signature validation),
+# over the always-on credential-free E2E (test.yml), never a replacement: it asserts ETSI
+# EN 319 142-1 V1.2.1 (2024-01) PAdES BASELINE-B/-T conformance with pdfsig
+# (PDF-native full-document signature validation),
 # pyHanko (AdES validation, RSA + ECDSA) and EU DSS (the structural baseline-LEVEL assertion). The
 # profile-gate toolchain (Poppler + pyHanko venv + the EU DSS
 # container) is NEVER linked into or required by the shipped SDK (Constitution Principle V).

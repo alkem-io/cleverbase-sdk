@@ -7,8 +7,8 @@
 # OPT-IN, off by default, and is NEVER linked into or required by the shipped SDK
 # (Constitution Principle V — pluggable, self-hosted validation backend).
 #
-# It asserts ETSI EN 319 142 PAdES BASELINE-B / BASELINE-T conformance with three backends, because no
-# single CLI does both halves (research D7, contracts/profile-conformance-gate.md):
+# It asserts ETSI EN 319 142-1 V1.2.1 (2024-01) PAdES BASELINE-B / BASELINE-T conformance with three
+# backends, because no single CLI does both halves (research D7, contracts/profile-conformance-gate.md):
 #
 #   * Poppler `pdfsig` — independent PDF-native signature validation that requires the signature's
 #     ByteRange to cover the complete document outside the signature value.
@@ -79,7 +79,7 @@ usage() {
   cat >&2 <<EOF
 Usage: $PROG --expect-level {B-B|B-T} --trust <pem> <signed.pdf> [<signed.pdf> ...]
 
-  --expect-level B-B|B-T   the ETSI EN 319 142 baseline level every input must structurally match
+  --expect-level B-B|B-T   the ETSI EN 319 142-1 V1.2.1 (2024-01) level every input must match
   --trust <pem>            PEM trust anchor (CA / issuer chain) the signer must chain to
   --print-pins             print the pinned tool versions (for CI to read) and exit 0
   -h, --help               show this help

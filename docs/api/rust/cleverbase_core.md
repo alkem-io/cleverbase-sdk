@@ -835,7 +835,7 @@ Host-provided context for a single call (keeps the core deterministic).
 ##### Fields
 
 - `now_unix: i64`
-  - Current time, Unix seconds.
+  - Current time, Unix seconds. Its UTC year must be representable as four digits (0000–9999).
 - `entropy: Vec<u8>`
   - Fresh random bytes (OAuth `state`, correlation id, RFC 3161 nonce). Provide ≥ 16 bytes.
 
@@ -1462,9 +1462,6 @@ A machine-readable limitation or failure observed while verifying a PDF.
   - The PDF has more than one signature; co-signing validation is a later phase.
 - `MalformedByteRange`
   - The signature's `/ByteRange` is malformed or inconsistent with `/Contents`.
-- `LegacyByteRangeConvention`
-  - The `/ByteRange` excludes only the raw `/Contents` hex, not its `<...>` delimiters.
-Re-sign the document with a conformant producer before relying on its integrity.
 - `UnsupportedSubfilter`
   - The signature uses a detached-signature subfilter this verifier does not support.
 - `UnsignedSuffix`
