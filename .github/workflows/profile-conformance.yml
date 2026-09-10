@@ -106,10 +106,10 @@ jobs:
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
         run: |
-          go build -o "$RUNNER_TEMP/mockupstream" \
-            ./examples/reference-integration/mock-upstream/cmd/mockupstream
-          go build -o "$RUNNER_TEMP/refsvc" \
-            ./examples/reference-integration/signing-service/cmd/refsvc
+          go -C examples/reference-integration/mock-upstream build \
+            -o "$RUNNER_TEMP/mockupstream" ./cmd/mockupstream
+          go -C examples/reference-integration/signing-service build \
+            -o "$RUNNER_TEMP/refsvc" ./cmd/refsvc
 
       # ---------------------------------------------------------------------------------------------
       # Produce the credential-free B-B and B-T PDFs for BOTH algorithms by driving the real REST flow
