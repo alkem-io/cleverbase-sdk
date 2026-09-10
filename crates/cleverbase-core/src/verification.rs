@@ -161,8 +161,8 @@ fn invalid(reason: VerificationReason) -> PdfVerification {
 /// Extract the padded DER CMS from the one detached PDF signature.
 ///
 /// The parser is deliberately anchored on ByteRange offsets, never on the first `/Contents`
-/// keyword: a regular PDF page may contain unrelated content streams. The gap is raw hex; its
-/// `<` and `>` delimiters are part of the signed ranges immediately outside that gap.
+/// keyword: a regular PDF page may contain unrelated content streams. The ByteRange gap is the
+/// complete hexadecimal string; `<` and `>` delimit the raw hex inside that unsigned gap.
 fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReason> {
     let parsed = Document::load_mem(document).map_err(|_| VerificationReason::MalformedPdf)?;
     let mut signatures = parsed.objects.values().filter_map(|object| {
@@ -219,12 +219,21 @@ fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReaso
     if end > document.len() {
         return Err(VerificationReason::MalformedByteRange);
     }
-    // Equality above proves second_start <= end == len, and first_len < second_start was checked.
-    let (first_and_gap, second_range) = document.split_at(*second_start);
-    let (first_range, hex) = first_and_gap.split_at(*first_len);
-    if first_range.last() != Some(&b'<') || second_range.first() != Some(&b'>') {
+    let contents_start = first_len
+        .checked_add(1)
+        .ok_or(VerificationReason::MalformedByteRange)?;
+    let contents_end = second_start
+        .checked_sub(1)
+        .ok_or(VerificationReason::MalformedByteRange)?;
+    if contents_start > contents_end
+        || document.get(*first_len) != Some(&b'<')
+        || document.get(contents_end) != Some(&b'>')
+    {
         return Err(VerificationReason::MalformedByteRange);
     }
+    let hex = document
+        .get(contents_start..contents_end)
+        .ok_or(VerificationReason::MalformedByteRange)?;
     let decoded = decode_hex(hex)?;
     let parsed_contents = signature
         .get_deref(b"Contents", &parsed)
@@ -245,7 +254,7 @@ fn extract_cms(document: &[u8]) -> Result<(Vec<u8>, [u8; 32]), VerificationReaso
         .map(ToOwned::to_owned)
         .ok_or(VerificationReason::InvalidContents)?;
     let byte_range_digest =
-        crate::pades::container::byte_range_digest(document, (*first_len, *second_start))
+        crate::pades::container::byte_range_digest(document, (contents_start, contents_end))
             .ok_or(VerificationReason::MalformedByteRange)?;
     Ok((cms_der, byte_range_digest))
 }
@@ -300,6 +309,15 @@ mod tests {
     const RSA_CERT: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.cert.der");
     const RSA_KEY: &[u8] = include_bytes!("../../../tests/fixtures/pki/signer-rsa.key.pk8");
 
+    fn signature_metadata() -> crate::pades::container::SignatureMetadata<'static> {
+        crate::pades::container::SignatureMetadata {
+            claimed_signing_time_unix: 1_781_000_000,
+            signer_name: Some("Jane Doe"),
+            reason: None,
+            location: None,
+        }
+    }
+
     fn signed_pdf_parts(with_timestamp: bool) -> (Vec<u8>, Vec<u8>, (usize, usize)) {
         let mut document = Document::with_version("1.7");
         let pages_id = document.new_object_id();
@@ -329,10 +347,10 @@ mod tests {
         let mut unsigned = Vec::new();
         document.save_to(&mut unsigned).unwrap();
 
-        let prepared = crate::pades::container::prepare(&unsigned, None, None, None).unwrap();
+        let prepared =
+            crate::pades::container::prepare(&unsigned, signature_metadata(), None).unwrap();
         let attrs =
-            crate::crypto::cms::build_signed_attrs(&prepared.content_hash, RSA_CERT, 1_781_000_000)
-                .unwrap();
+            crate::crypto::cms::build_signed_attrs(&prepared.content_hash, RSA_CERT).unwrap();
         let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
         let signature = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key)
             .sign(&attrs)

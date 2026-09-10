@@ -6,7 +6,9 @@
 //! PDF preparation → hash-bound credential authorization → `signHash` → CMS assembly → embed.
 //! PAdES B-B and B-T are both implemented.
 
+use der::Decode;
 use serde::{Deserialize, Serialize};
+use x509_cert::Certificate;
 
 pub mod csc;
 
@@ -24,7 +26,7 @@ use crate::crypto::SHA256_OID_STR as SHA256_OID;
 /// Host-provided context for a single call (keeps the core deterministic).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostContext {
-    /// Current time, Unix seconds.
+    /// Current time, Unix seconds. Its UTC year must be representable as four digits (0000–9999).
     pub now_unix: i64,
     /// Fresh random bytes (OAuth `state`, correlation id, RFC 3161 nonce). Provide ≥ 16 bytes.
     #[serde(with = "serde_bytes")]
@@ -91,10 +93,7 @@ pub enum CoreError {
 
 /// Format a UTC date/time for a visible appearance (civil-from-days; no external date dep).
 fn fmt_date(now_unix: i64) -> String {
-    let days = now_unix.div_euclid(86400);
-    let secs = now_unix.rem_euclid(86400);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let (y, m, d) = util::civil_from_days(days);
+    let (y, m, d, hh, mm, ss) = util::utc_components(now_unix);
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
 }
 
@@ -285,6 +284,24 @@ fn require_redirect(input: ResumeInput) -> Result<(String, String), CoreError> {
     }
 }
 
+fn validate_context(ctx: &HostContext) -> Result<(), CoreError> {
+    // OAuth state and the RFC 3161 nonce derive from entropy; too little makes them guessable.
+    if ctx.entropy.len() < 16 {
+        return Err(CoreError::InvalidConfig(
+            "entropy must be at least 16 bytes".into(),
+        ));
+    }
+    // PDF dates have a fixed four-digit year. Reject an unrepresentable host clock once at the
+    // input boundary so both begin and resume keep the formatter and persisted state unambiguous.
+    let year = util::utc_components(ctx.now_unix).0;
+    if !(0..=9_999).contains(&year) {
+        return Err(CoreError::InvalidConfig(
+            "now_unix UTC year must be in 0000..=9999".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Begin a signing flow. Returns the session handle plus the first [`Step`].
 pub fn begin(
     request: SigningRequest,
@@ -292,12 +309,7 @@ pub fn begin(
     ctx: HostContext,
 ) -> Result<(SigningSessionHandle, Step), CoreError> {
     config.validate().map_err(CoreError::InvalidConfig)?;
-    // The OAuth `state` CSRF token is derived from entropy; too little makes it guessable/empty.
-    if ctx.entropy.len() < 16 {
-        return Err(CoreError::InvalidConfig(
-            "entropy must be at least 16 bytes".into(),
-        ));
-    }
+    validate_context(&ctx)?;
     if request.conformance_level == ConformanceLevel::BT && config.tsa.is_none() {
         return Err(CoreError::MissingTsaConfig);
     }
@@ -361,14 +373,7 @@ pub fn resume(
             handle.schema_version
         )));
     }
-    // The credential-scope OAuth `state` (CSRF token) is regenerated here from entropy, so resume
-    // must enforce the same minimum as `begin` — otherwise the security-critical second round-trip
-    // could get an empty/guessable state.
-    if ctx.entropy.len() < 16 {
-        return Err(CoreError::InvalidConfig(
-            "entropy must be at least 16 bytes".into(),
-        ));
-    }
+    validate_context(&ctx)?;
     let config = handle
         .config
         .clone()
@@ -527,6 +532,9 @@ pub fn resume(
                 .first()
                 .ok_or_else(|| CoreError::BadHandle("empty certificate chain".into()))?;
             let identity = csc::signer_identity(&info, leaf_cert)?;
+            let leaf = Certificate::from_der(leaf_cert)
+                .map_err(|e| CoreError::ProtocolParse(format!("leaf certificate: {e}")))?;
+            let certificate_identity = csc::signer_identity_from_certificate(&leaf);
             handle.signer = Some(identity.clone());
 
             // Enforce expected-signer binding (FR-014).
@@ -556,10 +564,16 @@ pub fn resume(
             // PDF/A is preserved for invisible signatures; a visible appearance uses a non-embedded
             // base font, which is not PDF/A-conformant (font embedding is a later enhancement).
             let visible = build_visible_appearance(&request, &identity, ctx.now_unix);
+            let signature_metadata = container::SignatureMetadata {
+                claimed_signing_time_unix: ctx.now_unix,
+                signer_name: (!certificate_identity.common_name.is_empty())
+                    .then_some(certificate_identity.common_name.as_str()),
+                reason: reason.as_deref(),
+                location: location.as_deref(),
+            };
             let prepared = match container::prepare(
                 &request.document,
-                reason.as_deref(),
-                location.as_deref(),
+                signature_metadata,
                 visible.as_ref(),
             ) {
                 Ok(p) => p,
@@ -590,9 +604,8 @@ pub fn resume(
             // conformance (see docs/limitations.md), so never assert unverified preservation.
             handle.pdf_a =
                 Some(container::is_pdf_a(&prepared.staged_pdf) && request.appearance.is_none());
-            let signed_attrs =
-                cms::build_signed_attrs(&prepared.content_hash, leaf_cert, ctx.now_unix)
-                    .map_err(|e| CoreError::Internal(e.to_string()))?;
+            let signed_attrs = cms::build_signed_attrs(&prepared.content_hash, leaf_cert)
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
             let tbs = cms::tbs_hash(&signed_attrs);
 
             handle.cert_chain = Some(chain);
@@ -1053,6 +1066,33 @@ mod tests {
     }
 
     #[test]
+    fn host_context_year_must_fit_the_pdf_date_format() {
+        const YEAR_0000_START: i64 = -62_167_219_200;
+        const YEAR_9999_END: i64 = 253_402_300_799;
+
+        for now_unix in [YEAR_0000_START, YEAR_9999_END] {
+            let mut context = ctx();
+            context.now_unix = now_unix;
+            assert!(begin(request(ConformanceLevel::BB, None), cfg(), context).is_ok());
+        }
+
+        for now_unix in [YEAR_0000_START - 1, YEAR_9999_END + 1] {
+            let mut context = ctx();
+            context.now_unix = now_unix;
+            assert!(matches!(
+                begin(request(ConformanceLevel::BB, None), cfg(), context.clone()),
+                Err(CoreError::InvalidConfig(_))
+            ));
+
+            let (handle, _) = begin(request(ConformanceLevel::BB, None), cfg(), ctx()).unwrap();
+            assert!(matches!(
+                resume(handle, http_err(200), context),
+                Err(CoreError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
     fn upstream_base_url_drives_oauth_and_csc_effects() {
         let origin = "https://trust-driver-stub-hash-signing.cleverbase.com";
         let mut config = cfg();
@@ -1435,6 +1475,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pdf_signer_name_comes_from_the_embedded_leaf_certificate() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let mut info = info_json();
+        info["cert"]["subjectDN"] = serde_json::json!("CN=Provider Label,serialNumber=PNONL-123");
+
+        let (h, step) = resume(h, http_ok(info), ctx()).unwrap();
+        assert!(matches!(step, Step::Redirect(_)));
+        assert_eq!(h.signer.as_ref().unwrap().common_name, "Provider Label");
+        let document = lopdf::Document::load_mem(h.staged_pdf.as_ref().unwrap()).unwrap();
+        let signature = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .find(|dictionary| container::is_signature_dictionary(dictionary))
+            .unwrap();
+        assert_eq!(
+            lopdf::decode_text_string(signature.get(b"Name").unwrap()).unwrap(),
+            "Jane Doe"
+        );
+    }
+
     fn zero_page_pdf() -> Vec<u8> {
         let mut doc = lopdf::Document::with_version("1.7");
         let pages_id = doc.new_object_id();
@@ -1733,7 +1795,26 @@ mod tests {
         match step {
             Step::Done { signed, evidence } => {
                 assert_eq!(signed.conformance_level, ConformanceLevel::BB);
-                lopdf::Document::load_mem(&signed.pdf).expect("signed PDF loads");
+                let document = lopdf::Document::load_mem(&signed.pdf).expect("signed PDF loads");
+                let signature = document
+                    .objects
+                    .values()
+                    .find_map(|object| {
+                        let dictionary = object.as_dict().ok()?;
+                        dictionary.get(b"ByteRange").is_ok().then_some(dictionary)
+                    })
+                    .expect("signature dictionary");
+                assert_eq!(
+                    signature.get(b"M").and_then(lopdf::Object::as_str).unwrap(),
+                    b"D:20231114221320Z"
+                );
+                assert_eq!(
+                    signature
+                        .get(b"Name")
+                        .and_then(lopdf::Object::as_str)
+                        .unwrap(),
+                    b"Jane Doe"
+                );
                 assert_eq!(evidence.outcome, SigningOutcome::Signed);
                 assert_eq!(evidence.signer.unwrap().serial_number, "PNONL-123");
                 // The embedded CMS verifies over the ByteRange digest.

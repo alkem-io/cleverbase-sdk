@@ -4,9 +4,11 @@ name: PAdES profile conformance (opt-in)
 #
 # This job is OFF BY DEFAULT. It never runs on push or pull_request — only when manually dispatched
 # (`workflow_dispatch`) or when a PR carries the `profile-conformance` label. It is an ADDITIONAL gate
-# over the always-on credential-free E2E (test.yml), never a replacement: it asserts ETSI EN 319 142
-# PAdES BASELINE-B/-T conformance with pyHanko (AdES validation, RSA + ECDSA) and EU DSS (the
-# structural baseline-LEVEL assertion). The profile-gate toolchain (pyHanko venv + the EU DSS
+# over the always-on credential-free E2E (test.yml), never a replacement: it asserts ETSI
+# EN 319 142-1 V1.2.1 (2024-01) PAdES BASELINE-B/-T conformance with pdfsig
+# (PDF-native full-document signature validation),
+# pyHanko (AdES validation, RSA + ECDSA) and EU DSS (the structural baseline-LEVEL assertion). The
+# profile-gate toolchain (Poppler + pyHanko venv + the EU DSS
 # container) is NEVER linked into or required by the shipped SDK (Constitution Principle V).
 #
 # It generates the credential-free B-B and B-T PDFs for BOTH algorithms (v1_rsa, v2_ecdsa) by booting
@@ -34,11 +36,11 @@ concurrency:
 
 jobs:
   profile-conformance:
-    name: PAdES B-B/B-T conformance (pyHanko + EU DSS)
+    name: PAdES B-B/B-T conformance (pdfsig + pyHanko + EU DSS)
     runs-on: ubuntu-latest
     # Label gate: on a pull_request event, only run when the PR carries the `profile-conformance`
     # label (so it stays off by default); workflow_dispatch always runs. This is what keeps the
-    # heavyweight pyHanko+DSS toolchain off the default PR path.
+    # heavyweight Poppler+pyHanko+DSS toolchain off the default PR path.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'profile-conformance')
@@ -57,6 +59,12 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+
+      - name: Install Poppler pdfsig
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes poppler-utils
+          pdfsig -v
 
       # ---------------------------------------------------------------------------------------------
       # Read the pinned tool versions from the gate script (single source of truth — Principle III).
@@ -99,10 +107,10 @@ jobs:
         env:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
         run: |
-          go build -o "$RUNNER_TEMP/mockupstream" \
-            ./examples/reference-integration/mock-upstream/cmd/mockupstream
-          go build -o "$RUNNER_TEMP/refsvc" \
-            ./examples/reference-integration/signing-service/cmd/refsvc
+          go -C examples/reference-integration/mock-upstream build \
+            -o "$RUNNER_TEMP/mockupstream" ./cmd/mockupstream
+          go -C examples/reference-integration/signing-service build \
+            -o "$RUNNER_TEMP/refsvc" ./cmd/refsvc
 
       # ---------------------------------------------------------------------------------------------
       # Produce the credential-free B-B and B-T PDFs for BOTH algorithms by driving the real REST flow

@@ -16,9 +16,10 @@ a **gated live contract path** that signs against the real Cleverbase service th
 authorizer** (interactive default + opt-in headless) and independently verifies the result against the
 real Cleverbase trust chain.
 
-The technical approach is settled by research (see `research.md`): **no `cleverbase-core` changes** (it is
-already algorithm-parametric and DRY); all work is in `tests/fixtures/`, the mock upstream, the E2E
-harness, `independent_validation.rs`, and new opt-in CI tooling.
+The ECDSA algorithm path itself needed no `cleverbase-core` change because it was already
+algorithm-parametric and DRY. Independent validation of real output later exposed PAdES baseline
+container defects, so the delivered scope also corrects the core's PDF/CMS assembly and verification
+helpers while leaving the C-ABI and language-binding configuration surfaces unchanged.
 
 ## Technical Context
 
@@ -36,21 +37,25 @@ validation backend).
 **Testing**: `cargo test` (`independent_validation.rs` gains an ECDSA arm + a B-T ECDSA arm); `go test`
 (credential-free E2E becomes an algorithm table `{v1_rsa, v2_ecdsa}` × `{B-B, B-T}`; `live_test.go`
 becomes a full gated live contract path); `openssl cms -verify` (always-on, algorithm-agnostic);
-`pyhanko adesverify` + EU DSS (opt-in profile gate).
+Poppler `pdfsig` + `pyhanko adesverify` + EU DSS (opt-in profile gate).
 
 **Target Platform**: Linux + macOS CI runners (matches existing jobs).
 
 **Project Type**: Polyglot SDK monorepo (Rust core + C-ABI + Go/Python/Node bindings + reference
-integration). This feature touches the **core's test crate**, **fixtures**, the **reference
-integration**, and **CI** — not the shipped SDK API.
+integration). This feature touches the **core implementation and test crate**, **fixtures**, the
+**reference integration**, and **CI**. The conformance corrections change public Rust helper arities
+used to assemble CMS/PDF internals; the coarse C-ABI and binding configuration APIs are unchanged.
+Specifically, `pades::container::prepare` now takes one `SignatureMetadata` value,
+`crypto::cms::build_signed_attrs` no longer accepts a signing time, and `byte_range_digest` excludes
+the complete `<...>` `/Contents` string rather than only its raw hex digits.
 
 **Performance Goals**: N/A — this is a validation/coverage + contract-test feature; no hot paths.
 
 **Constraints**: unit-test coverage stays **≥95% per crate/package** (Principle VI); the credential-free
 pipeline stays **fully runnable with zero external dependencies** and green; the live path is **opt-in,
 skipped when credentials are absent**, and **never commits/logs secrets** (Principle IV / FR-010);
-**no `cleverbase-core` source change** (the core already supports ECDSA — changing it would be
-out-of-scope, Principle VIII).
+core changes are limited to PAdES baseline conformance defects demonstrated by independent validators;
+the RSA/ECDSA algorithm dispatch itself stays unchanged.
 
 **Scale/Scope**: 2 algorithms (RSA-2048, ECDSA P-256) × 2 conformance levels (B-B, B-T), one new Go
 `Authorizer` abstraction (2 impls), one reproducible PKI generation script, two opt-in CI validation
@@ -63,12 +68,12 @@ jobs (profile-conformance, live).
 | Principle | Assessment | Status |
 |-----------|-----------|--------|
 | I. Production-Grade Completeness | Ships ECDSA parity + the live contract path complete; no stubs (the existing `live_test.go` smoke stub is replaced by a full gated path). | ✅ PASS |
-| II. Standards-First Conformance | Cites ETSI EN 319 142 (PAdES B-B/B-T profile gate), CSC v1/v2, RFC 3161, ecdsa-with-SHA256 (`1.2.840.10045.4.3.2`). | ✅ PASS |
-| III. Single Rust Core, Idiomatic Bindings | **Zero core/binding changes**; no crypto/protocol logic added or duplicated. Algorithm dispatch already lives once in the core. | ✅ PASS |
-| IV. Security & Cryptographic Rigor | Real credentials only via secure external config, never committed/logged (FR-010); no hand-rolled crypto (reuse `p256`/`rsa`/openssl/pyHanko/DSS). | ✅ PASS |
-| V. Own the Full AdES Stack | The opt-in profile gate uses the **pluggable validation backend** the constitution names (pyHanko / EU DSS), self-hosted, never an external hosted service. | ✅ PASS |
+| II. Standards-First Conformance | Cites ETSI EN 319 142-1 V1.2.1 (2024-01) (PAdES B-B/B-T profile gate), CSC v1/v2, RFC 3161, and ecdsa-with-SHA256 (`1.2.840.10045.4.3.2`). | ✅ PASS |
+| III. Single Rust Core, Idiomatic Bindings | PAdES assembly/verification corrections live once in the Rust core; no crypto/protocol logic is duplicated in bindings. Algorithm dispatch already lives once in the core. | ✅ PASS |
+| IV. Security & Cryptographic Rigor | Real credentials only via secure external config, never committed/logged (FR-010); no hand-rolled crypto (reuse `p256`/`rsa`/OpenSSL/pdfsig/pyHanko/DSS). | ✅ PASS |
+| V. Own the Full AdES Stack | The opt-in profile gate uses self-hosted **pluggable validation backends** (pdfsig / pyHanko / EU DSS), never an external hosted service. | ✅ PASS |
 | VI. Test-First & Contract-Tested (≥95%) | The feature *is* test coverage: write the failing ECDSA E2E + `independent_validation` arms first; contract-test against the real Cleverbase surface (live path); independent-validator checks on produced signatures. Coverage floor preserved. | ✅ PASS |
-| VII. Versioning & ABI Stability | No ABI/API surface change. | ✅ PASS |
+| VII. Versioning & ABI Stability | C-ABI and binding configuration APIs stay stable. Public Rust helper arity and ByteRange semantic changes are release-noted for v0.3.2. | ✅ PASS |
 | VIII. DRY · RCA · No Opportunistic Edits | DRY is the central mandate (FR-004): one algorithm-parametrized fixture/sign/validate path, no RSA/ECDSA copy-paste. Scope is held to the ECDSA gap + live path; the PKI `gen.sh` is in-scope (it makes the algorithm-parametrized fixtures reproducible — a stated research gap, not a drive-by). | ✅ PASS |
 
 **Result**: No violations. Complexity Tracking is empty.
@@ -87,7 +92,7 @@ specs/003-ecdsa-and-live-signing/
 │   ├── authorizer.md            # the Go Authorizer interface (interactive | headless)
 │   ├── algorithm-fixtures.md    # mock multi-signer + credentials_info variants + PKI gen recipe
 │   ├── live-contract-path.md    # live flow, config env vars, gating/skip semantics
-│   └── profile-conformance-gate.md  # opt-in pyHanko/DSS gate contract
+│   └── profile-conformance-gate.md  # opt-in pdfsig/pyHanko/DSS gate contract
 └── checklists/requirements.md   # spec quality checklist (already 16/16)
 ```
 
@@ -99,7 +104,8 @@ tests/fixtures/
 └── upstream/                        # credentials_info: generalize to per-algorithm (RSA + ECDSA) variants
 
 crates/cleverbase-core/
-└── tests/independent_validation.rs  # parametrize over KeyAlgo: add ECDSA B-B + B-T arms (NO src change)
+├── src/                             # PAdES baseline assembly/verification corrections found by independent validation
+└── tests/independent_validation.rs  # parametrize over KeyAlgo: add ECDSA B-B + B-T arms
 
 examples/reference-integration/
 ├── mock-upstream/mock/
@@ -112,7 +118,7 @@ examples/reference-integration/
     └── internal/config/config.go    # live knobs: authorizer mode + real trust-anchor (CA bundle)
 
 scripts/
-└── validate-pades.sh                # NEW — opt-in profile-conformance gate (pyHanko adesverify; DSS baseline-level)
+└── validate-pades.sh                # NEW — opt-in gate (pdfsig + pyHanko; DSS baseline-level)
 
 .github/workflows/
 ├── test.yml                         # add the ECDSA E2E arm to the credential-free job (still no external deps)
@@ -120,12 +126,11 @@ scripts/
 └── live.yml                         # NEW — opt-in live job, gated on real-credential secrets, skip-when-absent
 ```
 
-**Structure Decision**: **Extend the existing monorepo in place** — no new top-level project. The feature
-is a test/fixture/reference-integration + CI change layered on the unchanged core. The one new
-abstraction is the Go `Authorizer` interface (research confirms the SDK/flow need no change — the
-authorizer seam is purely in the E2E harness, replacing the mock's auto-follow). The one new fixture
-asset is the reproducible PKI `gen.sh`. Everything else parametrizes existing RSA-hardcoded code by
-algorithm.
+**Structure Decision**: **Extend the existing monorepo in place** — no new top-level project. ECDSA
+parity remains a test/fixture/reference-integration + CI change. The later conformance correction stays
+in the existing core PAdES/CMS modules, where the faulty bytes are produced and verified. The one new
+harness abstraction is the Go `Authorizer` interface; it remains outside the SDK flow. The reproducible
+PKI `gen.sh` is the only new fixture generator.
 
 ## Complexity Tracking
 

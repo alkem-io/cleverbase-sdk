@@ -1,9 +1,9 @@
 # Contract: opt-in PAdES/eIDAS profile-conformance gate
 
 An **opt-in, additional** validation over produced signatures (credential-free + live) asserting ETSI
-EN 319 142 PAdES **B-B/B-T** profile conformance (FR-014). It runs **in addition to — never instead of** —
-the always-on OpenSSL cryptographic+structural bar (FR-003/FR-012), and is **never linked into the shipped
-SDK** (Principle V — pluggable, self-hosted validation backend).
+EN 319 142-1 V1.2.1 (2024-01) PAdES **B-B/B-T** profile conformance (FR-014). It runs **in addition to —
+never instead of** — the always-on OpenSSL cryptographic+structural bar (FR-003/FR-012), and is **never
+linked into the shipped SDK** (Principle V — pluggable, self-hosted validation backend).
 
 ## Entry point: `scripts/validate-pades.sh <pdf>... `
 
@@ -21,11 +21,13 @@ match `--expect-level`.
 
 | Backend | Role | Why |
 |---------|------|-----|
+| **Poppler `pdfsig`** | PDF-native signature and complete-document coverage validation | independent PDF implementation; pins the `/ByteRange` coverage contract that exposed the delimiter defect |
 | **pyHanko** (`pyhanko adesverify`, MIT, pip) | primary AdES validation: signature + chain + timestamp, RSA & ECDSA P-256 | constitution's named lighter default; CI-trivial; superset of the openssl check |
 | **EU DSS** (containerized, LGPL-2.1) | the **structural baseline-level** assertion: report `SignatureFormat == PAdES-BASELINE-B / -T` | pyHanko's CLI does **not** assert profile *level*; DSS does — FR-014's literal wording |
 
-The script pip-installs `pyhanko-cli` into a throwaway venv and invokes the DSS container only for the
-level assertion. Neither tool is a build/runtime dependency of the SDK. **Both versions MUST be pinned** —
+The workflow installs Poppler, the script uses its `pdfsig`, pip-installs `pyhanko-cli` into a
+throwaway venv, and invokes the DSS container only for the level assertion. None is a build/runtime
+dependency of the SDK. **The pyHanko and DSS versions MUST be pinned** —
 an exact `pyhanko-cli` version and a **digest-pinned EU DSS container image (or a fixed DSS release tag)**,
 declared once in `scripts/validate-pades.sh` (single source — Constitution III) — so the opt-in gate is
 reproducible across CI and dev.
@@ -42,12 +44,12 @@ reproducible across CI and dev.
 - Enabling/disabling the gate MUST NOT affect the always-on OpenSSL bar (it runs unconditionally — SC-007).
 - A cryptographically-valid but profile-non-conformant signature MUST fail the gate loudly, naming the
   non-conformant element (Edge Cases).
-- No private document or trust material leaves the operator's infrastructure (Principle IV) — both backends
+- No private document or trust material leaves the operator's infrastructure (Principle IV) — all backends
   run locally/in-container.
 
 ## Test (must fail first)
 
 - A known-good B-B PDF passes with `--expect-level B-B`; the same asserted as `--expect-level B-T` fails
-  (no timestamp). A tampered PDF fails AdES validation. (Run only when the opt-in toolchain is present;
+  (no timestamp). A tampered PDF fails independent signature validation. (Run only when the opt-in toolchain is present;
   otherwise the test self-skips, mirroring the credential-free `openssl`-absent skip.)
 </content>

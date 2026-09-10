@@ -8,8 +8,8 @@
 #   3. a tampered PDF FAILS         AdES validation                          (no false-accept)
 #
 # Like the always-on `openssl`-absent skip in the Go/Rust tests, this harness SELF-SKIPS (prints a
-# `SKIP:` line and exits 0) when the opt-in toolchain (pyHanko venv + the EU DSS container) is not
-# installed — which is the normal state of a dev machine. The real assertions run in CI
+# `SKIP:` line and exits 0) when no independent signature validator (pdfsig or pyHanko) is installed.
+# The full three-validator assertions run in CI
 # (.github/workflows/profile-conformance.yml, task T017), which installs the pinned toolchain and
 # generates the credential-free B-B/B-T PDFs for both algorithms before invoking the gate.
 #
@@ -17,8 +17,7 @@
 #   * If $PADES_TEST_PDF_DIR is set, this harness uses the PDFs CI already produced there
 #     (B-B-<algo>.pdf, B-T-<algo>.pdf — emitted by the producer the workflow runs).
 #   * Otherwise it cannot produce signed PDFs on its own (that requires the cleverbase-ffi build + the
-#     mock upstream), so it SELF-SKIPS early. This is the documented, preferred behaviour in a dev env
-#     (the task brief: "prefer self-skip cleanly when the toolchain is absent").
+#     mock upstream), so it SELF-SKIPS early.
 #
 # Exit status: 0 on all-pass OR on a clean self-skip; non-zero only if the gate behaves incorrectly
 # (a B-B PDF rejected at B-B, accepted at B-T, or a tampered PDF accepted).
@@ -37,13 +36,49 @@ if [ ! -x "$GATE" ]; then
   fail "gate script not found or not executable: $GATE"
 fi
 
+# Exercise the pdfsig-output decision through the real gate without depending on a locally installed
+# validator. The fake emits captured C-locale output shapes; all other optional backends are hidden.
+PDFSIG_FIXTURE_DIR="$REPO_ROOT/tests/fixtures/pades-conformance"
+FAKE_PDFSIG_DIR="$(mktemp -d)"
+cat >"$FAKE_PDFSIG_DIR/pdfsig" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-v" ]; then
+  printf '%s\n' 'pdfsig fixture'
+  exit 0
+fi
+cat "$PDFSIG_FIXTURE"
+SH
+chmod +x "$FAKE_PDFSIG_DIR/pdfsig"
+
+run_pdfsig_fixture() {
+  local fixture="$1"
+  PDFSIG_FIXTURE="$PDFSIG_FIXTURE_DIR/$fixture" \
+    PATH="$FAKE_PDFSIG_DIR:/usr/bin:/bin" \
+    PYHANKO_VENV="/nonexistent" \
+    CONTAINER_ENGINE="/nonexistent" \
+    "$GATE" --expect-level B-B \
+      --trust "$REPO_ROOT/tests/fixtures/pki/ca.cert.der" \
+      "$REPO_ROOT/tests/fixtures/pades-conformance/cleverbase-acceptance-dev-2026-09-10.pdf"
+}
+
+if run_pdfsig_fixture "pdfsig-mixed-signatures.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "pdfsig markers from different signature blocks were combined into a false pass"
+fi
+if ! run_pdfsig_fixture "pdfsig-valid-complete.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "a valid full-document signature block was rejected"
+fi
+if run_pdfsig_fixture "pdfsig-missing-marker.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "a signature block missing full-document coverage was accepted"
+fi
+rm -rf "$FAKE_PDFSIG_DIR"
+
 # ---------------------------------------------------------------------------------------------------
-# Self-skip when the opt-in toolchain is absent. pyHanko is the IRREDUCIBLE requirement: the contract's
-# central assertions — a tampered PDF fails AdES validation, and the AdES half of "PASS at B-B" — can
-# only be exercised by pyHanko (EU DSS alone asserts the structural level, not AdES). So if pyHanko is
-# absent we self-skip the whole harness even if a container engine happens to be present (there is no
-# meaningful assertion left to make). This is the normal dev-machine state; the full matrix runs in CI
-# (profile-conformance.yml).
+# Self-skip when no independent signature validator is available. pyHanko and pdfsig both prove the
+# signature covers the complete document; EU DSS alone asserts the structural level, not integrity.
+# The full matrix runs in CI (profile-conformance.yml), while a dev machine may run either validator.
 #
 # We do NOT separately detect the EU DSS container engine here: whether the level half actually ran is
 # the gate's own determination (it depends on the pinned DSS image being pullable, not merely on docker
@@ -54,8 +89,12 @@ have_pyhanko() {
   { [ -n "${PYHANKO_VENV:-}" ] && [ -x "$PYHANKO_VENV/bin/pyhanko" ]; } || command -v pyhanko >/dev/null 2>&1
 }
 
-if ! have_pyhanko; then
-  skip "profile-gate toolchain not installed (pyHanko absent — the primary AdES backend) — nothing to assert; the real run is in CI (profile-conformance.yml)"
+have_pdfsig() {
+  command -v pdfsig >/dev/null 2>&1
+}
+
+if ! have_pyhanko && ! have_pdfsig; then
+  skip "profile-gate toolchain not installed (pyHanko and pdfsig absent) — nothing to assert; the full run is in CI (profile-conformance.yml)"
   exit 0
 fi
 
@@ -125,15 +164,20 @@ gate_level_was_asserted() {
   printf '%s' "$GATE_OUTPUT" | grep -q 'baseline level confirmed'
 }
 
+# At least one independent signature validator must have run. An exit-zero self-skip is not evidence.
+gate_signature_was_asserted() {
+  printf '%s' "$GATE_OUTPUT" | grep -qE 'PASS \((AdES|pdfsig)\)'
+}
+
 PASS=0
 
 # Assertion 1: a known-good B-B PDF passes --expect-level B-B.
 note "assert 1: $BB_PDF passes --expect-level B-B"
-if run_gate "B-B" "$BB_PDF"; then
+if run_gate "B-B" "$BB_PDF" && gate_signature_was_asserted; then
   note "  ok: B-B PDF accepted at B-B"
   PASS=$((PASS + 1))
 else
-  fail "a known-good B-B PDF was REJECTED at --expect-level B-B"
+  fail "a known-good B-B PDF was rejected or no independent signature validator ran at --expect-level B-B"
 fi
 
 # Assertion 2: the same B-B PDF asserted as B-T fails (it has no timestamp → not BASELINE-T). This
@@ -151,7 +195,7 @@ if run_gate "B-T" "$BB_PDF"; then
   if gate_level_was_asserted; then
     fail "a B-B PDF (no timestamp) was wrongly ACCEPTED at --expect-level B-T (DSS confirmed the level)"
   else
-    skip "EU DSS level half did not run (engine present but DSS unavailable) — the B-B-as-B-T mismatch was NOT asserted here (CI asserts it)"
+    skip "EU DSS level half did not run — the B-B-as-B-T mismatch was NOT asserted here (CI asserts it)"
   fi
 else
   # Non-zero exit: the gate rejected the B-B PDF at B-T. This is the level mismatch being caught — it
@@ -160,11 +204,10 @@ else
   PASS=$((PASS + 1))
 fi
 
-# Assertion 3: a tampered PDF fails AdES validation. Flip a byte deep in the /Contents CMS region so
-# the document still parses but the signature no longer verifies. This leg needs pyHanko (the AdES
-# half); skip it cleanly if only the DSS engine is present.
-note "assert 3: a tampered copy of $BB_PDF FAILS AdES validation"
-if have_pyhanko; then
+# Assertion 3: a tampered PDF fails independent signature validation. Flip a signed byte while
+# keeping the PDF parseable. Either pyHanko or pdfsig is sufficient for this false-accept witness.
+note "assert 3: a tampered copy of $BB_PDF FAILS independent signature validation"
+if have_pyhanko || have_pdfsig; then
   TAMPERED="$(mktemp --suffix=.pdf 2>/dev/null || mktemp)"
   # Copy, then corrupt a byte near the end of the file (inside the signature /Contents blob for a
   # PAdES signature, which is appended last) without truncating it.
@@ -190,7 +233,7 @@ PY
   fi
   rm -f "$TAMPERED"
 else
-  skip "pyHanko not available — AdES half not running, so the tamper-rejection cannot be asserted here (CI asserts it)"
+  skip "pyHanko and pdfsig unavailable — tamper rejection cannot be asserted here (CI asserts it)"
 fi
 
 if [ "$PASS" -eq 0 ]; then

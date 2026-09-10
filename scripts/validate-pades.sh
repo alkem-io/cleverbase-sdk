@@ -7,9 +7,11 @@
 # OPT-IN, off by default, and is NEVER linked into or required by the shipped SDK
 # (Constitution Principle V — pluggable, self-hosted validation backend).
 #
-# It asserts ETSI EN 319 142 PAdES BASELINE-B / BASELINE-T conformance with two backends, because no
-# single CLI does both halves (research D7, contracts/profile-conformance-gate.md):
+# It asserts ETSI EN 319 142-1 V1.2.1 (2024-01) PAdES BASELINE-B / BASELINE-T conformance with three
+# backends, because no single CLI does both halves (research D7, contracts/profile-conformance-gate.md):
 #
+#   * Poppler `pdfsig` — independent PDF-native signature validation that requires the signature's
+#     ByteRange to cover the complete document outside the signature value.
 #   * pyHanko (`pyhanko sign adesverify`, MIT, pip)  — primary AdES validation: signature value +
 #     certificate chain + (for B-T) the embedded RFC 3161 timestamp, for BOTH RSA and ECDSA P-256.
 #     pyHanko's CLI does the full AdES check but does NOT emit the structural PAdES *profile level*.
@@ -24,7 +26,7 @@
 #   0  — every input PDF passed AdES validation AND its detected baseline level matched --expect-level
 #   1+ — at least one PDF failed AdES validation OR its level did not match (the gate FAILS loudly,
 #        naming the non-conformant element)
-#   0  — with a "SKIP:" message, when the opt-in toolchain (pyHanko venv / the DSS container image) is
+#   0  — with a "SKIP:" message, when the opt-in toolchain (pdfsig / pyHanko venv / DSS image) is
 #        not available — so the gate self-skips in environments that did not opt in, mirroring the
 #        `openssl`-absent skip in the always-on tests. The real run happens in CI (profile-conformance.yml).
 #
@@ -77,13 +79,13 @@ usage() {
   cat >&2 <<EOF
 Usage: $PROG --expect-level {B-B|B-T} --trust <pem> <signed.pdf> [<signed.pdf> ...]
 
-  --expect-level B-B|B-T   the ETSI EN 319 142 baseline level every input must structurally match
+  --expect-level B-B|B-T   the ETSI EN 319 142-1 V1.2.1 (2024-01) level every input must match
   --trust <pem>            PEM trust anchor (CA / issuer chain) the signer must chain to
   --print-pins             print the pinned tool versions (for CI to read) and exit 0
   -h, --help               show this help
 
-Drives pyHanko (AdES validation) + EU DSS (PAdES baseline-level assertion). Self-skips (exit 0 with a
-SKIP message) when the opt-in toolchain is unavailable.
+Drives pdfsig (PDF signature validation), pyHanko (AdES validation), and EU DSS (PAdES baseline-level
+assertion). Self-skips (exit 0 with a SKIP message) when the opt-in toolchain is unavailable.
 
 Pinned: pyhanko-cli==${PYHANKO_CLI_VERSION}, pyHanko==${PYHANKO_VERSION}, EU DSS ${DSS_RELEASE} (${DSS_IMAGE}).
 EOF
@@ -131,8 +133,8 @@ case "$EXPECT_LEVEL" in
 esac
 
 # ---------------------------------------------------------------------------------------------------
-# Toolchain discovery. If NEITHER backend is available we self-skip the whole gate (exit 0): this is
-# the opt-in env without the toolchain. If only one is available we run that half and SKIP the other
+# Toolchain discovery. If NO backend is available we self-skip the whole gate (exit 0): this is
+# the opt-in env without the toolchain. If only some are available we run those and SKIP the others
 # (still a meaningful partial check); a self-skip never fails the gate.
 # ---------------------------------------------------------------------------------------------------
 
@@ -144,6 +146,16 @@ detect_pyhanko() {
   fi
   if command -v pyhanko >/dev/null 2>&1; then
     PYHANKO_BIN="$(command -v pyhanko)"; return 0
+  fi
+  return 1
+}
+
+# Poppler's pdfsig validates the PDF ByteRange and CMS signature using a PDF implementation independent
+# of the SDK. CI installs it explicitly; local runs use it when already available.
+PDFSIG_BIN=""
+detect_pdfsig() {
+  if command -v pdfsig >/dev/null 2>&1; then
+    PDFSIG_BIN="$(command -v pdfsig)"; return 0
   fi
   return 1
 }
@@ -160,15 +172,53 @@ detect_engine() {
   return 1
 }
 
+HAVE_PDFSIG=0
 HAVE_PYHANKO=0
 HAVE_DSS=0
+detect_pdfsig && HAVE_PDFSIG=1 || true
 detect_pyhanko && HAVE_PYHANKO=1 || true
 detect_engine  && HAVE_DSS=1     || true
 
-if [ "$HAVE_PYHANKO" -eq 0 ] && [ "$HAVE_DSS" -eq 0 ]; then
-  skip "profile-gate toolchain not installed (need pyHanko==${PYHANKO_VERSION} via pip and a container engine for EU DSS ${DSS_RELEASE}); see .github/workflows/profile-conformance.yml"
+if [ "$HAVE_PDFSIG" -eq 0 ] && [ "$HAVE_PYHANKO" -eq 0 ] && [ "$HAVE_DSS" -eq 0 ]; then
+  skip "profile-gate toolchain not installed (need pdfsig, pyHanko==${PYHANKO_VERSION}, or a container engine for EU DSS ${DSS_RELEASE}); see .github/workflows/profile-conformance.yml"
   exit 0
 fi
+
+# ---------------------------------------------------------------------------------------------------
+# Poppler pdfsig validation. Exit status alone does not distinguish an untrusted but cryptographically
+# valid synthetic signer from a malformed signature, so pin both the signature verdict and complete
+# document coverage in its stable C-locale output. Chain trust remains pyHanko's separate assertion.
+# ---------------------------------------------------------------------------------------------------
+pdfsig_validate() {
+  local pdf="$1" output
+  if ! output="$(LC_ALL=C "$PDFSIG_BIN" "$pdf" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  printf '%s\n' "$output" >&2
+  printf '%s\n' "$output" | awk '
+    function finish_signature() {
+      if (in_signature && valid && total) found = 1
+    }
+    /^Signature #[0-9]+:/ {
+      finish_signature()
+      in_signature = 1
+      valid = 0
+      total = 0
+      next
+    }
+    in_signature && /^[[:space:]]*-[[:space:]]*Signature Validation: Signature is Valid\.[[:space:]]*$/ {
+      valid = 1
+    }
+    in_signature && /^[[:space:]]*-[[:space:]]*Total document signed[[:space:]]*$/ {
+      total = 1
+    }
+    END {
+      finish_signature()
+      exit(found ? 0 : 1)
+    }
+  '
+}
 
 # ---------------------------------------------------------------------------------------------------
 # pyHanko AdES validation. `pyhanko sign adesverify` performs signature + chain (+ timestamp for B-T)
@@ -301,10 +351,27 @@ EOF
 # Drive the gate over every input PDF.
 # ---------------------------------------------------------------------------------------------------
 FAILED=0
+PDFSIG_RAN=0    # set to 1 once pdfsig independently validated the PDF signature and full coverage
 ADES_RAN=0       # set to 1 once pyHanko actually ran AdES validation
 LEVEL_ASSERTED=0 # set to 1 ONLY when EU DSS actually confirmed the baseline level (--expect-level)
-# "Did any backend run?" is derivable: it is exactly (ADES_RAN==1 || LEVEL_ASSERTED==1), so we do NOT
-# keep a separate flag — the single read site below derives it from these two.
+# "Did any backend run?" is derivable from these three backend-specific witnesses.
+
+# --- PDF-native signature half (Poppler pdfsig) ---
+if [ "$HAVE_PDFSIG" -eq 1 ]; then
+  note "Poppler pdfsig validation ($("$PDFSIG_BIN" -v 2>&1 | head -1 || echo "$PDFSIG_BIN"))"
+  for pdf in "${PDFS[@]}"; do
+    note "pdfsig: $pdf"
+    PDFSIG_RAN=1
+    if pdfsig_validate "$pdf"; then
+      printf 'PASS (pdfsig): %s\n' "$pdf" >&2
+    else
+      err "pdfsig validation FAILED: $pdf"
+      FAILED=1
+    fi
+  done
+else
+  skip "pdfsig not available — PDF-native signature/coverage validation skipped"
+fi
 
 # --- AdES half (pyHanko) ---
 if [ "$HAVE_PYHANKO" -eq 1 ]; then
@@ -355,7 +422,7 @@ fi
 # than a misleading PASS (exit 0 either way: a self-skip never fails the gate). This only happens when
 # the opt-in toolchain is absent; the real validation runs in CI (profile-conformance.yml).
 # "Nothing ran" is exactly "neither half ran" = ADES_RAN==0 AND LEVEL_ASSERTED==0 (derived, no flag).
-if [ "$ADES_RAN" -eq 0 ] && [ "$LEVEL_ASSERTED" -eq 0 ]; then
+if [ "$PDFSIG_RAN" -eq 0 ] && [ "$ADES_RAN" -eq 0 ] && [ "$LEVEL_ASSERTED" -eq 0 ]; then
   skip "profile-gate toolchain not installed — every PDF was self-skipped (no AdES/level assertion made)"
   exit 0
 fi
@@ -369,15 +436,24 @@ fi
 #     checked. We do NOT print "PASSED ... at level X". The AdES half (if it ran) still passed; the
 #     level assertion is reported as SKIPPED and is left explicitly NOT PERFORMED.
 if [ "$LEVEL_ASSERTED" -eq 1 ]; then
-  if [ "$ADES_RAN" -eq 1 ]; then
-    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): AdES validated AND baseline level confirmed = ${EXPECT_LEVEL}"
+  if [ "$ADES_RAN" -eq 1 ] && [ "$PDFSIG_RAN" -eq 1 ]; then
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): pdfsig + AdES validated AND baseline level confirmed = ${EXPECT_LEVEL}"
+  elif [ "$ADES_RAN" -eq 1 ]; then
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): AdES validated AND baseline level confirmed = ${EXPECT_LEVEL} (pdfsig SKIPPED)"
+  elif [ "$PDFSIG_RAN" -eq 1 ]; then
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): pdfsig validated AND baseline level confirmed = ${EXPECT_LEVEL} (AdES SKIPPED)"
   else
-    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): baseline level confirmed = ${EXPECT_LEVEL} (AdES half SKIPPED — pyHanko unavailable)"
+    note "profile-conformance gate PASSED for ${#PDFS[@]} PDF(s): baseline level confirmed = ${EXPECT_LEVEL} (signature validators SKIPPED)"
   fi
   exit 0
 fi
-# DSS did not run: the baseline level was NOT asserted. We reach here only past the all-skipped guard
-# above, so with LEVEL_ASSERTED=0 the only way something ran is ADES_RAN=1 — the AdES half ran. Report
-# the AdES PASS and the level as explicitly SKIPPED — never claim "at level ${EXPECT_LEVEL}".
-note "profile-conformance gate: AdES PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (EU DSS unavailable — level NOT asserted)"
+# DSS did not run: the baseline level was NOT asserted. Report whichever independent signature
+# validators ran and the level as explicitly SKIPPED — never claim "at level ${EXPECT_LEVEL}".
+if [ "$PDFSIG_RAN" -eq 1 ] && [ "$ADES_RAN" -eq 1 ]; then
+  note "profile-conformance gate: pdfsig + AdES PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (EU DSS unavailable — level NOT asserted)"
+elif [ "$ADES_RAN" -eq 1 ]; then
+  note "profile-conformance gate: AdES PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (EU DSS unavailable — level NOT asserted)"
+else
+  note "profile-conformance gate: pdfsig PASSED for ${#PDFS[@]} PDF(s); baseline-level (${EXPECT_LEVEL}) assertion SKIPPED (pyHanko and EU DSS unavailable)"
+fi
 exit 0

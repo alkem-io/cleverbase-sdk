@@ -317,8 +317,8 @@ func assertTimestampToken(t *testing.T, pdf []byte) {
 	}
 }
 
-// extractContents decodes the ByteRange gap containing the CMS hex and trims it to the DER object's
-// declared length (dropping the zero padding).
+// extractContents decodes the complete ByteRange gap containing the `<CMS hex>` string and trims it
+// to the DER object's declared length (dropping the zero padding).
 func extractContents(t *testing.T, pdf []byte) []byte {
 	t.Helper()
 	parts, err := pdfByteRange(pdf)
@@ -326,13 +326,16 @@ func extractContents(t *testing.T, pdf []byte) []byte {
 		t.Fatal(err)
 	}
 	gap := pdf[parts[0]+parts[1] : parts[2]]
+	if len(gap) < 2 || gap[0] != '<' || gap[len(gap)-1] != '>' {
+		t.Fatal("ByteRange gap is not the complete <...> /Contents string")
+	}
 	hexStr := strings.Map(func(r rune) rune {
 		switch r {
 		case ' ', '\n', '\r', '\t':
 			return -1
 		}
 		return r
-	}, string(gap))
+	}, string(gap[1:len(gap)-1]))
 	raw := decodeHex(t, hexStr)
 	return raw[:derTotalLen(raw)]
 }

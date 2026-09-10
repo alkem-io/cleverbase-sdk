@@ -38,7 +38,8 @@ frontend/helper-ts             thin TS redirect/status helper (no crypto, no sec
 Implemented and tested (Rust unit + integration; independently validated with **OpenSSL**):
 
 - ✅ Remote QES over CSC (OAuth2 Authorization-Code, two-round: service + credential scopes).
-- ✅ **PAdES B-B** and **B-T** (RFC 3161 timestamp from an external qualified TSA).
+- ✅ **PAdES B-B** and **B-T** (required PDF `/M`, certificate-CN `/Name` when available, no CMS
+  `signing-time` attribute, complete `/Contents` exclusion, and an RFC 3161 timestamp for B-T).
 - ✅ **RSA** (CSC v1, OpenSSL-validated end-to-end) and **ECDSA P-256** (CSC v2, validated at the
   CMS layer — assembly + in-crate verification; a full ECDSA OpenSSL/DSS pass is on the roadmap,
   see `docs/limitations.md`); CAdES signed attributes incl. `signing-certificate-v2`; detached CMS
@@ -48,7 +49,8 @@ Implemented and tested (Rust unit + integration; independently validated with **
   (FR-013), WYSIWYS hash-bound authorization.
 - ✅ Stateless integrity verification of a singly-signed PAdES B-B/B-T PDF using the SHA-256 CMS
   profile emitted by this SDK (`rsaEncryption`/PKCS #1 v1.5 or P-256 ECDSA with SHA-256, with the
-  SDK's minimal `ESSCertIDv2` form): strict ByteRange/CMS binding, embedded-leaf signature and
+  SDK's minimal `ESSCertIDv2` form): strict complete-`/Contents` ByteRange/CMS binding,
+  embedded-leaf signature and
   digest checks, profile and signer identity. Other valid CMS profiles may return an unsupported
   or malformed verdict. B-T additionally requires a timestamp token bound to the signature value,
   with a matching CMS content digest and a signature verified by a certificate embedded in that

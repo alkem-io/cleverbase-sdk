@@ -6,7 +6,7 @@ credentials**; the live scenario is opt-in. Commands are run from the repo root.
 ## Prerequisites
 
 - Rust 1.94.1 (`rust-toolchain.toml`), Go 1.22+, `openssl` on PATH (always-on validator).
-- For the opt-in profile gate only: Python 3.11+ (pyHanko) and Docker (EU DSS).
+- For the opt-in profile gate only: Poppler `pdfsig`, Python 3.11+ (pyHanko), and Docker (EU DSS).
 - cgo env for the Go reference integration:
   ```bash
   cargo build -p cleverbase-ffi
@@ -63,7 +63,8 @@ scripts/validate-pades.sh --expect-level B-B --trust tests/fixtures/pki/ca.cert.
 scripts/validate-pades.sh --expect-level B-T --trust tests/fixtures/pki/ca.cert.pem out-bt.pdf
 ```
 
-**Expected**: pyHanko reports AdES-valid (RSA + ECDSA); EU DSS reports `PAdES-BASELINE-B` / `-T` matching
+**Expected**: pdfsig reports a valid signature covering the complete document, pyHanko reports
+AdES-valid (RSA + ECDSA), and EU DSS reports `PAdES-BASELINE-B` / `-T` matching
 `--expect-level`. Asserting the B-B PDF as `--expect-level B-T` fails loudly (no timestamp). The always-on
 OpenSSL bar (Scenario 1) is unaffected by whether this gate runs (SC-007).
 

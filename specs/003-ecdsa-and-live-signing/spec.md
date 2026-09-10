@@ -41,7 +41,8 @@ resulting signature against the real Cleverbase-issued trust chain.
   **Both.** The cryptographic + structural OpenSSL check (CMS signature, certificate chain, RFC 3161
   timestamp for B-T, and the PAdES ByteRange/Contents structure) is the **always-on** bar — extended to
   ECDSA at parity with RSA. In addition, a **PAdES/eIDAS baseline-profile conformance** validation (ETSI
-  EN 319 142 PAdES B-B/B-T: signed-attribute set, signing-certificate-v2 reference, timestamp) is provided
+  EN 319 142-1 V1.2.1 (2024-01) PAdES B-B/B-T: signed-attribute set,
+  signing-certificate-v2 reference, timestamp) is provided
   as an **opt-in** gate over produced signatures.
 - Q: Which signature algorithms must the live contract path cover? → A: **Both, opportunistically;
   require one.** Exercise whichever real credential the supplied account has; cover both RSA (v1) and
@@ -197,7 +198,8 @@ per algorithm), not a single-run one. With no real credentials configured, the p
   delivered when an automatable Cleverbase test credential becomes available (a pending external dependency
   — see Dependencies), and until then the headless mode ships as a configured, documented drop-in.
 - **FR-014**: An **opt-in PAdES/eIDAS baseline-profile conformance** validation MUST be available over
-  produced signatures (credential-free and live), asserting the output meets the ETSI EN 319 142 PAdES
+  produced signatures (credential-free and live), asserting the output meets the ETSI EN 319 142-1
+  V1.2.1 (2024-01) PAdES
   **B-B / B-T** profile (the required signed-attribute set, the signing-certificate-v2 reference, and the
   RFC 3161 timestamp for B-T). It runs in addition to — never instead of — the always-on cryptographic +
   structural check (FR-003 / FR-012) and MUST be independently enable-able.
@@ -242,8 +244,9 @@ per algorithm), not a single-run one. With no real credentials configured, the p
 - **SC-006**: A deliberately broken signature (wrong algorithm, tampered chain, bad timestamp) is rejected
   by the independent validator in 100% of cases — the verification has no false-accept.
 - **SC-007**: With the PAdES/eIDAS profile-conformance gate enabled, every produced B-B and B-T signature
-  (RSA and ECDSA) is confirmed to meet the ETSI EN 319 142 baseline profile, while the always-on
-  cryptographic + structural verification runs unconditionally regardless of whether that gate is enabled.
+  (RSA and ECDSA) is confirmed to meet the ETSI EN 319 142-1 V1.2.1 (2024-01) baseline profile, while
+  the always-on cryptographic + structural verification runs unconditionally regardless of whether that
+  gate is enabled.
 
 ## Assumptions
 
@@ -253,7 +256,8 @@ per algorithm), not a single-run one. With no real credentials configured, the p
 - **Independent verification means an external validator** (OpenSSL for the CMS/chain/timestamp, plus the
   existing structural PAdES checks), consistent with how RSA is validated today, as the **always-on** bar —
   for both the synthetic and live paths (live uses the real Cleverbase issuer chain as the trust anchor).
-  A **PAdES/eIDAS baseline-profile conformance** validation (ETSI EN 319 142) is provided as an additional
+  A **PAdES/eIDAS baseline-profile conformance** validation (ETSI EN 319 142-1 V1.2.1
+  (2024-01)) is provided as an additional
   **opt-in** gate (FR-014), not a replacement for the cryptographic bar.
 - **The live path targets the Cleverbase acceptance environment** by default, using externally supplied
   credentials (the project will provide the OIDC registration, account, and credential). It is a
