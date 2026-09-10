@@ -69,14 +69,21 @@ def create_manifest(
     )
 
 
-def verify_manifest(directory: Path, manifest: Path, tag: str, commit: str) -> None:
+def verify_manifest(
+    directory: Path,
+    manifest: Path,
+    expected_version: str,
+    tag: str,
+    commit: str,
+) -> None:
     """Fail unless release identity and every artifact byte match exactly."""
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     _require(payload.get("schema_version") == 1, "manifest schema mismatch")
     _require(payload.get("tag") == tag, "manifest tag mismatch")
     _require(payload.get("commit") == commit, "manifest commit mismatch")
     version = payload.get("version")
-    _require(isinstance(version, str) and tag == f"bindings/go/v{version}", "manifest version mismatch")
+    _require(version == expected_version, "manifest version mismatch")
+    _require(tag == f"bindings/go/v{expected_version}", "manifest version mismatch")
     recorded = payload.get("artifacts")
     _require(isinstance(recorded, dict), "manifest artifact set is invalid")
     current = _artifacts(directory, manifest)
@@ -99,7 +106,7 @@ def main(argv: list[str]) -> int:
         if command == "create":
             create_manifest(Path(directory), Path(manifest), version, tag, commit)
         else:
-            verify_manifest(Path(directory), Path(manifest), tag, commit)
+            verify_manifest(Path(directory), Path(manifest), version, tag, commit)
     except (ManifestError, OSError, json.JSONDecodeError, KeyError) as error:
         print(f"SDK artifact manifest failed: {error}", file=sys.stderr)
         return 1
