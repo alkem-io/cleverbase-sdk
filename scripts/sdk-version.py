@@ -6,11 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
-
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = ROOT / "SDK_VERSION"
@@ -31,11 +30,12 @@ def sdk_version() -> str:
     """Read and validate the one authoritative SDK version."""
     version = VERSION_FILE.read_text(encoding="utf-8").strip()
     if SEMVER.fullmatch(version) is None:
-        raise ValueError(f"SDK_VERSION is not semantic version: {version!r}")
+        msg = f"SDK_VERSION is not semantic version: {version!r}"
+        raise ValueError(msg)
     return version
 
 
-def toml_string(table: str, key: str) -> Optional[str]:
+def toml_string(table: str, key: str) -> str | None:
     """Read one quoted string from a controlled TOML table."""
     match = re.search(rf'(?m)^{re.escape(key)}\s*=\s*"([^"]+)"\s*$', table)
     return match.group(1) if match is not None else None
@@ -52,10 +52,11 @@ def toml_package(path: Path, package_name: str) -> dict[str, object]:
     for table in tables:
         if toml_string(table, "name") == package_name:
             return {"name": package_name, "version": toml_string(table, "version")}
-    raise ValueError(f"{path.relative_to(ROOT)}: package {package_name!r} not found")
+    msg = f"{path.relative_to(ROOT)}: package {package_name!r} not found"
+    raise ValueError(msg)
 
 
-def expected_values(version: str, release_tag: Optional[str]) -> list[tuple[str, object, object]]:
+def expected_values(version: str, release_tag: str | None) -> list[tuple[str, object, object]]:
     """Collect every independently serialized public version/name value."""
     values: list[tuple[str, object, object]] = []
     for path, package_name in PUBLIC_PACKAGES + LOCK_PACKAGES:
@@ -67,22 +68,41 @@ def expected_values(version: str, release_tag: Optional[str]) -> list[tuple[str,
     pyproject_text = (ROOT / "bindings/python/pyproject.toml").read_text(encoding="utf-8")
     project_match = re.search(r"(?ms)^\[project\]\s*$.*?(?=^\[|\Z)", pyproject_text)
     if project_match is None:
-        raise ValueError("bindings/python/pyproject.toml: [project] not found")
+        msg = "bindings/python/pyproject.toml: [project] not found"
+        raise ValueError(msg)
     project = project_match.group(0)
     values.extend(
         (
-            ("bindings/python/pyproject.toml:project.name", toml_string(project, "name"), "alkemio-cleverbase-sdk"),
-            ("bindings/python/pyproject.toml:project.version", toml_string(project, "version"), version),
+            (
+                "bindings/python/pyproject.toml:project.name",
+                toml_string(project, "name"),
+                "alkemio-cleverbase-sdk",
+            ),
+            (
+                "bindings/python/pyproject.toml:project.version",
+                toml_string(project, "version"),
+                version,
+            ),
         )
     )
 
     package_json = json.loads((ROOT / "bindings/node/package.json").read_text(encoding="utf-8"))
-    package_lock = json.loads((ROOT / "bindings/node/package-lock.json").read_text(encoding="utf-8"))
+    package_lock = json.loads(
+        (ROOT / "bindings/node/package-lock.json").read_text(encoding="utf-8")
+    )
     values.extend(
         (
-            ("bindings/node/package.json:name", package_json.get("name"), "@alkemio/cleverbase-sdk"),
+            (
+                "bindings/node/package.json:name",
+                package_json.get("name"),
+                "@alkemio/cleverbase-sdk",
+            ),
             ("bindings/node/package.json:version", package_json.get("version"), version),
-            ("bindings/node/package-lock.json:name", package_lock.get("name"), "@alkemio/cleverbase-sdk"),
+            (
+                "bindings/node/package-lock.json:name",
+                package_lock.get("name"),
+                "@alkemio/cleverbase-sdk",
+            ),
             ("bindings/node/package-lock.json:version", package_lock.get("version"), version),
             (
                 "bindings/node/package-lock.json:packages[''].name",
@@ -101,7 +121,7 @@ def expected_values(version: str, release_tag: Optional[str]) -> list[tuple[str,
     return values
 
 
-def check(release_tag: Optional[str]) -> int:
+def check(release_tag: str | None) -> int:
     """Fail closed when any public version or package identity has drifted."""
     version = sdk_version()
     mismatches = [
@@ -110,12 +130,20 @@ def check(release_tag: Optional[str]) -> int:
         if actual != expected
     ]
     if mismatches:
-        print("SDK version/package metadata is out of sync:", file=sys.stderr)
-        for mismatch in mismatches:
-            print(f"- {mismatch}", file=sys.stderr)
+        sys.stderr.write("SDK version/package metadata is out of sync:\n")
+        sys.stderr.writelines(f"- {mismatch}\n" for mismatch in mismatches)
         return 1
-    print(f"SDK version/package metadata: {version} (ok)")
+    sys.stdout.write(f"SDK version/package metadata: {version} (ok)\n")
     return 0
+
+
+def required_tool(name: str) -> str:
+    """Resolve a controlled package-manager executable to an absolute path."""
+    executable = shutil.which(name)
+    if executable is None:
+        msg = f"required executable not found: {name}"
+        raise RuntimeError(msg)
+    return executable
 
 
 def replace_package_version(path: Path, package_name: str, version: str) -> None:
@@ -128,7 +156,8 @@ def replace_package_version(path: Path, package_name: str, version: str) -> None
     )
     updated, count = pattern.subn(rf'\g<1>"{version}"', text, count=1)
     if count != 1:
-        raise ValueError(f"{path.relative_to(ROOT)}: could not replace {package_name} version")
+        msg = f"{path.relative_to(ROOT)}: could not replace {package_name} version"
+        raise ValueError(msg)
     path.write_text(updated, encoding="utf-8")
 
 
@@ -146,17 +175,22 @@ def synchronize() -> None:
     pyproject = re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', pyproject, count=1)
     pyproject_path.write_text(pyproject, encoding="utf-8")
 
-    subprocess.run(
-        ["npm", "version", version, "--no-git-tag-version", "--allow-same-version"],
+    npm = required_tool("npm")
+    cargo = required_tool("cargo")
+    subprocess.run(  # noqa: S603 -- executable resolved from the operator's PATH
+        [npm, "version", version, "--no-git-tag-version", "--allow-same-version"],
         cwd=ROOT / "bindings/node",
         check=True,
     )
     package_path = ROOT / "bindings/node/package.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
     package["name"] = "@alkemio/cleverbase-sdk"
-    package_path.write_text(json.dumps(package, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    subprocess.run(
-        ["npm", "install", "--package-lock-only", "--ignore-scripts"],
+    package_path.write_text(
+        json.dumps(package, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(  # noqa: S603 -- executable resolved from the operator's PATH
+        [npm, "install", "--package-lock-only", "--ignore-scripts"],
         cwd=ROOT / "bindings/node",
         check=True,
     )
@@ -166,8 +200,8 @@ def synchronize() -> None:
         ROOT / "bindings/python/Cargo.toml",
         ROOT / "bindings/node/Cargo.toml",
     ):
-        subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(manifest)],
+        subprocess.run(  # noqa: S603 -- executable resolved from the operator's PATH
+            [cargo, "metadata", "--format-version", "1", "--manifest-path", str(manifest)],
             cwd=ROOT,
             check=True,
             stdout=subprocess.DEVNULL,

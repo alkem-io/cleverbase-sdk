@@ -11,19 +11,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
-
+from typing import Any, cast
 
 PYPI_PACKAGE = "alkemio-cleverbase-sdk"
 NPM_PACKAGE = "@alkemio/cleverbase-sdk"
 SLSA_PROVENANCE = "https://slsa.dev/provenance/v1"
+HTTP_NOT_FOUND = 404
+MINIMUM_PYTHON_ARTIFACTS = 2
+ARGUMENT_COUNT = 5
+ALLOWED_REGISTRY_HOSTS = {"pypi.org", "registry.npmjs.org"}
 
 
 class RegistryError(ValueError):
     """Published bytes or provenance differ from the intended release."""
 
 
-def _require(condition: bool, message: str) -> None:
+def _require(condition: bool, message: str) -> None:  # noqa: FBT001
     if not condition:
         raise RegistryError(message)
 
@@ -46,7 +49,10 @@ def _python_artifacts(directory: Path, version: str) -> dict[str, Path]:
         and path.name.startswith(prefix)
         and (path.suffix == ".whl" or path.name == f"{prefix}.tar.gz")
     }
-    _require(len(artifacts) >= 2, "Python release must contain wheels and an sdist")
+    _require(
+        len(artifacts) >= MINIMUM_PYTHON_ARTIFACTS,
+        "Python release must contain wheels and an sdist",
+    )
     _require(any(name.endswith(".whl") for name in artifacts), "Python release has no wheels")
     _require(f"{prefix}.tar.gz" in artifacts, "Python release has no sdist")
     return artifacts
@@ -121,39 +127,51 @@ def npm_status(
     return "present"
 
 
-def _http_json(url: str, *, allow_missing: bool = False, accept: str | None = None) -> Any:
+def _http_json(url: str, *, allow_missing: bool = False, accept: str | None = None) -> object:
+    parsed = urllib.parse.urlsplit(url)
+    _require(
+        parsed.scheme == "https" and parsed.hostname in ALLOWED_REGISTRY_HOSTS,
+        "registry URL is not an approved HTTPS origin",
+    )
     headers = {"User-Agent": "alkemio-cleverbase-sdk-release/1"}
     if accept is not None:
         headers["Accept"] = accept
-    request = urllib.request.Request(url, headers=headers)
+    request = urllib.request.Request(url, headers=headers)  # noqa: S310 -- origin checked above
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(  # noqa: S310 -- request origin checked above
+            request,
+            timeout=30,
+        ) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        if allow_missing and error.code == 404:
+        if allow_missing and error.code == HTTP_NOT_FOUND:
             return None
-        raise RegistryError(f"registry request failed with HTTP {error.code}: {url}") from error
+        msg = f"registry request failed with HTTP {error.code}: {url}"
+        raise RegistryError(msg) from error
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise RegistryError(f"registry request failed: {url}: {error}") from error
+        msg = f"registry request failed: {url}: {error}"
+        raise RegistryError(msg) from error
 
 
 def _pypi_metadata(version: str) -> dict[str, Any] | None:
-    return _http_json(
+    payload = _http_json(
         f"https://pypi.org/pypi/{PYPI_PACKAGE}/{version}/json",
         allow_missing=True,
     )
+    return cast("dict[str, Any] | None", payload)
 
 
 def _npm_metadata(version: str) -> dict[str, Any] | None:
     package = urllib.parse.quote(NPM_PACKAGE, safe="@")
-    return _http_json(
+    payload = _http_json(
         f"https://registry.npmjs.org/{package}/{version}",
         allow_missing=True,
         accept="application/vnd.npm.install-v1+json",
     )
+    return cast("dict[str, Any] | None", payload)
 
 
-def pypi_provenance_valid(provenance: Any) -> bool:
+def pypi_provenance_valid(provenance: object) -> bool:
     """Recognize the current PyPI integrity API's non-empty bundle shape."""
     if not isinstance(provenance, dict):
         return False
@@ -176,14 +194,18 @@ def _verify_pypi_provenance(payload: dict[str, Any], version: str) -> None:
 
 def main(argv: list[str]) -> int:
     """Run one preflight or post-publication registry check."""
-    if len(argv) != 5 or argv[1] not in {"pypi", "npm"} or argv[2] not in {
-        "preflight",
-        "verify",
-    }:
-        print(
+    if (
+        len(argv) != ARGUMENT_COUNT
+        or argv[1] not in {"pypi", "npm"}
+        or argv[2]
+        not in {
+            "preflight",
+            "verify",
+        }
+    ):
+        sys.stderr.write(
             "usage: release_registry.py <pypi|npm> <preflight|verify> "
-            "<artifact-dir-or-tarball> <version>",
-            file=sys.stderr,
+            "<artifact-dir-or-tarball> <version>\n"
         )
         return 2
 
@@ -208,9 +230,9 @@ def main(argv: list[str]) -> int:
                 response = _http_json(attestations["url"])
                 _require(isinstance(response, dict) and bool(response), "npm attestation is empty")
     except (RegistryError, OSError, KeyError, TypeError) as error:
-        print(f"SDK registry reconciliation failed: {error}", file=sys.stderr)
+        sys.stderr.write(f"SDK registry reconciliation failed: {error}\n")
         return 1
-    print(status)
+    sys.stdout.write(f"{status}\n")
     return 0
 
 

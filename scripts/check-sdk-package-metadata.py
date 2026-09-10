@@ -8,7 +8,6 @@ import re
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 NODE_FILES = [
     "index.js",
@@ -22,7 +21,7 @@ NODE_FILES = [
 ]
 
 
-def require(errors: list[str], condition: bool, message: str) -> None:
+def require(errors: list[str], condition: bool, message: str) -> None:  # noqa: FBT001
     """Append one actionable contract failure."""
     if not condition:
         errors.append(message)
@@ -79,7 +78,11 @@ def main() -> int:
     )
 
     loader = (ROOT / "bindings/node/index.js").read_text(encoding="utf-8")
-    require(errors, "@cleverbase/" not in loader, "generated Node loader has legacy @cleverbase fallbacks")
+    require(
+        errors,
+        "@cleverbase/" not in loader,
+        "generated Node loader has legacy @cleverbase fallbacks",
+    )
     require(
         errors,
         "@alkemio/cleverbase-sdk-" not in loader,
@@ -93,11 +96,11 @@ def main() -> int:
         "Python README metadata": r'(?m)^readme = "README.md"$',
         "Python license metadata": r'(?m)^license = "EUPL-1\.2"$',
         "Python repository URL": (
-            r'(?ms)^\[project\.urls\]\s*$.*?^Repository = '
+            r"(?ms)^\[project\.urls\]\s*$.*?^Repository = "
             r'"https://github.com/alkem-io/cleverbase-sdk"$'
         ),
         "Python issue tracker": (
-            r'(?ms)^\[project\.urls\]\s*$.*?^Issues = '
+            r"(?ms)^\[project\.urls\]\s*$.*?^Issues = "
             r'"https://github.com/alkem-io/cleverbase-sdk/issues"$'
         ),
         "Python wheel typing include": r'(?m)^include = \["cleverbase\.pyi"\]$',
@@ -122,11 +125,10 @@ def main() -> int:
     )
 
     if errors:
-        print("SDK package metadata contract failed:", file=sys.stderr)
-        for error in errors:
-            print(f"- {error}", file=sys.stderr)
+        sys.stderr.write("SDK package metadata contract failed:\n")
+        sys.stderr.writelines(f"- {error}\n" for error in errors)
         return 1
-    print("SDK package metadata contract: ok")
+    sys.stdout.write("SDK package metadata contract: ok\n")
     return 0
 
 

@@ -10,12 +10,17 @@ import zipfile
 from contextlib import contextmanager
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Iterator
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
 
 NODE_PACKAGE = "@alkemio/cleverbase-sdk"
 PYTHON_PACKAGE = "alkemio-cleverbase-sdk"
 PYTHON_DIST = "alkemio_cleverbase_sdk"
+NODE_ARGUMENT_COUNT = 4
+WHEEL_ARGUMENT_COUNT = 5
+SYMLINK_MODE = 0o120000
 NODE_NATIVE_FILES = {
     "cleverbase.darwin-arm64.node",
     "cleverbase.darwin-x64.node",
@@ -41,11 +46,12 @@ def _safe_members(names: Iterable[str]) -> set[str]:
     for name in members:
         path = PurePosixPath(name)
         if path.is_absolute() or ".." in path.parts or not path.parts:
-            raise ArtifactError(f"unsafe archive path: {name}")
+            msg = f"unsafe archive path: {name}"
+            raise ArtifactError(msg)
     return members
 
 
-def _require(condition: bool, message: str) -> None:
+def _require(condition: bool, message: str) -> None:  # noqa: FBT001
     if not condition:
         raise ArtifactError(message)
 
@@ -103,7 +109,7 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
         infos = archive.infolist()
         members = _safe_members(info.filename for info in infos)
         _require(
-            all(((info.external_attr >> 16) & 0o170000) != 0o120000 for info in infos),
+            all(((info.external_attr >> 16) & 0o170000) != SYMLINK_MODE for info in infos),
             "wheel may not contain symlinks",
         )
         _require(members == expected_members, "wheel has unexpected members or typing surface")
@@ -151,32 +157,38 @@ def check_python_sdist(path: Path, version: str) -> None:
         for name in members:
             parts = set(PurePosixPath(name).parts)
             if parts & forbidden_parts or name.endswith((".env", ".pyc")):
-                raise ArtifactError(f"sdist contains forbidden member: {name}")
+                msg = f"sdist contains forbidden member: {name}"
+                raise ArtifactError(msg)
 
 
 def main(argv: list[str]) -> int:
     """Dispatch one artifact contract from the release workflow."""
-    if len(argv) not in {4, 5}:
-        print(
+    if len(argv) not in {NODE_ARGUMENT_COUNT, WHEEL_ARGUMENT_COUNT}:
+        sys.stderr.write(
             "usage: check_sdk_artifact.py "
-            "<node|python-wheel|python-sdist> <artifact> <version> [wheel-tag]",
-            file=sys.stderr,
+            "<node|python-wheel|python-sdist> <artifact> <version> [wheel-tag]\n"
         )
         return 2
     kind, artifact, version = argv[1:4]
     try:
-        if kind == "node" and len(argv) == 4:
+        if kind == "node" and len(argv) == NODE_ARGUMENT_COUNT:
             check_node_tarball(Path(artifact), version)
-        elif kind == "python-wheel" and len(argv) == 5:
+        elif kind == "python-wheel" and len(argv) == WHEEL_ARGUMENT_COUNT:
             check_python_wheel(Path(artifact), version, argv[4])
-        elif kind == "python-sdist" and len(argv) == 4:
+        elif kind == "python-sdist" and len(argv) == NODE_ARGUMENT_COUNT:
             check_python_sdist(Path(artifact), version)
         else:
-            raise ArtifactError("invalid artifact contract arguments")
-    except (ArtifactError, OSError, tarfile.TarError, zipfile.BadZipFile, json.JSONDecodeError) as error:
-        print(f"SDK artifact contract failed: {error}", file=sys.stderr)
+            return 2
+    except (
+        ArtifactError,
+        OSError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+        json.JSONDecodeError,
+    ) as error:
+        sys.stderr.write(f"SDK artifact contract failed: {error}\n")
         return 1
-    print(f"SDK {kind} artifact contract: ok")
+    sys.stdout.write(f"SDK {kind} artifact contract: ok\n")
     return 0
 
 

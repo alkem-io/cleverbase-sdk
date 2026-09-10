@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 from release_registry import RegistryError, npm_status, pypi_provenance_valid, pypi_status
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_pypi_allows_only_missing_or_digest_identical_files(tmp_path: Path) -> None:

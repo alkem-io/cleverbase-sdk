@@ -10,16 +10,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+ARGUMENT_COUNT = 7
 
 
 class ManifestError(ValueError):
     """Release identity or artifact bytes do not match the manifest."""
 
 
-def _require(condition: bool, message: str) -> None:
+def _require(condition: bool, message: str) -> None:  # noqa: FBT001
     if not condition:
         raise ManifestError(message)
 
@@ -94,11 +94,10 @@ def verify_manifest(
 
 def main(argv: list[str]) -> int:
     """Run create or verify from CI."""
-    if len(argv) != 7 or argv[1] not in {"create", "verify"}:
-        print(
+    if len(argv) != ARGUMENT_COUNT or argv[1] not in {"create", "verify"}:
+        sys.stderr.write(
             "usage: sdk_artifact_manifest.py <create|verify> "
-            "<artifact-dir> <manifest> <version> <tag> <commit>",
-            file=sys.stderr,
+            "<artifact-dir> <manifest> <version> <tag> <commit>\n"
         )
         return 2
     command, directory, manifest, version, tag, commit = argv[1:]
@@ -108,9 +107,9 @@ def main(argv: list[str]) -> int:
         else:
             verify_manifest(Path(directory), Path(manifest), version, tag, commit)
     except (ManifestError, OSError, json.JSONDecodeError, KeyError) as error:
-        print(f"SDK artifact manifest failed: {error}", file=sys.stderr)
+        sys.stderr.write(f"SDK artifact manifest failed: {error}\n")
         return 1
-    print(f"SDK artifact manifest {command}: ok")
+    sys.stdout.write(f"SDK artifact manifest {command}: ok\n")
     return 0
 
 

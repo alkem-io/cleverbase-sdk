@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import tarfile
 import zipfile
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -16,6 +16,8 @@ from check_sdk_artifact import (
     check_python_wheel,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 VERSION = "0.3.3"
 NODE_FILES = {
@@ -29,8 +31,7 @@ NODE_FILES = {
         b"require('./cleverbase.linux-x64-gnu.node')\n"
     ),
     "package/package.json": (
-        b'{"name":"@alkemio/cleverbase-sdk","version":"0.3.3",'
-        b'"publishConfig":{"access":"public"}}'
+        b'{"name":"@alkemio/cleverbase-sdk","version":"0.3.3","publishConfig":{"access":"public"}}'
     ),
     "package/cleverbase.darwin-arm64.node": b"darwin-arm64",
     "package/cleverbase.darwin-x64.node": b"darwin-x64",

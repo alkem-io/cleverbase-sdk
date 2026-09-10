@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/sdk-release.yml"
 
@@ -54,7 +53,8 @@ def test_publish_jobs_are_tag_only_ordered_and_protected() -> None:
     assert "needs: publish-github" in text
     assert "needs: publish-pypi" in text
     assert "needs: publish-npm" in text
-    assert "gh release create" in text and "--draft" in text
+    assert "gh release create" in text
+    assert "--draft" in text
     assert "--draft=false" in text
     assert "--clobber" not in text
     assert "continue-on-error: true" not in text
