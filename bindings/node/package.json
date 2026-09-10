@@ -43,7 +43,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "napi build --platform",
+    "build": "napi build --platform --js false",
     "test": "node --test test/*.test.cjs",
     "docs": "typedoc"
   },
