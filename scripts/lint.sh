@@ -7,27 +7,22 @@
 # goconst/revive violation passes `go test` yet fails CI. This script closes that gap — run it (or the
 # pre-push hook that calls it) before pushing.
 #
-# Behavior: runs each language's checks if its tool is installed; a MISSING tool is a loud WARNING
-# (not a hard failure) so a dev without all four toolchains can still push — but CI remains the
-# authoritative gate. Any check that actually RUNS and fails makes this script exit non-zero.
-# Set CLEVERBASE_LINT_STRICT=1 to also fail on a missing tool (full CI parity).
+# Behavior: runs every available language check and fails closed when a required tool is missing.
+# This keeps the pre-push result aligned with CI instead of silently blessing an incomplete gate.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$(pwd)"
 FAILED=()
-WARNED=()
-strict="${CLEVERBASE_LINT_STRICT:-0}"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 section() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 # run <label> <cmd...>: run a check, record failure. The label is stripped before executing the cmd.
 run() { local label="$1"; shift; echo "+ $*"; if "$@"; then echo "  ok: $label"; else FAILED+=("$label: $*"); echo "  FAIL: $*"; fi; }
-# need <tool> <install-hint>: gate a tool; returns 1 (skip) if missing, recording a warn/fail.
+# need <tool> <install-hint>: gate a tool; returns 1 if missing and records the failure.
 need() {
   if have "$1"; then return 0; fi
-  WARNED+=("$1 not installed — $2")
-  if [ "$strict" = "1" ]; then FAILED+=("$1 missing (strict): $2"); fi
+  FAILED+=("$1 missing: $2")
   return 1
 }
 
@@ -95,7 +90,6 @@ if need go "install Go 1.22+"; then
 fi
 
 section "Summary"
-for w in "${WARNED[@]:-}"; do [ -n "$w" ] && printf '\033[33mSKIPPED\033[0m %s\n' "$w"; done
 if [ "${#FAILED[@]}" -gt 0 ]; then
   for f in "${FAILED[@]}"; do printf '\033[31mFAILED\033[0m  %s\n' "$f"; done
   echo ""
@@ -103,5 +97,4 @@ if [ "${#FAILED[@]}" -gt 0 ]; then
   exit 1
 fi
 printf '\033[32mAll ran lint checks passed.\033[0m\n'
-[ "${#WARNED[@]}" -gt 0 ] && echo "(some linters were skipped — install them, or set CLEVERBASE_LINT_STRICT=1, for full CI parity)"
 exit 0

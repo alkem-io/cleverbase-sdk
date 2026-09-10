@@ -5,11 +5,11 @@
 
 [package]
 name = "cleverbase-py"
-version = "0.1.0"
+version = "0.3.3"
 edition = "2021"
 license = "EUPL-1.2"
 repository = "https://github.com/alkem-io/cleverbase-sdk"
-readme = "../../README.md"
+readme = "README.md"
 documentation = "https://docs.rs/cleverbase-py"
 keywords = ["qes", "pades", "eidas", "signing", "pyo3"]
 categories = ["cryptography", "api-bindings"]

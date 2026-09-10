@@ -9,7 +9,7 @@ const {
   resumeRedirect,
   resumeRedirectError,
   validateConfig,
-} = require("../index.js");
+} = require("./load-sdk.cjs");
 
 const NOW = 1_700_000_000;
 const ENTROPY = Buffer.from(Array.from({ length: 16 }, (_, i) => i));

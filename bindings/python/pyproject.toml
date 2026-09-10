@@ -3,11 +3,17 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "cleverbase"
-version = "0.1.0"
+name = "alkemio-cleverbase-sdk"
+version = "0.3.3"
 description = "Cleverbase SDK — Python binding"
+readme = "README.md"
 license = "EUPL-1.2"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
+
+[project.urls]
+Repository = "https://github.com/alkem-io/cleverbase-sdk"
+Issues = "https://github.com/alkem-io/cleverbase-sdk/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
