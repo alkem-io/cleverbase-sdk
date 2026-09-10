@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -136,7 +136,7 @@ def test_manifest_rejects_nested_or_empty_artifact_sets(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     manifest = tmp_path / "sdk-artifacts.json"
-    with pytest.raises(ManifestError, match="no release artifacts"):
+    with pytest.raises(ManifestError, match="artifact set mismatch"):
         create_manifest(artifacts, manifest, "0.3.3", "bindings/go/v0.3.3", "d" * 40)
 
     nested = artifacts / "nested"

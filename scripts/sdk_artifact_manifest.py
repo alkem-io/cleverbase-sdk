@@ -13,6 +13,18 @@ from typing import Any
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 ARGUMENT_COUNT = 7
+NATIVE_PLATFORMS = (
+    "linux-amd64",
+    "linux-arm64",
+    "darwin-amd64",
+    "darwin-arm64",
+)
+PYTHON_WHEEL_TAGS = (
+    "cp39-abi3-manylinux_2_28_x86_64",
+    "cp39-abi3-manylinux_2_28_aarch64",
+    "cp39-abi3-macosx_11_0_x86_64",
+    "cp39-abi3-macosx_11_0_arm64",
+)
 
 
 class ManifestError(ValueError):
@@ -32,14 +44,38 @@ def _digest(path: Path) -> dict[str, Any]:
     return {"sha256": hasher.hexdigest(), "size": path.stat().st_size}
 
 
-def _artifacts(directory: Path, manifest: Path) -> dict[str, dict[str, Any]]:
+def _expected_artifact_names(version: str) -> set[str]:
+    native = {f"cleverbase-ffi-v{version}-{platform}.tar.gz" for platform in NATIVE_PLATFORMS}
+    return (
+        native
+        | {f"{name}.sha256" for name in native}
+        | {f"alkemio_cleverbase_sdk-{version}-{tag}.whl" for tag in PYTHON_WHEEL_TAGS}
+        | {
+            f"alkemio_cleverbase_sdk-{version}.tar.gz",
+            f"alkemio-cleverbase-sdk-{version}.tgz",
+        }
+    )
+
+
+def _artifacts(
+    directory: Path,
+    manifest: Path,
+    version: str,
+) -> dict[str, dict[str, Any]]:
     _require(directory.is_dir(), f"artifact directory not found: {directory}")
     entries = sorted(directory.iterdir(), key=lambda path: path.name)
     other_entries = [entry for entry in entries if entry.resolve() != manifest.resolve()]
-    _require(other_entries, "no release artifacts")
     _require(
         all(entry.is_file() and not entry.is_symlink() for entry in other_entries),
         "release artifacts must be top-level regular files",
+    )
+    actual = {entry.name for entry in other_entries}
+    expected = _expected_artifact_names(version)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    _require(
+        not missing and not unexpected,
+        f"artifact set mismatch: missing={missing}, unexpected={unexpected}",
     )
     return {entry.name: _digest(entry) for entry in other_entries}
 
@@ -60,7 +96,7 @@ def create_manifest(
         "version": version,
         "tag": tag,
         "commit": commit,
-        "artifacts": _artifacts(directory, manifest),
+        "artifacts": _artifacts(directory, manifest, version),
     }
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(
@@ -86,7 +122,7 @@ def verify_manifest(
     _require(tag == f"bindings/go/v{expected_version}", "manifest version mismatch")
     recorded = payload.get("artifacts")
     _require(isinstance(recorded, dict), "manifest artifact set is invalid")
-    current = _artifacts(directory, manifest)
+    current = _artifacts(directory, manifest, expected_version)
     _require(set(recorded) == set(current), "manifest artifact set mismatch")
     for name, expected in recorded.items():
         _require(expected == current[name], f"artifact digest mismatch: {name}")
