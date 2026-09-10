@@ -1,6 +1,6 @@
 {
-  "name": "@cleverbase/sdk",
-  "version": "0.1.0",
+  "name": "@alkemio/cleverbase-sdk",
+  "version": "0.3.3",
   "description": "Cleverbase SDK — Node/TypeScript binding",
   "license": "EUPL-1.2",
   "main": "index.js",

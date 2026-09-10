@@ -154,7 +154,7 @@ def synchronize() -> None:
     package_path = ROOT / "bindings/node/package.json"
     package = json.loads(package_path.read_text(encoding="utf-8"))
     package["name"] = "@alkemio/cleverbase-sdk"
-    package_path.write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+    package_path.write_text(json.dumps(package, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     subprocess.run(
         ["npm", "install", "--package-lock-only", "--ignore-scripts"],
         cwd=ROOT / "bindings/node",
@@ -167,7 +167,7 @@ def synchronize() -> None:
         ROOT / "bindings/node/Cargo.toml",
     ):
         subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", str(manifest)],
+            ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(manifest)],
             cwd=ROOT,
             check=True,
             stdout=subprocess.DEVNULL,
