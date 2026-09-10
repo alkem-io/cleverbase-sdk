@@ -14,6 +14,19 @@ YEAR_0000_START = -62_167_219_200
 YEAR_9999_END = 253_402_300_799
 
 
+def test_host_context_contract_is_documented() -> None:
+    assert cleverbase.begin_signing.__doc__ is not None
+    assert "UTC year in 0000..9999" in cleverbase.begin_signing.__doc__
+    assert "at least 16 fresh random bytes" in cleverbase.begin_signing.__doc__
+    for resume in (
+        cleverbase.resume_redirect,
+        cleverbase.resume_redirect_error,
+        cleverbase.resume_http,
+    ):
+        assert resume.__doc__ is not None
+        assert "begin_signing's host-context contract" in resume.__doc__
+
+
 def test_verify_pdf_returns_typed_valid_verdict() -> None:
     verdict = cleverbase.verify_pdf(VALID_BT_PDF.read_bytes())
 
