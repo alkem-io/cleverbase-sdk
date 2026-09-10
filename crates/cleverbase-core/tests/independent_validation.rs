@@ -947,6 +947,10 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
                 evidence.outcome,
                 cleverbase_core::SigningOutcome::TimestampFailed
             );
+            assert_eq!(
+                evidence.failure_reason.as_deref(),
+                Some("timestamp imprint does not match the signature")
+            );
         }
         other => panic!("expected TimestampFailed, got {other:?}"),
     }
