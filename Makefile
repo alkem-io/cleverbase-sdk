@@ -1,7 +1,7 @@
 # Repo-root helper targets. The authoritative build recipes live in the per-language manifests
 # and in scripts/; this Makefile is a thin, discoverable entry point.
 
-.PHONY: help docs docs-clean go-test binding-coverage
+.PHONY: help docs docs-clean go-test binding-coverage sdk-version-check
 
 FFI_DEBUG_DIR := $(CURDIR)/target/debug
 
@@ -26,3 +26,6 @@ binding-coverage: ## run the public-surface gates (Python/Go >=95%, Node >=93%)
 	./scripts/test-binding-coverage.sh python
 	./scripts/test-binding-coverage.sh node
 	./scripts/test-binding-coverage.sh go
+
+sdk-version-check: ## verify one shared public SDK version across every binding
+	python3 scripts/sdk-version.py check
