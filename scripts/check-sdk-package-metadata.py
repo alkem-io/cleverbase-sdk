@@ -86,7 +86,7 @@ def main() -> int:
         "Python distribution name": r'(?m)^name = "alkemio-cleverbase-sdk"$',
         "Python package version": rf'(?m)^version = "{re.escape(version)}"$',
         "Python README metadata": r'(?m)^readme = "../../README.md"$',
-        "Python license file": r'(?m)^license = \{ file = "../../LICENSE" \}$',
+        "Python license metadata": r'(?m)^license = "EUPL-1\.2"$',
         "Python repository URL": (
             r'(?ms)^\[project\.urls\]\s*$.*?^Repository = '
             r'"https://github.com/alkem-io/cleverbase-sdk"$'
