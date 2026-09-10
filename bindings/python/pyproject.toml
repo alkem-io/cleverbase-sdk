@@ -6,11 +6,17 @@ build-backend = "maturin"
 name = "alkemio-cleverbase-sdk"
 version = "0.3.3"
 description = "Cleverbase SDK — Python binding"
-license = "EUPL-1.2"
+readme = "../../README.md"
+license = { file = "../../LICENSE" }
 requires-python = ">=3.9"
+
+[project.urls]
+Repository = "https://github.com/alkem-io/cleverbase-sdk"
+Issues = "https://github.com/alkem-io/cleverbase-sdk/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+include = ["cleverbase.pyi"]
 
 [tool.mypy]
 # Strictest practical type checking for the Python binding (tests + stub). Run from this

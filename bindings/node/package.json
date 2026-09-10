@@ -3,10 +3,41 @@
   "version": "0.3.3",
   "description": "Cleverbase SDK — Node/TypeScript binding",
   "license": "EUPL-1.2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alkem-io/cleverbase-sdk.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/alkem-io/cleverbase-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/alkem-io/cleverbase-sdk/issues"
+  },
   "main": "index.js",
   "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "cleverbase.darwin-arm64.node",
+    "cleverbase.darwin-x64.node",
+    "cleverbase.linux-arm64-gnu.node",
+    "cleverbase.linux-x64-gnu.node",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "napi": {
-    "name": "cleverbase"
+    "name": "cleverbase",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ]
+    }
   },
   "engines": {
     "node": ">=18"

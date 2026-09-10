@@ -60,6 +60,23 @@ def main() -> int:
     )
     require(errors, node.get("files") == NODE_FILES, "npm exact files allow-list")
     require(errors, node.get("publishConfig") == {"access": "public"}, "npm public publish config")
+    require(
+        errors,
+        node.get("napi")
+        == {
+            "name": "cleverbase",
+            "triples": {
+                "defaults": False,
+                "additional": [
+                    "x86_64-unknown-linux-gnu",
+                    "aarch64-unknown-linux-gnu",
+                    "x86_64-apple-darwin",
+                    "aarch64-apple-darwin",
+                ],
+            },
+        },
+        "npm advertised native target allow-list",
+    )
 
     loader = (ROOT / "bindings/node/index.js").read_text(encoding="utf-8")
     require(errors, "@cleverbase/" not in loader, "generated Node loader has legacy @cleverbase fallbacks")
