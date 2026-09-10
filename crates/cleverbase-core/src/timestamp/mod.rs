@@ -275,29 +275,47 @@ mod tests {
     #[test]
     fn request_is_wellformed_der() {
         let imprint = sha256(b"a signature value");
-        let der = build_request(&imprint, None).unwrap();
+        let nonce = [0x80, 0x01];
+        let der = build_request(&imprint, None, &nonce).unwrap();
         // SEQUENCE
         assert_eq!(der[0], 0x30);
-        // round-trips back to the same structure (version + imprint + certReq).
+        // round-trips back to the same structure (version + imprint + nonce + certReq).
         let back = TimeStampReq::from_der(&der).unwrap();
         assert_eq!(back.version, 1);
         assert!(back.cert_req);
         assert!(back.req_policy.is_none());
         assert_eq!(back.message_imprint.hashed_message.as_bytes(), &imprint);
+        assert_eq!(back.nonce.unwrap().as_bytes(), nonce);
     }
 
     #[test]
     fn request_carries_policy_oid() {
         let imprint = sha256(b"x");
-        let der = build_request(&imprint, Some("1.3.6.1.4.1.99999.1.1")).unwrap();
+        let nonce = nonce_from_entropy(&[0u8; 16]);
+        let der = build_request(
+            &imprint,
+            Some("1.3.6.1.4.1.99999.1.1"),
+            &nonce,
+        )
+        .unwrap();
         let back = TimeStampReq::from_der(&der).unwrap();
         assert_eq!(
             back.req_policy.unwrap().to_string(),
             "1.3.6.1.4.1.99999.1.1"
         );
         assert!(back.cert_req);
+        assert_eq!(back.nonce.unwrap().as_bytes(), [1]);
         // An invalid policy OID is rejected, not silently dropped.
-        assert!(build_request(&imprint, Some("not-an-oid")).is_err());
+        assert!(build_request(&imprint, Some("not-an-oid"), &nonce).is_err());
+    }
+
+    #[test]
+    fn nonce_from_entropy_is_positive_and_canonical() {
+        assert_eq!(nonce_from_entropy(&[0u8; 16]), vec![1]);
+        assert_eq!(
+            nonce_from_entropy(&[0, 0, 0x80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+            vec![0x80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
     }
 
     #[test]

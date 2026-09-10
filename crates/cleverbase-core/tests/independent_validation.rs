@@ -42,6 +42,8 @@ const BT_ECDSA_TOKEN: &[u8] =
 const BT_ECDSA_PDF: &[u8] = include_bytes!("../../../tests/fixtures/pades-bt/ecdsa-p256.pdf");
 const BT_WRONG_IMPRINT_RESPONSE: &[u8] =
     include_bytes!("../../../tests/fixtures/pades-bt/wrong-imprint.tsr");
+const BT_MISSING_NONCE_RESPONSE: &[u8] =
+    include_bytes!("../../../tests/fixtures/pades-bt/missing-nonce.tsr");
 
 /// Signature algorithm the harness drives end-to-end. ONE parametrized producer path covers both
 /// arms (FR-004) — no RSA/ECDSA copy-paste. Each arm pins the matching CSC API base, the
@@ -861,6 +863,7 @@ fn regenerate_pades_bt_fixtures() {
     let wrong_request = cleverbase_core::timestamp::build_request(
         &cleverbase_core::crypto::sha256(b"some unrelated bytes"),
         None,
+        &[1],
     )
     .unwrap();
     std::fs::write(
@@ -930,6 +933,47 @@ fn b_t_rejects_timestamp_with_wrong_imprint() {
         }
         other => panic!("expected TimestampFailed, got {other:?}"),
     }
+}
+
+#[test]
+fn b_t_requires_the_timestamp_response_to_echo_the_exact_nonce() {
+    let (handle, _tsa_req) = drive_bt_to_timestamp(KeyAlgo::Rsa);
+    assert!(handle.timestamp_nonce.is_some());
+
+    let (missing_handle, missing_step) = resume(
+        handle.clone(),
+        http_ok_bytes(BT_MISSING_NONCE_RESPONSE.to_vec()),
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(missing_handle.phase, cleverbase_core::SigningPhase::Failed);
+    assert_eq!(
+        match missing_step {
+            Step::Failed { evidence } => evidence.outcome,
+            other => panic!("expected TimestampFailed, got {other:?}"),
+        },
+        cleverbase_core::SigningOutcome::TimestampFailed
+    );
+
+    let mut mismatched = handle;
+    mismatched.timestamp_nonce = Some(vec![0xff]);
+    let (mismatched_handle, mismatched_step) = resume(
+        mismatched,
+        http_ok_bytes(BT_RSA_RESPONSE.to_vec()),
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(
+        mismatched_handle.phase,
+        cleverbase_core::SigningPhase::Failed
+    );
+    assert_eq!(
+        match mismatched_step {
+            Step::Failed { evidence } => evidence.outcome,
+            other => panic!("expected TimestampFailed, got {other:?}"),
+        },
+        cleverbase_core::SigningOutcome::TimestampFailed
+    );
 }
 
 #[test]
