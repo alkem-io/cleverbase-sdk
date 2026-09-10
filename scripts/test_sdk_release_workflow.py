@@ -82,6 +82,7 @@ def test_complete_release_cryptographically_verifies_registry_attestations() -> 
     npm_attestation = complete_job.index("npm audit signatures")
     release_completion = complete_job.index('gh release edit "$RELEASE_TAG" --draft=false')
 
+    assert 'python-version: "3.12"' in complete_job
     assert "pypi-attestations==0.0.30" in complete_job
     assert 'for artifact in "$python_dir"/*; do' in complete_job
     assert "--repository https://github.com/alkem-io/cleverbase-sdk" in complete_job
