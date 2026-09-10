@@ -1060,6 +1060,33 @@ mod tests {
     }
 
     #[test]
+    fn host_context_year_must_fit_the_pdf_date_format() {
+        const YEAR_0000_START: i64 = -62_167_219_200;
+        const YEAR_9999_END: i64 = 253_402_300_799;
+
+        for now_unix in [YEAR_0000_START, YEAR_9999_END] {
+            let mut context = ctx();
+            context.now_unix = now_unix;
+            assert!(begin(request(ConformanceLevel::BB, None), cfg(), context).is_ok());
+        }
+
+        for now_unix in [YEAR_0000_START - 1, YEAR_9999_END + 1] {
+            let mut context = ctx();
+            context.now_unix = now_unix;
+            assert!(matches!(
+                begin(request(ConformanceLevel::BB, None), cfg(), context.clone()),
+                Err(CoreError::InvalidConfig(_))
+            ));
+
+            let (handle, _) = begin(request(ConformanceLevel::BB, None), cfg(), ctx()).unwrap();
+            assert!(matches!(
+                resume(handle, http_err(200), context),
+                Err(CoreError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
     fn upstream_base_url_drives_oauth_and_csc_effects() {
         let origin = "https://trust-driver-stub-hash-signing.cleverbase.com";
         let mut config = cfg();
