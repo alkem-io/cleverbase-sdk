@@ -66,12 +66,23 @@ go_coverage() {
   export CGO_LDFLAGS="-L$repo_root/target/debug"
   export LD_LIBRARY_PATH="$repo_root/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   export DYLD_LIBRARY_PATH="$repo_root/target/debug${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+  local coverage_tmp
+  coverage_tmp="$(mktemp -d)"
+  trap 'rm -rf "$coverage_tmp"' RETURN
+  local normal_cov="$coverage_tmp/normal"
+  local fault_cov="$coverage_tmp/fault"
+  local merged_cov="$coverage_tmp/merged"
+  local fault_lib="$coverage_tmp/fault-lib"
+  mkdir -p "$normal_cov" "$fault_cov" "$merged_cov" "$fault_lib"
   (
     cd bindings/go
-    go test -coverprofile=cover.out ./...
-
     test_binary="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cleverbase-go.test"
-    go test -c -o "$test_binary" .
+    go test -c \
+      -cover \
+      -coverpkg=github.com/alkem-io/cleverbase-sdk/bindings/go \
+      -o "$test_binary" \
+      .
+    "$test_binary" -test.v -test.gocoverdir="$normal_cov"
     if command -v readelf >/dev/null; then
       loader_metadata="$(readelf -d "$test_binary")"
       checkout_path="$(printf '%s\n' "$loader_metadata" \
@@ -96,6 +107,48 @@ go_coverage() {
       exit 1
     fi
 
+    case "$(uname -s)" in
+      Darwin)
+        fault_library="$fault_lib/libcleverbase_ffi.dylib"
+        cc -std=c11 -Wall -Wextra -Werror -dynamiclib \
+          -Wl,-install_name,@rpath/libcleverbase_ffi.dylib \
+          -o "$fault_library" \
+          "$repo_root/tests/fixtures/go-ffi-faults/cleverbase_ffi.c"
+        ;;
+      Linux)
+        fault_library="$fault_lib/libcleverbase_ffi.so"
+        cc -std=c11 -Wall -Wextra -Werror -shared -fPIC \
+          -o "$fault_library" \
+          "$repo_root/tests/fixtures/go-ffi-faults/cleverbase_ffi.c"
+        ;;
+      *)
+        echo "unsupported coverage host: $(uname -s)" >&2
+        exit 1
+        ;;
+    esac
+    [[ -f "$fault_library" ]] || { echo "ABI fault fixture was not built" >&2; exit 1; }
+
+    fault_consumer="$coverage_tmp/fault-consumer"
+    CGO_LDFLAGS="-L$fault_lib" go build \
+      -cover \
+      -coverpkg=github.com/alkem-io/cleverbase-sdk/bindings/go,github.com/alkem-io/cleverbase-sdk/bindings/go/testdata/fault-consumer \
+      -o "$fault_consumer" \
+      ./testdata/fault-consumer
+    for fault in \
+      nonzero oversized invalid_cbor wrong_schema missing_config missing_ok missing_verify
+    do
+      CLEVERBASE_FFI_FAULT="$fault" \
+        GOCOVERDIR="$fault_cov" \
+        LD_LIBRARY_PATH="$fault_lib" \
+        DYLD_LIBRARY_PATH="$fault_lib" \
+        "$fault_consumer"
+    done
+
+    go tool covdata merge -i="$normal_cov,$fault_cov" -o="$merged_cov"
+    go tool covdata textfmt \
+      -i="$merged_cov" \
+      -pkg=github.com/alkem-io/cleverbase-sdk/bindings/go \
+      -o=cover.out
     total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
     echo "Go binding statement coverage: ${total}%"
     awk "BEGIN { exit !(${total} >= ${minimum}) }" || {
