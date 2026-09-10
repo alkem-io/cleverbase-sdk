@@ -1734,6 +1734,15 @@ mod tests {
             Step::Done { signed, evidence } => {
                 assert_eq!(signed.conformance_level, ConformanceLevel::BB);
                 lopdf::Document::load_mem(&signed.pdf).expect("signed PDF loads");
+                let pdf_text = String::from_utf8_lossy(&signed.pdf);
+                assert!(
+                    pdf_text.contains("/M (D:20231114221320Z)"),
+                    "PAdES requires the claimed UTC signing time in /M"
+                );
+                assert!(
+                    pdf_text.contains("/Name (Jane Doe)"),
+                    "the certificate CN must identify the signer in PDF viewers"
+                );
                 assert_eq!(evidence.outcome, SigningOutcome::Signed);
                 assert_eq!(evidence.signer.unwrap().serial_number, "PNONL-123");
                 // The embedded CMS verifies over the ByteRange digest.

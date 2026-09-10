@@ -167,3 +167,16 @@ fn multiple_signature_dictionaries_are_explicitly_unsupported() {
         vec![VerificationReason::MultipleSignaturesUnsupported]
     );
 }
+
+#[test]
+fn real_pre_fix_acceptance_pdf_is_rejected_as_nonconformant() {
+    let pdf = include_bytes!(
+        "../../../tests/fixtures/pades-conformance/cleverbase-acceptance-dev-2026-09-10.pdf"
+    );
+    let verdict = verify_pdf(pdf);
+    assert!(!verdict.integrity);
+    assert_eq!(
+        verdict.reasons,
+        vec![VerificationReason::MalformedByteRange]
+    );
+}

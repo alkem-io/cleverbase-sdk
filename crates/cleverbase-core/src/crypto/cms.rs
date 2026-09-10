@@ -974,6 +974,32 @@ mod tests {
     }
 
     #[test]
+    fn pades_rejects_the_cms_signing_time_attribute() {
+        let cms = valid_rsa_cms();
+        let with_signing_time = rewrite_signed_data(&cms, |_, signed_data| {
+            rewrite_signer_info(signed_data, |signer_info| {
+                replace_signed_attribute(
+                    signer_info,
+                    ID_SIGNING_TIME,
+                    Some(
+                        single_value_attr(
+                            ID_SIGNING_TIME,
+                            signing_time_value(1_700_000_000).unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                );
+            });
+        });
+        assert!(matches!(
+            verify_signed_data_auto(&with_signing_time),
+            Err(CmsError::Structure(
+                "PAdES CMS signing-time attribute is forbidden"
+            ))
+        ));
+    }
+
+    #[test]
     fn verifier_rejects_ambiguous_timestamp_attribute() {
         let cms = valid_rsa_cms();
         let ambiguous_timestamp = rewrite_signed_data(&cms, |_, signed_data| {

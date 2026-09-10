@@ -657,6 +657,20 @@ mod tests {
         let prep = prepare(&minimal_pdf(), Some("Approval"), Some("NL"), None).unwrap();
         Document::load_mem(&prep.staged_pdf).unwrap();
 
+        let (contents_start, contents_end) = prep.contents_span;
+        let expected_byte_range = format!(
+            "0 {} {} {}",
+            contents_start - 1,
+            contents_end + 1,
+            prep.staged_pdf.len() - contents_end - 1
+        );
+        assert!(
+            prep.staged_pdf
+                .windows(expected_byte_range.len())
+                .any(|window| window == expected_byte_range.as_bytes()),
+            "ByteRange must exclude the complete <...> /Contents string"
+        );
+
         let attrs = cms::build_signed_attrs(&prep.content_hash, RSA_CERT, 1_700_000_000).unwrap();
         let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
         let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(key);
