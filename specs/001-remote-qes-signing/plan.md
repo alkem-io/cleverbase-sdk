@@ -136,7 +136,7 @@ crates/
 
 bindings/
 ├── python/                  # PyO3 + maturin → `cleverbase`
-├── node/                    # napi-rs → `@alkemio/cleverbase-sdk` (+ bundled WASM)
+├── node/                    # napi-rs → `@alkemio/cleverbase-sdk`
 └── go/                      # cgo over cleverbase-ffi → `cleverbase`
 
 frontend/

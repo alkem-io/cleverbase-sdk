@@ -723,6 +723,11 @@ jobs:
           cp dist/alkemio_cleverbase_sdk-*.whl "$python_dir/"
           cp "dist/alkemio_cleverbase_sdk-${version}.tar.gz" "$python_dir/"
           python scripts/release_registry.py pypi verify "$python_dir" "$version"
+          python -m pip install pypi-attestations==0.0.30
+          for artifact in "$python_dir"/*; do
+            pypi-attestations verify pypi "$artifact" \
+              --repository https://github.com/alkem-io/cleverbase-sdk
+          done
           python scripts/release_registry.py npm verify \
             "dist/alkemio-cleverbase-sdk-${version}.tgz" "$version"
           for artifact in dist/*; do
@@ -738,6 +743,10 @@ jobs:
           npm install --prefix "$clean_node" \
             "@alkemio/cleverbase-sdk@${version}"
           node -e "require('$clean_node/node_modules/@alkemio/cleverbase-sdk')"
+          (
+            cd "$clean_node"
+            npm audit signatures
+          )
           go mod download "github.com/alkem-io/cleverbase-sdk/bindings/go@v${version}"
       - name: Complete the release
         env:
