@@ -140,6 +140,8 @@ Running the packaging contract locally on macOS requires GNU tar (`brew install 
 - Adds a positive RFC 3161 nonce to every timestamp request, derived from host entropy with the
   `rfc3161-nonce` domain label. The nonce persists only while the timestamp effect is pending and
   the response must echo it exactly before the message imprint is accepted.
+- Extends the shared configuration validator to reject malformed TSA URLs before a session starts;
+  the request-dependent B-T-requires-TSA rule remains in `Begin`.
 - Emits the PAdES baseline signature dictionary with `/M` fixed from the host clock and `/Name` from
   the non-empty embedded leaf-certificate common name, while omitting the forbidden CMS signing-time
   signed attribute. Host times outside the four-digit PDF year range are rejected before signing.
@@ -162,8 +164,8 @@ Running the packaging contract locally on macOS requires GNU tar (`brew install 
 - Uses the Rust core's existing configuration validator through the versioned CBOR ABI; `Begin`
   retains the same validation as defense in depth, and Go shares one configuration encoder across
   both calls.
-- The config-only operation validates a configured TSA URL but cannot enforce the request-dependent
-  B-T-requires-TSA rule; `Begin` remains the single place that combines request and configuration.
+- The config-only operation cannot enforce the request-dependent B-T-requires-TSA rule and does not
+  yet validate TSA URL syntax; that validation boundary is tracked in [#36](https://github.com/alkem-io/cleverbase-sdk/issues/36).
 
 #### v0.3.0 release notes
 
