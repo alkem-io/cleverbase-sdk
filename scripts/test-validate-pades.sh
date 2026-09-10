@@ -36,6 +36,45 @@ if [ ! -x "$GATE" ]; then
   fail "gate script not found or not executable: $GATE"
 fi
 
+# Exercise the pdfsig-output decision through the real gate without depending on a locally installed
+# validator. The fake emits captured C-locale output shapes; all other optional backends are hidden.
+PDFSIG_FIXTURE_DIR="$REPO_ROOT/tests/fixtures/pades-conformance"
+FAKE_PDFSIG_DIR="$(mktemp -d)"
+cat >"$FAKE_PDFSIG_DIR/pdfsig" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-v" ]; then
+  printf '%s\n' 'pdfsig fixture'
+  exit 0
+fi
+cat "$PDFSIG_FIXTURE"
+SH
+chmod +x "$FAKE_PDFSIG_DIR/pdfsig"
+
+run_pdfsig_fixture() {
+  local fixture="$1"
+  PDFSIG_FIXTURE="$PDFSIG_FIXTURE_DIR/$fixture" \
+    PATH="$FAKE_PDFSIG_DIR:/usr/bin:/bin" \
+    PYHANKO_VENV="/nonexistent" \
+    CONTAINER_ENGINE="/nonexistent" \
+    "$GATE" --expect-level B-B \
+      --trust "$REPO_ROOT/tests/fixtures/pki/ca.cert.der" \
+      "$REPO_ROOT/tests/fixtures/pades-conformance/cleverbase-acceptance-dev-2026-09-10.pdf"
+}
+
+if run_pdfsig_fixture "pdfsig-mixed-signatures.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "pdfsig markers from different signature blocks were combined into a false pass"
+fi
+if ! run_pdfsig_fixture "pdfsig-valid-complete.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "a valid full-document signature block was rejected"
+fi
+if run_pdfsig_fixture "pdfsig-missing-marker.txt"; then
+  rm -rf "$FAKE_PDFSIG_DIR"
+  fail "a signature block missing full-document coverage was accepted"
+fi
+rm -rf "$FAKE_PDFSIG_DIR"
+
 # ---------------------------------------------------------------------------------------------------
 # Self-skip when no independent signature validator is available. pyHanko and pdfsig both prove the
 # signature covers the complete document; EU DSS alone asserts the structural level, not integrity.

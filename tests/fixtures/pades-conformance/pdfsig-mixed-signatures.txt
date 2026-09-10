@@ -1,0 +1,7 @@
+Digital Signature Info of: mixed.pdf
+Signature #1:
+  - Signature Validation: Signature is Valid.
+  - Not total document signed
+Signature #2:
+  - Signature Validation: Signature is Invalid.
+  - Total document signed
