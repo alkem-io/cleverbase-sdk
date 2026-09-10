@@ -321,6 +321,34 @@ mod tests {
     use super::*;
     use crate::crypto::sha256;
 
+    fn token_with_tst_info_fields(fields: &[u8]) -> Vec<u8> {
+        let mut tst_info = vec![0x30, u8::try_from(fields.len()).unwrap()];
+        tst_info.extend_from_slice(fields);
+        let mut content_info = ContentInfo::from_der(include_bytes!(
+            "../../../../tests/fixtures/pades-bt/rsa-token.der"
+        ))
+        .unwrap();
+        let mut signed_data =
+            SignedData::from_der(&content_info.content.to_der().unwrap()).unwrap();
+        signed_data.encap_content_info.econtent =
+            Some(Any::from_der(&OctetString::new(tst_info).unwrap().to_der().unwrap()).unwrap());
+        content_info.content = Any::from_der(&signed_data.to_der().unwrap()).unwrap();
+        content_info.to_der().unwrap()
+    }
+
+    fn tst_info_fields(nonce: &[u8]) -> Vec<u8> {
+        let mut fields = vec![
+            0x02, 0x01, 0x01, // version
+            0x06, 0x02, 0x2a, 0x03, // policy 1.2.3
+            0x30, 0x00, // messageImprint (shape is enough for this field-order parser)
+            0x02, 0x01, 0x01, // serialNumber
+            0x18, 0x0f, // genTime
+        ];
+        fields.extend_from_slice(b"20260910000000Z");
+        fields.extend_from_slice(nonce);
+        fields
+    }
+
     #[test]
     fn request_is_wellformed_der() {
         let imprint = sha256(b"a signature value");
@@ -366,11 +394,31 @@ mod tests {
 
     #[test]
     fn nonce_from_entropy_is_positive_and_canonical() {
-        assert_eq!(nonce_from_entropy(&[0u8; 16]), vec![1]);
+        let entropy = (0u8..32).collect::<Vec<_>>();
         assert_eq!(
-            nonce_from_entropy(&[0, 0, 0x80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
-            vec![0x80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            nonce_from_entropy(&entropy),
+            vec![
+                0x45, 0xaf, 0x09, 0xd5, 0xfd, 0x39, 0x14, 0xda, 0xe6, 0xaa, 0x23, 0x7f, 0x37, 0x27,
+                0xba, 0x80,
+            ]
         );
+        assert_ne!(nonce_from_entropy(&entropy), entropy[..16]);
+    }
+
+    #[test]
+    fn nonce_parser_rejects_zero_and_unexpected_tst_info_field_order() {
+        let zero_nonce = token_with_tst_info_fields(&tst_info_fields(&[0x02, 0x01, 0x00]));
+        assert_eq!(parse_nonce(&zero_nonce), None);
+
+        let mut wrong_order = vec![
+            0x02, 0x01, 0x01, // version
+            0x06, 0x02, 0x2a, 0x03, // policy
+            0x30, 0x00, // messageImprint
+            0x18, 0x0f, // genTime appears where serialNumber is required
+        ];
+        wrong_order.extend_from_slice(b"20260910000000Z");
+        let token = token_with_tst_info_fields(&wrong_order);
+        assert_eq!(parse_nonce(&token), None);
     }
 
     #[test]

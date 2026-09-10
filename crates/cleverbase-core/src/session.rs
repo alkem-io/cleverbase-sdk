@@ -150,4 +150,22 @@ mod tests {
         let back: SigningSessionHandle = ciborium::from_reader(&buf[..]).unwrap();
         assert_eq!(h, back);
     }
+
+    #[test]
+    fn timestamp_pending_handle_roundtrips_its_nonce() {
+        let mut handle = SigningSessionHandle::terminal(
+            SigningPhase::TimestampPending,
+            "abcd".into(),
+            ConformanceLevel::BT,
+            "corr-1".into(),
+        );
+        handle.timestamp_nonce = Some(vec![0x80, 0x01]);
+
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&handle, &mut cbor).unwrap();
+        let restored: SigningSessionHandle = ciborium::from_reader(cbor.as_slice()).unwrap();
+
+        assert_eq!(restored.phase, SigningPhase::TimestampPending);
+        assert_eq!(restored.timestamp_nonce, Some(vec![0x80, 0x01]));
+    }
 }
