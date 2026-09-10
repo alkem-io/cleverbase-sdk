@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,13 +18,21 @@ PYPI_PACKAGE = "alkemio-cleverbase-sdk"
 NPM_PACKAGE = "@alkemio/cleverbase-sdk"
 SLSA_PROVENANCE = "https://slsa.dev/provenance/v1"
 HTTP_NOT_FOUND = 404
+HTTP_TOO_MANY_REQUESTS = 429
+HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVER_ERROR_MAX = 600
 MINIMUM_PYTHON_ARTIFACTS = 2
 ARGUMENT_COUNT = 5
 ALLOWED_REGISTRY_HOSTS = {"pypi.org", "registry.npmjs.org"}
+VERIFY_BACKOFF_SECONDS = (0, 2, 5, 10)
 
 
 class RegistryError(ValueError):
     """Published bytes or provenance differ from the intended release."""
+
+
+class RegistryVisibilityPendingError(RegistryError):
+    """A registry has not made a just-published HTTP resource visible yet."""
 
 
 def _require(condition: bool, message: str) -> None:  # noqa: FBT001
@@ -147,25 +156,38 @@ def _http_json(url: str, *, allow_missing: bool = False, accept: str | None = No
         if allow_missing and error.code == HTTP_NOT_FOUND:
             return None
         msg = f"registry request failed with HTTP {error.code}: {url}"
+        if (
+            error.code in {HTTP_NOT_FOUND, HTTP_TOO_MANY_REQUESTS}
+            or HTTP_SERVER_ERROR_MIN <= error.code < HTTP_SERVER_ERROR_MAX
+        ):
+            raise RegistryVisibilityPendingError(msg) from error
         raise RegistryError(msg) from error
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+    except TimeoutError as error:
+        msg = f"registry request timed out: {url}"
+        raise RegistryVisibilityPendingError(msg) from error
+    except urllib.error.URLError as error:
+        msg = f"registry request failed: {url}: {error}"
+        if isinstance(error.reason, TimeoutError):
+            raise RegistryVisibilityPendingError(msg) from error
+        raise RegistryError(msg) from error
+    except json.JSONDecodeError as error:
         msg = f"registry request failed: {url}: {error}"
         raise RegistryError(msg) from error
 
 
-def _pypi_metadata(version: str) -> dict[str, Any] | None:
+def _pypi_metadata(version: str, *, allow_missing: bool) -> dict[str, Any] | None:
     payload = _http_json(
         f"https://pypi.org/pypi/{PYPI_PACKAGE}/{version}/json",
-        allow_missing=True,
+        allow_missing=allow_missing,
     )
     return cast("dict[str, Any] | None", payload)
 
 
-def _npm_metadata(version: str) -> dict[str, Any] | None:
+def _npm_metadata(version: str, *, allow_missing: bool) -> dict[str, Any] | None:
     package = urllib.parse.quote(NPM_PACKAGE, safe="@")
     payload = _http_json(
         f"https://registry.npmjs.org/{package}/{version}",
-        allow_missing=True,
+        allow_missing=allow_missing,
         accept="application/vnd.npm.install-v1+json",
     )
     return cast("dict[str, Any] | None", payload)
@@ -192,6 +214,46 @@ def _verify_pypi_provenance(payload: dict[str, Any], version: str) -> None:
         )
 
 
+def _reconcile_once(registry: str, operation: str, artifact: str, version: str) -> str:
+    if registry == "pypi":
+        payload = _pypi_metadata(version, allow_missing=operation == "preflight")
+        status = pypi_status(Path(artifact), version, payload)
+        if operation == "verify":
+            _require(status == "present" and payload is not None, "PyPI release is incomplete")
+            _verify_pypi_provenance(payload, version)
+        return status
+
+    payload = _npm_metadata(version, allow_missing=operation == "preflight")
+    status = npm_status(
+        Path(artifact),
+        version,
+        payload,
+        require_provenance=operation == "verify",
+    )
+    if operation == "verify":
+        attestations = payload["dist"]["attestations"]
+        response = _http_json(attestations["url"])
+        _require(isinstance(response, dict) and bool(response), "npm attestation is empty")
+    return status
+
+
+def _reconcile(registry: str, operation: str, artifact: str, version: str) -> str:
+    if operation != "verify":
+        return _reconcile_once(registry, operation, artifact, version)
+
+    last_error = RegistryVisibilityPendingError("registry verification did not run")
+    # Registries can briefly return a transient HTTP status after accepting a publication. This
+    # fixed verify-only allowance never retries publication, rebuilds, or semantic mismatches.
+    for delay in VERIFY_BACKOFF_SECONDS:
+        if delay:
+            time.sleep(delay)
+        try:
+            return _reconcile_once(registry, operation, artifact, version)
+        except RegistryVisibilityPendingError as error:
+            last_error = error
+    raise last_error
+
+
 def main(argv: list[str]) -> int:
     """Run one preflight or post-publication registry check."""
     if (
@@ -211,24 +273,7 @@ def main(argv: list[str]) -> int:
 
     registry, operation, artifact, version = argv[1:]
     try:
-        if registry == "pypi":
-            payload = _pypi_metadata(version)
-            status = pypi_status(Path(artifact), version, payload)
-            if operation == "verify":
-                _require(status == "present" and payload is not None, "PyPI release is incomplete")
-                _verify_pypi_provenance(payload, version)
-        else:
-            payload = _npm_metadata(version)
-            status = npm_status(
-                Path(artifact),
-                version,
-                payload,
-                require_provenance=operation == "verify",
-            )
-            if operation == "verify":
-                attestations = payload["dist"]["attestations"]
-                response = _http_json(attestations["url"])
-                _require(isinstance(response, dict) and bool(response), "npm attestation is empty")
+        status = _reconcile(registry, operation, artifact, version)
     except (RegistryError, OSError, KeyError, TypeError) as error:
         sys.stderr.write(f"SDK registry reconciliation failed: {error}\n")
         return 1

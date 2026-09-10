@@ -27,6 +27,7 @@ NODE_NATIVE_FILES = {
     "cleverbase.linux-arm64-gnu.node",
     "cleverbase.linux-x64-gnu.node",
 }
+AUTHORITATIVE_LICENSE = (Path(__file__).resolve().parents[1] / "LICENSE").read_bytes()
 NODE_MEMBERS = {
     "package/LICENSE",
     "package/README.md",
@@ -75,13 +76,19 @@ def check_node_tarball(path: Path, version: str) -> None:
         _require(members == NODE_MEMBERS, "npm tarball has unexpected members")
         package_file = archive.extractfile("package/package.json")
         loader_file = archive.extractfile("package/index.js")
-        _require(package_file is not None and loader_file is not None, "npm metadata is unreadable")
+        license_file = archive.extractfile("package/LICENSE")
+        _require(
+            package_file is not None and loader_file is not None and license_file is not None,
+            "npm metadata is unreadable",
+        )
         package = json.loads(package_file.read())
         loader = loader_file.read().decode("utf-8")
+        license_text = license_file.read()
 
     _require(package.get("name") == NODE_PACKAGE, "npm package name mismatch")
     _require(package.get("version") == version, "npm package version mismatch")
     _require(package.get("publishConfig") == {"access": "public"}, "npm publish access mismatch")
+    _require(license_text == AUTHORITATIVE_LICENSE, "npm license content mismatch")
     _require(
         f"{NODE_PACKAGE}-" not in loader,
         "npm loader contains a platform-package fallback",
@@ -96,11 +103,13 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
     _require(path.name == expected_name, f"wheel filename must be {expected_name}")
     dist_info = f"{PYTHON_DIST}-{version}.dist-info"
     sbom_name = f"{dist_info}/sboms/cleverbase-py.cyclonedx.json"
+    license_name = f"{dist_info}/licenses/LICENSE"
     required_members = {
         f"{dist_info}/METADATA",
         f"{dist_info}/WHEEL",
         f"{dist_info}/RECORD",
         sbom_name,
+        license_name,
         "cleverbase/__init__.py",
         "cleverbase/__init__.pyi",
         "cleverbase/py.typed",
@@ -128,10 +137,13 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
         metadata = BytesParser().parsebytes(archive.read(f"{dist_info}/METADATA"))
         wheel = BytesParser().parsebytes(archive.read(f"{dist_info}/WHEEL"))
         sbom = json.loads(archive.read(sbom_name))
+        license_text = archive.read(license_name)
 
     _require(metadata.get("Name") == PYTHON_PACKAGE, "wheel package name mismatch")
     _require(metadata.get("Version") == version, "wheel package version mismatch")
     _require(metadata.get("License-Expression") == "EUPL-1.2", "wheel license mismatch")
+    _require(metadata.get_all("License-File", []) == ["LICENSE"], "wheel license file mismatch")
+    _require(license_text == AUTHORITATIVE_LICENSE, "wheel license content mismatch")
     project_urls = set(metadata.get_all("Project-URL", []))
     _require(
         "Repository, https://github.com/alkem-io/cleverbase-sdk" in project_urls,
@@ -165,9 +177,11 @@ def check_python_sdist(path: Path, version: str) -> None:
         f"{root}/PKG-INFO",
         f"{root}/pyproject.toml",
         f"{root}/README.md",
+        f"{root}/LICENSE",
         f"{root}/Cargo.toml",
         f"{root}/bindings/python/Cargo.toml",
         f"{root}/bindings/python/Cargo.lock",
+        f"{root}/bindings/python/LICENSE",
         f"{root}/bindings/python/cleverbase.pyi",
         f"{root}/bindings/python/src/lib.rs",
         f"{root}/crates/cleverbase-core/Cargo.toml",
@@ -175,8 +189,20 @@ def check_python_sdist(path: Path, version: str) -> None:
         f"{root}/crates/cleverbase-attestation/Cargo.toml",
         f"{root}/crates/cleverbase-attestation/src/lib.rs",
     }
-    with _checked_tar(path) as (_, members):
+    with _checked_tar(path) as (archive, members):
+        _require(f"{root}/LICENSE" in members, "sdist license is missing")
         _require(required <= members, "sdist is missing required build inputs")
+        license_file = archive.extractfile(f"{root}/LICENSE")
+        source_license_file = archive.extractfile(f"{root}/bindings/python/LICENSE")
+        _require(
+            license_file is not None and source_license_file is not None,
+            "sdist license is unreadable",
+        )
+        _require(
+            license_file.read() == AUTHORITATIVE_LICENSE
+            and source_license_file.read() == AUTHORITATIVE_LICENSE,
+            "sdist license content mismatch",
+        )
         _require(all(name.startswith(f"{root}/") for name in members), "sdist has multiple roots")
         forbidden_parts = {".git", "target", "node_modules", "__pycache__"}
         for name in members:

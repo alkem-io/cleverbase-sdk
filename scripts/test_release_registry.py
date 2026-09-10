@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import json
 import time
+import urllib.error
 from typing import TYPE_CHECKING
 
 import pytest
 
 import release_registry
-from release_registry import RegistryError, npm_status, pypi_provenance_valid, pypi_status
+from release_registry import (
+    RegistryError,
+    RegistryVisibilityPendingError,
+    npm_status,
+    pypi_provenance_valid,
+    pypi_status,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,9 +118,24 @@ def test_verify_retries_transient_registry_visibility_with_fixed_backoff(
             {"filename": sdist.name, "digests": {"sha256": hashlib.sha256(b"sdist").hexdigest()}},
         ],
     }
-    responses = iter([None, None, None, payload])
+    responses = iter(
+        [
+            RegistryVisibilityPendingError("HTTP 404"),
+            RegistryVisibilityPendingError("HTTP 429"),
+            RegistryVisibilityPendingError("HTTP 503"),
+            payload,
+        ],
+    )
     sleeps: list[int] = []
-    monkeypatch.setattr(release_registry, "_pypi_metadata", lambda _version: next(responses))
+
+    def metadata(_version: str, *, allow_missing: bool) -> dict[str, object] | None:
+        assert not allow_missing
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(release_registry, "_pypi_metadata", metadata)
     monkeypatch.setattr(release_registry, "_verify_pypi_provenance", lambda *_args: None)
     monkeypatch.setattr(time, "sleep", sleeps.append)
 
@@ -121,3 +145,205 @@ def test_verify_retries_transient_registry_visibility_with_fixed_backoff(
 
     assert result == 0
     assert sleeps == [2, 5, 10]
+
+
+def test_verify_exhausts_exactly_four_transient_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "alkemio_cleverbase_sdk-0.3.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    sdist = tmp_path / "alkemio_cleverbase_sdk-0.3.3.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    calls = 0
+    sleeps: list[int] = []
+
+    def pending(_version: str, *, allow_missing: bool) -> None:
+        nonlocal calls
+        assert not allow_missing
+        calls += 1
+        message = "HTTP 503"
+        raise RegistryVisibilityPendingError(message)
+
+    monkeypatch.setattr(release_registry, "_pypi_metadata", pending)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    result = release_registry.main(
+        ["release_registry.py", "pypi", "verify", str(tmp_path), "0.3.3"],
+    )
+
+    assert result == 1
+    assert calls == 4
+    assert sleeps == [2, 5, 10]
+
+
+def test_preflight_and_semantic_failures_are_never_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "alkemio_cleverbase_sdk-0.3.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    sdist = tmp_path / "alkemio_cleverbase_sdk-0.3.3.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    calls = 0
+    sleeps: list[int] = []
+
+    def missing(_version: str, *, allow_missing: bool) -> None:
+        nonlocal calls
+        assert allow_missing
+        calls += 1
+
+    monkeypatch.setattr(release_registry, "_pypi_metadata", missing)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    assert (
+        release_registry.main(
+            ["release_registry.py", "pypi", "preflight", str(tmp_path), "0.3.3"],
+        )
+        == 0
+    )
+    assert calls == 1
+    assert sleeps == []
+
+    def permanent(_version: str, *, allow_missing: bool) -> None:
+        nonlocal calls
+        assert not allow_missing
+        calls += 1
+        message = "digest mismatch"
+        raise RegistryError(message)
+
+    monkeypatch.setattr(release_registry, "_pypi_metadata", permanent)
+    assert (
+        release_registry.main(
+            ["release_registry.py", "pypi", "verify", str(tmp_path), "0.3.3"],
+        )
+        == 1
+    )
+    assert calls == 2
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("status", [404, 429, 500, 503])
+def test_http_boundary_classifies_only_transient_statuses(
+    status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = urllib.error.HTTPError("https://pypi.org/test", status, "pending", None, None)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(release_registry.urllib.request, "urlopen", fail)
+
+    with pytest.raises(RegistryVisibilityPendingError):
+        release_registry._http_json("https://pypi.org/test")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError("direct timeout"), urllib.error.URLError(TimeoutError("wrapped timeout"))],
+    ids=["direct", "url-error"],
+)
+def test_http_boundary_classifies_only_actual_timeouts_as_transient(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(release_registry.urllib.request, "urlopen", fail)
+
+    with pytest.raises(RegistryVisibilityPendingError):
+        release_registry._http_json("https://pypi.org/test")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        urllib.error.HTTPError("https://pypi.org/test", 400, "bad request", None, None),
+        urllib.error.URLError(OSError("certificate failure")),
+    ],
+    ids=["http-400", "url-error"],
+)
+def test_http_boundary_keeps_permanent_failures_non_retryable(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(release_registry.urllib.request, "urlopen", fail)
+
+    with pytest.raises(RegistryError) as caught:
+        release_registry._http_json("https://pypi.org/test")  # noqa: SLF001
+    assert not isinstance(caught.value, RegistryVisibilityPendingError)
+
+
+def test_http_boundary_keeps_malformed_json_non_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        release_registry.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(b"{"),
+    )
+
+    with pytest.raises(RegistryError) as caught:
+        release_registry._http_json("https://pypi.org/test")  # noqa: SLF001
+    assert not isinstance(caught.value, RegistryVisibilityPendingError)
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+def test_verify_does_not_retry_digest_or_provenance_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wheel = tmp_path / "alkemio_cleverbase_sdk-0.3.3-cp39-abi3-manylinux_2_28_x86_64.whl"
+    sdist = tmp_path / "alkemio_cleverbase_sdk-0.3.3.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    payload = {
+        "info": {"name": "alkemio-cleverbase-sdk", "version": "0.3.3"},
+        "urls": [
+            {"filename": wheel.name, "digests": {"sha256": "0" * 64}},
+            {"filename": sdist.name, "digests": {"sha256": hashlib.sha256(b"sdist").hexdigest()}},
+        ],
+    }
+    metadata_calls = 0
+    sleeps: list[int] = []
+
+    def metadata(_version: str, *, allow_missing: bool) -> dict[str, object]:
+        nonlocal metadata_calls
+        assert not allow_missing
+        metadata_calls += 1
+        return payload
+
+    monkeypatch.setattr(release_registry, "_pypi_metadata", metadata)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    assert (
+        release_registry.main(
+            ["release_registry.py", "pypi", "verify", str(tmp_path), "0.3.3"],
+        )
+        == 1
+    )
+    assert metadata_calls == 1
+    assert sleeps == []
+
+    payload["urls"][0]["digests"]["sha256"] = hashlib.sha256(b"wheel").hexdigest()
+    provenance_calls = 0
+
+    def invalid_provenance(*_args: object) -> None:
+        nonlocal provenance_calls
+        provenance_calls += 1
+        message = "PyPI provenance is missing"
+        raise RegistryError(message)
+
+    monkeypatch.setattr(release_registry, "_verify_pypi_provenance", invalid_provenance)
+    assert (
+        release_registry.main(
+            ["release_registry.py", "pypi", "verify", str(tmp_path), "0.3.3"],
+        )
+        == 1
+    )
+    assert metadata_calls == 2
+    assert provenance_calls == 1
+    assert sleeps == []

@@ -7,7 +7,6 @@ import json
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -17,9 +16,6 @@ from check_sdk_artifact import (
     check_python_sdist,
     check_python_wheel,
 )
-
-if TYPE_CHECKING:
-    pass
 
 VERSION = "0.3.3"
 ROOT_LICENSE = (Path(__file__).resolve().parents[1] / "LICENSE").read_bytes()
@@ -106,6 +102,7 @@ def sdist_files() -> dict[str, bytes]:
         f"{root}/Cargo.toml": b"[workspace]\n",
         f"{root}/bindings/python/Cargo.toml": b"[package]\n",
         f"{root}/bindings/python/Cargo.lock": b"version = 4\n",
+        f"{root}/bindings/python/LICENSE": ROOT_LICENSE,
         f"{root}/bindings/python/cleverbase.pyi": b"def verify_pdf(): ...\n",
         f"{root}/bindings/python/src/lib.rs": b"pub fn binding() {}\n",
         f"{root}/crates/cleverbase-core/Cargo.toml": b"[package]\n",
@@ -219,4 +216,10 @@ def test_python_sdist_is_self_contained_and_clean(tmp_path: Path) -> None:
     files.pop(f"{root}/LICENSE")
     write_tgz(sdist, files)
     with pytest.raises(ArtifactError, match="license"):
+        check_python_sdist(sdist, VERSION)
+
+    files = sdist_files()
+    files[f"{root}/bindings/python/LICENSE"] = b"stale license copy"
+    write_tgz(sdist, files)
+    with pytest.raises(ArtifactError, match="license content mismatch"):
         check_python_sdist(sdist, VERSION)
