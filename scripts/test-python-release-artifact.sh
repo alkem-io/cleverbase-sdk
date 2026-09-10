@@ -41,4 +41,5 @@ assert importlib.metadata.version("alkemio-cleverbase-sdk") == os.environ["SDK_V
 assert "site-packages" in Path(cleverbase.__file__).as_posix()
 PY
 
-"$venv_python" -m pytest -q "$repo_root/bindings/python/tests"
+cd "$work_dir"
+"$venv_python" -m pytest -q -p no:cacheprovider "$repo_root/bindings/python/tests"

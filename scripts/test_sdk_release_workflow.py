@@ -77,7 +77,11 @@ def test_external_actions_are_pinned_and_permissions_are_job_local() -> None:
     text = workflow_text()
 
     assert re.search(r"^permissions:\n  contents: read$", text, re.MULTILINE)
-    action_lines = [line.strip() for line in text.splitlines() if line.strip().startswith("uses:")]
+    action_lines = [
+        re.sub(r"^-\s+", "", line.strip())
+        for line in text.splitlines()
+        if re.match(r"^(?:-\s+)?uses:", line.strip())
+    ]
     assert action_lines
     assert len(action_lines) == text.count("uses:")
     for line in action_lines:
