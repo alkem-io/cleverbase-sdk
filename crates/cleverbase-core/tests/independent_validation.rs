@@ -818,6 +818,21 @@ fn drive_bt_to_timestamp(algo: KeyAlgo) -> (cleverbase_core::SigningSessionHandl
         }
         other => panic!("expected TSA request, got {other:?}"),
     };
+    let nonce = h.timestamp_nonce.as_ref().expect("pending timestamp nonce");
+    let mut encoded_nonce = vec![
+        0x02,
+        (nonce.len() + usize::from(nonce[0] & 0x80 != 0)) as u8,
+    ];
+    if nonce[0] & 0x80 != 0 {
+        encoded_nonce.push(0);
+    }
+    encoded_nonce.extend_from_slice(nonce);
+    assert!(
+        tsa_req
+            .windows(encoded_nonce.len())
+            .any(|window| window == encoded_nonce),
+        "the emitted TSA request must carry the pending nonce as a DER INTEGER"
+    );
     (h, tsa_req)
 }
 
@@ -996,8 +1011,9 @@ fn produced_b_t_signature_has_timestamp_and_verifies() {
         let verification = verify_pdf(&signed.pdf);
         assert!(
             verification.integrity,
-            "core verifier rejected valid {} B-T",
-            algo.name()
+            "core verifier rejected valid {} B-T: {:?}",
+            algo.name(),
+            verification.reasons
         );
         assert_eq!(verification.profile, Some(ConformanceLevel::BT));
         assert!(verification.signer.is_some());
@@ -1084,7 +1100,11 @@ fn tampered_ecdsa_b_t_signature_is_rejected_by_openssl() {
     let signed = produce_signed_pdf_bt(KeyAlgo::EcdsaP256);
     let (content, cms_der) = extract(&signed.pdf);
     let baseline = verify_pdf(&signed.pdf);
-    assert!(baseline.integrity);
+    assert!(
+        baseline.integrity,
+        "core verifier rejected valid ECDSA B-T: {:?}",
+        baseline.reasons
+    );
     assert_eq!(baseline.profile, Some(ConformanceLevel::BT));
     assert!(baseline.reasons.is_empty());
     let tampered = flip_signature_byte(&cms_der);

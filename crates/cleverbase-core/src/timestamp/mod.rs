@@ -14,7 +14,7 @@ use der::{Decode, Encode, Sequence};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
 use crate::crypto::{
-    CMS_SIGNED_DATA_OID as ID_SIGNED_DATA, RFC3161_TST_INFO_OID as ID_CT_TST_INFO,
+    sha256, CMS_SIGNED_DATA_OID as ID_SIGNED_DATA, RFC3161_TST_INFO_OID as ID_CT_TST_INFO,
     SHA256_OID as ID_SHA256,
 };
 
@@ -60,7 +60,11 @@ struct TimeStampReq {
 /// Derive a positive, canonical 128-bit nonce from host-provided fresh entropy.
 pub(crate) fn nonce_from_entropy(entropy: &[u8]) -> Vec<u8> {
     const NONCE_BYTES: usize = 16;
-    let candidate = entropy.get(..NONCE_BYTES).unwrap_or(entropy);
+    let mut domain_input = Vec::with_capacity(b"rfc3161-nonce".len() + entropy.len());
+    domain_input.extend_from_slice(b"rfc3161-nonce");
+    domain_input.extend_from_slice(entropy);
+    let digest = sha256(&domain_input);
+    let candidate = &digest[..NONCE_BYTES];
     let Some(first_nonzero) = candidate.iter().position(|byte| *byte != 0) else {
         return vec![1];
     };
@@ -376,7 +380,7 @@ mod tests {
             "1.3.6.1.4.1.99999.1.1"
         );
         assert!(back.cert_req);
-        assert_eq!(back.nonce.unwrap().as_bytes(), [1]);
+        assert_eq!(back.nonce.unwrap().as_bytes(), nonce);
         // An invalid policy OID is rejected, not silently dropped.
         assert!(build_request(&imprint, Some("not-an-oid"), &nonce).is_err());
         for invalid_nonce in [&[][..], &[0][..], &[0, 0][..]] {
