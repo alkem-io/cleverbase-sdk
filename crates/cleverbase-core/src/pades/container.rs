@@ -686,6 +686,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_encodes_signature_metadata_as_pdf_text() {
+        for text in ["Jane Doe", "José García"] {
+            let prepared = prepare(
+                &minimal_pdf(),
+                SignatureMetadata {
+                    signer_name: Some(text),
+                    reason: Some(text),
+                    location: Some(text),
+                    ..signature_metadata()
+                },
+                None,
+            )
+            .unwrap();
+            let document = Document::load_mem(&prepared.staged_pdf).unwrap();
+            let signature = document
+                .objects
+                .values()
+                .filter_map(|object| object.as_dict().ok())
+                .find(|dictionary| is_signature_dictionary(dictionary))
+                .unwrap();
+
+            for key in [b"Name".as_slice(), b"Reason", b"Location"] {
+                assert_eq!(
+                    lopdf::decode_text_string(signature.get(key).unwrap()).unwrap(),
+                    text
+                );
+            }
+        }
+    }
+
+    #[test]
     fn embed_cms_rejects_invalid_span() {
         // A corrupted/tampered contents_span must yield a clean error, never a panic.
         let mut buf = vec![0u8; 100];
