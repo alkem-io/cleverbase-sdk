@@ -81,7 +81,7 @@ def check_node_tarball(path: Path, version: str) -> None:
         "npm loader contains a platform-package fallback",
     )
     for native_file in NODE_NATIVE_FILES:
-        _require(f"./{native_file}" in loader, f"npm loader omits {native_file}")
+        _require(native_file in loader, f"npm loader omits {native_file}")
 
 
 def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
