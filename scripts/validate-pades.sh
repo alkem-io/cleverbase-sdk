@@ -196,8 +196,28 @@ pdfsig_validate() {
     return 1
   fi
   printf '%s\n' "$output" >&2
-  printf '%s\n' "$output" | grep -Fq 'Signature Validation: Signature is Valid.' \
-    && printf '%s\n' "$output" | grep -Fq 'Total document signed'
+  printf '%s\n' "$output" | awk '
+    function finish_signature() {
+      if (in_signature && valid && total) found = 1
+    }
+    /^Signature #[0-9]+:/ {
+      finish_signature()
+      in_signature = 1
+      valid = 0
+      total = 0
+      next
+    }
+    in_signature && /^[[:space:]]*-[[:space:]]*Signature Validation: Signature is Valid\.[[:space:]]*$/ {
+      valid = 1
+    }
+    in_signature && /^[[:space:]]*-[[:space:]]*Total document signed[[:space:]]*$/ {
+      total = 1
+    }
+    END {
+      finish_signature()
+      exit(found ? 0 : 1)
+    }
+  '
 }
 
 # ---------------------------------------------------------------------------------------------------
