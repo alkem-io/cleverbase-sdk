@@ -114,7 +114,7 @@ fi
       --repository.url "$GOMARKDOC_REPOSITORY_URL" \
       --repository.default-branch "$GOMARKDOC_DEFAULT_BRANCH" \
       --repository.path "$GOMARKDOC_REPOSITORY_PATH" \
-      --output "$OUT/go.md" ./...
+      --output "$OUT/go.md" .
 )
 
 # ---------------------------------------------------------------------------
