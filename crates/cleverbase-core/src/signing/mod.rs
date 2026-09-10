@@ -1456,6 +1456,29 @@ mod tests {
         assert!(signature.get(b"Name").is_err());
     }
 
+    #[test]
+    fn pdf_signer_name_comes_from_the_embedded_leaf_certificate() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let mut info = info_json();
+        info["cert"]["subjectDN"] =
+            serde_json::json!("CN=Provider Label,serialNumber=PNONL-123");
+
+        let (h, step) = resume(h, http_ok(info), ctx()).unwrap();
+        assert!(matches!(step, Step::Redirect(_)));
+        assert_eq!(h.signer.as_ref().unwrap().common_name, "Provider Label");
+        let document = lopdf::Document::load_mem(h.staged_pdf.as_ref().unwrap()).unwrap();
+        let signature = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .find(|dictionary| container::is_signature_dictionary(dictionary))
+            .unwrap();
+        assert_eq!(
+            lopdf::decode_text_string(signature.get(b"Name").unwrap()).unwrap(),
+            "Jane Doe"
+        );
+    }
+
     fn zero_page_pdf() -> Vec<u8> {
         let mut doc = lopdf::Document::with_version("1.7");
         let pages_id = doc.new_object_id();
