@@ -80,6 +80,11 @@ def main() -> int:
 
     loader = (ROOT / "bindings/node/index.js").read_text(encoding="utf-8")
     require(errors, "@cleverbase/" not in loader, "generated Node loader has legacy @cleverbase fallbacks")
+    require(
+        errors,
+        "@alkemio/cleverbase-sdk-" not in loader,
+        "Node loader must not reference unpublished platform packages",
+    )
 
     pyproject = (ROOT / "bindings/python/pyproject.toml").read_text(encoding="utf-8")
     python_patterns = {
