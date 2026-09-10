@@ -1,8 +1,9 @@
 //! Node/TypeScript (napi-rs) binding for the Cleverbase SDK.
 //!
-//! Thin idiomatic wrapper: native args in, a CBOR `{handle, step}` Buffer out (callers only decode
-//! CBOR). All protocol/crypto logic — including the wire envelope and wire-string enum parsing —
-//! lives in the Rust core (Constitution Principle III/VIII).
+//! Thin idiomatic wrapper: native args in; signing returns a CBOR `{handle, step}` Buffer, PDF
+//! verification returns a typed object, and attestation operations remain CBOR-through. All
+//! protocol/crypto logic — including the wire envelope and wire-string enum parsing — lives in the
+//! Rust core (Constitution Principle III/VIII).
 
 use cleverbase_core::wire::{decode_handle, encode_handle_step};
 use cleverbase_core::{

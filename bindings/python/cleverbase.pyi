@@ -12,6 +12,8 @@ from typing import Annotated, TypedDict
 
 SCHEMA_VERSION: int
 
+# Typing-only shapes: verify_pdf returns a runtime dict; the compiled module does not export these
+# names as Python classes (tracked for a package-layout follow-up in #59).
 class PDFSigner(TypedDict):
     serial: str
     cn: str

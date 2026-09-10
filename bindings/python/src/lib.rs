@@ -1,9 +1,10 @@
 //! Python (PyO3) binding for the Cleverbase SDK.
 //!
-//! Thin idiomatic wrapper: native Python args in, and a CBOR `{handle, step}` result out (so
-//! callers only ever *decode* CBOR, never hand-build it). All protocol/crypto logic — including the
-//! wire envelope and the wire-string enum parsing — lives in the Rust core (Constitution
-//! Principle III/VIII). The opaque `handle` is passed back verbatim to resume.
+//! Thin idiomatic wrapper: native Python args in; signing returns a CBOR `{handle, step}` envelope,
+//! PDF verification returns a typed dictionary, and attestation operations remain CBOR-through.
+//! All protocol/crypto logic — including the wire envelope and wire-string enum parsing — lives in
+//! the Rust core (Constitution Principle III/VIII). The opaque signing `handle` is passed back
+//! verbatim to resume.
 
 use cleverbase_core::wire::{decode_handle, encode_handle_step};
 use cleverbase_core::{

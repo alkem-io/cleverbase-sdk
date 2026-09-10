@@ -90,21 +90,38 @@ func TestBeginSigningHostContextBoundaries(t *testing.T) {
 	for name, test := range map[string]struct {
 		nowUnix int64
 		entropy []byte
+		message string
 	}{
-		"year before 0000": {nowUnix: year0000Start - 1, entropy: testEntropy()},
-		"year after 9999":  {nowUnix: year9999End + 1, entropy: testEntropy()},
-		"short entropy":    {nowUnix: 1_700_000_000, entropy: make([]byte, 15)},
+		"year before 0000": {
+			nowUnix: year0000Start - 1,
+			entropy: testEntropy(),
+			message: "invalid configuration: now_unix UTC year must be in 0000..=9999",
+		},
+		"year after 9999": {
+			nowUnix: year9999End + 1,
+			entropy: testEntropy(),
+			message: "invalid configuration: now_unix UTC year must be in 0000..=9999",
+		},
+		"short entropy": {
+			nowUnix: 1_700_000_000,
+			entropy: make([]byte, 15),
+			message: "invalid configuration: entropy must be at least 16 bytes",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := BeginSigning(
+			_, err := BeginSigning(
 				[]byte("%PDF-1.7\nminimal"),
 				testConfig(),
 				"B-B",
 				nil,
 				test.nowUnix,
 				test.entropy,
-			); err == nil {
+			)
+			if err == nil {
 				t.Fatal("BeginSigning accepted invalid host context")
+			}
+			if err.Error() != test.message {
+				t.Fatalf("error = %q, want %q", err, test.message)
 			}
 		})
 	}

@@ -48,6 +48,7 @@ def test_verify_pdf_returns_typed_valid_verdict() -> None:
         (b"not a PDF", "not_pdf"),
         (LEGACY_BYTE_RANGE_PDF.read_bytes(), "malformed_byte_range"),
     ],
+    ids=["not_pdf", "malformed_byte_range"],
 )
 def test_verify_pdf_returns_typed_invalid_verdict(document: bytes, reason: str) -> None:
     verdict = cleverbase.verify_pdf(document)
@@ -78,15 +79,27 @@ def test_begin_accepts_host_context_year_boundaries(now_unix: int) -> None:
 
 
 @pytest.mark.parametrize(
-    ("now_unix", "entropy"),
+    ("now_unix", "entropy", "message"),
     [
-        (YEAR_0000_START - 1, bytes(range(16))),
-        (YEAR_9999_END + 1, bytes(range(16))),
-        (1_700_000_000, bytes(range(15))),
+        (
+            YEAR_0000_START - 1,
+            bytes(range(16)),
+            "invalid configuration: now_unix UTC year must be in 0000..=9999",
+        ),
+        (
+            YEAR_9999_END + 1,
+            bytes(range(16)),
+            "invalid configuration: now_unix UTC year must be in 0000..=9999",
+        ),
+        (
+            1_700_000_000,
+            bytes(range(15)),
+            "invalid configuration: entropy must be at least 16 bytes",
+        ),
     ],
 )
-def test_begin_rejects_invalid_host_context(now_unix: int, entropy: bytes) -> None:
-    with pytest.raises(ValueError):
+def test_begin_rejects_invalid_host_context(now_unix: int, entropy: bytes, message: str) -> None:
+    with pytest.raises(ValueError) as raised:
         cleverbase.begin_signing(
             b"%PDF-1.7\nminimal",
             "acceptance",
@@ -98,10 +111,11 @@ def test_begin_rejects_invalid_host_context(now_unix: int, entropy: bytes) -> No
             now_unix,
             entropy,
         )
+    assert str(raised.value) == message
 
 
 def test_begin_rejects_non_integer_unix_time_at_the_python_boundary() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as raised:
         cleverbase.begin_signing(
             b"%PDF-1.7\nminimal",
             "acceptance",
@@ -113,3 +127,7 @@ def test_begin_rejects_non_integer_unix_time_at_the_python_boundary() -> None:
             cast("int", 0.5),
             bytes(range(16)),
         )
+    assert (
+        str(raised.value)
+        == "argument 'now_unix': 'float' object cannot be interpreted as an integer"
+    )

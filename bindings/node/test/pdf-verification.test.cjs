@@ -63,28 +63,38 @@ test("beginSigning accepts the host-context year boundaries", () => {
 });
 
 test("beginSigning rejects an invalid host context", () => {
-  for (const [nowUnix, entropy] of [
-    [YEAR_0000_START - 1, Buffer.alloc(16)],
-    [YEAR_9999_END + 1, Buffer.alloc(16)],
-    [Number.NaN, Buffer.alloc(16)],
-    [Number.POSITIVE_INFINITY, Buffer.alloc(16)],
-    [Number.NEGATIVE_INFINITY, Buffer.alloc(16)],
-    [1.5, Buffer.alloc(16)],
-    [1_700_000_000, Buffer.alloc(15)],
+  for (const [nowUnix, entropy, message] of [
+    [
+      YEAR_0000_START - 1,
+      Buffer.alloc(16),
+      "invalid configuration: now_unix UTC year must be in 0000..=9999",
+    ],
+    [
+      YEAR_9999_END + 1,
+      Buffer.alloc(16),
+      "invalid configuration: now_unix UTC year must be in 0000..=9999",
+    ],
+    [Number.NaN, Buffer.alloc(16), "now_unix must be a finite integer"],
+    [Number.POSITIVE_INFINITY, Buffer.alloc(16), "now_unix must be a finite integer"],
+    [Number.NEGATIVE_INFINITY, Buffer.alloc(16), "now_unix must be a finite integer"],
+    [1.5, Buffer.alloc(16), "now_unix must be a finite integer"],
+    [1_700_000_000, Buffer.alloc(15), "invalid configuration: entropy must be at least 16 bytes"],
   ]) {
-    assert.throws(() =>
-      beginSigning(
-        Buffer.from("%PDF-1.7\nminimal"),
-        "acceptance",
-        "v1_rsa",
-        "client-123",
-        "secret",
-        "https://app.example/cb",
-        "B-B",
-        nowUnix,
-        entropy,
-        null,
-      ),
+    assert.throws(
+      () =>
+        beginSigning(
+          Buffer.from("%PDF-1.7\nminimal"),
+          "acceptance",
+          "v1_rsa",
+          "client-123",
+          "secret",
+          "https://app.example/cb",
+          "B-B",
+          nowUnix,
+          entropy,
+          null,
+        ),
+      (error) => error.message === message,
     );
   }
 });
