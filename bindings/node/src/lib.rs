@@ -32,6 +32,16 @@ fn wire_profile(profile: ConformanceLevel) -> Result<String> {
         .ok_or_else(|| e("verification profile did not serialize as a string"))
 }
 
+fn host_context(now_unix: f64, entropy: Buffer) -> Result<HostContext> {
+    if !now_unix.is_finite() || now_unix.fract() != 0.0 {
+        return Err(e("now_unix must be a finite integer"));
+    }
+    Ok(HostContext {
+        now_unix: now_unix as i64,
+        entropy: entropy.to_vec(),
+    })
+}
+
 /// Identity read from the embedded signer certificate.
 #[napi(object)]
 #[derive(Debug)]
@@ -161,10 +171,7 @@ pub fn begin_signing(
         tsa_auth,
         tsa_policy_oid,
     )?;
-    let ctx = HostContext {
-        now_unix: now_unix as i64,
-        entropy: entropy.to_vec(),
-    };
+    let ctx = host_context(now_unix, entropy)?;
     let (handle, step) = begin(request, config, ctx).map_err(e)?;
     Ok(encode_handle_step(&handle, &step).into())
 }
@@ -182,10 +189,7 @@ pub fn resume_redirect(
     entropy: Buffer,
 ) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;
-    let ctx = HostContext {
-        now_unix: now_unix as i64,
-        entropy: entropy.to_vec(),
-    };
+    let ctx = host_context(now_unix, entropy)?;
     let (handle, step) = resume(h, ResumeInput::RedirectReturn { code, state }, ctx).map_err(e)?;
     Ok(encode_handle_step(&handle, &step).into())
 }
@@ -203,10 +207,7 @@ pub fn resume_redirect_error(
     entropy: Buffer,
 ) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;
-    let ctx = HostContext {
-        now_unix: now_unix as i64,
-        entropy: entropy.to_vec(),
-    };
+    let ctx = host_context(now_unix, entropy)?;
     let (handle, step) = resume(h, ResumeInput::RedirectError { error, state }, ctx).map_err(e)?;
     Ok(encode_handle_step(&handle, &step).into())
 }
@@ -224,10 +225,7 @@ pub fn resume_http(
     entropy: Buffer,
 ) -> Result<Buffer> {
     let h = decode_handle(handle.as_ref()).map_err(e)?;
-    let ctx = HostContext {
-        now_unix: now_unix as i64,
-        entropy: entropy.to_vec(),
-    };
+    let ctx = host_context(now_unix, entropy)?;
     let input = ResumeInput::HttpResult {
         status,
         headers: vec![],
