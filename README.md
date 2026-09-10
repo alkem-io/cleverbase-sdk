@@ -108,32 +108,52 @@ make go-test
 
 ### Consume the Go binding from a release
 
-The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.1`, while Go
+The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.2`, while Go
 consumers pin the module version normally:
 
 ```bash
-go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.1
+go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.2
 ```
 
-The same GitHub Release contains `cleverbase-ffi-v0.3.1-<os>-<arch>.tar.gz` and a matching
+The same GitHub Release contains `cleverbase-ffi-v0.3.2-<os>-<arch>.tar.gz` and a matching
 `.sha256` file for Linux and Darwin, on amd64 and arm64. Download the pair for the build host, verify
 the checksum before extraction, and point `CGO_LDFLAGS` at the extracted `lib` directory. For
 example:
 
 ```bash
-gh release download bindings/go/v0.3.1 \
+gh release download bindings/go/v0.3.2 \
   --repo alkem-io/cleverbase-sdk \
-  --pattern 'cleverbase-ffi-v0.3.1-linux-amd64*' --dir .cleverbase
-( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.1-linux-amd64.tar.gz.sha256 )
-tar -xzf .cleverbase/cleverbase-ffi-v0.3.1-linux-amd64.tar.gz -C .cleverbase
+  --pattern 'cleverbase-ffi-v0.3.2-linux-amd64*' --dir .cleverbase
+( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.2-linux-amd64.tar.gz.sha256 )
+tar -xzf .cleverbase/cleverbase-ffi-v0.3.2-linux-amd64.tar.gz -C .cleverbase
 CGO_LDFLAGS="-L$PWD/.cleverbase/lib" go build ./...
 ```
 
 To publish a release, update `cleverbase-ffi` to the intended SemVer and push the matching tag, for
-example `bindings/go/v0.3.1`. The tag workflow builds, link-tests, attests, and attaches all
+example `bindings/go/v0.3.2`. The tag workflow builds, link-tests, attests, and attaches all
 four native archives. The Go module and native ABI versions are deliberately welded: even a Go-only
 binding fix bumps `cleverbase-ffi` and receives a new matching tag.
 Running the packaging contract locally on macOS requires GNU tar (`brew install gnu-tar`).
+
+#### v0.3.2 release notes
+
+- Adds a positive RFC 3161 nonce to every timestamp request, derived from host entropy with the
+  `rfc3161-nonce` domain label. The nonce persists only while the timestamp effect is pending and
+  the response must echo it exactly before the message imprint is accepted.
+- Emits the PAdES baseline signature dictionary with `/M` fixed from the host clock and `/Name` from
+  the non-empty embedded leaf-certificate common name, while omitting the forbidden CMS signing-time
+  signed attribute. Host times outside the four-digit PDF year range are rejected before signing.
+- Makes ByteRange exclude the complete `<...>` Contents string and keeps verification strict to that
+  ETSI EN 319 142-1 V1.2.1 (2024-01) layout.
+- Fails closed across the upgrade boundary: timestamp-pending sessions created before nonce
+  persistence must restart, and PDFs emitted with the earlier raw-hex ByteRange convention return
+  `integrity=false` with `malformed_byte_range` and must be re-signed. There is no compatibility path.
+- Poppler `pdfsig` and pyHanko independently validate RSA and P-256 B-T fixtures as cryptographically
+  sound and covering the complete document; the opt-in profile job retains EU DSS for the explicit
+  PAdES baseline-level assertion and binds pdfsig validity and coverage within one signature block.
+- The low-level Rust `pades::container::prepare` and `crypto::cms::build_signed_attrs` helper
+  signatures change with the consolidated metadata path. The FFI wire contract and Go, Python, and
+  Node binding APIs are unchanged.
 
 #### v0.3.1 release notes
 
