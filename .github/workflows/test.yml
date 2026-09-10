@@ -29,6 +29,8 @@ jobs:
         run: rustup show
       - name: Shared SDK version contract
         run: python3 scripts/sdk-version.py check
+      - name: Public package metadata contract
+        run: python3 scripts/check-sdk-package-metadata.py
       - name: Native release packaging contract
         run: bash scripts/test-package-ffi-release.sh
       - name: Install cargo-llvm-cov
