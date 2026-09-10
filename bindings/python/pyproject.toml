@@ -7,7 +7,7 @@ name = "alkemio-cleverbase-sdk"
 version = "0.3.3"
 description = "Cleverbase SDK — Python binding"
 readme = "../../README.md"
-license = { file = "../../LICENSE" }
+license = "EUPL-1.2"
 requires-python = ">=3.9"
 
 [project.urls]

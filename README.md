@@ -28,7 +28,7 @@ crates/cleverbase-core         sans-IO signing state machine, CSC/OIDC client, C
 crates/cleverbase-attestation  sans-IO EUDI verify (SD-JWT VC + mdoc), OpenID4VP/DCQL, status, OpenID4VCI issuance
 crates/cleverbase-ffi          stable C ABI (CBOR in / result out) — consumed by Go
 bindings/python                PyO3 + maturin            → import cleverbase
-bindings/node                  napi-rs                   → @cleverbase/sdk
+bindings/node                  napi-rs                   → @alkemio/cleverbase-sdk
 bindings/go                    cgo over the C ABI        → typed Go API
 frontend/helper-ts             thin TS redirect/status helper (no crypto, no secrets)
 ```
