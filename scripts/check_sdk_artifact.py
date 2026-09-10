@@ -95,10 +95,12 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
     expected_name = f"{PYTHON_DIST}-{version}-{expected_tag}.whl"
     _require(path.name == expected_name, f"wheel filename must be {expected_name}")
     dist_info = f"{PYTHON_DIST}-{version}.dist-info"
+    sbom_name = f"{dist_info}/sboms/cleverbase-py.cyclonedx.json"
     expected_members = {
         f"{dist_info}/METADATA",
         f"{dist_info}/WHEEL",
         f"{dist_info}/RECORD",
+        sbom_name,
         "cleverbase.pyi",
         "cleverbase/__init__.py",
         "cleverbase/__init__.pyi",
@@ -115,6 +117,7 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
         _require(members == expected_members, "wheel has unexpected members or typing surface")
         metadata = BytesParser().parsebytes(archive.read(f"{dist_info}/METADATA"))
         wheel = BytesParser().parsebytes(archive.read(f"{dist_info}/WHEEL"))
+        sbom = json.loads(archive.read(sbom_name))
 
     _require(metadata.get("Name") == PYTHON_PACKAGE, "wheel package name mismatch")
     _require(metadata.get("Version") == version, "wheel package version mismatch")
@@ -129,6 +132,18 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
         "wheel issue tracker mismatch",
     )
     _require(wheel.get("Tag") == expected_tag, "wheel compatibility tag mismatch")
+    sbom_metadata = sbom.get("metadata")
+    _require(isinstance(sbom_metadata, dict), "wheel SBOM metadata is invalid")
+    sbom_component = sbom_metadata.get("component")
+    _require(
+        sbom.get("bomFormat") == "CycloneDX"
+        and sbom.get("specVersion") == "1.5"
+        and isinstance(sbom_component, dict)
+        and sbom_component.get("type") == "library"
+        and sbom_component.get("name") == "cleverbase-py"
+        and sbom_component.get("version") == version,
+        "wheel SBOM identity mismatch",
+    )
 
 
 def check_python_sdist(path: Path, version: str) -> None:
