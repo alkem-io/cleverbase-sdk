@@ -36,6 +36,15 @@ fn minimal_pdf() -> Vec<u8> {
     bytes
 }
 
+fn signature_metadata() -> cleverbase_core::pades::container::SignatureMetadata<'static> {
+    cleverbase_core::pades::container::SignatureMetadata {
+        claimed_signing_time_unix: 1_700_000_000,
+        signer_name: Some("Jane Doe"),
+        reason: None,
+        location: None,
+    }
+}
+
 #[test]
 fn non_pdf_is_an_invalid_verdict_not_an_api_error() {
     let verification = verify_pdf(b"not a PDF");
@@ -69,7 +78,8 @@ fn unsigned_pdf_reports_a_missing_signature() {
 fn malformed_embedded_cms_is_distinguished_from_a_missing_signature() {
     // `30 00` is valid DER but not a CMS ContentInfo, so parsing reaches the CMS layer.
     let mut prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     prepared.staged_pdf[prepared.contents_span.0..prepared.contents_span.0 + 4]
         .copy_from_slice(b"3000");
 
@@ -82,7 +92,8 @@ fn malformed_embedded_cms_is_distinguished_from_a_missing_signature() {
 #[test]
 fn invalid_contents_hex_is_rejected() {
     let mut prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     // PDF parsers permit whitespace in a hexadecimal string. The integrity verifier deliberately
     // requires the excluded gap itself to be hex-only so the ByteRange-to-Contents binding is exact.
     prepared.staged_pdf[prepared.contents_span.0] = b' ';
@@ -98,7 +109,8 @@ fn invalid_contents_hex_is_rejected() {
 #[test]
 fn nonzero_bytes_after_the_cms_der_are_rejected() {
     let mut prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     prepared.staged_pdf[prepared.contents_span.0..prepared.contents_span.0 + 4]
         .copy_from_slice(b"3000");
     let last = prepared.contents_span.1 - 1;
@@ -115,7 +127,8 @@ fn nonzero_bytes_after_the_cms_der_are_rejected() {
 #[test]
 fn contents_delimiters_must_be_immediately_outside_the_unsigned_gap() {
     let mut prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     prepared.staged_pdf[prepared.contents_span.0 - 1] = b'(';
     prepared.staged_pdf[prepared.contents_span.1] = b')';
 
@@ -130,7 +143,8 @@ fn contents_delimiters_must_be_immediately_outside_the_unsigned_gap() {
 #[test]
 fn bytes_after_the_second_range_are_rejected_as_unsigned_suffix() {
     let mut prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     prepared.staged_pdf.extend_from_slice(b"unsigned");
 
     let verification = verify_pdf(&prepared.staged_pdf);
@@ -144,7 +158,8 @@ fn bytes_after_the_second_range_are_rejected_as_unsigned_suffix() {
 #[test]
 fn multiple_signature_dictionaries_are_explicitly_unsupported() {
     let prepared =
-        cleverbase_core::pades::container::prepare(&minimal_pdf(), None, None, None).unwrap();
+        cleverbase_core::pades::container::prepare(&minimal_pdf(), signature_metadata(), None)
+            .unwrap();
     let mut document = Document::load_mem(&prepared.staged_pdf).unwrap();
     let signature = document
         .objects

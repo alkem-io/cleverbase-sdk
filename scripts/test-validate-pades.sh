@@ -8,8 +8,8 @@
 #   3. a tampered PDF FAILS         AdES validation                          (no false-accept)
 #
 # Like the always-on `openssl`-absent skip in the Go/Rust tests, this harness SELF-SKIPS (prints a
-# `SKIP:` line and exits 0) when the opt-in toolchain (pyHanko venv + the EU DSS container) is not
-# installed — which is the normal state of a dev machine. The real assertions run in CI
+# `SKIP:` line and exits 0) when no independent signature validator (pdfsig or pyHanko) is installed.
+# The full three-validator assertions run in CI
 # (.github/workflows/profile-conformance.yml, task T017), which installs the pinned toolchain and
 # generates the credential-free B-B/B-T PDFs for both algorithms before invoking the gate.
 #
@@ -17,8 +17,7 @@
 #   * If $PADES_TEST_PDF_DIR is set, this harness uses the PDFs CI already produced there
 #     (B-B-<algo>.pdf, B-T-<algo>.pdf — emitted by the producer the workflow runs).
 #   * Otherwise it cannot produce signed PDFs on its own (that requires the cleverbase-ffi build + the
-#     mock upstream), so it SELF-SKIPS early. This is the documented, preferred behaviour in a dev env
-#     (the task brief: "prefer self-skip cleanly when the toolchain is absent").
+#     mock upstream), so it SELF-SKIPS early.
 #
 # Exit status: 0 on all-pass OR on a clean self-skip; non-zero only if the gate behaves incorrectly
 # (a B-B PDF rejected at B-B, accepted at B-T, or a tampered PDF accepted).
@@ -157,7 +156,7 @@ if run_gate "B-T" "$BB_PDF"; then
   if gate_level_was_asserted; then
     fail "a B-B PDF (no timestamp) was wrongly ACCEPTED at --expect-level B-T (DSS confirmed the level)"
   else
-    skip "EU DSS level half did not run (engine present but DSS unavailable) — the B-B-as-B-T mismatch was NOT asserted here (CI asserts it)"
+    skip "EU DSS level half did not run — the B-B-as-B-T mismatch was NOT asserted here (CI asserts it)"
   fi
 else
   # Non-zero exit: the gate rejected the B-B PDF at B-T. This is the level mismatch being caught — it

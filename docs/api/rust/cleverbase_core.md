@@ -77,7 +77,7 @@ chain (DER, leaf first), the signed-attributes DER, and the raw signature value 
 ##### fn `build_signed_attrs`
 
 ```rust
-fn build_signed_attrs(content_hash: &[u8], leaf_cert_der: &[u8], now_unix: i64) -> Result<Vec<u8>, CmsError>
+fn build_signed_attrs(content_hash: &[u8], leaf_cert_der: &[u8]) -> Result<Vec<u8>, CmsError>
 ```
 
 Build the DER of the signed attributes as a `SET OF` (tag `0x31`) — the bytes whose SHA-256 the
@@ -412,7 +412,8 @@ PAdES (PDF) signature container: incremental signature dictionary + `/ByteRange`
 placeholder, hash over the ByteRange, CMS embedding, and an optional visible appearance.
 
 Cleverbase signs only a hash; we own the container (Constitution Principle V). The to-be-signed
-digest is `sha256` over the whole PDF except the `/Contents` value (the standard PAdES
+digest is `sha256` over the whole PDF except the complete `/Contents` hexadecimal string,
+including its delimiters (the standard PAdES
 ByteRange). After the signer's signature is wrapped into a detached CMS (see
 [`crate::crypto::cms`]), the CMS DER is written into the `/Contents` placeholder.
 
@@ -434,6 +435,25 @@ A PDF staged for signing.
   - SHA-256 over the ByteRange (the CMS `message-digest`).
 - `contents_span: (usize, usize)`
   - Byte span (start, end) of the hex digits inside `/Contents` (exclusive of `< >`).
+
+##### struct `SignatureMetadata`
+
+```rust
+struct SignatureMetadata<'a>
+```
+
+Values written into the PDF signature dictionary before the document hash is computed.
+
+###### Fields
+
+- `claimed_signing_time_unix: i64`
+  - Claimed signing time, as Unix seconds, serialized as the required UTC PDF `/M` date.
+- `signer_name: Option<&'a str>`
+  - Signer display name for `/Name`; omitted when the certificate has no common name.
+- `reason: Option<&'a str>`
+  - Optional signing reason.
+- `location: Option<&'a str>`
+  - Optional signing location.
 
 ##### struct `VisibleAppearance`
 
@@ -487,10 +507,10 @@ Errors from PAdES container operations.
 fn byte_range_digest(staged: &[u8], span: (usize, usize)) -> Option<[u8; 32]>
 ```
 
-SHA-256 over the signed byte range of a staged PDF: everything except the `/Contents` hex value
-between `span.0` and `span.1`. This is the value the CMS `message-digest` attribute must equal,
-binding the signature to exactly this document (WYSIWYS). Returns `None` if `span` is out of
-bounds (e.g. a corrupted/tampered handle).
+SHA-256 over the signed byte range of a staged PDF: everything except the complete
+`/Contents` hexadecimal string, including its `<` and `>` delimiters. `span` identifies only
+the raw hex digits so CMS embedding and hashing share one resolved placeholder. Returns `None`
+if the span or delimiters are invalid (for example in a corrupted session handle).
 
 ##### fn `embed_cms`
 
@@ -523,7 +543,7 @@ Heuristic PDF/A detection: PDF/A documents carry XMP metadata in the `pdfaid` na
 ##### fn `prepare`
 
 ```rust
-fn prepare(original_pdf: &[u8], reason: Option<&str>, location: Option<&str>, appearance: Option<&VisibleAppearance>) -> Result<PreparedSignature, PadesError>
+fn prepare(original_pdf: &[u8], metadata: SignatureMetadata<'_>, appearance: Option<&VisibleAppearance>) -> Result<PreparedSignature, PadesError>
 ```
 
 Prepare a PDF for signing. Adds a signature field + dictionary (invisible, or visible when an

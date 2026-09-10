@@ -18,6 +18,18 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+/// UTC `(year, month, day, hour, minute, second)` for Unix seconds.
+///
+/// This is the single calendar split used by both the human-readable appearance and the PDF `/M`
+/// signature-dictionary date.
+pub(crate) fn utc_components(unix_seconds: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds = unix_seconds.rem_euclid(86_400);
+    let (hour, minute, second) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    let (year, month, day) = civil_from_days(days);
+    (year, month, day, hour, minute, second)
+}
+
 /// Days since the Unix epoch for a proleptic-Gregorian date — the inverse of [`civil_from_days`].
 pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y - i64::from(m <= 2);

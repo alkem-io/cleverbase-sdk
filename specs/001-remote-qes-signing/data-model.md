@@ -91,8 +91,9 @@ next effect from `phase`; effects are not stored on the handle.
   `pdf_a`: bool (preserved if input was PDF/A).
 
 ### PdfVerification (output)
-- `integrity`: bool — true only when one signature dictionary is structurally bound to its raw-hex
-  `/Contents` gap, the embedded CMS signature verifies with the certificate selected by SignerInfo,
+- `integrity`: bool — true only when one signature dictionary is structurally bound to the complete
+  `/Contents` hexadecimal string (including `<` and `>`), the embedded CMS signature verifies with the
+  certificate selected by SignerInfo, the PAdES signed attributes omit CMS `signing-time`,
   and the signed `message-digest` equals SHA-256 of the two `/ByteRange` segments.
 - `profile?`: enum `{ B_B, B_T }`, present only when `integrity=true`. B-T has the timestamp-token
   binding and embedded-signer integrity semantics defined by the SDK API contract.

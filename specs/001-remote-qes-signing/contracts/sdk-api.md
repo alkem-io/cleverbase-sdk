@@ -56,8 +56,11 @@ unbounded concurrency). `Failed` always carries an evidence record (FR-015).
 profile emitted by this SDK: `rsaEncryption` with PKCS #1 v1.5 or P-256 ECDSA with SHA-256
 (`ecdsa-with-SHA256`), plus `ESSCertIDv2` with its default SHA-256 algorithm and no `issuerSerial`.
 Other valid CMS profiles may return an unsupported or malformed verdict. Within that profile it
-validates one signature's strict `/ByteRange` and `/Contents` binding, detached CMS structure,
-signed attributes, embedded signer certificate selection, signature, and document message digest.
+validates one signature's strict `/ByteRange` binding to the complete `/Contents` hexadecimal string
+(including its delimiters), detached CMS structure, PAdES signed-attribute profile (including the
+absence of CMS `signing-time`), embedded signer certificate selection, signature, and document
+message digest. SDK-produced signature dictionaries carry `/M` from the signing context and `/Name`
+from the embedded signer certificate's non-empty common name.
 `profile=B_T` means the signature-time-stamp token binds the signature value through its declared
 SHA-2 `messageImprint`, and the token's CMS signature and content digest verify against the signer
 certificate selected from the token's own certificate set. It does not establish signer or TSA

@@ -2,7 +2,8 @@
 //! placeholder, hash over the ByteRange, CMS embedding, and an optional visible appearance.
 //!
 //! Cleverbase signs only a hash; we own the container (Constitution Principle V). The to-be-signed
-//! digest is `sha256` over the whole PDF except the `/Contents` value (the standard PAdES
+//! digest is `sha256` over the whole PDF except the complete `/Contents` hexadecimal string,
+//! including its delimiters (the standard PAdES
 //! ByteRange). After the signer's signature is wrapped into a detached CMS (see
 //! [`crate::crypto::cms`]), the CMS DER is written into the `/Contents` placeholder.
 
@@ -79,6 +80,19 @@ pub struct VisibleAppearance {
     pub lines: Vec<String>,
 }
 
+/// Values written into the PDF signature dictionary before the document hash is computed.
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureMetadata<'a> {
+    /// Claimed signing time, as Unix seconds, serialized as the required UTC PDF `/M` date.
+    pub claimed_signing_time_unix: i64,
+    /// Signer display name for `/Name`; omitted when the certificate has no common name.
+    pub signer_name: Option<&'a str>,
+    /// Optional signing reason.
+    pub reason: Option<&'a str>,
+    /// Optional signing location.
+    pub location: Option<&'a str>,
+}
+
 /// A PDF staged for signing.
 #[derive(Debug, Clone)]
 pub struct PreparedSignature {
@@ -140,6 +154,11 @@ fn escape_pdf_text(s: &str) -> String {
         }
     }
     out
+}
+
+fn pdf_utc_date(unix_seconds: i64) -> String {
+    let (year, month, day, hour, minute, second) = crate::util::utc_components(unix_seconds);
+    format!("D:{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z")
 }
 
 /// Add a visible appearance to `field`: a form XObject drawing the text lines, referenced via `/AP`.
@@ -214,8 +233,7 @@ fn add_visible_appearance(
 /// span to embed into.
 pub fn prepare(
     original_pdf: &[u8],
-    reason: Option<&str>,
-    location: Option<&str>,
+    metadata: SignatureMetadata<'_>,
     appearance: Option<&VisibleAppearance>,
 ) -> Result<PreparedSignature, PadesError> {
     let mut doc = Document::load_mem(original_pdf)?;
@@ -258,13 +276,26 @@ pub fn prepare(
             StringFormat::Hexadecimal,
         ),
     );
-    if let Some(r) = reason {
+    sig.set(
+        "M",
+        Object::String(
+            pdf_utc_date(metadata.claimed_signing_time_unix).into_bytes(),
+            StringFormat::Literal,
+        ),
+    );
+    if let Some(name) = metadata.signer_name.filter(|name| !name.is_empty()) {
+        sig.set(
+            "Name",
+            Object::String(name.as_bytes().to_vec(), StringFormat::Literal),
+        );
+    }
+    if let Some(r) = metadata.reason {
         sig.set(
             "Reason",
             Object::String(r.as_bytes().to_vec(), StringFormat::Literal),
         );
     }
-    if let Some(l) = location {
+    if let Some(l) = metadata.location {
         sig.set(
             "Location",
             Object::String(l.as_bytes().to_vec(), StringFormat::Literal),
@@ -385,9 +416,9 @@ pub fn prepare(
         return Err(PadesError::Placeholder("/Contents delimiters"));
     }
 
-    let region1_len = z0; // through and including '<'
-    let region2_start = z1; // from '>' to EOF
-    let region2_len = buf.len() - z1;
+    let region1_len = z0 - 1; // stop before '<'
+    let region2_start = z1 + 1; // resume after '>'
+    let region2_len = buf.len() - region2_start;
     let inner = format!("0 {region1_len} {region2_start} {region2_len}");
     let span = br_close - br_open - 1;
     if inner.len() > span {
@@ -401,12 +432,8 @@ pub fn prepare(
         .ok_or(PadesError::Placeholder("/ByteRange slot"))?
         .copy_from_slice(&padded);
 
-    let head = buf.get(..region1_len).unwrap_or_default();
-    let tail = buf.get(region2_start..).unwrap_or_default();
-    let mut hasher_input = Vec::with_capacity(head.len() + tail.len());
-    hasher_input.extend_from_slice(head);
-    hasher_input.extend_from_slice(tail);
-    let content_hash = sha256(&hasher_input);
+    let content_hash =
+        byte_range_digest(&buf, (z0, z1)).ok_or(PadesError::Placeholder("/Contents delimiters"))?;
 
     Ok(PreparedSignature {
         staged_pdf: buf,
@@ -428,14 +455,19 @@ pub fn is_already_signed(pdf: &[u8]) -> bool {
     pdf.windows(b"/ByteRange".len()).any(|w| w == b"/ByteRange")
 }
 
-/// SHA-256 over the signed byte range of a staged PDF: everything except the `/Contents` hex value
-/// between `span.0` and `span.1`. This is the value the CMS `message-digest` attribute must equal,
-/// binding the signature to exactly this document (WYSIWYS). Returns `None` if `span` is out of
-/// bounds (e.g. a corrupted/tampered handle).
+/// SHA-256 over the signed byte range of a staged PDF: everything except the complete
+/// `/Contents` hexadecimal string, including its `<` and `>` delimiters. `span` identifies only
+/// the raw hex digits so CMS embedding and hashing share one resolved placeholder. Returns `None`
+/// if the span or delimiters are invalid (for example in a corrupted session handle).
 pub fn byte_range_digest(staged: &[u8], span: (usize, usize)) -> Option<[u8; 32]> {
     let (lo, hi) = span;
-    let head = staged.get(..lo)?;
-    let tail = staged.get(hi..)?;
+    let signed_head_end = lo.checked_sub(1)?;
+    let signed_tail_start = hi.checked_add(1)?;
+    if staged.get(signed_head_end) != Some(&b'<') || staged.get(hi) != Some(&b'>') {
+        return None;
+    }
+    let head = staged.get(..signed_head_end)?;
+    let tail = staged.get(signed_tail_start..)?;
     let mut input = Vec::with_capacity(head.len() + tail.len());
     input.extend_from_slice(head);
     input.extend_from_slice(tail);
@@ -487,6 +519,15 @@ mod tests {
 
     const RSA_CERT: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-rsa.cert.der");
     const RSA_KEY: &[u8] = include_bytes!("../../../../tests/fixtures/pki/signer-rsa.key.pk8");
+
+    fn signature_metadata() -> SignatureMetadata<'static> {
+        SignatureMetadata {
+            claimed_signing_time_unix: 1_700_000_000,
+            signer_name: Some("Jane Doe"),
+            reason: None,
+            location: None,
+        }
+    }
 
     fn minimal_pdf() -> Vec<u8> {
         let mut doc = Document::with_version("1.7");
@@ -550,7 +591,7 @@ mod tests {
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
         assert!(matches!(
-            prepare(&buf, None, None, None),
+            prepare(&buf, signature_metadata(), None),
             Err(PadesError::NoPages)
         ));
     }
@@ -594,7 +635,7 @@ mod tests {
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
 
-        let prep = prepare(&buf, None, None, None).unwrap();
+        let prep = prepare(&buf, signature_metadata(), None).unwrap();
         let out = Document::load_mem(&prep.staged_pdf).unwrap();
 
         let cat = out
@@ -639,7 +680,7 @@ mod tests {
 
         assert!(document_is_signed(&Document::load_mem(&buf).unwrap()));
         assert!(matches!(
-            prepare(&buf, None, None, None),
+            prepare(&buf, signature_metadata(), None),
             Err(PadesError::AlreadySigned)
         ));
     }
@@ -654,7 +695,16 @@ mod tests {
 
     #[test]
     fn prepare_embed_and_verify_b_b_invisible() {
-        let prep = prepare(&minimal_pdf(), Some("Approval"), Some("NL"), None).unwrap();
+        let prep = prepare(
+            &minimal_pdf(),
+            SignatureMetadata {
+                reason: Some("Approval"),
+                location: Some("NL"),
+                ..signature_metadata()
+            },
+            None,
+        )
+        .unwrap();
         Document::load_mem(&prep.staged_pdf).unwrap();
 
         let (contents_start, contents_end) = prep.contents_span;
@@ -671,7 +721,7 @@ mod tests {
             "ByteRange must exclude the complete <...> /Contents string"
         );
 
-        let attrs = cms::build_signed_attrs(&prep.content_hash, RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = cms::build_signed_attrs(&prep.content_hash, RSA_CERT).unwrap();
         let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
         let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(key);
         let signature = signer.sign(&attrs).to_bytes();
@@ -698,7 +748,15 @@ mod tests {
             rect: (72.0, 72.0, 220.0, 64.0),
             lines: vec!["Signed by: Jane Doe".into(), "Reason: Approval".into()],
         };
-        let prep = prepare(&minimal_pdf(), Some("Approval"), None, Some(&appearance)).unwrap();
+        let prep = prepare(
+            &minimal_pdf(),
+            SignatureMetadata {
+                reason: Some("Approval"),
+                ..signature_metadata()
+            },
+            Some(&appearance),
+        )
+        .unwrap();
         Document::load_mem(&prep.staged_pdf).unwrap();
         assert!(
             find_from(&prep.staged_pdf, b"/AP", 0).is_some(),
@@ -716,7 +774,7 @@ mod tests {
             lines: vec!["x".into()],
         };
         assert!(matches!(
-            prepare(&minimal_pdf(), None, None, Some(&appearance)),
+            prepare(&minimal_pdf(), signature_metadata(), Some(&appearance)),
             Err(PadesError::InvalidPlacement)
         ));
     }
@@ -729,14 +787,14 @@ mod tests {
             lines: vec!["x".into()],
         };
         assert!(matches!(
-            prepare(&minimal_pdf(), None, None, Some(&appearance)),
+            prepare(&minimal_pdf(), signature_metadata(), Some(&appearance)),
             Err(PadesError::InvalidPlacement)
         ));
     }
 
     #[test]
     fn embed_rejects_oversized_cms() {
-        let prep = prepare(&minimal_pdf(), None, None, None).unwrap();
+        let prep = prepare(&minimal_pdf(), signature_metadata(), None).unwrap();
         let mut staged = prep.staged_pdf.clone();
         let too_big = vec![0u8; CONTENTS_PLACEHOLDER_BYTES + 1];
         assert!(matches!(

@@ -10,7 +10,7 @@ use cms::content_info::{CmsVersion, ContentInfo};
 use cms::signed_data::{
     CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo, SignerInfos,
 };
-use der::asn1::{Any, GeneralizedTime, Null, OctetString, SetOfVec, UtcTime};
+use der::asn1::{Any, Null, OctetString, SetOfVec};
 use der::oid::ObjectIdentifier;
 use der::{Decode, Encode};
 use x509_cert::attr::Attribute;
@@ -34,9 +34,6 @@ const RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.1
 const SHA256_WITH_RSA_ENCRYPTION: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
 const ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-
-// 2050-01-01T00:00:00Z in Unix seconds — UTCTime covers up to (not incl.) this; later uses GeneralizedTime.
-const UTC_TIME_UPPER_BOUND_SECS: u64 = 2_524_608_000;
 
 /// Errors from CMS assembly/verification.
 #[derive(Debug, thiserror::Error)]
@@ -96,30 +93,14 @@ fn single_value_attr(oid: ObjectIdentifier, value: Any) -> Result<Attribute, Cms
     Ok(Attribute { oid, values })
 }
 
-fn signing_time_value(now_unix: i64) -> Result<Any, CmsError> {
-    let secs = now_unix.max(0) as u64;
-    let dur = core::time::Duration::from_secs(secs);
-    if secs < UTC_TIME_UPPER_BOUND_SECS {
-        any_of(&UtcTime::from_unix_duration(dur)?)
-    } else {
-        any_of(&GeneralizedTime::from_unix_duration(dur)?)
-    }
-}
-
 /// Build the DER of the signed attributes as a `SET OF` (tag `0x31`) — the bytes whose SHA-256 the
 /// signer authorizes and signs (`signHash`). `content_hash` is sha256 of the PDF ByteRange bytes.
-pub fn build_signed_attrs(
-    content_hash: &[u8],
-    leaf_cert_der: &[u8],
-    now_unix: i64,
-) -> Result<Vec<u8>, CmsError> {
+pub fn build_signed_attrs(content_hash: &[u8], leaf_cert_der: &[u8]) -> Result<Vec<u8>, CmsError> {
     let content_type = single_value_attr(ID_CONTENT_TYPE, any_of(&ID_DATA)?)?;
     let message_digest = single_value_attr(
         ID_MESSAGE_DIGEST,
         any_of(&OctetString::new(content_hash.to_vec())?)?,
     )?;
-    let signing_time = single_value_attr(ID_SIGNING_TIME, signing_time_value(now_unix)?)?;
-
     let cert_hash = sha256(leaf_cert_der);
     let scv2 = SigningCertificateV2 {
         certs: vec![EssCertIdV2 {
@@ -131,7 +112,6 @@ pub fn build_signed_attrs(
     let mut attrs: SetOfVec<Attribute> = SetOfVec::new();
     attrs.insert(content_type)?;
     attrs.insert(message_digest)?;
-    attrs.insert(signing_time)?;
     attrs.insert(signing_cert)?;
     Ok(attrs.to_der()?)
 }
@@ -617,17 +597,13 @@ fn validate_pades_attributes(
     attrs: &SetOfVec<Attribute>,
     signer_certificate: &Certificate,
 ) -> Result<(), CmsError> {
-    let signing_time = single_attribute(attrs, ID_SIGNING_TIME, "invalid signing-time attribute")?;
-    let signing_time_der = signing_time
-        .values
-        .as_slice()
-        .first()
-        .ok_or(CmsError::Structure("invalid signing-time attribute"))?
-        .to_der()?;
-    if UtcTime::from_der(&signing_time_der).is_err()
-        && GeneralizedTime::from_der(&signing_time_der).is_err()
+    if attrs
+        .iter()
+        .any(|attribute| attribute.oid == ID_SIGNING_TIME)
     {
-        return Err(CmsError::Structure("invalid signing-time attribute"));
+        return Err(CmsError::Structure(
+            "PAdES CMS signing-time attribute is forbidden",
+        ));
     }
 
     let signing_certificate = single_attribute(
@@ -679,7 +655,7 @@ mod tests {
 
     fn valid_rsa_cms() -> Vec<u8> {
         let content_hash = sha256(b"CMS verifier structural fixture");
-        let attrs = build_signed_attrs(&content_hash, RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, RSA_CERT).unwrap();
         let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
         let signature = rsa::pkcs1v15::SigningKey::<Sha256>::new(key)
             .sign(&attrs)
@@ -733,7 +709,7 @@ mod tests {
     #[test]
     fn rsa_signed_data_assembles_and_verifies() {
         let content_hash = sha256(b"the PDF byte-range content");
-        let attrs = build_signed_attrs(&content_hash, RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, RSA_CERT).unwrap();
         assert_eq!(tbs_hash(&attrs).len(), 32);
 
         // Simulate Cleverbase signHash: PKCS#1 v1.5 over sha256(signedAttrs).
@@ -767,7 +743,7 @@ mod tests {
     #[test]
     fn signer_certificate_is_resolved_when_leaf_is_not_first_in_der_set() {
         let content_hash = sha256(b"certificate SET ordering is not chain ordering");
-        let attrs = build_signed_attrs(&content_hash, RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, RSA_CERT).unwrap();
         let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
         let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(key);
         let signature = signer.sign(&attrs).to_bytes();
@@ -942,7 +918,9 @@ mod tests {
         });
         assert!(matches!(
             verify_signed_data_auto(&invalid_signing_time),
-            Err(CmsError::Structure("invalid signing-time attribute"))
+            Err(CmsError::Structure(
+                "PAdES CMS signing-time attribute is forbidden"
+            ))
         ));
 
         let wrong_signing_certificate = rewrite_signed_data(&cms, |_, signed_data| {
@@ -984,7 +962,7 @@ mod tests {
                     Some(
                         single_value_attr(
                             ID_SIGNING_TIME,
-                            signing_time_value(1_700_000_000).unwrap(),
+                            Any::from_der(b"\x17\x0d231114221320Z").unwrap(),
                         )
                         .unwrap(),
                     ),
@@ -1076,7 +1054,7 @@ mod tests {
     #[test]
     fn verify_signed_data_rejects_bad_signatures() {
         let content_hash = sha256(b"a document");
-        let attrs = build_signed_attrs(&content_hash, RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, RSA_CERT).unwrap();
         // A garbage 256-byte signature assembles structurally but must fail verification.
         let cms_garbage =
             assemble_signed_data(&[RSA_CERT.to_vec()], &attrs, &[0u8; 256], KeyAlgo::Rsa).unwrap();
@@ -1090,7 +1068,7 @@ mod tests {
     #[test]
     fn ecdsa_signed_data_assembles_and_verifies() {
         let content_hash = sha256(b"another document");
-        let attrs = build_signed_attrs(&content_hash, EC_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, EC_CERT).unwrap();
 
         let key = P256Key::from_pkcs8_der(EC_KEY).unwrap();
         let sig: P256Sig = key.sign(&attrs);
@@ -1119,7 +1097,7 @@ mod tests {
     fn ecdsa_raw_signature_is_normalized_to_der() {
         // CSC v2 returns ECDSA signatures as raw r‖s (64 bytes); we must DER-encode for CMS.
         let content_hash = sha256(b"raw ecdsa doc");
-        let attrs = build_signed_attrs(&content_hash, EC_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, EC_CERT).unwrap();
         let key = P256Key::from_pkcs8_der(EC_KEY).unwrap();
         let sig: P256Sig = key.sign(&attrs);
         let raw = sig.to_bytes();
@@ -1150,7 +1128,7 @@ mod tests {
         // For ECDSA the CMS stores the DER signature, so a B-T timestamp must hash THAT, not the
         // raw r‖s. signer_signature() must return the stored (DER) value.
         let content_hash = sha256(b"bt ecdsa");
-        let attrs = build_signed_attrs(&content_hash, EC_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&content_hash, EC_CERT).unwrap();
         let key = P256Key::from_pkcs8_der(EC_KEY).unwrap();
         let sig: P256Sig = key.sign(&attrs);
         let raw = sig.to_bytes();
@@ -1173,30 +1151,9 @@ mod tests {
         );
     }
 
-    /// ASN.1 tag of the signing-time attribute's value in freshly built signed attributes.
-    fn signing_time_tag(now_unix: i64) -> der::Tag {
-        use der::Tagged;
-        let der = build_signed_attrs(&sha256(b"x"), RSA_CERT, now_unix).unwrap();
-        let attrs = SetOfVec::<Attribute>::from_der(&der).unwrap();
-        let st = attrs
-            .iter()
-            .find(|a| a.oid == ID_SIGNING_TIME)
-            .expect("signing-time attribute present");
-        st.values.iter().next().expect("a signing-time value").tag()
-    }
-
-    #[test]
-    fn signing_time_switches_to_generalized_time_at_2050() {
-        // CMS/X.509 require UTCTime for years < 2050 and GeneralizedTime from 2050 on. Assert the
-        // signing-time value's *tag* switches at the boundary — not merely that some 0x18 byte
-        // appears in the DER (which is true regardless of the encoding chosen).
-        assert_eq!(signing_time_tag(1_700_000_000), der::Tag::UtcTime); // 2023
-        assert_eq!(signing_time_tag(2_524_608_000), der::Tag::GeneralizedTime); // 2050-01-01
-    }
-
     #[test]
     fn unsupported_algo_is_rejected() {
-        let attrs = build_signed_attrs(&sha256(b"x"), RSA_CERT, 1_700_000_000).unwrap();
+        let attrs = build_signed_attrs(&sha256(b"x"), RSA_CERT).unwrap();
         let err = assemble_signed_data(&[RSA_CERT.to_vec()], &attrs, b"sig", KeyAlgo::Other);
         assert!(matches!(err, Err(CmsError::UnsupportedAlgo)));
     }

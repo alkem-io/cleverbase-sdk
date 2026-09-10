@@ -36,7 +36,7 @@ validation backend).
 **Testing**: `cargo test` (`independent_validation.rs` gains an ECDSA arm + a B-T ECDSA arm); `go test`
 (credential-free E2E becomes an algorithm table `{v1_rsa, v2_ecdsa}` × `{B-B, B-T}`; `live_test.go`
 becomes a full gated live contract path); `openssl cms -verify` (always-on, algorithm-agnostic);
-`pyhanko adesverify` + EU DSS (opt-in profile gate).
+Poppler `pdfsig` + `pyhanko adesverify` + EU DSS (opt-in profile gate).
 
 **Target Platform**: Linux + macOS CI runners (matches existing jobs).
 
@@ -65,8 +65,8 @@ jobs (profile-conformance, live).
 | I. Production-Grade Completeness | Ships ECDSA parity + the live contract path complete; no stubs (the existing `live_test.go` smoke stub is replaced by a full gated path). | ✅ PASS |
 | II. Standards-First Conformance | Cites ETSI EN 319 142 (PAdES B-B/B-T profile gate), CSC v1/v2, RFC 3161, ecdsa-with-SHA256 (`1.2.840.10045.4.3.2`). | ✅ PASS |
 | III. Single Rust Core, Idiomatic Bindings | **Zero core/binding changes**; no crypto/protocol logic added or duplicated. Algorithm dispatch already lives once in the core. | ✅ PASS |
-| IV. Security & Cryptographic Rigor | Real credentials only via secure external config, never committed/logged (FR-010); no hand-rolled crypto (reuse `p256`/`rsa`/openssl/pyHanko/DSS). | ✅ PASS |
-| V. Own the Full AdES Stack | The opt-in profile gate uses the **pluggable validation backend** the constitution names (pyHanko / EU DSS), self-hosted, never an external hosted service. | ✅ PASS |
+| IV. Security & Cryptographic Rigor | Real credentials only via secure external config, never committed/logged (FR-010); no hand-rolled crypto (reuse `p256`/`rsa`/OpenSSL/pdfsig/pyHanko/DSS). | ✅ PASS |
+| V. Own the Full AdES Stack | The opt-in profile gate uses self-hosted **pluggable validation backends** (pdfsig / pyHanko / EU DSS), never an external hosted service. | ✅ PASS |
 | VI. Test-First & Contract-Tested (≥95%) | The feature *is* test coverage: write the failing ECDSA E2E + `independent_validation` arms first; contract-test against the real Cleverbase surface (live path); independent-validator checks on produced signatures. Coverage floor preserved. | ✅ PASS |
 | VII. Versioning & ABI Stability | No ABI/API surface change. | ✅ PASS |
 | VIII. DRY · RCA · No Opportunistic Edits | DRY is the central mandate (FR-004): one algorithm-parametrized fixture/sign/validate path, no RSA/ECDSA copy-paste. Scope is held to the ECDSA gap + live path; the PKI `gen.sh` is in-scope (it makes the algorithm-parametrized fixtures reproducible — a stated research gap, not a drive-by). | ✅ PASS |
@@ -87,7 +87,7 @@ specs/003-ecdsa-and-live-signing/
 │   ├── authorizer.md            # the Go Authorizer interface (interactive | headless)
 │   ├── algorithm-fixtures.md    # mock multi-signer + credentials_info variants + PKI gen recipe
 │   ├── live-contract-path.md    # live flow, config env vars, gating/skip semantics
-│   └── profile-conformance-gate.md  # opt-in pyHanko/DSS gate contract
+│   └── profile-conformance-gate.md  # opt-in pdfsig/pyHanko/DSS gate contract
 └── checklists/requirements.md   # spec quality checklist (already 16/16)
 ```
 
@@ -112,7 +112,7 @@ examples/reference-integration/
     └── internal/config/config.go    # live knobs: authorizer mode + real trust-anchor (CA bundle)
 
 scripts/
-└── validate-pades.sh                # NEW — opt-in profile-conformance gate (pyHanko adesverify; DSS baseline-level)
+└── validate-pades.sh                # NEW — opt-in gate (pdfsig + pyHanko; DSS baseline-level)
 
 .github/workflows/
 ├── test.yml                         # add the ECDSA E2E arm to the credential-free job (still no external deps)

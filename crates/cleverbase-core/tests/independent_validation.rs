@@ -364,7 +364,7 @@ fn replace_cms(pdf: &[u8], cms_der: &[u8]) -> Vec<u8> {
     let first_len = values[1];
     let second_start = values[2];
     let mut replaced = pdf.to_vec();
-    let gap = &mut replaced[first_len..second_start];
+    let gap = &mut replaced[first_len + 1..second_start - 1];
     assert!(cms_der.len() * 2 <= gap.len());
     gap.fill(b'0');
     for (encoded, byte) in gap.chunks_exact_mut(2).zip(cms_der) {
@@ -471,16 +471,16 @@ fn produced_b_b_signature_verifies_with_openssl() {
 }
 
 #[test]
-fn signing_output_is_byte_stable_after_shared_verifier_refactor() {
-    // Captured from develop at 4b06117 before the CMS self-check was refactored to share the
-    // offline verifier. The fixed clock, entropy, fixture key, and PKCS#1 v1.5 signature make this
-    // RSA B-B output deterministic; changing signer-certificate selection must not rewrite it.
+fn signing_output_matches_the_pades_conformance_baseline() {
+    // The fixed clock, entropy, fixture key, and PKCS#1 v1.5 signature make this RSA B-B output
+    // deterministic. Pin the corrected dictionary, CMS attributes, ByteRange and signer-certificate
+    // selection together so a later refactor cannot silently rewrite the signed output.
     assert_eq!(
         cleverbase_core::crypto::sha256(&produce_signed_pdf(KeyAlgo::Rsa).pdf),
         [
-            0x3c, 0xbf, 0x4e, 0x64, 0x4d, 0xbc, 0x68, 0xcb, 0x35, 0x26, 0xde, 0x0b, 0xb6, 0x70,
-            0x10, 0xc6, 0x60, 0x20, 0x1c, 0x17, 0xd6, 0x0b, 0xf1, 0x43, 0x4e, 0xe9, 0xcf, 0x0f,
-            0xa1, 0x6e, 0xbd, 0x49,
+            0x3f, 0x86, 0x95, 0x90, 0xac, 0x53, 0x65, 0x9e, 0x6e, 0x9d, 0x2a, 0xf4, 0xe3, 0x91,
+            0x8f, 0x06, 0x4c, 0xce, 0xa5, 0xb5, 0xad, 0x40, 0x3b, 0x67, 0x43, 0xa6, 0xe3, 0x52,
+            0xfc, 0xf8, 0xf3, 0xbd,
         ]
     );
 }
@@ -492,7 +492,7 @@ fn verifier_rejects_cms_signed_by_a_key_other_than_its_embedded_certificate() {
 
     let signed = produce_signed_pdf(KeyAlgo::Rsa).pdf;
     let (content, _) = extract(&signed);
-    let attributes = cms::build_signed_attrs(&sha256(&content), EC_CERT, ctx().now_unix).unwrap();
+    let attributes = cms::build_signed_attrs(&sha256(&content), EC_CERT).unwrap();
     let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY).unwrap();
     let signature = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key)
         .sign(&attributes)
@@ -527,7 +527,7 @@ fn verifier_rejects_the_public_cleverbase_stub_fake_signature() {
     let signed = produce_signed_pdf(KeyAlgo::Rsa).pdf;
     let (content, _) = extract(&signed);
     let leaf = base64_decode(STUB_LEAF_B64.trim()).unwrap();
-    let attributes = cms::build_signed_attrs(&sha256(&content), &leaf, ctx().now_unix).unwrap();
+    let attributes = cms::build_signed_attrs(&sha256(&content), &leaf).unwrap();
     let fake_signature = base64_decode(STUB_SIGNATURE_B64).unwrap();
     let fake_cms = cms::assemble_signed_data(
         &[leaf],

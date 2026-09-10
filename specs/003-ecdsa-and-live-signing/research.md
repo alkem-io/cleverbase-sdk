@@ -105,11 +105,12 @@ green and the live job out of the default path (FR-009).
 **Alternatives considered**: Hardcoding the real CA — **rejected** (chains rotate; FR-008 wants the real
 issuer chain, configurable).
 
-## D7 — Opt-in profile-conformance gate: pyHanko primary, EU DSS for the baseline-level assertion
+## D7 — Opt-in profile-conformance gate: pdfsig + pyHanko, EU DSS for the baseline-level assertion
 
 **Decision**: Implement the opt-in PAdES/eIDAS profile gate (FR-014) as `scripts/validate-pades.sh` driving
+**Poppler `pdfsig`** for PDF-native signature and complete-document coverage validation,
 **pyHanko (`pyhanko adesverify`)** as the primary AdES validator (signature + chain + timestamp, RSA and
-ECDSA P-256), **plus EU DSS** specifically for the **structural baseline-level** assertion
+ECDSA P-256), and **EU DSS** specifically for the **structural baseline-level** assertion
 (`SignatureFormat == PAdES-BASELINE-B / -T`). Run as an **off-by-default** CI job
 (`profile-conformance.yml`), separate from the always-on `openssl` check; **never linked into the SDK**.
 
@@ -129,7 +130,7 @@ documents must never leave the operator's infrastructure).
 
 **Decision**: Keep `openssl cms -verify` (+ the RFC 3161 timestamp grep + PAdES ByteRange/Contents
 structural checks) as the **always-on** validation bar for both algorithms and both paths (synthetic +
-live); the pyHanko/DSS profile gate (D7) is strictly additional and opt-in.
+live); the pdfsig/pyHanko/DSS profile gate (D7) is strictly additional and opt-in.
 
 **Rationale**: This is the established RSA bar (`credfree_test.go:172-223`, `independent_validation.rs`),
 algorithm-agnostic, zero-dependency, and already green — extending it to ECDSA is free. Matches the spec's

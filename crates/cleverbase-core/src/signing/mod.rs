@@ -91,10 +91,7 @@ pub enum CoreError {
 
 /// Format a UTC date/time for a visible appearance (civil-from-days; no external date dep).
 fn fmt_date(now_unix: i64) -> String {
-    let days = now_unix.div_euclid(86400);
-    let secs = now_unix.rem_euclid(86400);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let (y, m, d) = util::civil_from_days(days);
+    let (y, m, d, hh, mm, ss) = util::utc_components(now_unix);
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
 }
 
@@ -556,10 +553,16 @@ pub fn resume(
             // PDF/A is preserved for invisible signatures; a visible appearance uses a non-embedded
             // base font, which is not PDF/A-conformant (font embedding is a later enhancement).
             let visible = build_visible_appearance(&request, &identity, ctx.now_unix);
+            let signature_metadata = container::SignatureMetadata {
+                claimed_signing_time_unix: ctx.now_unix,
+                signer_name: (!identity.common_name.is_empty())
+                    .then_some(identity.common_name.as_str()),
+                reason: reason.as_deref(),
+                location: location.as_deref(),
+            };
             let prepared = match container::prepare(
                 &request.document,
-                reason.as_deref(),
-                location.as_deref(),
+                signature_metadata,
                 visible.as_ref(),
             ) {
                 Ok(p) => p,
@@ -590,9 +593,8 @@ pub fn resume(
             // conformance (see docs/limitations.md), so never assert unverified preservation.
             handle.pdf_a =
                 Some(container::is_pdf_a(&prepared.staged_pdf) && request.appearance.is_none());
-            let signed_attrs =
-                cms::build_signed_attrs(&prepared.content_hash, leaf_cert, ctx.now_unix)
-                    .map_err(|e| CoreError::Internal(e.to_string()))?;
+            let signed_attrs = cms::build_signed_attrs(&prepared.content_hash, leaf_cert)
+                .map_err(|e| CoreError::Internal(e.to_string()))?;
             let tbs = cms::tbs_hash(&signed_attrs);
 
             handle.cert_chain = Some(chain);
@@ -1733,15 +1735,25 @@ mod tests {
         match step {
             Step::Done { signed, evidence } => {
                 assert_eq!(signed.conformance_level, ConformanceLevel::BB);
-                lopdf::Document::load_mem(&signed.pdf).expect("signed PDF loads");
-                let pdf_text = String::from_utf8_lossy(&signed.pdf);
-                assert!(
-                    pdf_text.contains("/M (D:20231114221320Z)"),
-                    "PAdES requires the claimed UTC signing time in /M"
+                let document = lopdf::Document::load_mem(&signed.pdf).expect("signed PDF loads");
+                let signature = document
+                    .objects
+                    .values()
+                    .find_map(|object| {
+                        let dictionary = object.as_dict().ok()?;
+                        dictionary.get(b"ByteRange").is_ok().then_some(dictionary)
+                    })
+                    .expect("signature dictionary");
+                assert_eq!(
+                    signature.get(b"M").and_then(lopdf::Object::as_str).unwrap(),
+                    b"D:20231114221320Z"
                 );
-                assert!(
-                    pdf_text.contains("/Name (Jane Doe)"),
-                    "the certificate CN must identify the signer in PDF viewers"
+                assert_eq!(
+                    signature
+                        .get(b"Name")
+                        .and_then(lopdf::Object::as_str)
+                        .unwrap(),
+                    b"Jane Doe"
                 );
                 assert_eq!(evidence.outcome, SigningOutcome::Signed);
                 assert_eq!(evidence.signer.unwrap().serial_number, "PNONL-123");

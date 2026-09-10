@@ -93,12 +93,12 @@ addition to (never instead of) the always-on OpenSSL bar. Validates US1 outputs 
 
 ### Test (write first — MUST fail / self-skip if toolchain absent)
 
-- [X] T015 [P] **(F5 — concrete artifact path)** Add `scripts/test-validate-pades.sh` asserting: a known-good B-B PDF passes `--expect-level B-B`; the same asserted as `--expect-level B-T` fails; a tampered PDF fails AdES validation. Self-skips (exit 0 with a SKIP message) when `pyhanko`/the DSS container are absent, mirroring the `openssl`-absent skip.
+- [X] T015 [P] **(F5 — concrete artifact path)** Add `scripts/test-validate-pades.sh` asserting: a known-good B-B PDF passes `--expect-level B-B`; the same asserted as `--expect-level B-T` fails; a tampered PDF fails independent signature validation. Self-skips (exit 0 with a SKIP message) when `pdfsig`/`pyhanko` and the DSS container are absent, mirroring the `openssl`-absent skip.
 
 ### Implementation
 
-- [X] T016 Implement `scripts/validate-pades.sh --expect-level {B-B|B-T} --trust <pem> <pdf>...` driving pyHanko `adesverify` (AdES validation, RSA + ECDSA) and EU DSS (structural `PAdES-BASELINE-B/-T` level assertion); non-zero on AdES failure or level mismatch. **(N2 — pin the toolchain)** Pin `pyhanko-cli` to an exact version and the **EU DSS container to a digest-pinned image (or a fixed DSS release tag) declared ONCE in this script** (single source — Constitution III), so the gate is reproducible across CI and dev. (contracts/profile-conformance-gate.md)
-- [X] T017 [P] Add `.github/workflows/profile-conformance.yml` — **off by default** (`workflow_dispatch`/label gate), installs the **pinned** `pyhanko-cli` into a throwaway venv + runs the **digest-pinned** DSS container (the same pins declared in `scripts/validate-pades.sh`, N2), over the credential-free B-B/B-T PDFs for both algorithms.
+- [X] T016 Implement `scripts/validate-pades.sh --expect-level {B-B|B-T} --trust <pem> <pdf>...` driving Poppler `pdfsig` (PDF-native signature/coverage validation), pyHanko `adesverify` (AdES validation, RSA + ECDSA) and EU DSS (structural `PAdES-BASELINE-B/-T` level assertion); non-zero on signature/AdES failure or level mismatch. **(N2 — pin the toolchain)** Pin `pyhanko-cli` to an exact version and the **EU DSS container to a digest-pinned image (or a fixed DSS release tag) declared ONCE in this script** (single source — Constitution III), so the gate is reproducible across CI and dev. (contracts/profile-conformance-gate.md)
+- [X] T017 [P] Add `.github/workflows/profile-conformance.yml` — **off by default** (`workflow_dispatch`/label gate), installs Poppler and the **pinned** `pyhanko-cli` into a throwaway venv + runs the **digest-pinned** DSS container (the same pins declared in `scripts/validate-pades.sh`, N2), over the credential-free B-B/B-T PDFs for both algorithms.
 
 **Checkpoint**: enabling/disabling the gate does not affect the always-on OpenSSL bar (SC-007); a
 crypto-valid-but-non-conformant signature fails loudly. **(C1)** SC-007's "every produced B-B/B-T
