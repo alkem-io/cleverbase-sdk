@@ -16,7 +16,6 @@ Issues = "https://github.com/alkem-io/cleverbase-sdk/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-include = ["cleverbase.pyi"]
 
 [tool.mypy]
 # Strictest practical type checking for the Python binding (tests + stub). Run from this

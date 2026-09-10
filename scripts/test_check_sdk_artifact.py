@@ -84,7 +84,6 @@ def wheel_files(tag: str) -> dict[str, bytes]:
         f"{dist_info}/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
         f"{dist_info}/RECORD": b"record\n",
         f"{dist_info}/sboms/cleverbase-py.cyclonedx.json": json.dumps(sbom).encode(),
-        "cleverbase.pyi": b"def verify_pdf(document: bytes): ...\n",
         "cleverbase/__init__.py": b"from .cleverbase import *\n",
         "cleverbase/__init__.pyi": b"def verify_pdf(document: bytes): ...\n",
         "cleverbase/py.typed": b"",
@@ -166,6 +165,16 @@ def test_python_wheel_rejects_unsafe_member(tmp_path: Path) -> None:
     files["../credential.env"] = b"secret"
     write_zip(wheel, files)
     with pytest.raises(ArtifactError, match="unsafe archive path"):
+        check_python_wheel(wheel, VERSION, tag)
+
+
+def test_python_wheel_rejects_unexpected_non_sbom_member(tmp_path: Path) -> None:
+    tag = "cp39-abi3-manylinux_2_28_x86_64"
+    wheel = tmp_path / f"alkemio_cleverbase_sdk-{VERSION}-{tag}.whl"
+    files = wheel_files(tag)
+    files["cleverbase/private.rs"] = b"source"
+    write_zip(wheel, files)
+    with pytest.raises(ArtifactError, match="unexpected non-SBOM"):
         check_python_wheel(wheel, VERSION, tag)
 
 

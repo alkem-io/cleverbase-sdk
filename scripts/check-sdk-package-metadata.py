@@ -103,7 +103,6 @@ def main() -> int:
             r"(?ms)^\[project\.urls\]\s*$.*?^Issues = "
             r'"https://github.com/alkem-io/cleverbase-sdk/issues"$'
         ),
-        "Python wheel typing include": r'(?m)^include = \["cleverbase\.pyi"\]$',
     }
     for label, pattern in python_patterns.items():
         require(errors, re.search(pattern, pyproject) is not None, label)

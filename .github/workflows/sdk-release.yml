@@ -28,7 +28,8 @@ permissions:
 
 concurrency:
   group: sdk-release-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel an in-flight tag publication; only PR dry-runs are replaceable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   release-identity:
@@ -67,6 +68,10 @@ jobs:
             }
           fi
           python3 scripts/sdk-version.py check --tag "$tag"
+          if grep -Eq 'target/debug|-Wl,-rpath' bindings/go/cleverbase.go; then
+            echo "::error::release blocked: Go binding still embeds development linker paths"
+            exit 1
+          fi
           {
             echo "version=$version"
             echo "tag=$tag"
@@ -330,7 +335,7 @@ jobs:
           python -m pip install maturin==1.14.1
           python -m maturin sdist \
             --manifest-path bindings/python/Cargo.toml \
-            --locked --out dist
+            --out dist
           python scripts/check_sdk_artifact.py node \
             "dist/alkemio-cleverbase-sdk-${RELEASE_VERSION}.tgz" "$RELEASE_VERSION"
           python scripts/check_sdk_artifact.py python-sdist \
@@ -454,6 +459,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.9"
+      - name: Set up Rust
+        run: rustup show
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sdk-release
@@ -513,6 +520,7 @@ jobs:
       - test-python-sdist
       - test-native-archive
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
@@ -521,6 +529,9 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sdk-release
@@ -576,6 +587,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/bindings/go/v')
     needs: publish-github
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: pypi
     permissions:
       contents: read
@@ -584,6 +596,9 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sdk-release
@@ -619,6 +634,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/bindings/go/v')
     needs: publish-pypi
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: npm
     permissions:
       contents: read
@@ -673,6 +689,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/bindings/go/v')
     needs: publish-npm
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:

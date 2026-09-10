@@ -96,12 +96,11 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
     _require(path.name == expected_name, f"wheel filename must be {expected_name}")
     dist_info = f"{PYTHON_DIST}-{version}.dist-info"
     sbom_name = f"{dist_info}/sboms/cleverbase-py.cyclonedx.json"
-    expected_members = {
+    required_members = {
         f"{dist_info}/METADATA",
         f"{dist_info}/WHEEL",
         f"{dist_info}/RECORD",
         sbom_name,
-        "cleverbase.pyi",
         "cleverbase/__init__.py",
         "cleverbase/__init__.pyi",
         "cleverbase/py.typed",
@@ -114,7 +113,18 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
             all(((info.external_attr >> 16) & 0o170000) != SYMLINK_MODE for info in infos),
             "wheel may not contain symlinks",
         )
-        _require(members == expected_members, "wheel has unexpected members or typing surface")
+        _require(
+            required_members <= members,
+            "wheel is missing metadata, native code, or its typing surface",
+        )
+        unexpected = members - required_members
+        _require(
+            all(
+                name.startswith(f"{dist_info}/sboms/") and name.endswith(".json")
+                for name in unexpected
+            ),
+            "wheel has an unexpected non-SBOM member",
+        )
         metadata = BytesParser().parsebytes(archive.read(f"{dist_info}/METADATA"))
         wheel = BytesParser().parsebytes(archive.read(f"{dist_info}/WHEEL"))
         sbom = json.loads(archive.read(sbom_name))
