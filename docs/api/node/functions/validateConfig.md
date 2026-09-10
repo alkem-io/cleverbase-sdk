@@ -2,7 +2,7 @@
 
 > **validateConfig**(`environment`, `cscApi`, `clientId`, `clientSecret`, `redirectUri`, `tsaUrl?`, `upstreamBaseUrl?`, `tsaAuth?`, `tsaPolicyOid?`): `void`
 
-Defined in: [index.d.ts:10](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L10)
+Defined in: [index.d.ts:28](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L28)
 
 Validate signing configuration without creating a signing session. Request-dependent rules are
 checked later by `beginSigning`, which validates the configuration again.

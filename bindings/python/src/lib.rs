@@ -1,20 +1,38 @@
 //! Python (PyO3) binding for the Cleverbase SDK.
 //!
-//! Thin idiomatic wrapper: native Python args in, and a CBOR `{handle, step}` result out (so
-//! callers only ever *decode* CBOR, never hand-build it). All protocol/crypto logic — including the
-//! wire envelope and the wire-string enum parsing — lives in the Rust core (Constitution
-//! Principle III/VIII). The opaque `handle` is passed back verbatim to resume.
+//! Thin idiomatic wrapper: native Python args in; signing returns a CBOR `{handle, step}` envelope,
+//! PDF verification returns a typed dictionary, and attestation operations remain CBOR-through.
+//! All protocol/crypto logic — including the wire envelope and wire-string enum parsing — lives in
+//! the Rust core (Constitution Principle III/VIII). The opaque signing `handle` is passed back
+//! verbatim to resume.
 
 use cleverbase_core::wire::{decode_handle, encode_handle_step};
 use cleverbase_core::{
     begin, resume, ConformanceLevel, CscApi, Environment, HostContext, RequestOptions, ResumeInput,
-    Secret, SigningRequest, TrustServiceConfiguration, TsaConfiguration,
+    Secret, SigningRequest, TrustServiceConfiguration, TsaConfiguration, VerificationReason,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 fn err(e: impl ToString) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+fn wire_reason(reason: &VerificationReason) -> PyResult<String> {
+    serde_json::to_value(reason)
+        .map_err(err)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| err("verification reason did not serialize as a string"))
+}
+
+fn wire_profile(profile: ConformanceLevel) -> PyResult<String> {
+    serde_json::to_value(profile)
+        .map_err(err)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| err("verification profile did not serialize as a string"))
 }
 
 // The scalar list is the binding contract; a private options struct would duplicate the core model.
@@ -78,6 +96,10 @@ fn validate_config(
     .map_err(err)
 }
 
+/// Begin a signing flow and return a CBOR handle/step envelope.
+///
+/// now_unix must have a UTC year in 0000..9999.
+/// entropy must contain at least 16 fresh random bytes for this call.
 #[pyfunction]
 #[pyo3(signature = (document, environment, csc_api, client_id, client_secret, redirect_uri, conformance, now_unix, entropy, tsa_url=None, options_json=None, *, upstream_base_url=None, tsa_auth=None, tsa_policy_oid=None))]
 // FFI entry point: the individual scalar args cross the pyo3 boundary cleanly, where a params
@@ -124,28 +146,98 @@ fn begin_signing(
     Ok(encode_handle_step(&handle, &step))
 }
 
+/// Resume after an OAuth code and state redirect.
+///
+/// now_unix and entropy follow begin_signing's host-context contract; entropy must be fresh for
+/// this call.
 #[pyfunction]
-fn resume_redirect(handle: Vec<u8>, code: &str, state: &str, now_unix: i64, entropy: Vec<u8>) -> PyResult<Vec<u8>> {
+fn resume_redirect(
+    handle: Vec<u8>,
+    code: &str,
+    state: &str,
+    now_unix: i64,
+    entropy: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     let h = decode_handle(&handle).map_err(err)?;
-    let input = ResumeInput::RedirectReturn { code: code.to_string(), state: state.to_string() };
+    let input = ResumeInput::RedirectReturn {
+        code: code.to_string(),
+        state: state.to_string(),
+    };
     let (handle, step) = resume(h, input, HostContext { now_unix, entropy }).map_err(err)?;
     Ok(encode_handle_step(&handle, &step))
 }
 
+/// Resume after an OAuth error redirect.
+///
+/// now_unix and entropy follow begin_signing's host-context contract; entropy must be fresh for
+/// this call.
 #[pyfunction]
-fn resume_redirect_error(handle: Vec<u8>, error: &str, state: &str, now_unix: i64, entropy: Vec<u8>) -> PyResult<Vec<u8>> {
+fn resume_redirect_error(
+    handle: Vec<u8>,
+    error: &str,
+    state: &str,
+    now_unix: i64,
+    entropy: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     let h = decode_handle(&handle).map_err(err)?;
-    let input = ResumeInput::RedirectError { error: error.to_string(), state: state.to_string() };
+    let input = ResumeInput::RedirectError {
+        error: error.to_string(),
+        state: state.to_string(),
+    };
     let (handle, step) = resume(h, input, HostContext { now_unix, entropy }).map_err(err)?;
     Ok(encode_handle_step(&handle, &step))
 }
 
+/// Resume after a performed HTTP effect.
+///
+/// now_unix and entropy follow begin_signing's host-context contract; entropy must be fresh for
+/// this call.
 #[pyfunction]
-fn resume_http(handle: Vec<u8>, status: u16, body: Vec<u8>, now_unix: i64, entropy: Vec<u8>) -> PyResult<Vec<u8>> {
+fn resume_http(
+    handle: Vec<u8>,
+    status: u16,
+    body: Vec<u8>,
+    now_unix: i64,
+    entropy: Vec<u8>,
+) -> PyResult<Vec<u8>> {
     let h = decode_handle(&handle).map_err(err)?;
-    let input = ResumeInput::HttpResult { status, headers: vec![], body };
+    let input = ResumeInput::HttpResult {
+        status,
+        headers: vec![],
+        body,
+    };
     let (handle, step) = resume(h, input, HostContext { now_unix, entropy }).map_err(err)?;
     Ok(encode_handle_step(&handle, &step))
+}
+
+/// Verify one PDF's ByteRange and embedded CMS signature.
+///
+/// Invalid input returns a typed verdict with integrity false; this operation does not establish
+/// certificate-chain trust, revocation status, signer authorization, TSA trust, or TSA policy.
+#[pyfunction]
+fn verify_pdf(py: Python<'_>, document: Vec<u8>) -> PyResult<Py<PyDict>> {
+    let verification = cleverbase_core::verify_pdf(&document);
+    let result = PyDict::new(py);
+    result.set_item("integrity", verification.integrity)?;
+    result.set_item(
+        "profile",
+        verification.profile.map(wire_profile).transpose()?,
+    )?;
+    if let Some(signer) = verification.signer {
+        let mapped = PyDict::new(py);
+        mapped.set_item("serial", signer.serial_number)?;
+        mapped.set_item("cn", signer.common_name)?;
+        result.set_item("signer", mapped)?;
+    } else {
+        result.set_item("signer", py.None())?;
+    }
+    let reasons = verification
+        .reasons
+        .iter()
+        .map(wire_reason)
+        .collect::<PyResult<Vec<_>>>()?;
+    result.set_item("reasons", reasons)?;
+    Ok(result.unbind())
 }
 
 /// Run the EUDI attestation verifier over a CBOR `VerifyRequest` envelope (attestation schema
@@ -183,7 +275,9 @@ fn attestation_verify(request: Vec<u8>) -> PyResult<Vec<u8>> {
 // CBOR-through: every outcome rides inside the response envelope (see [`attestation_verify`]).
 #[allow(clippy::unnecessary_wraps)]
 fn attestation_verify_vp_token(request: Vec<u8>) -> PyResult<Vec<u8>> {
-    Ok(cleverbase_attestation::wire::process_vp_token_bytes(&request))
+    Ok(cleverbase_attestation::wire::process_vp_token_bytes(
+        &request,
+    ))
 }
 
 /// Drive the EUDI attestation issuance / presentation sans-IO state machine over a CBOR
@@ -208,6 +302,7 @@ fn cleverbase(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resume_redirect, m)?)?;
     m.add_function(wrap_pyfunction!(resume_redirect_error, m)?)?;
     m.add_function(wrap_pyfunction!(resume_http, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_pdf, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_verify, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_verify_vp_token, m)?)?;
     m.add_function(wrap_pyfunction!(attestation_issuance, m)?)?;

@@ -2,9 +2,12 @@
 
 > **resumeRedirectError**(`handle`, `error`, `state`, `nowUnix`, `entropy`): `Buffer`
 
-Defined in: [index.d.ts:16](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L16)
+Defined in: [index.d.ts:49](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L49)
 
-Resume after a redirect OAuth error (`error` + `state`). Returns a CBOR `{handle, step}` Buffer.
+Resume after an OAuth error redirect. Returns a CBOR handle/step Buffer.
+
+nowUnix and entropy follow beginSigning's host-context contract; entropy must be fresh for this
+call.
 
 ## Parameters
 

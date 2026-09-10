@@ -1,5 +1,10 @@
 # Cleverbase Node binding
 
+## Interfaces
+
+- [PdfSigner](interfaces/PdfSigner.md)
+- [PdfVerification](interfaces/PdfVerification.md)
+
 ## Functions
 
 - [attestationIssuance](functions/attestationIssuance.md)
@@ -10,3 +15,4 @@
 - [resumeRedirect](functions/resumeRedirect.md)
 - [resumeRedirectError](functions/resumeRedirectError.md)
 - [validateConfig](functions/validateConfig.md)
+- [verifyPdf](functions/verifyPdf.md)
