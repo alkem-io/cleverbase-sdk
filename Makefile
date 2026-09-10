@@ -22,7 +22,7 @@ go-test: ## build the debug C ABI and test the Go binding against it
 		DYLD_LIBRARY_PATH="$(FFI_DEBUG_DIR)" \
 		go test ./...
 
-binding-coverage: ## run the authoritative >=95% public-surface gate for every language binding
+binding-coverage: ## run the public-surface gates (Python/Go >=95%, Node >=93%)
 	./scripts/test-binding-coverage.sh python
 	./scripts/test-binding-coverage.sh node
 	./scripts/test-binding-coverage.sh go

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build each published language binding exactly as its public tests consume it and enforce the
-# constitution's per-binding >=95% line-coverage floor. CI and the release dry-run share this entry
-# point so coverage cannot drift between ordinary development and publication.
+# approved line-coverage floors: >=95% for Python and Go, >=93% for Node. CI and the release dry-run
+# share this entry point so coverage cannot drift between ordinary development and publication.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
