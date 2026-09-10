@@ -101,7 +101,7 @@ pub fn build_request(
         None => None,
     };
     let nonce = Uint::new(nonce)?;
-    if nonce.is_empty() {
+    if !nonce.as_bytes().iter().any(|byte| *byte != 0) {
         return Err(TimestampError::InvalidNonce);
     }
     let req = TimeStampReq {
@@ -212,7 +212,7 @@ pub(crate) fn parse_nonce(token_der: &[u8]) -> Option<Vec<u8>> {
     }
     let nonce_der = first_tlv_with_tag(fields, 0x02)?;
     let nonce = Uint::from_der(nonce_der).ok()?;
-    if nonce.is_empty() {
+    if !nonce.as_bytes().iter().any(|byte| *byte != 0) {
         return None;
     }
     Some(nonce.as_bytes().to_vec())
@@ -361,10 +361,7 @@ mod tests {
         let high_bit_nonce = [0x80, 0x01];
         let high_bit_request = build_request(&imprint, None, &high_bit_nonce).unwrap();
         let high_bit_roundtrip = TimeStampReq::from_der(&high_bit_request).unwrap();
-        assert_eq!(
-            high_bit_roundtrip.nonce.unwrap().as_bytes(),
-            high_bit_nonce
-        );
+        assert_eq!(high_bit_roundtrip.nonce.unwrap().as_bytes(), high_bit_nonce);
     }
 
     #[test]
