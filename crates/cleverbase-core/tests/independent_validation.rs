@@ -858,8 +858,12 @@ fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
 fn regenerate_pades_bt_fixtures() {
     let fixture_dir = pki_dir().parent().unwrap().join("pades-bt");
     std::fs::create_dir_all(&fixture_dir).unwrap();
+    let mut rsa_nonce = None;
     for algo in [KeyAlgo::Rsa, KeyAlgo::EcdsaP256] {
         let (handle, request) = drive_bt_to_timestamp(algo);
+        if matches!(algo, KeyAlgo::Rsa) {
+            rsa_nonce = handle.timestamp_nonce.clone();
+        }
         let response = openssl_timestamp(&request);
         let token = cleverbase_core::timestamp::parse_response(&response).unwrap();
         let signed = match resume(handle, http_ok_bytes(response.clone()), ctx())
@@ -880,7 +884,7 @@ fn regenerate_pades_bt_fixtures() {
     let wrong_request = cleverbase_core::timestamp::build_request(
         &cleverbase_core::crypto::sha256(b"some unrelated bytes"),
         None,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        rsa_nonce.as_deref().expect("RSA fixture nonce"),
     )
     .unwrap();
     std::fs::write(
