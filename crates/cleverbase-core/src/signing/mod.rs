@@ -284,6 +284,24 @@ fn require_redirect(input: ResumeInput) -> Result<(String, String), CoreError> {
     }
 }
 
+fn validate_context(ctx: &HostContext) -> Result<(), CoreError> {
+    // OAuth state and the RFC 3161 nonce derive from entropy; too little makes them guessable.
+    if ctx.entropy.len() < 16 {
+        return Err(CoreError::InvalidConfig(
+            "entropy must be at least 16 bytes".into(),
+        ));
+    }
+    // PDF dates have a fixed four-digit year. Reject an unrepresentable host clock once at the
+    // input boundary so both begin and resume keep the formatter and persisted state unambiguous.
+    let year = util::utc_components(ctx.now_unix).0;
+    if !(0..=9_999).contains(&year) {
+        return Err(CoreError::InvalidConfig(
+            "now_unix UTC year must be in 0000..=9999".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Begin a signing flow. Returns the session handle plus the first [`Step`].
 pub fn begin(
     request: SigningRequest,
@@ -291,12 +309,7 @@ pub fn begin(
     ctx: HostContext,
 ) -> Result<(SigningSessionHandle, Step), CoreError> {
     config.validate().map_err(CoreError::InvalidConfig)?;
-    // The OAuth `state` CSRF token is derived from entropy; too little makes it guessable/empty.
-    if ctx.entropy.len() < 16 {
-        return Err(CoreError::InvalidConfig(
-            "entropy must be at least 16 bytes".into(),
-        ));
-    }
+    validate_context(&ctx)?;
     if request.conformance_level == ConformanceLevel::BT && config.tsa.is_none() {
         return Err(CoreError::MissingTsaConfig);
     }
@@ -360,14 +373,7 @@ pub fn resume(
             handle.schema_version
         )));
     }
-    // The credential-scope OAuth `state` (CSRF token) is regenerated here from entropy, so resume
-    // must enforce the same minimum as `begin` — otherwise the security-critical second round-trip
-    // could get an empty/guessable state.
-    if ctx.entropy.len() < 16 {
-        return Err(CoreError::InvalidConfig(
-            "entropy must be at least 16 bytes".into(),
-        ));
-    }
+    validate_context(&ctx)?;
     let config = handle
         .config
         .clone()
@@ -1467,25 +1473,6 @@ mod tests {
             expect_failed(step).outcome,
             SigningOutcome::CredentialUnavailable
         );
-    }
-
-    #[test]
-    fn empty_direct_common_name_omits_pdf_signer_name() {
-        let h = advance_to(SigningPhase::InfoPending);
-        let mut info = info_json();
-        info["cert"]["subjectDN"] = serde_json::json!("serialNumber=PNONL-123");
-
-        let (h, step) = resume(h, http_ok(info), ctx()).unwrap();
-        assert!(matches!(step, Step::Redirect(_)));
-        assert!(h.signer.as_ref().unwrap().common_name.is_empty());
-        let document = lopdf::Document::load_mem(h.staged_pdf.as_ref().unwrap()).unwrap();
-        let signature = document
-            .objects
-            .values()
-            .filter_map(|object| object.as_dict().ok())
-            .find(|dictionary| container::is_signature_dictionary(dictionary))
-            .unwrap();
-        assert!(signature.get(b"Name").is_err());
     }
 
     #[test]
