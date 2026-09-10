@@ -97,11 +97,7 @@ jobs:
           python scripts/check-sdk-package-metadata.py
       - name: Release contract tests
         run: |
-          python -m pytest -q \
-            scripts/test_check_sdk_artifact.py \
-            scripts/test_sdk_artifact_manifest.py \
-            scripts/test_release_registry.py \
-            scripts/test_sdk_release_workflow.py
+          python -m pytest -q scripts/
           bash scripts/test-package-ffi-release.sh
           bash scripts/test-package-node-release.sh
 

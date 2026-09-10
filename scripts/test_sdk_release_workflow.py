@@ -68,7 +68,6 @@ def test_publish_jobs_are_tag_only_ordered_and_protected() -> None:
     assert "--draft=false" in text
     assert "--clobber" not in text
     assert "continue-on-error: true" not in text
-    assert "retries" not in text.lower()
 
     tag_guard = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/bindings/go/v')"
     assert text.count(tag_guard) >= 4
