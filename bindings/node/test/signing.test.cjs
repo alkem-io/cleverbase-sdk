@@ -89,6 +89,12 @@ test("config validation accepts valid inputs and rejects a missing client ID", (
       "https://tsa.example/rfc3161",
     ),
   );
+  assert.throws(() =>
+    validateConfig("invalid", "v1_rsa", "client-123", "secret", "https://app.example/cb", null),
+  );
+  assert.throws(() =>
+    validateConfig("acceptance", "invalid", "client-123", "secret", "https://app.example/cb", null),
+  );
 });
 
 test("config options match the Go binding surface", () => {
@@ -254,10 +260,14 @@ test("invalid enum values and bad handles throw", () => {
   assert.throws(() =>
     beginSigning(PDF, "NOPE", "v1_rsa", "c", "s", "https://a/cb", "B-B", NOW, ENTROPY, null),
   );
+  assert.throws(() =>
+    beginSigning(PDF, "acceptance", "NOPE", "c", "s", "https://a/cb", "B-B", NOW, ENTROPY, null),
+  );
   assert.throws(() => resumeRedirect(Buffer.from("bad handle"), "c", "s", NOW, ENTROPY));
   assert.throws(() =>
     resumeRedirectError(Buffer.from("bad handle"), "access_denied", "s", NOW, ENTROPY),
   );
+  assert.throws(() => resumeHttp(Buffer.from("bad handle"), 200, Buffer.alloc(0), NOW, ENTROPY));
   assert.throws(() =>
     beginSigning(
       PDF,

@@ -64,14 +64,12 @@ jobs:
       - name: Install build + test deps
         # Pinned for reproducible builds/tests (same versions the lint job's mypy uses).
         run: .venv/bin/pip install maturin==1.14.1 pytest==9.1.1 cbor2==6.1.2
-      - name: Build the extension (into the venv)
-        run: ../../.venv/bin/maturin develop
-        working-directory: bindings/python
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Public tests + coverage >=95%
+        run: bash scripts/test-binding-coverage.sh python
         env:
           VIRTUAL_ENV: ${{ github.workspace }}/.venv
-      - name: pytest
-        run: ../../.venv/bin/pytest tests
-        working-directory: bindings/python
 
   node:
     name: Node binding
@@ -87,13 +85,12 @@ jobs:
           node-version: "20"
       - run: npm install
         working-directory: bindings/node
-      - name: Build and verify generated declarations
-        run: |
-          npm run build
-          git diff --exit-code -- index.js index.d.ts
-        working-directory: bindings/node
-      - run: npm test
-        working-directory: bindings/node
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Public tests + coverage >=93%
+        run: bash scripts/test-binding-coverage.sh node
+      - name: Verify generated declarations
+        run: git diff --exit-code -- bindings/node/index.js bindings/node/index.d.ts
 
   go:
     name: Go binding (test + coverage)
@@ -107,28 +104,8 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.22"
-      - run: cargo build -p cleverbase-ffi
-      - name: Test + coverage
-        working-directory: bindings/go
-        env:
-          CGO_LDFLAGS: -L${{ github.workspace }}/target/debug
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
-        run: |
-          go test -coverprofile=cover.out ./...
-          go test -c -o "$RUNNER_TEMP/cleverbase-go.test" .
-          command -v readelf >/dev/null || { echo "::error::readelf is required for the RUNPATH check"; exit 1; }
-          dynamic_section="$(readelf -d "$RUNNER_TEMP/cleverbase-go.test")"
-          test -n "$dynamic_section" || { echo "::error::readelf returned no dynamic-section output"; exit 1; }
-          if printf '%s\n' "$dynamic_section" | grep -E '\((RPATH|RUNPATH)\)' \
-            | grep -F 'target/debug'; then
-            echo "::error::Go binding embeds a checkout-local target/debug RUNPATH"
-            exit 1
-          fi
-          total="$(go tool cover -func=cover.out | awk '/^total:/ {print $3}' | tr -d '%')"
-          echo "Go binding statement coverage: ${total}%"
-          # The thin cgo shim's remaining lines are unreachable defensive branches (the C-ABI
-          # non-zero status, init/decode failure). Gate against regression at the achievable floor.
-          awk "BEGIN { exit !(${total} >= 80) }" || { echo "Go coverage ${total}% < 80%"; exit 1; }
+      - name: Public tests + coverage >=95%
+        run: bash scripts/test-binding-coverage.sh go
 
   frontend:
     name: Frontend helper

@@ -1,7 +1,7 @@
 # Repo-root helper targets. The authoritative build recipes live in the per-language manifests
 # and in scripts/; this Makefile is a thin, discoverable entry point.
 
-.PHONY: help docs docs-clean go-test
+.PHONY: help docs docs-clean go-test binding-coverage
 
 FFI_DEBUG_DIR := $(CURDIR)/target/debug
 
@@ -21,3 +21,8 @@ go-test: ## build the debug C ABI and test the Go binding against it
 		LD_LIBRARY_PATH="$(FFI_DEBUG_DIR)" \
 		DYLD_LIBRARY_PATH="$(FFI_DEBUG_DIR)" \
 		go test ./...
+
+binding-coverage: ## run the public-surface gates (Python/Go >=95%, Node >=93%)
+	./scripts/test-binding-coverage.sh python
+	./scripts/test-binding-coverage.sh node
+	./scripts/test-binding-coverage.sh go
