@@ -109,6 +109,12 @@ def main() -> int:
         (ROOT / "bindings/python/README.md").is_file(),
         "Python package README",
     )
+    python_cargo = (ROOT / "bindings/python/Cargo.toml").read_text(encoding="utf-8")
+    require(
+        errors,
+        re.search(r'(?m)^readme = "README.md"$', python_cargo) is not None,
+        "Python crate README metadata",
+    )
 
     if errors:
         print("SDK package metadata contract failed:", file=sys.stderr)
