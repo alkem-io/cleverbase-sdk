@@ -137,6 +137,8 @@ Running the packaging contract locally on macOS requires GNU tar (`brew install 
 
 #### v0.3.2 release notes
 
+- This is a Go/native release. The Python and Node bindings compile and pass their suites against
+  the same core, but this tag does not publish either language package.
 - Adds a positive RFC 3161 nonce to every timestamp request, derived from host entropy with the
   `rfc3161-nonce` domain label. The nonce persists only while the timestamp effect is pending and
   the response must echo it exactly before the message imprint is accepted.
