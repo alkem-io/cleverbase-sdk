@@ -1,6 +1,7 @@
 """PDF verification and host-context contract tests for the Python binding."""
 
 from pathlib import Path
+from typing import cast
 
 import cleverbase
 import pytest
@@ -96,4 +97,19 @@ def test_begin_rejects_invalid_host_context(now_unix: int, entropy: bytes) -> No
             "B-B",
             now_unix,
             entropy,
+        )
+
+
+def test_begin_rejects_non_integer_unix_time_at_the_python_boundary() -> None:
+    with pytest.raises(TypeError):
+        cleverbase.begin_signing(
+            b"%PDF-1.7\nminimal",
+            "acceptance",
+            "v1_rsa",
+            "client-123",
+            "secret",
+            "https://app.example/cb",
+            "B-B",
+            cast("int", 0.5),
+            bytes(range(16)),
         )

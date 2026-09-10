@@ -66,6 +66,10 @@ test("beginSigning rejects an invalid host context", () => {
   for (const [nowUnix, entropy] of [
     [YEAR_0000_START - 1, Buffer.alloc(16)],
     [YEAR_9999_END + 1, Buffer.alloc(16)],
+    [Number.NaN, Buffer.alloc(16)],
+    [Number.POSITIVE_INFINITY, Buffer.alloc(16)],
+    [Number.NEGATIVE_INFINITY, Buffer.alloc(16)],
+    [1.5, Buffer.alloc(16)],
     [1_700_000_000, Buffer.alloc(15)],
   ]) {
     assert.throws(() =>
