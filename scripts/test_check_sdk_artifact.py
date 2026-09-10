@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 import zipfile
 from typing import TYPE_CHECKING
@@ -59,6 +60,17 @@ def write_zip(path: Path, files: dict[str, bytes]) -> None:
 def wheel_files(tag: str) -> dict[str, bytes]:
     """Return the required wheel members for one platform tag."""
     dist_info = f"alkemio_cleverbase_sdk-{VERSION}.dist-info"
+    sbom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "metadata": {
+            "component": {
+                "type": "library",
+                "name": "cleverbase-py",
+                "version": VERSION,
+            }
+        },
+    }
     return {
         f"{dist_info}/METADATA": (
             b"Metadata-Version: 2.4\n"
@@ -71,6 +83,7 @@ def wheel_files(tag: str) -> dict[str, bytes]:
         ),
         f"{dist_info}/WHEEL": f"Wheel-Version: 1.0\nTag: {tag}\n".encode(),
         f"{dist_info}/RECORD": b"record\n",
+        f"{dist_info}/sboms/cleverbase-py.cyclonedx.json": json.dumps(sbom).encode(),
         "cleverbase.pyi": b"def verify_pdf(document: bytes): ...\n",
         "cleverbase/__init__.py": b"from .cleverbase import *\n",
         "cleverbase/__init__.pyi": b"def verify_pdf(document: bytes): ...\n",
@@ -129,6 +142,20 @@ def test_python_wheel_pins_tag_and_typing_surface(tmp_path: Path) -> None:
     files.pop("cleverbase/py.typed")
     write_zip(wheel, files)
     with pytest.raises(ArtifactError, match="typing surface"):
+        check_python_wheel(wheel, VERSION, tag)
+
+
+def test_python_wheel_pins_generated_sbom_identity(tmp_path: Path) -> None:
+    tag = "cp39-abi3-manylinux_2_28_x86_64"
+    wheel = tmp_path / f"alkemio_cleverbase_sdk-{VERSION}-{tag}.whl"
+    files = wheel_files(tag)
+    dist_info = f"alkemio_cleverbase_sdk-{VERSION}.dist-info"
+    sbom_name = f"{dist_info}/sboms/cleverbase-py.cyclonedx.json"
+    sbom = json.loads(files[sbom_name])
+    sbom["metadata"]["component"]["version"] = "9.9.9"
+    files[sbom_name] = json.dumps(sbom).encode()
+    write_zip(wheel, files)
+    with pytest.raises(ArtifactError, match="SBOM identity"):
         check_python_wheel(wheel, VERSION, tag)
 
 
