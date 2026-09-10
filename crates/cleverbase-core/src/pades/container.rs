@@ -284,22 +284,13 @@ pub fn prepare(
         ),
     );
     if let Some(name) = metadata.signer_name.filter(|name| !name.is_empty()) {
-        sig.set(
-            "Name",
-            Object::String(name.as_bytes().to_vec(), StringFormat::Literal),
-        );
+        sig.set("Name", lopdf::text_string(name));
     }
     if let Some(r) = metadata.reason {
-        sig.set(
-            "Reason",
-            Object::String(r.as_bytes().to_vec(), StringFormat::Literal),
-        );
+        sig.set("Reason", lopdf::text_string(r));
     }
     if let Some(l) = metadata.location {
-        sig.set(
-            "Location",
-            Object::String(l.as_bytes().to_vec(), StringFormat::Literal),
-        );
+        sig.set("Location", lopdf::text_string(l));
     }
     let sig_id = doc.add_object(Object::Dictionary(sig));
 
