@@ -73,6 +73,21 @@ def test_publish_jobs_are_tag_only_ordered_and_protected() -> None:
     assert text.count(tag_guard) >= 4
 
 
+def test_complete_release_cryptographically_verifies_registry_attestations() -> None:
+    complete_job = job_text("complete-release")
+
+    pypi_digest = complete_job.index("release_registry.py pypi verify")
+    pypi_attestation = complete_job.index("pypi-attestations verify pypi")
+    npm_install = complete_job.index('npm install --prefix "$clean_node"')
+    npm_attestation = complete_job.index("npm audit signatures")
+    release_completion = complete_job.index('gh release edit "$RELEASE_TAG" --draft=false')
+
+    assert "pypi-attestations==0.0.30" in complete_job
+    assert pypi_digest < pypi_attestation < release_completion
+    assert npm_install < npm_attestation < release_completion
+    assert 'cd "$clean_node"' in complete_job
+
+
 def test_external_actions_are_pinned_and_permissions_are_job_local() -> None:
     text = workflow_text()
 
