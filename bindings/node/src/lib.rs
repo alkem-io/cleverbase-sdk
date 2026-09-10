@@ -44,7 +44,7 @@ fn host_context(now_unix: f64, entropy: Buffer) -> Result<HostContext> {
 }
 
 /// Identity read from the embedded signer certificate.
-#[napi(object, object_from_js = false)]
+#[napi(object)]
 #[derive(Debug)]
 pub struct PdfSigner {
     /// Canonical uppercase certificate serial without separators.
@@ -54,7 +54,7 @@ pub struct PdfSigner {
 }
 
 /// Integrity-only verdict for one PDF signature.
-#[napi(object, object_from_js = false)]
+#[napi(object)]
 #[derive(Debug)]
 pub struct PdfVerification {
     /// Whether the CMS signature and signed PDF bytes are internally consistent.
