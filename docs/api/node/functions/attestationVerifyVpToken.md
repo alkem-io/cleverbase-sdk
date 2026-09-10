@@ -2,7 +2,7 @@
 
 > **attestationVerifyVpToken**(`request`): `Buffer`
 
-Defined in: [index.d.ts:51](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L51)
+Defined in: [index.d.ts:96](https://github.com/alkem-io/cleverbase-sdk/blob/main/bindings/node/index.d.ts#L96)
 
 Verify a set-level OpenID4VP `vp_token` (the multi-credential presentation).
 

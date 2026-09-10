@@ -334,7 +334,8 @@ func (cfg Config) toWire() map[string]any {
 }
 
 // BeginSigning starts a signing flow and returns the first Step. Pass opts (or nil) for the
-// optional expected-signer / appearance / signature-metadata parts of the request.
+// optional expected-signer / appearance / signature-metadata parts of the request. nowUnix must
+// have a UTC year in 0000..9999; entropy must contain at least 16 fresh random bytes for this call.
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error) {
 	request := map[string]any{"document": document, "conformance_level": conformance}
 	if opts != nil {
@@ -356,7 +357,8 @@ func BeginSigning(document []byte, cfg Config, conformance string, opts *Request
 	})
 }
 
-// ResumeRedirect advances the flow with the OAuth code+state from a redirect return.
+// ResumeRedirect advances the flow with the OAuth code+state from a redirect return. nowUnix and
+// entropy follow BeginSigning's host-context contract and entropy must be fresh for this call.
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error) {
 	return dispatch(map[string]any{
 		keyOp:     opResume,
@@ -368,7 +370,8 @@ func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, e
 
 // ResumeRedirectError advances the flow with an OAuth error returned to the redirect URI instead
 // of a code (e.g. "access_denied" when the signer declines), yielding a terminal Declined or
-// AuthorizationExpired outcome.
+// AuthorizationExpired outcome. nowUnix and entropy follow BeginSigning's host-context contract and
+// entropy must be fresh for this call.
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error) {
 	return dispatch(map[string]any{
 		keyOp:     opResume,
@@ -378,7 +381,8 @@ func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUn
 	})
 }
 
-// ResumeHTTP advances the flow with the result of a performed HTTP effect.
+// ResumeHTTP advances the flow with the result of a performed HTTP effect. nowUnix and entropy
+// follow BeginSigning's host-context contract and entropy must be fresh for this call.
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error) {
 	return dispatch(map[string]any{
 		keyOp:     opResume,

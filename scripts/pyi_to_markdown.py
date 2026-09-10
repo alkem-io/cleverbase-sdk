@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Render the Python binding's public surface to Markdown via pydoc-markdown.
 
-The `cleverbase` runtime module is a compiled PyO3 extension: its `#[pyfunction]` definitions
-carry no `__doc__`, and PEP 484 stubs are type-only by rule (ruff PYI021), so neither the compiled
-module nor the stub holds docstrings. The durable documented contract is therefore the
-mypy-strict-enforced *type signatures* in `bindings/python/cleverbase.pyi` (the four public
-functions + `SCHEMA_VERSION`).
+The `cleverbase` runtime module is a compiled PyO3 extension: its `#[pyfunction]` definitions carry
+runtime `__doc__` prose, while PEP 484 stubs are type-only by rule (ruff PYI021). The durable
+generated contract is therefore the mypy-strict-enforced signatures and `Annotated` constraints in
+`bindings/python/cleverbase.pyi`.
 
 `pydoc-markdown`'s bundled Python loader resolves modules by import name and only finds `.py`
 files (`docspec_python.find_module` ignores `.pyi`), so it cannot target the stub directly. This
@@ -22,6 +21,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import docspec
 import docspec_python
 from pydoc_markdown.contrib.renderers.markdown import MarkdownRenderer
 from pydoc_markdown.interfaces import Context
@@ -36,6 +36,10 @@ _EXPECTED_ARGC = 3
 def render(pyi_path: Path) -> str:
     """Parse the `.pyi` stub and render its public surface to a Markdown string."""
     module = docspec_python.parse_python_module(pyi_path, module_name=_MODULE_NAME)
+    # Imported typing helpers support the signatures but are not exports of the compiled module.
+    module.members = [
+        member for member in module.members if not isinstance(member, docspec.Indirection)
+    ]
     renderer = MarkdownRenderer(
         # A self-contained API page: no table of contents, no HTML anchors, no source links.
         render_toc=False,

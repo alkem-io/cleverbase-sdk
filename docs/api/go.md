@@ -211,40 +211,40 @@ type Session struct {
 ```
 
 <a name="BeginSigning"></a>
-### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L338>)
+### func [BeginSigning](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L339>)
 
 ```go
 func BeginSigning(document []byte, cfg Config, conformance string, opts *RequestOptions, nowUnix int64, entropy []byte) (*Session, error)
 ```
 
-BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request.
+BeginSigning starts a signing flow and returns the first Step. Pass opts \(or nil\) for the optional expected\-signer / appearance / signature\-metadata parts of the request. nowUnix must have a UTC year in 0000..9999; entropy must contain at least 16 fresh random bytes for this call.
 
 <a name="ResumeHTTP"></a>
-### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L382>)
+### func [ResumeHTTP](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L386>)
 
 ```go
 func ResumeHTTP(handle cbor.RawMessage, status int, body []byte, nowUnix int64, entropy []byte) (*Session, error)
 ```
 
-ResumeHTTP advances the flow with the result of a performed HTTP effect.
+ResumeHTTP advances the flow with the result of a performed HTTP effect. nowUnix and entropy follow BeginSigning's host\-context contract and entropy must be fresh for this call.
 
 <a name="ResumeRedirect"></a>
-### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L360>)
+### func [ResumeRedirect](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L362>)
 
 ```go
 func ResumeRedirect(handle cbor.RawMessage, code, state string, nowUnix int64, entropy []byte) (*Session, error)
 ```
 
-ResumeRedirect advances the flow with the OAuth code\+state from a redirect return.
+ResumeRedirect advances the flow with the OAuth code\+state from a redirect return. nowUnix and entropy follow BeginSigning's host\-context contract and entropy must be fresh for this call.
 
 <a name="ResumeRedirectError"></a>
-### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L372>)
+### func [ResumeRedirectError](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L375>)
 
 ```go
 func ResumeRedirectError(handle cbor.RawMessage, oauthError, state string, nowUnix int64, entropy []byte) (*Session, error)
 ```
 
-ResumeRedirectError advances the flow with an OAuth error returned to the redirect URI instead of a code \(e.g. "access\_denied" when the signer declines\), yielding a terminal Declined or AuthorizationExpired outcome.
+ResumeRedirectError advances the flow with an OAuth error returned to the redirect URI instead of a code \(e.g. "access\_denied" when the signer declines\), yielding a terminal Declined or AuthorizationExpired outcome. nowUnix and entropy follow BeginSigning's host\-context contract and entropy must be fresh for this call.
 
 <a name="SignatureMeta"></a>
 ## type [SignatureMeta](<https://github.com/alkem-io/cleverbase-sdk/blob/develop/bindings/go/cleverbase.go#L114-L117>)
