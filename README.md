@@ -106,34 +106,64 @@ make go-test
 ( cd frontend/helper-ts && npm install && npm run build && npm test )
 ```
 
-### Consume the Go binding from a release
+### Consume released bindings
 
-The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.2`, while Go
+One shared SDK version identifies the native archives and all three language bindings. Python keeps
+the import name `cleverbase`; the distribution names are Alkemio-owned:
+
+```bash
+pip install alkemio-cleverbase-sdk==0.3.3
+npm install @alkemio/cleverbase-sdk@0.3.3
+```
+
+The Go binding is a nested module. Its releases use tags such as `bindings/go/v0.3.3`, while Go
 consumers pin the module version normally:
 
 ```bash
-go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.2
+go get github.com/alkem-io/cleverbase-sdk/bindings/go@v0.3.3
 ```
 
-The same GitHub Release contains `cleverbase-ffi-v0.3.2-<os>-<arch>.tar.gz` and a matching
+The same GitHub Release contains `cleverbase-ffi-v0.3.3-<os>-<arch>.tar.gz` and a matching
 `.sha256` file for Linux and Darwin, on amd64 and arm64. Download the pair for the build host, verify
 the checksum before extraction, and point `CGO_LDFLAGS` at the extracted `lib` directory. For
 example:
 
 ```bash
-gh release download bindings/go/v0.3.2 \
+gh release download bindings/go/v0.3.3 \
   --repo alkem-io/cleverbase-sdk \
-  --pattern 'cleverbase-ffi-v0.3.2-linux-amd64*' --dir .cleverbase
-( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.2-linux-amd64.tar.gz.sha256 )
-tar -xzf .cleverbase/cleverbase-ffi-v0.3.2-linux-amd64.tar.gz -C .cleverbase
+  --pattern 'cleverbase-ffi-v0.3.3-linux-amd64*' --dir .cleverbase
+( cd .cleverbase && sha256sum -c cleverbase-ffi-v0.3.3-linux-amd64.tar.gz.sha256 )
+tar -xzf .cleverbase/cleverbase-ffi-v0.3.3-linux-amd64.tar.gz -C .cleverbase
 CGO_LDFLAGS="-L$PWD/.cleverbase/lib" go build ./...
 ```
 
-To publish a release, update `cleverbase-ffi` to the intended SemVer and push the matching tag, for
-example `bindings/go/v0.3.2`. The tag workflow builds, link-tests, attests, and attaches all
-four native archives. The Go module and native ABI versions are deliberately welded: even a Go-only
-binding fix bumps `cleverbase-ffi` and receives a new matching tag.
-Running the packaging contract locally on macOS requires GNU tar (`brew install gnu-tar`).
+`SDK_VERSION` is the authoritative public version. To publish, synchronize its manifest and lockfile
+copies, then push the matching annotated tag, for example `bindings/go/v0.3.3`. The tag workflow
+builds once from that commit, tests the assembled native archives, Python wheels/sdist, and one
+four-platform npm tarball, and binds their digests to the tag and commit. It stages a draft GitHub
+release and publishes in deterministic GitHub → PyPI → npm order. A rerun may fill a missing
+destination only when every already-published byte matches; any mismatch stops the release. The
+GitHub release becomes public only after all registries, provenance records, and clean installs
+verify. Running the native packaging contract locally on macOS requires GNU tar
+(`brew install gnu-tar`).
+
+#### v0.3.3 release notes
+
+- Makes the Python and Node bindings first-class published packages alongside Go and the native
+  libraries, with one synchronized SDK version and one coordinated release.
+- Adds `verify_pdf` parity to Python and Node. All three bindings expose the same integrity, profile,
+  signer and snake-case reason contract, including strict `malformed_byte_range` results.
+- Documents and tests the host-context boundary in every binding: callers provide fresh entropy of
+  at least 16 bytes, and `now_unix` must resolve to a UTC year in `0000..=9999`.
+- Gates the public bindings at Python 97.51%, Go 97.3%, and the user-approved Node 93.47% measured
+  boundary. Node's generated napi-rs registration/conversion locations execute outside the profiler;
+  no source exclusions or remapping are used.
+- Publishes four Linux/macOS amd64/arm64 native archives, four Python `abi3` wheels plus an sdist,
+  and one npm tarball carrying the four native modules. The Linux artifacts target glibc 2.28 and
+  macOS artifacts target 11.0.
+- Attests GitHub assets with GitHub build provenance, publishes PyPI registry attestations through
+  trusted publishing, and publishes npm provenance through GitHub OIDC. The npm bootstrap token is
+  used only for the first publication and is then revoked after the trusted publisher is configured.
 
 #### v0.3.2 release notes
 
