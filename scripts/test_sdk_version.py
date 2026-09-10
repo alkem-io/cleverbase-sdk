@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import ModuleType
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
 def load_sdk_version() -> ModuleType:
     """Load the hyphenated release helper as an ordinary Python module."""
     path = Path(__file__).with_name("sdk-version.py")
     spec = importlib.util.spec_from_file_location("sdk_version", path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

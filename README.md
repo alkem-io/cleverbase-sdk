@@ -237,8 +237,7 @@ CI runs a lint/format/type-check gate (`.github/workflows/lint.yml`) — `cargo 
 that gate locally:
 
 ```bash
-./scripts/lint.sh            # runs every lint tool that is installed; warns on any that are missing
-CLEVERBASE_LINT_STRICT=1 ./scripts/lint.sh   # also fail on a missing tool
+./scripts/lint.sh            # runs every lint tool; a missing required tool fails the gate
 ```
 
 `scripts/lint.sh` covers everything CI's lint job runs **except** the TypeScript `tsc --noEmit`

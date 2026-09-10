@@ -136,7 +136,23 @@ def check_python_wheel(path: Path, version: str, expected_tag: str) -> None:
         )
         metadata = BytesParser().parsebytes(archive.read(f"{dist_info}/METADATA"))
         wheel = BytesParser().parsebytes(archive.read(f"{dist_info}/WHEEL"))
-        sbom = json.loads(archive.read(sbom_name))
+        sboms: dict[str, object] = {}
+        for name in sorted(
+            member for member in members if member.startswith(f"{dist_info}/sboms/")
+        ):
+            try:
+                document = json.loads(archive.read(name))
+            except json.JSONDecodeError as error:
+                msg = f"wheel SBOM is not valid JSON: {name}"
+                raise ArtifactError(msg) from error
+            _require(
+                isinstance(document, dict)
+                and document.get("bomFormat") == "CycloneDX"
+                and isinstance(document.get("specVersion"), str),
+                f"wheel SBOM format is invalid: {name}",
+            )
+            sboms[name] = document
+        sbom = sboms[sbom_name]
         license_text = archive.read(license_name)
 
     _require(metadata.get("Name") == PYTHON_PACKAGE, "wheel package name mismatch")
@@ -229,6 +245,7 @@ def main(argv: list[str]) -> int:
         elif kind == "python-sdist" and len(argv) == NODE_ARGUMENT_COUNT:
             check_python_sdist(Path(artifact), version)
         else:
+            sys.stderr.write(f"unsupported SDK artifact kind or arguments: {kind}\n")
             return 2
     except (
         ArtifactError,
