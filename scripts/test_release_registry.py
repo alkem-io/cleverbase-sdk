@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from release_registry import RegistryError, npm_status, pypi_status
+from release_registry import RegistryError, npm_status, pypi_provenance_valid, pypi_status
 
 
 def test_pypi_allows_only_missing_or_digest_identical_files(tmp_path: Path) -> None:
@@ -82,3 +82,8 @@ def test_npm_requires_exact_tarball_identity_and_provenance(tmp_path: Path) -> N
     with pytest.raises(RegistryError, match="npm provenance"):
         npm_status(tarball, "0.3.3", payload, require_provenance=True)
 
+
+def test_pypi_provenance_matches_the_integrity_api_shape() -> None:
+    assert pypi_provenance_valid({"attestation_bundles": [{"attestations": [{}]}]})
+    assert not pypi_provenance_valid({"attestation_bundles": []})
+    assert not pypi_provenance_valid({"version": 1})
