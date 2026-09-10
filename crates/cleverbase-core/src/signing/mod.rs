@@ -26,7 +26,7 @@ use crate::crypto::SHA256_OID_STR as SHA256_OID;
 pub struct HostContext {
     /// Current time, Unix seconds.
     pub now_unix: i64,
-    /// Fresh random bytes (OAuth `state`, correlation id). Provide ≥ 16 bytes.
+    /// Fresh random bytes (OAuth `state`, correlation id, RFC 3161 nonce). Provide ≥ 16 bytes.
     #[serde(with = "serde_bytes")]
     pub entropy: Vec<u8>,
 }
@@ -229,6 +229,7 @@ fn scrub_sensitive(handle: &mut SigningSessionHandle) {
     handle.signed_attrs_der = None;
     handle.staged_pdf = None;
     handle.cms_der = None;
+    handle.timestamp_nonce = None;
     handle.request = None;
     handle.config = None;
 }
@@ -755,7 +756,8 @@ pub fn resume(
                 let stored_signature = cms::signer_signature(&cms_der)
                     .map_err(|e| CoreError::Internal(e.to_string()))?;
                 let imprint = crypto::sha256(&stored_signature);
-                let req = timestamp::build_request(&imprint, tsa.policy_oid.as_deref())
+                let nonce = timestamp::nonce_from_entropy(&ctx.entropy);
+                let req = timestamp::build_request(&imprint, tsa.policy_oid.as_deref(), &nonce)
                     .map_err(|e| CoreError::Internal(e.to_string()))?;
                 let mut headers = vec![(
                     "Content-Type".to_string(),
@@ -771,6 +773,7 @@ pub fn resume(
                     body: Some(req),
                 };
                 handle.cms_der = Some(cms_der);
+                handle.timestamp_nonce = Some(nonce);
                 handle.phase = SigningPhase::TimestampPending;
                 return Ok((handle, Step::PerformHttp(effect)));
             }
@@ -806,6 +809,17 @@ pub fn resume(
                     ))
                 }
             };
+            let expected_nonce = handle
+                .timestamp_nonce
+                .as_deref()
+                .ok_or_else(|| CoreError::BadHandle("missing timestamp nonce".into()))?;
+            if timestamp::parse_nonce(&token).as_deref() != Some(expected_nonce) {
+                return Ok(fail(
+                    handle,
+                    SigningOutcome::TimestampFailed,
+                    "timestamp nonce does not match the request",
+                ));
+            }
             let cms_der = handle
                 .cms_der
                 .clone()

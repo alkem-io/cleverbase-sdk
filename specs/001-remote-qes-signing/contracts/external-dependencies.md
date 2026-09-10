@@ -25,8 +25,10 @@ Informative — documents the upstream contracts the sans-IO core targets via `H
 
 - **RFC 3161** TSA, **external and qualified** (Cleverbase provides none). Configured via
   `TsaConfiguration.url` (+ optional auth, policy OID). The core emits a `TimeStampReq` over the
-  signature value as an `HttpEffect`; the response `TimeStampToken` is embedded as the
-  `signature-time-stamp` attribute. Procurement of a qualified TSA is a delivery dependency.
+  signature value as an `HttpEffect`, with a fresh positive nonce and `certReq=true`; the response
+  must echo that exact nonce and bind the signature through its `messageImprint`. The accepted
+  `TimeStampToken` is embedded as the `signature-time-stamp` attribute. Procurement of a qualified
+  TSA is a delivery dependency.
 
 ## Independent validators (test/CI only — not a runtime dependency)
 

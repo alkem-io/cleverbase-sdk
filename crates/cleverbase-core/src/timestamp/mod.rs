@@ -1,13 +1,14 @@
 //! RFC 3161 timestamping for PAdES B-T.
 //!
 //! Builds a `TimeStampReq` over `sha256(signature value)` and extracts the `TimeStampToken` from
-//! the TSA's `TimeStampResp`. The token is embedded into the CMS as the `signature-time-stamp`
+//! the TSA's `TimeStampResp`. Each request carries a fresh positive nonce and requires the response
+//! token to echo it exactly. The token is embedded into the CMS as the `signature-time-stamp`
 //! unsigned attribute (see [`crate::crypto::cms::embed_timestamp`]). Cleverbase's CSC signing API
 //! exposes no timestamp endpoint, so the host points this at a configured RFC 3161 TSA.
 
 use cms::content_info::ContentInfo;
 use cms::signed_data::SignedData;
-use der::asn1::{Any, Null, OctetString};
+use der::asn1::{Any, Null, OctetString, Uint};
 use der::oid::ObjectIdentifier;
 use der::{Decode, Encode, Sequence};
 use x509_cert::spki::AlgorithmIdentifierOwned;
@@ -32,6 +33,9 @@ pub enum TimestampError {
     /// The configured TSA policy OID was not a valid object identifier.
     #[error("invalid TSA policy OID: {0}")]
     InvalidPolicyOid(String),
+    /// An RFC 3161 nonce must be a positive integer.
+    #[error("timestamp nonce must be a positive integer")]
+    InvalidNonce,
 }
 
 /// `MessageImprint ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }`
@@ -41,14 +45,26 @@ struct MessageImprint {
     hashed_message: OctetString,
 }
 
-/// `TimeStampReq` (subset: version, messageImprint, reqPolicy OPTIONAL, certReq).
+/// `TimeStampReq` (subset: version, messageImprint, reqPolicy OPTIONAL, nonce, certReq).
 #[derive(Sequence)]
 struct TimeStampReq {
     version: u8,
     message_imprint: MessageImprint,
     #[asn1(optional = "true")]
     req_policy: Option<ObjectIdentifier>,
+    #[asn1(optional = "true")]
+    nonce: Option<Uint>,
     cert_req: bool,
+}
+
+/// Derive a positive, canonical 128-bit nonce from host-provided fresh entropy.
+pub(crate) fn nonce_from_entropy(entropy: &[u8]) -> Vec<u8> {
+    const NONCE_BYTES: usize = 16;
+    let candidate = entropy.get(..NONCE_BYTES).unwrap_or(entropy);
+    let Some(first_nonzero) = candidate.iter().position(|byte| *byte != 0) else {
+        return vec![1];
+    };
+    candidate.get(first_nonzero..).unwrap_or_default().to_vec()
 }
 
 /// `PKIStatusInfo ::= SEQUENCE { status PKIStatus, statusString PKIFreeText OPTIONAL,
@@ -70,11 +86,12 @@ struct TimeStampResp {
     token: Option<ContentInfo>,
 }
 
-/// Build an RFC 3161 `TimeStampReq` over `sha256(signature value)` with `certReq = true`, optionally
-/// constraining the TSA to a specific policy OID.
+/// Build an RFC 3161 `TimeStampReq` over `sha256(signature value)` with a positive nonce and
+/// `certReq = true`, optionally constraining the TSA to a specific policy OID.
 pub fn build_request(
     signature_sha256: &[u8],
     policy_oid: Option<&str>,
+    nonce: &[u8],
 ) -> Result<Vec<u8>, TimestampError> {
     let req_policy = match policy_oid {
         Some(oid) => Some(
@@ -83,6 +100,10 @@ pub fn build_request(
         ),
         None => None,
     };
+    let nonce = Uint::new(nonce)?;
+    if nonce.is_empty() {
+        return Err(TimestampError::InvalidNonce);
+    }
     let req = TimeStampReq {
         version: 1,
         message_imprint: MessageImprint {
@@ -93,6 +114,7 @@ pub fn build_request(
             hashed_message: OctetString::new(signature_sha256.to_vec())?,
         },
         req_policy,
+        nonce: Some(nonce),
         cert_req: true,
     };
     Ok(req.to_der()?)
@@ -173,6 +195,27 @@ fn parse_generalized_time_secs(tlv: &[u8]) -> Option<i64> {
 /// Returns `None` if the token cannot be parsed.
 pub fn parse_message_imprint(token_der: &[u8]) -> Option<Vec<u8>> {
     parse_message_imprint_with_algorithm(token_der).map(|(_, imprint)| imprint)
+}
+
+/// Parse the canonical positive nonce echoed by the TSA in the token's `TSTInfo`.
+pub(crate) fn parse_nonce(token_der: &[u8]) -> Option<Vec<u8>> {
+    let tstinfo = token_tst_info(token_der)?;
+    let mut fields = sequence_content(&tstinfo)?;
+    // Skip version, policy, messageImprint, serialNumber, and genTime. The only remaining
+    // top-level INTEGER permitted by RFC 3161 is the optional nonce.
+    for expected_tag in [0x02, 0x06, 0x30, 0x02, 0x18] {
+        let field = first_tlv(fields)?;
+        if field.first().copied() != Some(expected_tag) {
+            return None;
+        }
+        fields = fields.get(field.len()..)?;
+    }
+    let nonce_der = first_tlv_with_tag(fields, 0x02)?;
+    let nonce = Uint::from_der(nonce_der).ok()?;
+    if nonce.is_empty() {
+        return None;
+    }
+    Some(nonce.as_bytes().to_vec())
 }
 
 /// Parse the algorithm and bytes of the RFC 3161 `messageImprint` from a timestamp token.
@@ -267,6 +310,12 @@ fn first_tlv_with_tag(der: &[u8], tag: u8) -> Option<&[u8]> {
     None
 }
 
+/// Return the first complete DER TLV in `der`.
+fn first_tlv(der: &[u8]) -> Option<&[u8]> {
+    let (content_len, len_bytes) = read_der_len(der.get(1..)?)?;
+    der.get(..1 + len_bytes + content_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,12 +341,7 @@ mod tests {
     fn request_carries_policy_oid() {
         let imprint = sha256(b"x");
         let nonce = nonce_from_entropy(&[0u8; 16]);
-        let der = build_request(
-            &imprint,
-            Some("1.3.6.1.4.1.99999.1.1"),
-            &nonce,
-        )
-        .unwrap();
+        let der = build_request(&imprint, Some("1.3.6.1.4.1.99999.1.1"), &nonce).unwrap();
         let back = TimeStampReq::from_der(&der).unwrap();
         assert_eq!(
             back.req_policy.unwrap().to_string(),
@@ -307,6 +351,10 @@ mod tests {
         assert_eq!(back.nonce.unwrap().as_bytes(), [1]);
         // An invalid policy OID is rejected, not silently dropped.
         assert!(build_request(&imprint, Some("not-an-oid"), &nonce).is_err());
+        assert!(matches!(
+            build_request(&imprint, None, &[]),
+            Err(TimestampError::InvalidNonce)
+        ));
     }
 
     #[test]
@@ -364,6 +412,7 @@ mod tests {
         // Malformed token bytes must yield None (exercising the DER-walk None paths), never panic.
         assert_eq!(parse_gen_time(b"not a token"), None);
         assert_eq!(parse_message_imprint(b"\x30\x03garbage"), None);
+        assert_eq!(parse_nonce(b"not a token"), None);
         assert_eq!(parse_gen_time(&[0x30, 0x80]), None); // indefinite-length form rejected
     }
 

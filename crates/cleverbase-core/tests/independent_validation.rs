@@ -827,10 +827,12 @@ fn produce_signed_pdf_bt(algo: KeyAlgo) -> SignedDocument {
         KeyAlgo::Rsa => BT_RSA_RESPONSE,
         KeyAlgo::EcdsaP256 => BT_ECDSA_RESPONSE,
     };
-    match resume(h, http_ok_bytes(response.to_vec()), ctx())
-        .unwrap()
-        .1
-    {
+    let (completed, step) = resume(h, http_ok_bytes(response.to_vec()), ctx()).unwrap();
+    assert!(
+        completed.timestamp_nonce.is_none(),
+        "terminal handle must not retain its RFC 3161 nonce"
+    );
+    match step {
         Step::Done { signed, .. } => signed,
         other => panic!("expected Done, got {other:?}"),
     }
@@ -863,7 +865,7 @@ fn regenerate_pades_bt_fixtures() {
     let wrong_request = cleverbase_core::timestamp::build_request(
         &cleverbase_core::crypto::sha256(b"some unrelated bytes"),
         None,
-        &[1],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     )
     .unwrap();
     std::fs::write(
@@ -947,6 +949,7 @@ fn b_t_requires_the_timestamp_response_to_echo_the_exact_nonce() {
     )
     .unwrap();
     assert_eq!(missing_handle.phase, cleverbase_core::SigningPhase::Failed);
+    assert!(missing_handle.timestamp_nonce.is_none());
     assert_eq!(
         match missing_step {
             Step::Failed { evidence } => evidence.outcome,
@@ -957,16 +960,13 @@ fn b_t_requires_the_timestamp_response_to_echo_the_exact_nonce() {
 
     let mut mismatched = handle;
     mismatched.timestamp_nonce = Some(vec![0xff]);
-    let (mismatched_handle, mismatched_step) = resume(
-        mismatched,
-        http_ok_bytes(BT_RSA_RESPONSE.to_vec()),
-        ctx(),
-    )
-    .unwrap();
+    let (mismatched_handle, mismatched_step) =
+        resume(mismatched, http_ok_bytes(BT_RSA_RESPONSE.to_vec()), ctx()).unwrap();
     assert_eq!(
         mismatched_handle.phase,
         cleverbase_core::SigningPhase::Failed
     );
+    assert!(mismatched_handle.timestamp_nonce.is_none());
     assert_eq!(
         match mismatched_step {
             Step::Failed { evidence } => evidence.outcome,
@@ -974,6 +974,16 @@ fn b_t_requires_the_timestamp_response_to_echo_the_exact_nonce() {
         },
         cleverbase_core::SigningOutcome::TimestampFailed
     );
+
+    let (mut missing_expected, _) = drive_bt_to_timestamp(KeyAlgo::Rsa);
+    missing_expected.timestamp_nonce = None;
+    let error = resume(
+        missing_expected,
+        http_ok_bytes(BT_RSA_RESPONSE.to_vec()),
+        ctx(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, cleverbase_core::CoreError::BadHandle(_)));
 }
 
 #[test]

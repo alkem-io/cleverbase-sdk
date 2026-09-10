@@ -53,7 +53,8 @@ Optional visible block (FR-016).
 ### TsaConfiguration
 - `url`: string (RFC 3161 endpoint of an external **qualified** TSA); `auth?`: secret (e.g. a Bearer
   header value); `policy_oid?`: string (requested TSA policy). The imprint hash is always SHA-256
-  (hard-coded in the request builder, not a config field).
+  (hard-coded in the request builder, not a config field). Each request sets `certReq=true` and a
+  fresh positive nonce; the response must echo the nonce exactly.
 
 ### SigningCredential (discovered)
 From `credentials/list` + `credentials/info`.
@@ -80,7 +81,8 @@ next effect from `phase`; effects are not stored on the handle.
 - Carried as the flow advances (all optional): `state` (OAuth CSRF); `service_token` (Bearer,
   secret); `credential_id`; `cert_chain`; `key_algo`; `signed_attrs_der`; `staged_pdf` (PDF with
   ByteRange + placeholder, pre-signature); `contents_span`; `cms_der`; `signing_time_unix`;
-  `signer`; `pdf_a`; `request` (**carries the document**); `config` (**carries `client_secret`**).
+  `timestamp_nonce` (only while `phase=TimestampPending`); `signer`; `pdf_a`; `request` (**carries
+  the document**); `config` (**carries `client_secret`**).
 - Rules: contains the document and short-lived secrets ⇒ **store securely server-side, encrypted at
   rest**; the flow resumes statelessly from the handle alone.
 
@@ -159,7 +161,8 @@ Signing
   │ embed raw signature into CMS → splice into /Contents  (= B-B)
   ▼
 Augmenting   (only when level=B_T)
-  │                                       → emits HttpEffect TimeStampReq to TSA
+  │                                       → emits HttpEffect TimeStampReq with fresh nonce to TSA
+  │   missing/mismatched nonce ────────────────────────────► Failed(TimestampFailed)
   │   tsa failure ─────────────────────────────────────────► Failed(TimestampFailed)   [no downgrade]
   │ embed TimeStampToken (signature-time-stamp attribute)
   ▼
