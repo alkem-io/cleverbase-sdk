@@ -2,7 +2,9 @@
 
 #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
-use cleverbase_core::{verify_pdf, VerificationReason};
+use cleverbase_core::{
+    resume, verify_pdf, CoreError, HostContext, ResumeInput, VerificationReason,
+};
 use lopdf::{Dictionary, Document, Object};
 
 fn minimal_pdf() -> Vec<u8> {
@@ -223,4 +225,37 @@ fn real_pre_fix_acceptance_pdf_is_rejected_as_nonconformant() {
         verify_pdf(&malformed_near_miss).reasons,
         vec![VerificationReason::MalformedByteRange]
     );
+}
+
+#[test]
+fn released_v031_timestamp_pending_handle_fails_closed() {
+    let handle_cbor = cleverbase_core::util::base64_decode(include_str!(
+        "../../../tests/fixtures/pades-conformance/v0.3.1-timestamp-pending.cbor.b64"
+    ))
+    .unwrap();
+    let handle = cleverbase_core::wire::decode_handle(&handle_cbor).unwrap();
+    assert!(handle.timestamp_nonce.is_none());
+    let tsa_response = cleverbase_core::util::base64_decode(include_str!(
+        "../../../tests/fixtures/pades-conformance/v0.3.1-rsa.tsr.b64"
+    ))
+    .unwrap();
+
+    let error = resume(
+        handle,
+        ResumeInput::HttpResult {
+            status: 200,
+            headers: Vec::new(),
+            body: tsa_response,
+        },
+        HostContext {
+            now_unix: 1_700_000_000,
+            entropy: (0u8..16).collect(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::BadHandle(message) if message == "missing timestamp nonce"
+    ));
 }
