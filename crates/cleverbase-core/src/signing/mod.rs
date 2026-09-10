@@ -1437,6 +1437,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_direct_common_name_omits_pdf_signer_name() {
+        let h = advance_to(SigningPhase::InfoPending);
+        let mut info = info_json();
+        info["cert"]["subjectDN"] = serde_json::json!("serialNumber=PNONL-123");
+
+        let (h, step) = resume(h, http_ok(info), ctx()).unwrap();
+        assert!(matches!(step, Step::Redirect(_)));
+        assert!(h.signer.as_ref().unwrap().common_name.is_empty());
+        let document = lopdf::Document::load_mem(h.staged_pdf.as_ref().unwrap()).unwrap();
+        let signature = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .find(|dictionary| container::is_signature_dictionary(dictionary))
+            .unwrap();
+        assert!(signature.get(b"Name").is_err());
+    }
+
     fn zero_page_pdf() -> Vec<u8> {
         let mut doc = lopdf::Document::with_version("1.7");
         let pages_id = doc.new_object_id();

@@ -191,7 +191,23 @@ fn real_pre_fix_acceptance_pdf_is_rejected_as_nonconformant() {
     let verdict = verify_pdf(pdf);
     assert!(!verdict.integrity);
     assert_eq!(
-        verdict.reasons,
+        serde_json::to_value(&verdict.reasons).unwrap(),
+        serde_json::json!(["legacy_byte_range_convention"])
+    );
+
+    let parsed = Document::load_mem(pdf).unwrap();
+    let signature = parsed
+        .objects
+        .values()
+        .filter_map(|object| object.as_dict().ok())
+        .find(|dictionary| dictionary.get(b"ByteRange").is_ok())
+        .unwrap();
+    let byte_range = signature.get(b"ByteRange").unwrap().as_array().unwrap();
+    let first_len = usize::try_from(byte_range[1].as_i64().unwrap()).unwrap();
+    let mut malformed_near_miss = pdf.to_vec();
+    malformed_near_miss[first_len] = b'G';
+    assert_eq!(
+        verify_pdf(&malformed_near_miss).reasons,
         vec![VerificationReason::MalformedByteRange]
     );
 }

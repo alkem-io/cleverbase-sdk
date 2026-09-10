@@ -708,6 +708,30 @@ mod tests {
     }
 
     #[test]
+    fn prepare_omits_an_absent_or_empty_signer_name() {
+        for signer_name in [None, Some("")] {
+            let prepared = prepare(
+                &minimal_pdf(),
+                SignatureMetadata {
+                    signer_name,
+                    ..signature_metadata()
+                },
+                None,
+            )
+            .unwrap();
+            let document = Document::load_mem(&prepared.staged_pdf).unwrap();
+            let signature = document
+                .objects
+                .values()
+                .filter_map(|object| object.as_dict().ok())
+                .find(|dictionary| is_signature_dictionary(dictionary))
+                .unwrap();
+
+            assert!(signature.get(b"Name").is_err());
+        }
+    }
+
+    #[test]
     fn embed_cms_rejects_invalid_span() {
         // A corrupted/tampered contents_span must yield a clean error, never a panic.
         let mut buf = vec![0u8; 100];
