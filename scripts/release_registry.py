@@ -153,6 +153,14 @@ def _npm_metadata(version: str) -> dict[str, Any] | None:
     )
 
 
+def pypi_provenance_valid(provenance: Any) -> bool:
+    """Recognize the current PyPI integrity API's non-empty bundle shape."""
+    if not isinstance(provenance, dict):
+        return False
+    bundles = provenance.get("attestation_bundles")
+    return isinstance(bundles, list) and bool(bundles)
+
+
 def _verify_pypi_provenance(payload: dict[str, Any], version: str) -> None:
     for entry in payload["urls"]:
         filename = urllib.parse.quote(entry["filename"], safe="")
@@ -161,10 +169,7 @@ def _verify_pypi_provenance(payload: dict[str, Any], version: str) -> None:
             accept="application/vnd.pypi.integrity.v1+json",
         )
         _require(
-            isinstance(provenance, dict)
-            and provenance.get("version") == 1
-            and isinstance(provenance.get("attestation_bundles"), list)
-            and bool(provenance["attestation_bundles"]),
+            pypi_provenance_valid(provenance),
             f"PyPI provenance is missing: {entry['filename']}",
         )
 
