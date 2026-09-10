@@ -31,7 +31,7 @@ def test_manifest_binds_tag_commit_and_artifact_bytes(tmp_path: Path) -> None:
     assert parsed["tag"] == "bindings/go/v0.3.3"
     assert parsed["commit"] == "a" * 40
     assert list(parsed["artifacts"]) == ["a.whl", "b.tgz"]
-    verify_manifest(artifacts, manifest, "bindings/go/v0.3.3", "a" * 40)
+    verify_manifest(artifacts, manifest, "0.3.3", "bindings/go/v0.3.3", "a" * 40)
 
 
 def test_manifest_rejects_tampering_or_wrong_release_identity(tmp_path: Path) -> None:
@@ -43,13 +43,15 @@ def test_manifest_rejects_tampering_or_wrong_release_identity(tmp_path: Path) ->
 
     (artifacts / "sdk.whl").write_bytes(b"tampered")
     with pytest.raises(ManifestError, match="digest mismatch"):
-        verify_manifest(artifacts, manifest, "bindings/go/v0.3.3", "b" * 40)
+        verify_manifest(artifacts, manifest, "0.3.3", "bindings/go/v0.3.3", "b" * 40)
 
     (artifacts / "sdk.whl").write_bytes(b"original")
     with pytest.raises(ManifestError, match="tag mismatch"):
-        verify_manifest(artifacts, manifest, "bindings/go/v0.3.4", "b" * 40)
+        verify_manifest(artifacts, manifest, "0.3.3", "bindings/go/v0.3.4", "b" * 40)
     with pytest.raises(ManifestError, match="commit mismatch"):
-        verify_manifest(artifacts, manifest, "bindings/go/v0.3.3", "c" * 40)
+        verify_manifest(artifacts, manifest, "0.3.3", "bindings/go/v0.3.3", "c" * 40)
+    with pytest.raises(ManifestError, match="version mismatch"):
+        verify_manifest(artifacts, manifest, "0.3.4", "bindings/go/v0.3.3", "b" * 40)
 
 
 def test_manifest_rejects_nested_or_empty_artifact_sets(tmp_path: Path) -> None:
