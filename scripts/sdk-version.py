@@ -162,8 +162,10 @@ def replace_package_version(path: Path, package_name: str, version: str) -> None
 
 
 def synchronize() -> None:
-    """Update manifests, then let their native package managers regenerate locks."""
+    """Resolve package managers, update manifests, then regenerate locks."""
     version = sdk_version()
+    npm = required_tool("npm")
+    cargo = required_tool("cargo")
     for path, package_name in PUBLIC_PACKAGES:
         replace_package_version(path, package_name, version)
 
@@ -175,8 +177,6 @@ def synchronize() -> None:
     pyproject = re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', pyproject, count=1)
     pyproject_path.write_text(pyproject, encoding="utf-8")
 
-    npm = required_tool("npm")
-    cargo = required_tool("cargo")
     subprocess.run(  # noqa: S603 -- executable resolved from the operator's PATH
         [npm, "version", version, "--no-git-tag-version", "--allow-same-version"],
         cwd=ROOT / "bindings/node",

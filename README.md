@@ -159,8 +159,8 @@ verify. Running the native packaging contract locally on macOS requires GNU tar
   boundary. Node's generated napi-rs registration/conversion locations execute outside the profiler;
   no source exclusions or remapping are used.
 - Publishes four Linux/macOS amd64/arm64 native archives, four Python `abi3` wheels plus an sdist,
-  and one npm tarball carrying the four native modules. The Linux artifacts target glibc 2.28 and
-  macOS artifacts target 11.0.
+  and one npm tarball carrying the four native modules. The Linux Python wheels and Node modules
+  target glibc 2.28; macOS artifacts target 11.0.
 - Attests GitHub assets with GitHub build provenance, publishes PyPI registry attestations through
   trusted publishing, and publishes npm provenance through GitHub OIDC. The npm bootstrap token is
   used only for the first publication and is then revoked after the trusted publisher is configured.
